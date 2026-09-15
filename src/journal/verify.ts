@@ -1,6 +1,7 @@
 import { HASH_RE } from './canon.js';
 import { FORMAT_VERSION, GENESIS_HASH, assertKnownType, verifyEvent, type EventEnvelope } from './envelope.js';
 import type { ScannedBatch } from './framing.js';
+import { CorruptionError } from './errors.js';
 
 /**
  * Chain verification, shared by the reader and the writer's `resume`.
@@ -10,10 +11,9 @@ import type { ScannedBatch } from './framing.js';
  * a log that verifies for one of them verifies identically for the other. Any
  * violation is a typed `ChainBreakError` naming the seq.
  */
-export class ChainBreakError extends Error {
+export class ChainBreakError extends CorruptionError {
   constructor(public readonly seq: number, reason: string) {
     super(`hash chain broken at seq ${seq}: ${reason}`);
-    this.name = 'ChainBreakError';
   }
 }
 
@@ -56,10 +56,22 @@ export function parseEnvelope(line: string, seq: number): EventEnvelope {
  * and the writer's `resume` share it, so both apply identical rules; `known` is
  * null on the resume path, which only needs the chain itself to be intact.
  */
+/**
+ * Chain state carried across a verification pass. `firstHash` is set on the
+ * first event seen, so a caller resuming a journal learns the chain's root from
+ * the same walk that verified it — there is no separate peek at the first line.
+ */
+export interface ChainState {
+  prevHash: string;
+  seq: number;
+  /** The hash of the first event of the chain, or null while none was seen. */
+  firstHash: string | null;
+}
+
 export function* verifyChain(
   batches: ScannedBatch[],
   known: ReadonlySet<string> | null,
-  state: { prevHash: string; seq: number },
+  state: ChainState,
 ): Generator<EventEnvelope> {
   for (const batch of batches) {
     for (const line of batch.lines) {
@@ -73,6 +85,7 @@ export function* verifyChain(
       if (e.prev_hash !== state.prevHash) throw new ChainBreakError(e.seq, 'prev_hash mismatch');
       if (!verifyEvent(e)) throw new ChainBreakError(e.seq, 'hash recomputation failed');
       if (known !== null) assertKnownType(e.type, e.ignorable ?? false, known);
+      state.firstHash ??= e.hash;
       state.prevHash = e.hash;
       state.seq += 1;
       yield e;
@@ -81,6 +94,20 @@ export function* verifyChain(
 }
 
 /** The genesis chain state a log is verified from. */
-export function genesisState(): { prevHash: string; seq: number } {
-  return { prevHash: GENESIS_HASH, seq: 0 };
+export function genesisState(): ChainState {
+  return { prevHash: GENESIS_HASH, seq: 0, firstHash: null };
+}
+
+/**
+ * Walks the whole chain, discarding the events, and returns the resulting
+ * state. The writer's `resume` uses this: it needs only the verified tail and
+ * root, not the events themselves.
+ */
+export function verifyAll(
+  batches: ScannedBatch[],
+  known: ReadonlySet<string> | null,
+  state: ChainState,
+): ChainState {
+  for (const _ of verifyChain(batches, known, state)) { /* consume */ }
+  return state;
 }

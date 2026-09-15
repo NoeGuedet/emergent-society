@@ -1,8 +1,8 @@
-import { randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
+import { mkdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { sha256HexOf } from './canon.js';
-import { isErrno, syncDir } from './fsutil.js';
+import { JournalError } from './errors.js';
+import { atomicWriteFile, isErrno, syncPath } from './fsutil.js';
 
 /**
  * Format constant — a payload whose canonical UTF-8 byte length is at or beyond
@@ -23,10 +23,9 @@ export const MAX_BLOB_BYTES = 4 * 1024 * 1024;
 /** A blob name is the lowercase hex SHA-256 of its content. */
 const BLOB_HASH_RE = /^[0-9a-f]{64}$/;
 
-export class InvalidBlobHashError extends Error {
+export class InvalidBlobHashError extends JournalError {
   constructor(hash: string) {
     super(`not a blob hash: ${JSON.stringify(hash)}`);
-    this.name = 'InvalidBlobHashError';
   }
 }
 
@@ -53,21 +52,9 @@ export class BlobStore {
     // asked to store, so there is nothing to write.
     if (await this.has(hash)) return hash;
     // Write, fsync and rename a temporary file: a crash mid-write then cannot
-    // leave a torn blob under a name that later reads would trust. On any
-    // failure the temp file is removed, so failed writes leave nothing behind.
-    const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    const handle = await open(tmp, 'wx');
-    try {
-      await handle.write(content);
-      await handle.sync();
-      await handle.close();
-      await rename(tmp, path);
-    } catch (err) {
-      await handle.close().catch(() => {});
-      await rm(tmp, { force: true }).catch(() => {});
-      throw err;
-    }
-    await syncDir(dir);
+    // leave a torn blob under a name that later reads would trust.
+    await atomicWriteFile(path, content);
+    await syncPath(dir);
     return hash;
   }
 

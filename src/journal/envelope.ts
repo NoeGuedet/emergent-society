@@ -1,4 +1,5 @@
 import { canonicalizeJson, sha256Hex, type JsonValue } from './canon.js';
+import { JournalError } from './errors.js';
 
 /**
  * The event envelope and its hash chain.
@@ -9,7 +10,15 @@ import { canonicalizeJson, sha256Hex, type JsonValue } from './canon.js';
  * `EventDataMap`, which is what makes the event union a compile-time contract
  * rather than a convention.
  */
+/**
+ * The envelope format version. It is frozen from the genesis event: a change to
+ * the field set or the hashing formula means `v: 1` in a *new* file, never an
+ * in-place mutation of an existing log — which is what lets a reader refuse a
+ * mismatched `v` outright instead of guessing at a compatibility shim.
+ */
 export const FORMAT_VERSION = 0;
+
+/** `prev_hash` of the first event of a node's chain. */
 export const GENESIS_HASH = '0'.repeat(64);
 
 /**
@@ -54,6 +63,14 @@ export function computeHash(e: Omit<EventEnvelope, 'hash'>): string {
   return sha256Hex(e.prev_hash + canonicalizeJson(payload));
 }
 
+/**
+ * Builds and hashes one event.
+ *
+ * `ignorable` is spread in only when the caller passed it: the frozen format
+ * distinguishes *absent* (the type is required — a reader that does not know it
+ * refuses to rebuild) from explicit `false`, so that convention is written once
+ * here rather than repeated at every construction site.
+ */
 export function makeEvent<T extends string>(input: {
   type: T;
   data: EventDataFor<T>;
@@ -62,10 +79,10 @@ export function makeEvent<T extends string>(input: {
   prevHash: string;
   ignorable?: boolean;
 }): EventEnvelope<EventDataFor<T>> {
+  const { type, data, seq, time, prevHash, ignorable } = input;
   const unsigned: Omit<EventEnvelope, 'hash'> = {
-    v: FORMAT_VERSION, type: input.type, seq: input.seq, time: input.time,
-    prev_hash: input.prevHash, data: input.data as JsonValue,
-    ...(input.ignorable !== undefined ? { ignorable: input.ignorable } : {}),
+    v: FORMAT_VERSION, type, seq, time, prev_hash: prevHash, data: data as JsonValue,
+    ...(ignorable !== undefined ? { ignorable } : {}),
   };
   return { ...unsigned, hash: computeHash(unsigned) } as EventEnvelope<EventDataFor<T>>;
 }
@@ -86,10 +103,9 @@ export function envelopeJson(e: EventEnvelope): JsonValue {
   return e as unknown as JsonValue;
 }
 
-export class UnknownEventTypeError extends Error {
+export class UnknownEventTypeError extends JournalError {
   constructor(public readonly eventType: string) {
     super(`unknown non-ignorable event type: ${eventType} — refusing to rebuild`);
-    this.name = 'UnknownEventTypeError';
   }
 }
 

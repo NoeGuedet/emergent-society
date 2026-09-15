@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import canonicalize from 'canonicalize';
+import { JournalError } from './errors.js';
 
 /**
  * Canonical bytes and hashes: the journal's one serialization.
@@ -21,10 +22,9 @@ export type JsonValue =
   | JsonValue[]
   | { [k: string]: JsonValue };
 
-export class NonCanonicalizableError extends Error {
+export class NonCanonicalizableError extends JournalError {
   constructor(reason: string, options?: { cause?: unknown }) {
     super(`value is not canonicalizable: ${reason}`, options);
-    this.name = 'NonCanonicalizableError';
   }
 }
 

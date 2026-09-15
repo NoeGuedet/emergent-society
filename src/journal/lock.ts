@@ -1,4 +1,5 @@
 import { readFile, rm, writeFile } from 'node:fs/promises';
+import { JournalError } from './errors.js';
 import { isErrno } from './fsutil.js';
 import { lockPath } from './layout.js';
 
@@ -12,10 +13,9 @@ import { lockPath } from './layout.js';
  * rather than the pid alone, because a recycled pid would otherwise read as a
  * live owner and strand the journal forever.
  */
-export class SessionAlreadyOwnedError extends Error {
+export class SessionAlreadyOwnedError extends JournalError {
   constructor(nodeUid: string) {
     super(`journal for node "${nodeUid}" is already owned by a live writer`);
-    this.name = 'SessionAlreadyOwnedError';
   }
 }
 

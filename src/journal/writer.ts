@@ -1,13 +1,14 @@
-import { open as openFile, mkdir, readFile, rename, rm, truncate, writeFile } from 'node:fs/promises';
+import { open as openFile, mkdir, truncate } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { canonicalizeJson, sha256HexOf, type JsonValue } from './canon.js';
 import { GENESIS_HASH, makeEvent, envelopeJson, type EventDataFor, type EventEnvelope } from './envelope.js';
 import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from './blobs.js';
 import { encodeBatch, scanBatches } from './framing.js';
-import { isErrno, syncDir, syncFile, writeAll } from './fsutil.js';
+import { CorruptionError, JournalError } from './errors.js';
+import { atomicWriteFile, readFileOrNull, syncPath, writeAll } from './fsutil.js';
 import { headPath, journalPath, nodeDir, type Head } from './layout.js';
 import { acquireLock, releaseLock, SessionAlreadyOwnedError } from './lock.js';
-import { genesisState, verifyChain } from './verify.js';
+import { genesisState, verifyAll } from './verify.js';
 
 export { SessionAlreadyOwnedError };
 
@@ -22,10 +23,9 @@ export { SessionAlreadyOwnedError };
  * typed terminal state rather than silently skipping events the caller was told
  * were logged.
  */
-export class JournalClosedError extends Error {
+export class JournalClosedError extends JournalError {
   constructor() {
     super('journal writer is closed');
-    this.name = 'JournalClosedError';
   }
 }
 
@@ -34,10 +34,9 @@ export class JournalClosedError extends Error {
  * would hide every later event from the reader, so the writer refuses and the
  * caller runs `repair()` first.
  */
-export class TornTailError extends Error {
+export class TornTailError extends CorruptionError {
   constructor(public readonly dir: string, public readonly tornBytes: number) {
     super(`${dir}: torn trailing fragment of ${tornBytes} bytes — run repair() before opening`);
-    this.name = 'TornTailError';
   }
 }
 
@@ -47,10 +46,9 @@ export class TornTailError extends Error {
  * every further append/flush/close is refused instead of silently skipping the
  * events the caller already believes are logged.
  */
-export class JournalPoisonedError extends Error {
+export class JournalPoisonedError extends JournalError {
   constructor(public readonly dir: string, reason: string) {
     super(`${dir}: journal writer is poisoned — ${reason}`);
-    this.name = 'JournalPoisonedError';
   }
 }
 
@@ -107,6 +105,7 @@ const systemClock = (): number => Date.now();
 export class JournalWriter {
   private seq = 0;
   private prevHash = GENESIS_HASH;
+  /** The chain's root, or null before the first event; written into the head. */
   private firstHash: string | null = null;
   private pending: PendingEvent[] = [];
   /**
@@ -165,7 +164,7 @@ export class JournalWriter {
     try {
       // The log file was just created: fsync the directory so its entry is
       // durable even if the process dies before the first flush.
-      await syncDir(dir);
+      await syncPath(dir);
       await w.resume();
     } catch (err) {
       await w.forceClose();
@@ -178,16 +177,11 @@ export class JournalWriter {
   private get headFilePath(): string { return headPath(this.dir); }
 
   private async resume(): Promise<void> {
-    let raw: Buffer;
-    try {
-      raw = await readFile(this.logPath);
-    } catch (err) {
-      // A missing log is a brand-new journal. Any other read error (EACCES,
-      // EIO) must not be mistaken for genesis: forking the chain from seq 0
-      // over an existing log would corrupt it silently.
-      if (isErrno(err, 'ENOENT')) return;
-      throw err;
-    }
+    // A missing log is a brand-new journal. Any other read error (EACCES, EIO)
+    // must not be mistaken for genesis: forking the chain from seq 0 over an
+    // existing log would corrupt it silently, so readFileOrNull rethrows it.
+    const raw = await readFileOrNull(this.logPath);
+    if (raw === null) return;
     // repair() must have run first (kernel.md §3: at boot, before the writer
     // opens). Appending after a torn fragment would bury the fragment inside
     // the log, where the reader — which stops at the first torn region —
@@ -195,11 +189,10 @@ export class JournalWriter {
     const { batches, tornBytes } = scanBatches(raw);
     if (tornBytes > 0) throw new TornTailError(this.dir, tornBytes);
     // Verify the full chain exactly as the reader would, and refuse to append
-    // onto a tail that does not verify.
-    const state = genesisState();
-    for (const e of verifyChain(batches, null, state)) {
-      this.firstHash ??= e.hash;
-    }
+    // onto a tail that does not verify. The walk leaves the chain's tail and
+    // root in `state`, which is everything needed to continue it.
+    const state = verifyAll(batches, null, genesisState());
+    this.firstHash = state.firstHash;
     this.seq = state.seq;
     this.prevHash = state.prevHash;
     this.committed = { bytes: raw.length, seq: this.seq, lastHash: this.prevHash };
@@ -218,6 +211,7 @@ export class JournalWriter {
       type, data: this.claimCheck(data), seq: this.seq, time: this.now(),
       prevHash: this.prevHash, ...opts,
     });
+
     this.seq += 1;
     this.prevHash = e.hash;
     this.firstHash ??= e.hash;
@@ -364,19 +358,11 @@ export class JournalWriter {
       ts: this.now(),
     };
     // Atomic replace: a crash can leave the previous head, never a torn one.
-    // The tmp file is fsynced before the rename, so the rename cannot become
-    // durable ahead of the contents it points at; on failure it is removed so
-    // the directory cannot collect stale checkpoints.
-    const tmp = `${this.headFilePath}.${process.pid}.tmp`;
-    try {
-      await writeFile(tmp, JSON.stringify(head));
-      await syncFile(tmp);
-      await rename(tmp, this.headFilePath);
-    } catch (err) {
-      await rm(tmp, { force: true }).catch(() => {});
-      throw err;
-    }
-    await syncDir(this.dir);
+    // The temp file is fsynced before the rename, so the rename cannot become
+    // durable ahead of the contents it points at, and the directory is fsynced
+    // after so the rename itself survives a crash.
+    await atomicWriteFile(this.headFilePath, JSON.stringify(head));
+    await syncPath(this.dir);
   }
 
   async close(): Promise<void> {

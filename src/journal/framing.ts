@@ -1,4 +1,5 @@
 import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib';
+import { CorruptionError } from './errors.js';
 
 const LEN_BYTES = 4;
 
@@ -27,10 +28,9 @@ const COMPRESS_OPTIONS = {
  * not at the end, so truncating to this offset would silently discard valid
  * committed events.
  */
-export class CorruptFrameError extends Error {
+export class CorruptFrameError extends CorruptionError {
   constructor(public readonly offset: number, reason: string) {
     super(`corrupt frame at byte ${offset}: ${reason}`);
-    this.name = 'CorruptFrameError';
   }
 }
 

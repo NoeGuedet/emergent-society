@@ -1,6 +1,6 @@
 import { readFile, rm, truncate } from 'node:fs/promises';
 import { scanBatches } from './framing.js';
-import { isErrno, syncDir, syncFile } from './fsutil.js';
+import { readFileOrNull, syncPath } from './fsutil.js';
 import { headPath, journalPath, nodeDir, parseHead, type Head } from './layout.js';
 import { genesisState, verifyChain } from './verify.js';
 import type { EventEnvelope } from './envelope.js';
@@ -31,7 +31,8 @@ export class JournalReader {
 
   async head(): Promise<Head | null> {
     // The head checkpoint is disposable: a missing, unreadable or malformed one
-    // means "rebuild from the log", which is what events() does anyway.
+    // means "rebuild from the log", which is what events() does anyway. Unlike
+    // the log itself, no read error here is worth surfacing.
     let raw: string;
     try {
       raw = await readFile(headPath(this.dir), 'utf8');
@@ -46,15 +47,10 @@ export class JournalReader {
    * prefix is served; a torn tail is where iteration stops.
    */
   async *events(fromSeq = 0): AsyncGenerator<EventEnvelope> {
-    let raw: Buffer;
-    try {
-      raw = await readFile(journalPath(this.dir));
-    } catch (err) {
-      // A missing log is an empty journal. Anything else (EACCES, EIO) must not
-      // be mistaken for genesis.
-      if (isErrno(err, 'ENOENT')) return;
-      throw err;
-    }
+    // A missing log is an empty journal. Anything else (EACCES, EIO) must not
+    // be mistaken for genesis, so readFileOrNull rethrows it.
+    const raw = await readFileOrNull(journalPath(this.dir));
+    if (raw === null) return;
     const { batches } = scanBatches(raw);
     for (const e of verifyChain(batches, this.known, genesisState())) {
       if (e.seq >= fromSeq) yield e;
@@ -66,21 +62,18 @@ export class JournalReader {
 export async function repair(home: string, nodeUid: string): Promise<{ tornBytes: number }> {
   const dir = nodeDir(home, nodeUid);
   const path = journalPath(dir);
-  let raw: Buffer;
-  try {
-    raw = await readFile(path);
-  } catch (err) {
-    if (isErrno(err, 'ENOENT')) return { tornBytes: 0 };
-    throw err;
-  }
+  const raw = await readFileOrNull(path);
+  if (raw === null) return { tornBytes: 0 };
   // scanBatches throws CorruptFrameError on interior corruption: repair must
   // never truncate through valid committed events, so that error propagates
   // and nothing is deleted.
   const { tornBytes } = scanBatches(raw);
   if (tornBytes > 0) {
     await truncate(path, raw.length - tornBytes);
-    await syncFile(path);
-    await syncDir(dir);
+    // The truncation and its directory entry are both metadata changes, so both
+    // are fsynced before the caller trusts the new length.
+    await syncPath(path);
+    await syncPath(dir);
     // The head checkpoint may now point past the truncation point; it is
     // disposable, so it is removed and rebuilt from the log on the next flush.
     await rm(headPath(dir), { force: true });
