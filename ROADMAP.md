@@ -1,6 +1,6 @@
 # Next steps
 
-> **READ FIRST: `docs/vision.md`** — this is the project's living document (refocused vision + all decisions made). The spec `docs/archive/emergent-org-harness-v0.md` remains the **long-term** reference for Parts II/III (Instance, Loop) only — its Part I has been amputated (P4, P5, rights/promotions taken out of scope). The research reports are in `docs/research/` (state of the art, metrics, devil's advocate, models, Harness/Cordis deep dive, DeepSeek discussion).
+> **READ FIRST: `docs/vision.md`** — this is the project's living document (refocused vision + all decisions made). An earlier long-term spec (Parts II/III: Instance, Loop) exists but is **not published at this stage** — its Part I has been amputated (P4, P5, rights/promotions taken out of scope). The research reports are in `docs/research/` (state of the art, metrics, devil's advocate, models, Harness/Cordis deep dive).
 
 ## The project in one sentence
 

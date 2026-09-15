@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-11
 **Status:** validated — sessions 2–5 of the roadmap below have since been completed (see `../ROADMAP.md`); amended by `seed.md`, `direction.md` and `kernel.md`
-**Partially supersedes:** the spec `archive/emergent-org-harness-v0.md` remains the reference for Parts II/III (long term), but Part I is **amputated** of everything that is premature product work.
+**Partially supersedes:** an earlier long-term spec (not published at this stage) remains the reference for Parts II/III (long term), but its Part I is **amputated** of everything that is premature product work.
 
 ---
 
@@ -57,7 +57,7 @@ Consequences settled in that discussion (msg 12) and adopted here:
 - **The cockpit = a navigation instrument** (showing the trajectory), not a debug tool.
 - The main risk = **ossification** (and its mirror: perpetual reorganization).
 
-⚠️ **Reliability**: the small model's answers in that conversation contain massive hallucinations (invented models and benchmarks). Only the architectural reasoning is to be kept — the external factual material is to be thrown away. See the warning at the head of `research/deepseek-discussion.md`.
+⚠️ **Reliability**: the small model's answers in that conversation contain massive hallucinations (invented models and benchmarks). Only the architectural reasoning is to be kept — the external factual material is to be thrown away.
 
 ### Technical lessons for the kernel (Harness/Cordis deep dive)
 

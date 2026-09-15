@@ -35,7 +35,6 @@ Design phase — no code yet. The design documents below have been iterated and 
 | [Kernel](docs/kernel.md) | The full technical spec: event-native async runtime, journal format, sandboxing, driver |
 | [Research corpus](docs/research/) | State of the art, metrics, devil's advocate, harness internals deep-dive |
 | [Roadmap](ROADMAP.md) | Where we stand and what's next |
-| [Archive](docs/archive/) | Historical pre-refocus spec, kept for the record |
 
 ## License
 
