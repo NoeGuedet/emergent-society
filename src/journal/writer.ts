@@ -1,22 +1,27 @@
-import { createHash } from 'node:crypto';
 import { open as openFile, mkdir, readFile, rename, rm, truncate, writeFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { join } from 'node:path';
-import { canonicalizeJson, type JsonValue } from './canon.js';
+import { canonicalizeJson, sha256HexOf, type JsonValue } from './canon.js';
 import { GENESIS_HASH, makeEvent, envelopeJson, type EventDataFor, type EventEnvelope } from './envelope.js';
 import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from './blobs.js';
 import { encodeBatch, scanBatches } from './framing.js';
-import { isErrno, syncDir, syncFile } from './fsutil.js';
-import { HEAD_FILE, type Head } from './head.js';
+import { isErrno, syncDir, syncFile, writeAll } from './fsutil.js';
+import { headPath, journalPath, nodeDir, type Head } from './layout.js';
+import { acquireLock, releaseLock, SessionAlreadyOwnedError } from './lock.js';
 import { genesisState, verifyChain } from './verify.js';
 
-export class SessionAlreadyOwnedError extends Error {
-  constructor(nodeUid: string) {
-    super(`journal for node "${nodeUid}" is already owned by a live writer`);
-    this.name = 'SessionAlreadyOwnedError';
-  }
-}
+export { SessionAlreadyOwnedError };
 
+/**
+ * The append side of the journal: the only writer of a node's canonical log.
+ *
+ * Appends are synchronous and in-memory; a bounded write-behind window turns a
+ * burst into one framed batch with one `write` + `fsync`, and `flush` is the
+ * explicit barrier callers use before a model request or a top-level tool
+ * effect. Ownership is exclusive (see `lock.ts`), and a batch is never dropped:
+ * a failed write is retried, and a writer that cannot make progress ends in a
+ * typed terminal state rather than silently skipping events the caller was told
+ * were logged.
+ */
 export class JournalClosedError extends Error {
   constructor() {
     super('journal writer is closed');
@@ -66,6 +71,12 @@ const MAX_WRITE_FAILURE_STREAK = 2;
 const MAX_CONCURRENT_BLOB_WRITES = 4;
 
 /**
+ * The write-behind window: the first event of a burst starts the clock (no
+ * debounce) and one batch is written when it elapses.
+ */
+const DEFAULT_BATCH_WINDOW_MS = 200;
+
+/**
  * An entry carries the canonical bytes captured at `append`, so `flush` writes
  * exactly the lines that were hashed even if the caller mutates the payload
  * afterwards.
@@ -73,6 +84,18 @@ const MAX_CONCURRENT_BLOB_WRITES = 4;
 interface PendingEvent {
   event: EventEnvelope;
   line: string;
+}
+
+/**
+ * The on-disk watermark. It lags `seq`/`prevHash` while a batch is pending, and
+ * is the rollback target when a write fails: `bytes` is the last durable length,
+ * `seq`/`lastHash` describe the last durable event.
+ */
+interface Watermark {
+  /** Bytes durably committed; the truncate target after a failed write. */
+  bytes: number;
+  seq: number;
+  lastHash: string;
 }
 
 /**
@@ -97,11 +120,8 @@ export class JournalWriter {
   private closed = false;
   /** Serializes flushes so a burst can never be written twice. */
   private flushChain: Promise<void> = Promise.resolve();
-  /** Bytes durably committed; the truncate target after a failed write. */
-  private committedBytes = 0;
   /** On-disk watermark, which lags `seq` while a batch is still pending. */
-  private committedSeq = 0;
-  private committedLastHash = GENESIS_HASH;
+  private committed: Watermark = { bytes: 0, seq: 0, lastHash: GENESIS_HASH };
   /** Streak of consecutive failed writes for the same batch. */
   private writeFailureStreak = 0;
   private poisoned = false;
@@ -126,21 +146,21 @@ export class JournalWriter {
       onError?: (err: Error) => void;
     } = {},
   ): Promise<JournalWriter> {
-    const dir = join(home, 'nodes', nodeUid);
+    const dir = nodeDir(home, nodeUid);
     await mkdir(dir, { recursive: true });
     await acquireLock(dir, nodeUid);
     let log: FileHandle;
     try {
       // 'a' both creates the log and makes every write an append: no code path
       // can seek backwards into journaled history.
-      log = await openFile(join(dir, 'journal.v0.jsonl.zstd'), 'a');
+      log = await openFile(journalPath(dir), 'a');
     } catch (err) {
       await releaseLock(dir);
       throw err;
     }
     const w = new JournalWriter(
       dir, new BlobStore(home),
-      opts.now ?? systemClock, opts.batchWindowMs ?? 200, opts.onError, log,
+      opts.now ?? systemClock, opts.batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS, opts.onError, log,
     );
     try {
       // The log file was just created: fsync the directory so its entry is
@@ -154,8 +174,8 @@ export class JournalWriter {
     return w;
   }
 
-  private get logPath(): string { return join(this.dir, 'journal.v0.jsonl.zstd'); }
-  private get headPath(): string { return join(this.dir, HEAD_FILE); }
+  private get logPath(): string { return journalPath(this.dir); }
+  private get headFilePath(): string { return headPath(this.dir); }
 
   private async resume(): Promise<void> {
     let raw: Buffer;
@@ -182,9 +202,7 @@ export class JournalWriter {
     }
     this.seq = state.seq;
     this.prevHash = state.prevHash;
-    this.committedBytes = raw.length;
-    this.committedSeq = this.seq;
-    this.committedLastHash = this.prevHash;
+    this.committed = { bytes: raw.length, seq: this.seq, lastHash: this.prevHash };
   }
 
   /** Synchronous and in-memory: the hot path never blocks on I/O. */
@@ -194,12 +212,11 @@ export class JournalWriter {
   append(type: string, data: JsonValue, opts: { ignorable?: boolean } = {}): EventEnvelope {
     // A write-behind failure must be seen before anything else is accepted:
     // the caller has to know the previous burst is not durable.
-    this.throwIfFailed();
+    this.throwIfUnusable();
     if (this.closed) throw new JournalClosedError();
     const e = makeEvent({
       type, data: this.claimCheck(data), seq: this.seq, time: this.now(),
-      prevHash: this.prevHash,
-      ...(opts.ignorable !== undefined ? { ignorable: opts.ignorable } : {}),
+      prevHash: this.prevHash, ...opts,
     });
     this.seq += 1;
     this.prevHash = e.hash;
@@ -229,7 +246,7 @@ export class JournalWriter {
     // prefix and the reference says so (`truncated: true` + original size).
     const truncated = bytes.length >= MAX_BLOB_BYTES;
     const stored = truncated ? bytes.subarray(0, MAX_BLOB_BYTES) : bytes;
-    const blobHash = createHash('sha256').update(stored).digest('hex');
+    const blobHash = sha256HexOf(stored);
     this.pendingBlobs.set(blobHash, stored);
     const ref: Record<string, JsonValue> = { blob: blobHash, size: bytes.length };
     if (truncated) ref['truncated'] = true;
@@ -316,9 +333,12 @@ export class JournalWriter {
       }
       throw err;
     }
-    this.committedBytes += frame.length;
-    this.committedSeq = batch[batch.length - 1]!.event.seq + 1;
-    this.committedLastHash = batch[batch.length - 1]!.event.hash;
+    const last = batch[batch.length - 1]!;
+    this.committed = {
+      bytes: this.committed.bytes + frame.length,
+      seq: last.event.seq + 1,
+      lastHash: last.event.hash,
+    };
     this.writeFailureStreak = 0;
     this.pendingFailure = null;
     await this.writeHead();
@@ -327,7 +347,7 @@ export class JournalWriter {
   /** Rolls the log back to the last durable byte; false if the rollback failed. */
   private async truncateToCommitted(): Promise<boolean> {
     try {
-      await truncate(this.logPath, this.committedBytes);
+      await truncate(this.logPath, this.committed.bytes);
       return true;
     } catch {
       // The caller poisons the writer: appending over a partial frame would
@@ -339,19 +359,19 @@ export class JournalWriter {
   private async writeHead(): Promise<void> {
     const head: Head = {
       first_hash: this.firstHash ?? GENESIS_HASH,
-      last_hash: this.committedLastHash,
-      count: this.committedSeq,
+      last_hash: this.committed.lastHash,
+      count: this.committed.seq,
       ts: this.now(),
     };
     // Atomic replace: a crash can leave the previous head, never a torn one.
     // The tmp file is fsynced before the rename, so the rename cannot become
     // durable ahead of the contents it points at; on failure it is removed so
     // the directory cannot collect stale checkpoints.
-    const tmp = `${this.headPath}.${process.pid}.tmp`;
+    const tmp = `${this.headFilePath}.${process.pid}.tmp`;
     try {
       await writeFile(tmp, JSON.stringify(head));
       await syncFile(tmp);
-      await rename(tmp, this.headPath);
+      await rename(tmp, this.headFilePath);
     } catch (err) {
       await rm(tmp, { force: true }).catch(() => {});
       throw err;
@@ -382,7 +402,7 @@ export class JournalWriter {
     }
   }
 
-  private throwIfFailed(): void {
+  private throwIfUnusable(): void {
     this.throwIfPoisoned();
     if (this.pendingFailure) throw this.pendingFailure;
   }
@@ -398,15 +418,6 @@ export class JournalWriter {
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     await this.log.close();
     await releaseLock(this.dir);
-  }
-}
-
-async function writeAll(handle: FileHandle, buf: Buffer): Promise<void> {
-  let written = 0;
-  while (written < buf.length) {
-    const { bytesWritten } = await handle.write(buf, written, buf.length - written, null);
-    if (bytesWritten === 0) throw new Error('journal write made no progress');
-    written += bytesWritten;
   }
 }
 
@@ -433,114 +444,4 @@ async function runBounded<T>(
   });
   await Promise.all(workers);
   return firstError;
-}
-
-function lockPathFor(dir: string): string {
-  return join(dir, 'journal.v0.lock');
-}
-
-interface LockRecord {
-  pid: number;
-  /** Process start time, so a recycled PID is detected as stale. */
-  startedAt: number | null;
-}
-
-async function acquireLock(dir: string, nodeUid: string): Promise<void> {
-  const lockPath = lockPathFor(dir);
-  const record = JSON.stringify(await currentLockRecord());
-  try {
-    await writeFile(lockPath, record, { flag: 'wx' });
-    return;
-  } catch (err) {
-    if (!isErrno(err, 'EEXIST')) throw err;
-  }
-  if (await isLockHeldByLiveProcess(lockPath)) throw new SessionAlreadyOwnedError(nodeUid);
-  // Stale lock: the previous owner is gone.
-  await rm(lockPath, { force: true });
-  try {
-    await writeFile(lockPath, record, { flag: 'wx' });
-  } catch (err) {
-    // Another writer won the race between the removal and this write.
-    if (isErrno(err, 'EEXIST')) throw new SessionAlreadyOwnedError(nodeUid);
-    throw err;
-  }
-}
-
-async function currentLockRecord(): Promise<LockRecord> {
-  return { pid: process.pid, startedAt: await processStartTime(process.pid) };
-}
-
-/**
- * Process start time in clock ticks since boot, read from `/proc/<pid>/stat`
- * field 22 (the value after the command in parentheses and the state char).
- * Together with the PID it identifies a process across PID reuse. Returns null
- * where `/proc` is unavailable, falling back to pid-only behaviour.
- */
-async function processStartTime(pid: number): Promise<number | null> {
-  let stat: string;
-  try {
-    stat = await readFile(`/proc/${pid}/stat`, 'utf8');
-  } catch {
-    return null;
-  }
-  const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-  const field = rest[19];
-  if (field === undefined) return null;
-  const value = Number(field);
-  return Number.isFinite(value) ? value : null;
-}
-
-/**
- * The PID range `process.kill` accepts. A value outside it names no process at
- * all, so such a lock is stale rather than an unkillable live owner.
- */
-const MAX_PID = 2 ** 31 - 1;
-
-function isPid(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= MAX_PID;
-}
-
-async function readLockRecord(lockPath: string): Promise<LockRecord | null> {
-  let raw: string;
-  try {
-    raw = await readFile(lockPath, 'utf8');
-  } catch {
-    return null;
-  }
-  // Tolerate the bare-PID lock written by an older writer.
-  const barePid = Number(raw.trim());
-  if (isPid(barePid)) return { pid: barePid, startedAt: null };
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    if (!isPid(parsed['pid'])) return null;
-    const startedAt = parsed['startedAt'];
-    if (startedAt !== null && (typeof startedAt !== 'number' || !Number.isFinite(startedAt))) {
-      return null;
-    }
-    return { pid: parsed['pid'], startedAt: startedAt as number | null };
-  } catch {
-    return null;
-  }
-}
-
-async function isLockHeldByLiveProcess(lockPath: string): Promise<boolean> {
-  const record = await readLockRecord(lockPath);
-  // Unparseable contents do not identify a live owner, so the lock is stale.
-  if (record === null) return false;
-  try {
-    process.kill(record.pid, 0);
-  } catch (err) {
-    // EPERM means the process exists but is not ours — still a live owner.
-    return !isErrno(err, 'ESRCH');
-  }
-  // The PID is alive; check that it is the same process and not a recycled one.
-  if (record.startedAt === null) return true;
-  const actual = await processStartTime(record.pid);
-  // An unreadable start time cannot disprove ownership: treat it as live.
-  if (actual === null) return true;
-  return actual === record.startedAt;
-}
-
-async function releaseLock(dir: string): Promise<void> {
-  await rm(lockPathFor(dir), { force: true });
 }

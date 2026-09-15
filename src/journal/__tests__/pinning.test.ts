@@ -9,13 +9,14 @@ import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from '../blobs.js';
 import { repair } from '../reader.js';
 import { canonicalizeJson } from '../canon.js';
 import { encodeBatch } from '../framing.js';
+import { journalPath, nodeDir } from '../layout.js';
 
 let home: string;
 beforeEach(async () => { home = await mkdtemp(join(tmpdir(), 'cell-pin-')); });
 afterEach(async () => { vi.restoreAllMocks(); await rm(home, { recursive: true, force: true }); });
 
 function logPath(node = 'n1'): string {
-  return join(home, `nodes/${node}/journal.v0.jsonl.zstd`);
+  return journalPath(nodeDir(home, node));
 }
 
 /** Counts every FileHandle#sync call while `fn` runs. */

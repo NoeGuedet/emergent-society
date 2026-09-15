@@ -7,6 +7,7 @@ import { JournalReader, ChainBreakError, repair } from '../reader.js';
 import { UnknownEventTypeError, computeHash } from '../envelope.js';
 import { canonicalizeJson } from '../canon.js';
 import { encodeBatch, scanBatches, CorruptFrameError } from '../framing.js';
+import { headPath, journalPath, nodeDir } from '../layout.js';
 
 const KNOWN = new Set(['test/ping']);
 let home: string;
@@ -14,7 +15,7 @@ beforeEach(async () => { home = await mkdtemp(join(tmpdir(), 'cell-reader-')); }
 afterEach(async () => { await rm(home, { recursive: true, force: true }); });
 
 function logPath(node = 'n1'): string {
-  return join(home, `nodes/${node}/journal.v0.jsonl.zstd`);
+  return journalPath(nodeDir(home, node));
 }
 
 async function collect(r: JournalReader, fromSeq = 0) {
@@ -111,7 +112,7 @@ describe('JournalReader verification and repair edges', () => {
     await w.close();
     const r = await JournalReader.open(home, 'n1', KNOWN);
     for (const bad of ['null', '[]', '{"count":2}', '{"first_hash":"x","last_hash":"y","count":-1,"ts":1}', 'not json']) {
-      await writeFile(join(home, 'nodes/n1/journal.v0.head'), bad);
+      await writeFile(headPath(nodeDir(home, 'n1')), bad);
       expect(await r.head()).toBeNull();
     }
   });

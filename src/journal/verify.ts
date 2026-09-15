@@ -1,14 +1,21 @@
+import { HASH_RE } from './canon.js';
 import { FORMAT_VERSION, GENESIS_HASH, assertKnownType, verifyEvent, type EventEnvelope } from './envelope.js';
 import type { ScannedBatch } from './framing.js';
 
+/**
+ * Chain verification, shared by the reader and the writer's `resume`.
+ *
+ * One iterator enforces every rule of the chain — format version, seq
+ * contiguity, `prev_hash` linkage, hash recomputation, known-type refusal — so
+ * a log that verifies for one of them verifies identically for the other. Any
+ * violation is a typed `ChainBreakError` naming the seq.
+ */
 export class ChainBreakError extends Error {
   constructor(public readonly seq: number, reason: string) {
     super(`hash chain broken at seq ${seq}: ${reason}`);
     this.name = 'ChainBreakError';
   }
 }
-
-export const HASH_RE = /^[0-9a-f]{64}$/;
 
 /** The frozen v0 envelope key set; a field outside it refuses to rebuild. */
 const ENVELOPE_KEYS = new Set(['v', 'type', 'seq', 'time', 'prev_hash', 'hash', 'ignorable', 'data']);

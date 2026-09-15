@@ -1,6 +1,18 @@
 import { createHash } from 'node:crypto';
 import canonicalize from 'canonicalize';
 
+/**
+ * Canonical bytes and hashes: the journal's one serialization.
+ *
+ * RFC 8785 (JCS) is frozen before the first event, so the string this module
+ * produces for a value *is* its identity in the log — the hash chain is computed
+ * over it, and a value whose canonical form would be lossy is refused rather
+ * than serialized to something the caller did not intend.
+ */
+
+/** The shape of every hash in the journal: lowercase hex SHA-256. */
+export const HASH_RE = /^[0-9a-f]{64}$/;
+
 export type JsonValue =
   | null
   | boolean
@@ -89,4 +101,9 @@ export function canonicalizeJson(value: JsonValue): string {
 
 export function sha256Hex(input: string): string {
   return createHash('sha256').update(input, 'utf8').digest('hex');
+}
+
+/** Lowercase hex SHA-256 of raw bytes — the digest of a stored blob. */
+export function sha256HexOf(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
 }

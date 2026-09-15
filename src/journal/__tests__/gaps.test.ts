@@ -6,6 +6,7 @@ import { JournalWriter, JournalClosedError, JournalPoisonedError } from '../writ
 import { JournalReader, repair } from '../reader.js';
 import { BlobStore } from '../blobs.js';
 import { encodeBatch, scanBatches, CorruptFrameError } from '../framing.js';
+import { headPath, journalPath, nodeDir } from '../layout.js';
 
 const KNOWN = new Set(['test/ping', 'test/big']);
 let home: string;
@@ -13,7 +14,7 @@ beforeEach(async () => { home = await mkdtemp(join(tmpdir(), 'cell-gaps-')); });
 afterEach(async () => { vi.restoreAllMocks(); await rm(home, { recursive: true, force: true }); });
 
 function logPath(node = 'n1'): string {
-  return join(home, `nodes/${node}/journal.v0.jsonl.zstd`);
+  return journalPath(nodeDir(home, node));
 }
 
 async function collectEvents(node = 'n1') {
@@ -272,9 +273,9 @@ describe('head checkpoint tmp files', () => {
     const w = await JournalWriter.open(home, 'n1', { batchWindowMs: 60_000 });
     w.append('test/ping', { n: 0 });
     // A directory occupies the head's path, so the atomic rename must fail.
-    await mkdir(join(home, 'nodes/n1/journal.v0.head'), { recursive: true });
+    await mkdir(headPath(nodeDir(home, 'n1')), { recursive: true });
     await expect(w.flush()).rejects.toThrow();
-    const leaked = (await readdir(join(home, 'nodes/n1'))).filter((n) => n.endsWith('.tmp'));
+    const leaked = (await readdir(nodeDir(home, 'n1'))).filter((n) => n.endsWith('.tmp'));
     expect(leaked).toEqual([]);
     await w.close().catch(() => {});
   });

@@ -1,6 +1,7 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { sha256HexOf } from './canon.js';
 import { isErrno, syncDir } from './fsutil.js';
 
 /**
@@ -44,7 +45,7 @@ export class BlobStore {
   }
 
   async put(content: Buffer): Promise<string> {
-    const hash = createHash('sha256').update(content).digest('hex');
+    const hash = sha256HexOf(content);
     const dir = this.dirFor(hash);
     const path = this.pathFor(hash);
     await mkdir(dir, { recursive: true });

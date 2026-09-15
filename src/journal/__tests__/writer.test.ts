@@ -8,6 +8,7 @@ import { encodeBatch } from '../framing.js';
 import { verifyEvent, makeEvent, envelopeJson, GENESIS_HASH } from '../envelope.js';
 import { CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, BlobStore } from '../blobs.js';
 import { canonicalizeJson } from '../canon.js';
+import { journalPath, lockPath, nodeDir } from '../layout.js';
 
 let home: string;
 beforeEach(async () => { home = await mkdtemp(join(tmpdir(), 'cell-writer-')); });
@@ -35,7 +36,7 @@ describe('JournalWriter', () => {
     const expected = encodeBatch([canonicalizeJson(envelopeJson(makeEvent({
       type: 'test/ping', data: { n: 0 }, seq: 0, time: now, prevHash: GENESIS_HASH,
     })))]);
-    const onDisk = await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'));
+    const onDisk = await readFile(journalPath(nodeDir(home, 'n1')));
     expect(onDisk.equals(expected)).toBe(true);
     await w.close();
   });
@@ -113,10 +114,10 @@ describe('JournalWriter durability and ownership', () => {
     const w = await JournalWriter.open(home, 'n1', { batchWindowMs: 60_000 });
     w.append('test/ping', { n: 0 });
     // No flush yet: the log file exists (created at open) but holds no events.
-    const size = (await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'))).length;
+    const size = (await readFile(journalPath(nodeDir(home, 'n1')))).length;
     expect(size).toBe(0);
     await w.flush();
-    const flushed = (await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'))).length;
+    const flushed = (await readFile(journalPath(nodeDir(home, 'n1')))).length;
     expect(flushed).toBeGreaterThan(0);
     await w.close();
   });
@@ -124,7 +125,7 @@ describe('JournalWriter durability and ownership', () => {
     const w = await JournalWriter.open(home, 'n1', { batchWindowMs: 10 });
     w.append('test/ping', { n: 0 });
     await vi.waitFor(async () => {
-      const size = (await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'))).length;
+      const size = (await readFile(journalPath(nodeDir(home, 'n1')))).length;
       expect(size).toBeGreaterThan(0);
     });
     await w.close();
@@ -133,9 +134,9 @@ describe('JournalWriter durability and ownership', () => {
     const w = await JournalWriter.open(home, 'n1');
     w.append('test/ping', { n: 0 });
     await w.flush();
-    const size = (await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'))).length;
+    const size = (await readFile(journalPath(nodeDir(home, 'n1')))).length;
     await w.flush();
-    expect((await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'))).length).toBe(size);
+    expect((await readFile(journalPath(nodeDir(home, 'n1')))).length).toBe(size);
     await w.close();
   });
   it('serializes concurrent flushes without duplicating events', async () => {
@@ -143,7 +144,7 @@ describe('JournalWriter durability and ownership', () => {
     w.append('test/ping', { n: 0 });
     w.append('test/ping', { n: 1 });
     await Promise.all([w.flush(), w.flush(), w.flush()]);
-    const lines = (await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd')));
+    const lines = (await readFile(journalPath(nodeDir(home, 'n1'))));
     expect(lines.length).toBeGreaterThan(0);
     // Reopen and count: duplicated events would break seq contiguity.
     await w.close();
@@ -172,7 +173,7 @@ describe('JournalWriter durability and ownership', () => {
     let w = await JournalWriter.open(home, 'n1');
     w.append('test/ping', { n: 0 });
     await w.close();
-    await appendFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'), encodeBatch(['x']).subarray(0, 9));
+    await appendFile(journalPath(nodeDir(home, 'n1')), encodeBatch(['x']).subarray(0, 9));
     await expect(JournalWriter.open(home, 'n1')).rejects.toThrow(TornTailError);
     // The failed open releases its lock, so repair() + reopen recovers.
     expect(await repair(home, 'n1')).toEqual({ tornBytes: 9 });
@@ -182,9 +183,9 @@ describe('JournalWriter durability and ownership', () => {
   });
   it('takes over a lock whose owner is dead', async () => {
     const { mkdir, writeFile } = await import('node:fs/promises');
-    const dir = join(home, 'nodes/n1');
+    const dir = nodeDir(home, 'n1');
     await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, 'journal.v0.lock'), '999999999');
+    await writeFile(lockPath(dir), '999999999');
     const w = await JournalWriter.open(home, 'n1');
     await w.close();
   });
@@ -193,7 +194,7 @@ describe('JournalWriter durability and ownership', () => {
     let w = await JournalWriter.open(home, 'n1');
     w.append('test/ping', { n: 0 });
     await w.close();
-    const path = join(home, 'nodes/n1/journal.v0.jsonl.zstd');
+    const path = journalPath(nodeDir(home, 'n1'));
     const { readFile } = await import('node:fs/promises');
     const { scanBatches } = await import('../framing.js');
     const { batches } = scanBatches(await readFile(path));
@@ -214,30 +215,30 @@ describe('JournalWriter durability and ownership', () => {
       await w.close();
       // Write-only: the append handle still opens, so the failure is isolated
       // to `resume`'s read. (Skipped as root, which bypasses permissions.)
-      await chmod(join(home, 'nodes/n1/journal.v0.jsonl.zstd'), 0o200);
+      await chmod(journalPath(nodeDir(home, 'n1')), 0o200);
       try {
         await expect(JournalWriter.open(home, 'n1')).rejects.toThrow();
       } finally {
-        await chmod(join(home, 'nodes/n1/journal.v0.jsonl.zstd'), 0o600);
+        await chmod(journalPath(nodeDir(home, 'n1')), 0o600);
       }
     },
   );
   it('refuses a lock held by the current live process', async () => {
     const { mkdir, writeFile } = await import('node:fs/promises');
-    const dir = join(home, 'nodes/n1');
+    const dir = nodeDir(home, 'n1');
     await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, 'journal.v0.lock'), JSON.stringify({
+    await writeFile(lockPath(dir), JSON.stringify({
       pid: process.pid, startedAt: await currentProcessStartTime(),
     }));
     await expect(JournalWriter.open(home, 'n1')).rejects.toThrow(SessionAlreadyOwnedError);
   });
   it('takes over a lock whose PID was recycled by an unrelated process', async () => {
     const { mkdir, writeFile } = await import('node:fs/promises');
-    const dir = join(home, 'nodes/n1');
+    const dir = nodeDir(home, 'n1');
     await mkdir(dir, { recursive: true });
     // The PID is alive (ours) but the recorded start time cannot match, so the
     // lock belongs to a process that is gone.
-    await writeFile(join(dir, 'journal.v0.lock'), JSON.stringify({
+    await writeFile(lockPath(dir), JSON.stringify({
       pid: process.pid, startedAt: 1,
     }));
     const w = await JournalWriter.open(home, 'n1');
@@ -245,10 +246,10 @@ describe('JournalWriter durability and ownership', () => {
   });
   it('takes over a lock whose contents are garbage', async () => {
     const { mkdir, writeFile } = await import('node:fs/promises');
-    const dir = join(home, 'nodes/n1');
+    const dir = nodeDir(home, 'n1');
     await mkdir(dir, { recursive: true });
     for (const garbage of ['', 'abc', '0', '-1', '9999999999999', '{"pid":']) {
-      await writeFile(join(dir, 'journal.v0.lock'), garbage);
+      await writeFile(lockPath(dir), garbage);
       const w = await JournalWriter.open(home, 'n1');
       await w.close();
     }

@@ -1,5 +1,14 @@
 import { canonicalizeJson, sha256Hex, type JsonValue } from './canon.js';
 
+/**
+ * The event envelope and its hash chain.
+ *
+ * Every event is `SHA-256(prev_hash || canon(payload))`, so the log is
+ * append-only by construction: rewriting any event breaks every hash after it.
+ * The field set is frozen at v0 and extended only by declaration merging into
+ * `EventDataMap`, which is what makes the event union a compile-time contract
+ * rather than a convention.
+ */
 export const FORMAT_VERSION = 0;
 export const GENESIS_HASH = '0'.repeat(64);
 
