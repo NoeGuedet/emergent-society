@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2024",
+    "lib": ["ES2024"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "strict": true,
@@ -9,11 +10,14 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
-    "types": ["node"],
-    "outDir": "dist",
-    "rootDir": "src"
+    "types": ["node"]
   },
   "include": ["src"]
 }
