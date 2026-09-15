@@ -21,7 +21,7 @@ describe('journal end to end', () => {
 
     await repair(home, 'node-0');
 
-    const r = await JournalReader.open(home, 'node-0', KNOWN);
+    const r = await JournalReader.open(home, 'node-0', { knownTypes: KNOWN });
     let count = 0;
     for await (const e of r.events()) {
       expect(e.seq).toBe(count);

@@ -27,7 +27,7 @@ const ENVELOPE_KEYS = new Set(['v', 'type', 'seq', 'time', 'prev_hash', 'hash', 
  * a typed `ChainBreakError` rather than a raw `TypeError` — and an injected
  * top-level field can never ride along unnoticed.
  */
-export function parseEnvelope(line: string, seq: number): EventEnvelope {
+function parseEnvelope(line: string, seq: number): EventEnvelope {
   let parsed: unknown;
   try {
     parsed = JSON.parse(line);

@@ -5,17 +5,12 @@ import { headPath, journalPath, nodeDir, parseHead, type Head } from './layout.j
 import { genesisState, verifyChain } from './verify.js';
 import type { EventEnvelope } from './envelope.js';
 
-export { ChainBreakError } from './verify.js';
-
 /**
  * The read side of the journal: verification and crash repair.
  *
  * `events()` serves only the fully linked, `v`-matching prefix of a node's log
  * and refuses to rebuild past a break rather than guessing; the reader is
- * otherwise stateless and never mutates the log. `repair()` is a free function
- * because discarding a torn trailing fragment is an explicit operator action
- * that runs *before* the writer opens (kernel.md §3), not something a reader
- * should decide on its own.
+ * otherwise stateless and never mutates the log.
  */
 export class JournalReader {
   private constructor(
@@ -23,12 +18,27 @@ export class JournalReader {
     private readonly known: ReadonlySet<string>,
   ) {}
 
+  /**
+   * Opens a reader over a node's journal.
+   *
+   * `knownTypes` is required: a reader that cannot say which event types it
+   * understands cannot honour the "refuse to rebuild" rule, so there is no
+   * correct default. (Deriving it from a runtime registry is C1.2 design.)
+   *
+   * @throws never — the log is read lazily by `events()`.
+   */
   static async open(
-    home: string, nodeUid: string, knownTypes: ReadonlySet<string>,
+    home: string, nodeUid: string, opts: { knownTypes: ReadonlySet<string> },
   ): Promise<JournalReader> {
-    return new JournalReader(nodeDir(home, nodeUid), knownTypes);
+    return new JournalReader(nodeDir(home, nodeUid), opts.knownTypes);
   }
 
+  /**
+   * Reads the chain checkpoint, or null when it is missing, unreadable or
+   * malformed (the head is disposable and rebuilt from the log).
+   *
+   * @throws never — a bad head is reported as null, never thrown.
+   */
   async head(): Promise<Head | null> {
     // The head checkpoint is disposable: a missing, unreadable or malformed one
     // means "rebuild from the log", which is what events() does anyway. Unlike
@@ -45,6 +55,10 @@ export class JournalReader {
   /**
    * Verifies and yields events in order. Only the `v`-matching, fully linked
    * prefix is served; a torn tail is where iteration stops.
+   *
+   * @throws ChainBreakError on a broken link, a seq gap, a hash mismatch, a
+   * non-v0 envelope or a malformed line; CorruptFrameError on interior damage;
+   * UnknownEventTypeError on an unknown non-ignorable type.
    */
   async *events(fromSeq = 0): AsyncGenerator<EventEnvelope> {
     // A missing log is an empty journal. Anything else (EACCES, EIO) must not
@@ -58,7 +72,16 @@ export class JournalReader {
   }
 }
 
-/** Discards a physically torn trailing fragment. The only destructive path. */
+/**
+ * Discards a physically torn trailing fragment. The only destructive path.
+ *
+ * A free function, not a reader method: discarding a fragment is an explicit
+ * operator action that runs *before* the writer opens (kernel.md §3), so it
+ * needs no reader instance and can never happen as a side effect of reading.
+ *
+ * @throws CorruptFrameError on interior corruption — it refuses to truncate
+ * through valid committed events; any other read error propagates.
+ */
 export async function repair(home: string, nodeUid: string): Promise<{ tornBytes: number }> {
   const dir = nodeDir(home, nodeUid);
   const path = journalPath(dir);

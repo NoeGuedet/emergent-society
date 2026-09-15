@@ -3,7 +3,8 @@ import { mkdtemp, rm, appendFile, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JournalWriter } from '../writer.js';
-import { JournalReader, ChainBreakError, repair } from '../reader.js';
+import { JournalReader, repair } from '../reader.js';
+import { ChainBreakError } from '../verify.js';
 import { UnknownEventTypeError, computeHash } from '../envelope.js';
 import { canonicalizeJson } from '../canon.js';
 import { encodeBatch, scanBatches, CorruptFrameError } from '../framing.js';
@@ -53,7 +54,7 @@ describe('JournalReader', () => {
     w.append('test/ping', { n: 0 });
     w.append('test/ping', { n: 1 });
     await w.close();
-    const events = await collect(await JournalReader.open(home, 'n1', KNOWN));
+    const events = await collect(await JournalReader.open(home, 'n1', { knownTypes: KNOWN }));
     expect(events.map((e) => e.seq)).toEqual([0, 1]);
   });
   it('detects a broken chain', async () => {
@@ -65,14 +66,14 @@ describe('JournalReader', () => {
       hash: 'f'.repeat(64), data: {},
     });
     await appendFile(logPath(), encodeBatch([forged]));
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     await expect(collect(r)).rejects.toThrow(ChainBreakError);
   });
   it('refuses an unknown non-ignorable type', async () => {
     const w = await JournalWriter.open(home, 'n1');
     w.append('future/thing', { n: 0 });
     await w.close();
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     await expect(collect(r)).rejects.toThrow(UnknownEventTypeError);
   });
   it('repair discards a torn trailing fragment', async () => {
@@ -85,14 +86,14 @@ describe('JournalReader', () => {
     const { tornBytes } = await repair(home, 'n1');
     expect(tornBytes).toBe(9);
     expect((await readFile(path)).length).toBe(before);
-    const events = await collect(await JournalReader.open(home, 'n1', KNOWN));
+    const events = await collect(await JournalReader.open(home, 'n1', { knownTypes: KNOWN }));
     expect(events).toHaveLength(1);
   });
 });
 
 describe('JournalReader verification and repair edges', () => {
   it('yields nothing for a journal that was never written', async () => {
-    const r = await JournalReader.open(home, 'absent', KNOWN);
+    const r = await JournalReader.open(home, 'absent', { knownTypes: KNOWN });
     expect(await collect(r)).toEqual([]);
     expect(await r.head()).toBeNull();
   });
@@ -101,7 +102,7 @@ describe('JournalReader verification and repair edges', () => {
     const e0 = w.append('test/ping', { n: 0 });
     const e1 = w.append('test/ping', { n: 1 });
     await w.flush();
-    const head = await (await JournalReader.open(home, 'n1', KNOWN)).head();
+    const head = await (await JournalReader.open(home, 'n1', { knownTypes: KNOWN })).head();
     expect(head).toEqual({ first_hash: e0.hash, last_hash: e1.hash, count: 2, ts: expect.any(Number) });
     await w.close();
   });
@@ -110,7 +111,7 @@ describe('JournalReader verification and repair edges', () => {
     w.append('test/ping', { n: 0 });
     await w.flush();
     await w.close();
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     for (const bad of ['null', '[]', '{"count":2}', '{"first_hash":"x","last_hash":"y","count":-1,"ts":1}', 'not json']) {
       await writeFile(headPath(nodeDir(home, 'n1')), bad);
       expect(await r.head()).toBeNull();
@@ -122,7 +123,7 @@ describe('JournalReader verification and repair edges', () => {
     w.append('test/ping', { n: 1 });
     w.append('test/ping', { n: 2 });
     await w.close();
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     expect((await collect(r, 1)).map((e) => e.seq)).toEqual([1, 2]);
   });
   it('treats a negative fromSeq as 0 and a beyond-end fromSeq as empty', async () => {
@@ -130,7 +131,7 @@ describe('JournalReader verification and repair edges', () => {
     w.append('test/ping', { n: 0 });
     w.append('test/ping', { n: 1 });
     await w.close();
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     expect((await collect(r, -5)).map((e) => e.seq)).toEqual([0, 1]);
     expect(await collect(r, 99)).toEqual([]);
   });
@@ -141,14 +142,14 @@ describe('JournalReader verification and repair edges', () => {
     const unsigned = { v: 1, type: 'test/ping', seq: 1, time: 1789000000001, prev_hash: e0.hash, data: {} };
     const line = canonicalizeJson({ ...unsigned, hash: computeHash(unsigned as never) } as never);
     await appendFile(logPath(), encodeBatch([line]));
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     await expect(collect(r)).rejects.toThrow(ChainBreakError);
   });
   it('tolerates an unknown ignorable type', async () => {
     const w = await JournalWriter.open(home, 'n1');
     w.append('future/thing', { n: 0 }, { ignorable: true });
     await w.close();
-    const events = await collect(await JournalReader.open(home, 'n1', KNOWN));
+    const events = await collect(await JournalReader.open(home, 'n1', { knownTypes: KNOWN }));
     expect(events).toHaveLength(1);
   });
   it('rebuilds past a torn tail without repairing first', async () => {
@@ -156,7 +157,7 @@ describe('JournalReader verification and repair edges', () => {
     w.append('test/ping', { n: 0 });
     await w.close();
     await appendFile(logPath(), encodeBatch(['{"torn":true}']).subarray(0, 9));
-    const events = await collect(await JournalReader.open(home, 'n1', KNOWN));
+    const events = await collect(await JournalReader.open(home, 'n1', { knownTypes: KNOWN }));
     expect(events).toHaveLength(1);
   });
   it('repair is a no-op on an intact journal', async () => {
@@ -191,7 +192,7 @@ describe('JournalReader integrity', () => {
       e['data'] = { n: 999 };
       return [lines[0]!, canonicalizeJson(e as never)];
     });
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     const err = await collectFailure(r);
     expect(err.name).toBe('ChainBreakError');
     expect(err.seq).toBe(1);
@@ -208,7 +209,7 @@ describe('JournalReader integrity', () => {
       e['hash'] = computeHash(e as never);
       return [lines[0]!, canonicalizeJson(e as never)];
     });
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     const err = await collectFailure(r);
     expect(err.name).toBe('ChainBreakError');
     expect(err.seq).toBe(3);
@@ -228,7 +229,7 @@ describe('JournalReader integrity', () => {
       e['hash'] = computeHash(e as never);
       return [lines[0]!, lines[1]!, canonicalizeJson(e as never)];
     });
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     const err = await collectFailure(r);
     expect(err.name).toBe('ChainBreakError');
     expect(err.seq).toBe(2);
@@ -245,7 +246,7 @@ describe('JournalReader integrity', () => {
       e['hash'] = 'ZZ';
       return [lines[0]!, JSON.stringify(e)];
     });
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     const err = await collectFailure(r);
     expect(err.name).toBe('ChainBreakError');
     expect(err.message).toContain('hash is not 64 lowercase hex');
@@ -260,7 +261,7 @@ describe('JournalReader integrity', () => {
       e['prev_hash'] = 'not-hex';
       return [lines[0]!, JSON.stringify(e)];
     });
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     const err = await collectFailure(r);
     expect(err.name).toBe('ChainBreakError');
     expect(err.message).toContain('prev_hash is not 64 lowercase hex');
@@ -271,7 +272,7 @@ describe('JournalReader integrity', () => {
     await w.close();
     // `{oops` is neither valid JSON nor anything else: only the parse branch fires.
     await rewriteLog(logPath(), (lines) => [...lines, '{oops']);
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     const err = await collectFailure(r);
     expect(err.name).toBe('ChainBreakError');
     expect(err.message).toContain('not valid JSON');
@@ -282,7 +283,7 @@ describe('JournalReader integrity', () => {
     const e0 = w.append('test/ping', { text: 'é日😀', nested: [1, { a: null }] });
     const e1 = w.append('test/ping', { n: 1 });
     await w.close();
-    const events = await collect(await JournalReader.open(home, 'n1', KNOWN));
+    const events = await collect(await JournalReader.open(home, 'n1', { knownTypes: KNOWN }));
     expect(events).toEqual([e0, e1]);
   });
   it('refuses a line that is not a JSON object with a typed error', async () => {
@@ -290,7 +291,7 @@ describe('JournalReader integrity', () => {
     w.append('test/ping', { n: 0 });
     await w.close();
     await rewriteLog(logPath(), (lines) => [...lines, '42']);
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     await expect(collect(r)).rejects.toThrow(ChainBreakError);
   });
   it('refuses an envelope carrying a field outside the frozen v0 set', async () => {
@@ -302,7 +303,7 @@ describe('JournalReader integrity', () => {
       e['injected'] = 'evil';
       return [canonicalizeJson(e as never)];
     });
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     const err = await collectFailure(r);
     expect(err.name).toBe('ChainBreakError');
     expect(err.message).toContain('unknown envelope field');
@@ -316,7 +317,7 @@ describe('JournalReader integrity', () => {
       e['prev_hash'] = 'ZZ';
       return [canonicalizeJson(e as never)];
     });
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     await expect(collect(r)).rejects.toThrow(ChainBreakError);
   });
   it('throws a CorruptFrameError on a corrupt middle frame instead of serving a truncated history', async () => {
@@ -340,7 +341,7 @@ describe('JournalReader integrity', () => {
     corrupt.fill(0xff, middle.offset + 4, middle.offset + middle.size);
     await writeFile(logPath(), corrupt);
 
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     await expect(collect(r)).rejects.toThrow(CorruptFrameError);
   });
   it('repair refuses interior corruption and deletes nothing', async () => {
@@ -373,7 +374,7 @@ describe('JournalReader integrity', () => {
     const { rm, mkdir } = await import('node:fs/promises');
     await rm(logPath());
     await mkdir(logPath());
-    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const r = await JournalReader.open(home, 'n1', { knownTypes: KNOWN });
     await expect(collect(r)).rejects.toThrow();
   });
   it('repair deletes a stale head so it cannot serve a watermark past the truncation', async () => {
@@ -384,9 +385,9 @@ describe('JournalReader integrity', () => {
     w2.append('test/ping', { n: 1 });
     await w2.flush();
     await w2.close();
-    expect((await (await JournalReader.open(home, 'n1', KNOWN)).head())?.count).toBe(2);
+    expect((await (await JournalReader.open(home, 'n1', { knownTypes: KNOWN })).head())?.count).toBe(2);
     await appendFile(logPath(), encodeBatch(['{"torn":true}']).subarray(0, 9));
     await repair(home, 'n1');
-    expect(await (await JournalReader.open(home, 'n1', KNOWN)).head()).toBeNull();
+    expect(await (await JournalReader.open(home, 'n1', { knownTypes: KNOWN })).head()).toBeNull();
   });
 });

@@ -13,7 +13,7 @@ afterEach(async () => { vi.restoreAllMocks(); await rm(home, { recursive: true, 
 
 async function collectEvents() {
   const out = [];
-  for await (const e of (await JournalReader.open(home, 'n1', KNOWN)).events()) out.push(e);
+  for await (const e of (await JournalReader.open(home, 'n1', { knownTypes: KNOWN })).events()) out.push(e);
   return out;
 }
 

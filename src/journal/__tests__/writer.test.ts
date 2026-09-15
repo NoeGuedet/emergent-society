@@ -3,9 +3,10 @@ import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JournalWriter, SessionAlreadyOwnedError, JournalClosedError, TornTailError } from '../writer.js';
-import { repair, ChainBreakError, JournalReader } from '../reader.js';
+import { repair, JournalReader } from '../reader.js';
+import { ChainBreakError } from '../verify.js';
 import { encodeBatch } from '../framing.js';
-import { verifyEvent, makeEvent, envelopeJson, GENESIS_HASH } from '../envelope.js';
+import { verifyEvent, makeEvent, eventLine, GENESIS_HASH } from '../envelope.js';
 import { CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, BlobStore } from '../blobs.js';
 import { canonicalizeJson } from '../canon.js';
 import { journalPath, lockPath, nodeDir } from '../layout.js';
@@ -33,9 +34,9 @@ describe('JournalWriter', () => {
     w.append('test/ping', { n: 0 });
     await w.flush();
     // One event, one frame: the file is exactly the frame for that envelope.
-    const expected = encodeBatch([canonicalizeJson(envelopeJson(makeEvent({
+    const expected = encodeBatch([eventLine(makeEvent({
       type: 'test/ping', data: { n: 0 }, seq: 0, time: now, prevHash: GENESIS_HASH,
-    })))]);
+    }))]);
     const onDisk = await readFile(journalPath(nodeDir(home, 'n1')));
     expect(onDisk.equals(expected)).toBe(true);
     await w.close();
@@ -158,7 +159,7 @@ describe('JournalWriter durability and ownership', () => {
     w.append('test/ping', { n: 0 });
     await w.close();
     const events = [];
-    for await (const e of (await JournalReader.open(home, 'n1', new Set(['test/ping']))).events()) {
+    for await (const e of (await JournalReader.open(home, 'n1', { knownTypes: new Set(['test/ping']) })).events()) {
       events.push(e);
     }
     expect(events.map((e) => e.seq)).toEqual([0]);

@@ -19,7 +19,7 @@ function logPath(node = 'n1'): string {
 
 async function collectEvents(node = 'n1') {
   const out = [];
-  for await (const e of (await JournalReader.open(home, node, KNOWN)).events()) out.push(e);
+  for await (const e of (await JournalReader.open(home, node, { knownTypes: KNOWN })).events()) out.push(e);
   return out;
 }
 

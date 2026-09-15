@@ -1,7 +1,7 @@
 import { open as openFile, mkdir, truncate } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { canonicalizeJson, sha256HexOf, type JsonValue } from './canon.js';
-import { GENESIS_HASH, makeEvent, envelopeJson, type EventDataFor, type EventEnvelope } from './envelope.js';
+import { GENESIS_HASH, makeEvent, eventLine, type EventDataFor, type EventEnvelope } from './envelope.js';
 import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from './blobs.js';
 import { encodeBatch, scanBatches } from './framing.js';
 import { CorruptionError, JournalError } from './errors.js';
@@ -102,6 +102,15 @@ interface Watermark {
  */
 const systemClock = (): number => Date.now();
 
+/** Options for `JournalWriter.open`. */
+export interface JournalWriterOptions {
+  now?: () => number;
+  /** Write-behind window; defaults to `DEFAULT_BATCH_WINDOW_MS`. */
+  batchWindowMs?: number;
+  /** Observes write-behind failures; the failure still surfaces on the next call. */
+  onError?: (err: Error) => void;
+}
+
 export class JournalWriter {
   private seq = 0;
   private prevHash = GENESIS_HASH;
@@ -136,14 +145,17 @@ export class JournalWriter {
     private readonly log: FileHandle,
   ) {}
 
+  /**
+   * Opens (or creates) a node's journal for exclusive writing.
+   *
+   * @throws SessionAlreadyOwnedError when a live writer already owns the node.
+   * @throws TornTailError when the log ends in a torn fragment — run `repair()`
+   * first; the failed open releases its lock so the repair can proceed.
+   * @throws ChainBreakError when the existing log does not verify.
+   * @throws any raw fs error (EACCES, EIO) from creating or reading the log.
+   */
   static async open(
-    home: string, nodeUid: string,
-    opts: {
-      now?: () => number;
-      batchWindowMs?: number;
-      /** Observes write-behind failures; the failure still surfaces on the next call. */
-      onError?: (err: Error) => void;
-    } = {},
+    home: string, nodeUid: string, opts: JournalWriterOptions = {},
   ): Promise<JournalWriter> {
     const dir = nodeDir(home, nodeUid);
     await mkdir(dir, { recursive: true });
@@ -198,7 +210,15 @@ export class JournalWriter {
     this.committed = { bytes: raw.length, seq: this.seq, lastHash: this.prevHash };
   }
 
-  /** Synchronous and in-memory: the hot path never blocks on I/O. */
+  /**
+   * Adds an event to the current burst. Synchronous and in-memory: the hot path
+   * never blocks on I/O.
+   *
+   * @throws JournalClosedError after `close()`.
+   * @throws JournalPoisonedError once a batch has failed to commit twice.
+   * @throws the recorded write-behind failure, if a prior flush failed.
+   * @throws NonCanonicalizableError when the payload has no JSON form.
+   */
   append<T extends string>(
     type: T, data: EventDataFor<T>, opts?: { ignorable?: boolean },
   ): EventEnvelope<EventDataFor<T>>;
@@ -218,7 +238,7 @@ export class JournalWriter {
     // The canonical line is captured here, once: `flush` writes these exact
     // bytes, so a caller mutating `data` afterwards cannot desynchronize the
     // persisted bytes from the hash that was chained.
-    this.pending.push({ event: e, line: canonicalizeJson(envelopeJson(e)) });
+    this.pending.push({ event: e, line: eventLine(e) });
     // No debounce: the window starts with the first event of the burst. The
     // guard makes a timer that outlives `close()` a no-op instead of a
     // synchronous throw from `flush()` inside a callback nothing can catch.
@@ -253,6 +273,11 @@ export class JournalWriter {
    * Total in promise style: `async` so the closed guard becomes a rejection
    * rather than a synchronous throw, which a caller reaching it through a
    * callback (the write-behind timer) could not catch.
+   *
+   * @throws JournalClosedError after `close()`.
+   * @throws JournalPoisonedError once a batch has failed to commit twice.
+   * @throws the underlying fs error when the write or fsync fails; the batch
+   * stays pending and a later flush retries it.
    */
   async flush(): Promise<void> {
     // Flushing a closed writer would have nothing to flush into: the handle is
@@ -365,6 +390,15 @@ export class JournalWriter {
     await syncPath(this.dir);
   }
 
+  /**
+   * Flushes the pending burst and releases the handle and lock. Runs the
+   * release in a `finally`, so the writer is never left holding the node after
+   * a rejected flush.
+   *
+   * @throws JournalPoisonedError once a batch has failed to commit twice.
+   * @throws the underlying fs error when the final flush cannot commit; the
+   * lock and handle are released regardless.
+   */
   async close(): Promise<void> {
     // `closed` is set on entry so an append racing the flush is refused rather
     // than accepted and then dropped. `finally` guarantees the handle and lock

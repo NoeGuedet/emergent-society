@@ -126,7 +126,7 @@ export function scanBatches(buf: Buffer): { batches: ScannedBatch[]; tornBytes: 
     }
     let lines: string[];
     try {
-      lines = decompress(buf.subarray(offset + LEN_BYTES, end));
+      lines = decodeBatch(buf.subarray(offset, end));
     } catch (err) {
       throw new CorruptFrameError(offset, err instanceof Error ? err.message : 'decode failed');
     }

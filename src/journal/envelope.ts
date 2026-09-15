@@ -27,9 +27,6 @@ export const GENESIS_HASH = '0'.repeat(64);
  */
 export interface EventDataMap {}
 
-/** The registered event types, or `string` while none is registered yet. */
-export type EventType = keyof EventDataMap extends never ? string : keyof EventDataMap;
-
 export interface EventEnvelope<T extends JsonValue = JsonValue> {
   v: number;
   type: string;
@@ -93,14 +90,18 @@ export function verifyEvent(e: EventEnvelope): boolean {
 }
 
 /**
- * The frozen envelope viewed as a JSON value, for canonicalization. The
- * envelope's own shape is by construction JSON (scalars, hex strings and a
- * `JsonValue` payload), but its TypeScript interface carries optional members
- * that no index signature admits, so the conversion is named here once rather
- * than cast at every call site.
+ * The canonical line for an event — exactly the bytes the log stores and the
+ * hash was computed over. Capturing it once at append is what stops a later
+ * mutation of the payload from desynchronizing the persisted bytes from the
+ * chained hash.
+ *
+ * The envelope's shape is by construction JSON (scalars, hex strings and a
+ * `JsonValue` payload), but its interface carries optional members no index
+ * signature admits, so the conversion is named here rather than cast at the
+ * call site.
  */
-export function envelopeJson(e: EventEnvelope): JsonValue {
-  return e as unknown as JsonValue;
+export function eventLine(e: EventEnvelope): string {
+  return canonicalizeJson(e as unknown as JsonValue);
 }
 
 export class UnknownEventTypeError extends JournalError {
