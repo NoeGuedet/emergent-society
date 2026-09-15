@@ -7,10 +7,11 @@ This document specifies the kernel of the system: the behavior of its nodes, its
 ## 1. Behavior
 
 1. **Async, event-native, non-blocking.** Everything is an event: human message, shell completion, LLM response, timer, Package activation, heading ratification. There is **no "waiting for the human" state** — raising a problem = emitting an event, life goes on; the human response, when it arrives, is an event absorbed along the way. (Documented counter-model: dsh's `ask_user_question` / `ctx.approval` path **blocks** a turn on the human — forbidden here.)
-2. **Free loop per node + explicit wait.** Each node chains its turns on its own initiative; it may choose to wait (suspended until the next event in its inbox). Proactivity is its own; the work/wait choice is observable in the journal. **Wake budget** (modeled on dsh's `maxConsecutiveWakes`): a perpetual loop equipped with tools is self-excitable without bound — the bound exists, its recharge source is to be fixed in the plan (candidate: heading ratification).
+2. **Free loop per node + explicit wait, unbounded.** Each node chains its turns on its own initiative; it may choose to wait (suspended until the next event in its inbox). There is **no wake budget**: a perpetual loop equipped with tools is self-excitable without bound, and that is accepted — the only physical bounds are the upstream API ceiling (§8) and the kill switch. A node stuck in an obsessive loop is not a fault to prevent mechanically but a phenomenon to observe; the work/wait choice is observable in the journal. (Documented counter-model: dsh's `maxConsecutiveWakes` — rejected, in the design direction of the whole project: full freedom, observation over prevention.)
 3. **Re-alignment without interruption.** A ratified heading propagates to the next turn of each node, via pinning. The propagation delay **is** the relaxation measure — any forced interruption would destroy it.
 4. **Heading propagation in two layers.** The kernel injects the **reference** (verbatim heading + proxy, current version) into *every* context, without intermediary — inherited drift prevented, single point of drift eliminated, drift locally detectable. The **flow-down of meaning** (local translation, priorities) goes through the charters and delegation — emergent, observable. The cascade carries the interpretation, never the reference.
 5. **Agent zero is the root custody node, subject to the same physics** (same loop, same inbox, same compaction, same journal). Its equipment is data: human channel, drafting of heading proposals, **reading of the raw journal and of projections**, **right to question nodes** (see `direction.md` §1: raw facts yes, metrics no; readings and questions journaled; never the human's only window). A single category of entity in the whole system.
+6. **Physical / behavioral frontier.** The kernel is the *physics* of the world — immutable and invisible to the agents: journal + hash-chain, the mutation gate (journaling before every model call and every tool effect), kill switch, Landlock sandbox, upstream budget ceiling. Everything that makes a node's *phenotype* — its loop policy, context policy, compaction policy, tools, instincts — is mounted at boot as **behavior Packages**, introspectable and redefinable through `extend` (§6). The organism can rewrite what it is; it cannot rewrite the laws of its universe: every model call and every effect still crosses the gate, so the very act of self-rewriting stays journaled. An organism that could rewrite the measurement apparatus would destroy the observability the project exists for.
 
 ## 2. Stack
 
@@ -106,14 +107,13 @@ Rewriting of the dsh loop (`agent.ts`, 619 lines → ~200 lines):
 - **Single primitive** `send(message, target, wakeup)`; everything enters through the same inbox (human chat via agent zero, results, timers, completions).
 - **Atomic claim** of the inbox into a durable projection; **wake latch** (`wakeRequested` replayed at convergence); `runMaintenance` for background work outside turns.
 - **Non-blocking question/answer**: a question = emitted event + answer event that arrives later in the inbox; the node finishes its turn and wakes on the answer. Never an await on the human (§1.1).
-- **Bounded wake budget** (§1.2).
 - No `turn/step` vocabulary from a coding-harness: markers specific to the perpetual node ("waiting" / "active").
 - **Frozen** (deep freeze) request before sending; complete envelope logged before the call.
-- The dsh runtime confirms it: claiming a *human-authored* message recharges the wake budget — for us, candidate: heading ratification (to be fixed in the plan).
 
 ## 6. Self-extension (`extend`)
 
 - **Model**: Plugin → **immutable Packages** → Runs (taken from dsh: minted IDs never reused, `define` adds a Package, `run` activates an exact version, `stop` removes the Run, `undefine` deletes).
+- **The behavior layer is made of Packages** (§1.6): the loop, context and compaction policies ship as seed Packages, so `extend` can redefine the node's own functioning — the gate and the journal stay in the kernel, below the reachable floor.
 - **dsh's gap is filled for free**: the `define` (name + code + purpose) is a **journal event** → the Package is rebuilt by replay at boot; the Run stays in memory. Package persistence = ~0 extra lines, since the journal exists.
 - **Package execution**: `node:vm` + restricted `ctx` facade (allowlist, no `ctx.provide`) — the mutation gate remains non-bypassable (§2). Assumed posture: containment, not a security boundary ("treat a dynamic package like bash access").
 - **Composition traps documented by dsh, not to be rediscovered**: superseded generation never reclaimed (watcher leak); health audit ≠ importability; a change of tooling mid-conversation that orphans calls.
@@ -144,14 +144,13 @@ Kill switch · upstream budget ceiling · journal. Nothing else is kept; everyth
 4. `execute` tool (PTY + Landlock + git commit); `speak`; `web_search`/`web_fetch`.
 5. `extend` (Plugin/Package/Run registry + vm facade + persistence by replay).
 6. Agent zero (root node, human channel, heading drafting/ratification).
-7. Reconstructability invariant at boot + wake budget + kill switch.
+7. Reconstructability invariant at boot + kill switch.
 
 ## 11. Deferred
 
 - **Session monitoring/cockpit** (the 3 sensors + metronome, readable projections) — next item of `ROADMAP.md`.
 - PTY daemon surviving restart (known path: daemon + Unix socket + restore) — non-blocking, do not build now.
 - Effect-TS as infrastructure (if backpressure/durable execution become necessary) — v4 still in RC.
-- The exact recharge source of the wake budget (candidate: heading ratification).
 
 ## Sources
 
