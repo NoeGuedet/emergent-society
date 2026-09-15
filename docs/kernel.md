@@ -19,7 +19,7 @@ This document specifies the kernel of the system: the behavior of its nodes, its
 
 Three reasons, in order of weight:
 
-1. **The model's entire reference corpus is in TS** (paper, Cordis, dsh). The kernel maintainer (Kimi) will have the reference at hand in the right language.
+1. **The entire reference corpus is in TS** (paper, Cordis, dsh): the implementation reads its references in the source language, with no translation layer.
 2. **94% of compilation errors in LLM-generated code are type errors** (arXiv:2504.09246) — our invariants (event discriminated union extensible by merge, capability attenuation, `effect → disposer` gate, node state machine) are precisely what a type system makes mechanically unavoidable. In Python they would live in docstrings.
 3. **The only operational precedent for transactional hot-reload is in TS**; in Python, `importlib.reload` is documented as unreliable and `jurigged` has disqualifying caveats for a perpetual system.
 
