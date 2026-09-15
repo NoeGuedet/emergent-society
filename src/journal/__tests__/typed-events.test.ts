@@ -12,9 +12,9 @@ declare module '../envelope.js' {
 
 import { makeEvent, GENESIS_HASH, type AnyEvent } from '../envelope.js';
 import { JournalWriter } from '../writer.js';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { useTempHome } from './helpers.js';
+
+const home = useTempHome('cell-typed-');
 
 describe('EventDataMap declaration merging', () => {
   it('accepts a payload that matches its registered type', () => {
@@ -32,17 +32,12 @@ describe('EventDataMap declaration merging', () => {
   });
 
   it('narrows the appended payload type at the writer', async () => {
-    const home = await mkdtemp(join(tmpdir(), 'cell-typed-'));
-    try {
-      const w = await JournalWriter.open(home, 'n1', { batchWindowMs: 60_000 });
-      const e = w.append('test/typed', { n: 1 });
-      expect(e.data.n).toBe(1);
-      // @ts-expect-error a string is not assignable to `test/typed`'s `n: number`
-      w.append('test/typed', { n: 'wrong' });
-      await w.close();
-    } finally {
-      await rm(home, { recursive: true, force: true });
-    }
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    const e = w.append('test/typed', { n: 1 });
+    expect(e.data.n).toBe(1);
+    // @ts-expect-error a string is not assignable to `test/typed`'s `n: number`
+    w.append('test/typed', { n: 'wrong' });
+    await w.close();
   });
 
   it('derives a real discriminated union from EventDataMap', () => {
@@ -57,14 +52,9 @@ describe('EventDataMap declaration merging', () => {
   });
 
   it('still allows an unregistered type at the runtime boundary', async () => {
-    const home = await mkdtemp(join(tmpdir(), 'cell-typed-'));
-    try {
-      const w = await JournalWriter.open(home, 'n1', { batchWindowMs: 60_000 });
-      const e = w.append('not/registered', { anything: true });
-      expect(e.data).toEqual({ anything: true });
-      await w.close();
-    } finally {
-      await rm(home, { recursive: true, force: true });
-    }
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    const e = w.append('not/registered', { anything: true });
+    expect(e.data).toEqual({ anything: true });
+    await w.close();
   });
 });
