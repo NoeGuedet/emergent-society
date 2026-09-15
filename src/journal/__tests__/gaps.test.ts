@@ -182,7 +182,7 @@ describe('writer lifecycle guards', () => {
     await w.close();
     expect(() => w.flush()).toThrow(JournalClosedError);
   });
-  it('poisons the writer when the rollback truncate fails', async () => {
+  it.skipIf(process.getuid?.() === 0)('poisons the writer when the rollback truncate fails', async () => {
     const { chmod } = await import('node:fs/promises');
     const probe = await openFile(join(home, 'probe'), 'w');
     const proto = Object.getPrototypeOf(probe) as {

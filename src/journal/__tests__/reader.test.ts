@@ -32,6 +32,20 @@ async function rewriteLog(
   await writeFile(path, encodeBatch(mutate(lines)));
 }
 
+/**
+ * Collects events and returns the typed error they raised. Asserts on the error
+ * object directly: `message` is non-enumerable on `Error`, so a
+ * `toMatchObject({ message })` assertion would silently never match.
+ */
+async function collectFailure(r: JournalReader): Promise<ChainBreakError> {
+  try {
+    await collect(r);
+  } catch (err) {
+    return err as ChainBreakError;
+  }
+  throw new Error('expected the reader to reject');
+}
+
 describe('JournalReader', () => {
   it('reads back exactly what was written', async () => {
     const w = await JournalWriter.open(home, 'n1');
@@ -177,9 +191,10 @@ describe('JournalReader integrity', () => {
       return [lines[0]!, canonicalizeJson(e as never)];
     });
     const r = await JournalReader.open(home, 'n1', KNOWN);
-    await expect(collect(r)).rejects.toMatchObject({
-      name: 'ChainBreakError', seq: 1, message: expect.stringContaining('hash recomputation failed'),
-    });
+    const err = await collectFailure(r);
+    expect(err.name).toBe('ChainBreakError');
+    expect(err.seq).toBe(1);
+    expect(err.message).toContain('hash recomputation failed');
   });
   it('rejects a seq gap even when every hash is self-consistent', async () => {
     const w = await JournalWriter.open(home, 'n1');
@@ -193,9 +208,72 @@ describe('JournalReader integrity', () => {
       return [lines[0]!, canonicalizeJson(e as never)];
     });
     const r = await JournalReader.open(home, 'n1', KNOWN);
-    await expect(collect(r)).rejects.toMatchObject({
-      name: 'ChainBreakError', seq: 3, message: expect.stringContaining('expected seq 1'),
+    const err = await collectFailure(r);
+    expect(err.name).toBe('ChainBreakError');
+    expect(err.seq).toBe(3);
+    expect(err.message).toContain('expected seq 1');
+  });
+  it('rejects an event whose prev_hash was relinked to a well-formed but wrong hash', async () => {
+    const w = await JournalWriter.open(home, 'n1');
+    w.append('test/ping', { n: 0 });
+    w.append('test/ping', { n: 1 });
+    w.append('test/ping', { n: 2 });
+    await w.close();
+    // Event 2 is re-signed against a wrong-but-valid prev_hash: only the
+    // linkage check stands between this and acceptance.
+    await rewriteLog(logPath(), (lines) => {
+      const e = JSON.parse(lines[2]!) as Record<string, unknown>;
+      e['prev_hash'] = 'a'.repeat(64);
+      e['hash'] = computeHash(e as never);
+      return [lines[0]!, lines[1]!, canonicalizeJson(e as never)];
     });
+    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const err = await collectFailure(r);
+    expect(err.name).toBe('ChainBreakError');
+    expect(err.seq).toBe(2);
+    expect(err.message).toContain('prev_hash mismatch');
+  });
+  it('isolates the hash hex-format check from linkage', async () => {
+    const w = await JournalWriter.open(home, 'n1');
+    w.append('test/ping', { n: 0 });
+    w.append('test/ping', { n: 1 });
+    await w.close();
+    // prev_hash is correct, so linkage passes; only the `hash` field is malformed.
+    await rewriteLog(logPath(), (lines) => {
+      const e = JSON.parse(lines[1]!) as Record<string, unknown>;
+      e['hash'] = 'ZZ';
+      return [lines[0]!, JSON.stringify(e)];
+    });
+    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const err = await collectFailure(r);
+    expect(err.name).toBe('ChainBreakError');
+    expect(err.message).toContain('hash is not 64 lowercase hex');
+  });
+  it('isolates the prev_hash hex-format check from linkage', async () => {
+    const w = await JournalWriter.open(home, 'n1');
+    w.append('test/ping', { n: 0 });
+    w.append('test/ping', { n: 1 });
+    await w.close();
+    await rewriteLog(logPath(), (lines) => {
+      const e = JSON.parse(lines[1]!) as Record<string, unknown>;
+      e['prev_hash'] = 'not-hex';
+      return [lines[0]!, JSON.stringify(e)];
+    });
+    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const err = await collectFailure(r);
+    expect(err.name).toBe('ChainBreakError');
+    expect(err.message).toContain('prev_hash is not 64 lowercase hex');
+  });
+  it('rejects a line that fails only JSON.parse', async () => {
+    const w = await JournalWriter.open(home, 'n1');
+    w.append('test/ping', { n: 0 });
+    await w.close();
+    // `{oops` is neither valid JSON nor anything else: only the parse branch fires.
+    await rewriteLog(logPath(), (lines) => [...lines, '{oops']);
+    const r = await JournalReader.open(home, 'n1', KNOWN);
+    const err = await collectFailure(r);
+    expect(err.name).toBe('ChainBreakError');
+    expect(err.message).toContain('not valid JSON');
   });
   it('round-trips the full envelope unchanged, including non-ASCII payloads', async () => {
     let t = 1789000000000;
@@ -224,9 +302,9 @@ describe('JournalReader integrity', () => {
       return [canonicalizeJson(e as never)];
     });
     const r = await JournalReader.open(home, 'n1', KNOWN);
-    await expect(collect(r)).rejects.toMatchObject({
-      name: 'ChainBreakError', message: expect.stringContaining('unknown envelope field'),
-    });
+    const err = await collectFailure(r);
+    expect(err.name).toBe('ChainBreakError');
+    expect(err.message).toContain('unknown envelope field');
   });
   it('rejects a hash that is not 64 lowercase hex characters', async () => {
     const w = await JournalWriter.open(home, 'n1');
@@ -288,14 +366,14 @@ describe('JournalReader integrity', () => {
     const w = await JournalWriter.open(home, 'n1');
     w.append('test/ping', { n: 0 });
     await w.close();
-    const { chmod } = await import('node:fs/promises');
-    await chmod(logPath(), 0o200); // write-only: readable only by a non-existent privilege
-    try {
-      const r = await JournalReader.open(home, 'n1', KNOWN);
-      await expect(collect(r)).rejects.toThrow();
-    } finally {
-      await chmod(logPath(), 0o600);
-    }
+    // Replace the log with a directory: reading it fails with EISDIR, a
+    // non-ENOENT error the reader must surface rather than treat as genesis.
+    // This is root-independent, unlike a permission-based fixture.
+    const { rm, mkdir } = await import('node:fs/promises');
+    await rm(logPath());
+    await mkdir(logPath());
+    const r = await JournalReader.open(home, 'n1', KNOWN);
+    await expect(collect(r)).rejects.toThrow();
   });
   it('repair deletes a stale head so it cannot serve a watermark past the truncation', async () => {
     const w = await JournalWriter.open(home, 'n1');

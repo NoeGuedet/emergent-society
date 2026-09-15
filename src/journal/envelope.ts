@@ -66,6 +66,17 @@ export function verifyEvent(e: EventEnvelope): boolean {
   return computeHash(unsigned) === hash;
 }
 
+/**
+ * The frozen envelope viewed as a JSON value, for canonicalization. The
+ * envelope's own shape is by construction JSON (scalars, hex strings and a
+ * `JsonValue` payload), but its TypeScript interface carries optional members
+ * that no index signature admits, so the conversion is named here once rather
+ * than cast at every call site.
+ */
+export function envelopeJson(e: EventEnvelope): JsonValue {
+  return e as unknown as JsonValue;
+}
+
 export class UnknownEventTypeError extends Error {
   constructor(public readonly eventType: string) {
     super(`unknown non-ignorable event type: ${eventType} — refusing to rebuild`);

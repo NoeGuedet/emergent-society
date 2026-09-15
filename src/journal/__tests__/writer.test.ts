@@ -3,9 +3,9 @@ import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JournalWriter, SessionAlreadyOwnedError, JournalClosedError, TornTailError } from '../writer.js';
-import { repair, ChainBreakError } from '../reader.js';
+import { repair, ChainBreakError, JournalReader } from '../reader.js';
 import { encodeBatch } from '../framing.js';
-import { verifyEvent } from '../envelope.js';
+import { verifyEvent, makeEvent, envelopeJson, GENESIS_HASH } from '../envelope.js';
 import { CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, BlobStore } from '../blobs.js';
 import { canonicalizeJson } from '../canon.js';
 
@@ -27,11 +27,16 @@ describe('JournalWriter', () => {
     await w.close();
   });
   it('persists events durably after flush', async () => {
-    const w = await JournalWriter.open(home, 'n1');
+    const now = 1789000000000;
+    const w = await JournalWriter.open(home, 'n1', { now: () => now });
     w.append('test/ping', { n: 0 });
     await w.flush();
-    const size = (await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'))).length;
-    expect(size).toBeGreaterThan(0);
+    // One event, one frame: the file is exactly the frame for that envelope.
+    const expected = encodeBatch([canonicalizeJson(envelopeJson(makeEvent({
+      type: 'test/ping', data: { n: 0 }, seq: 0, time: now, prevHash: GENESIS_HASH,
+    })))]);
+    const onDisk = await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'));
+    expect(onDisk.equals(expected)).toBe(true);
     await w.close();
   });
   it('rejects a second writer on the same journal', async () => {
@@ -111,7 +116,8 @@ describe('JournalWriter durability and ownership', () => {
     const size = (await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'))).length;
     expect(size).toBe(0);
     await w.flush();
-    expect((await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'))).length).toBeGreaterThan(0);
+    const flushed = (await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'))).length;
+    expect(flushed).toBeGreaterThan(0);
     await w.close();
   });
   it('writes the batch when the write-behind window elapses', async () => {
@@ -150,7 +156,11 @@ describe('JournalWriter durability and ownership', () => {
     const w = await JournalWriter.open(home, 'n1', { batchWindowMs: 60_000 });
     w.append('test/ping', { n: 0 });
     await w.close();
-    expect((await readFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'))).length).toBeGreaterThan(0);
+    const events = [];
+    for await (const e of (await JournalReader.open(home, 'n1', new Set(['test/ping']))).events()) {
+      events.push(e);
+    }
+    expect(events.map((e) => e.seq)).toEqual([0]);
   });
   it('rejects appends after close', async () => {
     const w = await JournalWriter.open(home, 'n1');
@@ -195,18 +205,23 @@ describe('JournalWriter durability and ownership', () => {
     await writeFile(path, encodeBatch([...lines, forged]));
     await expect(JournalWriter.open(home, 'n1')).rejects.toThrow(ChainBreakError);
   });
-  it('refuses to resume when the log is unreadable instead of forking from genesis', async () => {
-    const { chmod } = await import('node:fs/promises');
-    const w = await JournalWriter.open(home, 'n1');
-    w.append('test/ping', { n: 0 });
-    await w.close();
-    await chmod(join(home, 'nodes/n1/journal.v0.jsonl.zstd'), 0o200);
-    try {
-      await expect(JournalWriter.open(home, 'n1')).rejects.toThrow();
-    } finally {
-      await chmod(join(home, 'nodes/n1/journal.v0.jsonl.zstd'), 0o600);
-    }
-  });
+  it.skipIf(process.getuid?.() === 0)(
+    'refuses to resume when the log is unreadable instead of forking from genesis',
+    async () => {
+      const { chmod } = await import('node:fs/promises');
+      const w = await JournalWriter.open(home, 'n1');
+      w.append('test/ping', { n: 0 });
+      await w.close();
+      // Write-only: the append handle still opens, so the failure is isolated
+      // to `resume`'s read. (Skipped as root, which bypasses permissions.)
+      await chmod(join(home, 'nodes/n1/journal.v0.jsonl.zstd'), 0o200);
+      try {
+        await expect(JournalWriter.open(home, 'n1')).rejects.toThrow();
+      } finally {
+        await chmod(join(home, 'nodes/n1/journal.v0.jsonl.zstd'), 0o600);
+      }
+    },
+  );
   it('refuses a lock held by the current live process', async () => {
     const { mkdir, writeFile } = await import('node:fs/promises');
     const dir = join(home, 'nodes/n1');

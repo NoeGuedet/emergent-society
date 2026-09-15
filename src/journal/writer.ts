@@ -3,7 +3,7 @@ import { open as openFile, mkdir, readFile, rename, rm, truncate, writeFile } fr
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { canonicalizeJson, type JsonValue } from './canon.js';
-import { GENESIS_HASH, makeEvent, type EventDataFor, type EventEnvelope } from './envelope.js';
+import { GENESIS_HASH, makeEvent, envelopeJson, type EventDataFor, type EventEnvelope } from './envelope.js';
 import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from './blobs.js';
 import { encodeBatch, scanBatches } from './framing.js';
 import { isErrno, syncDir, syncFile } from './fsutil.js';
@@ -200,7 +200,7 @@ export class JournalWriter {
     // The canonical line is captured here, once: `flush` writes these exact
     // bytes, so a caller mutating `data` afterwards cannot desynchronize the
     // persisted bytes from the hash that was chained.
-    this.pending.push({ event: e, line: canonicalizeJson(e as unknown as JsonValue) });
+    this.pending.push({ event: e, line: canonicalizeJson(envelopeJson(e)) });
     // No debounce: the window starts with the first event of the burst.
     this.timer ??= setTimeout(() => {
       void this.flush().catch((err: unknown) => { this.recordAsyncFailure(err); });
@@ -217,7 +217,7 @@ export class JournalWriter {
     if (bytes.length < CLAIM_CHECK_THRESHOLD) return data;
     // Past MAX_BLOB_BYTES the payload is not stored whole: the blob holds a
     // prefix and the reference says so (`truncated: true` + original size).
-    const truncated = bytes.length > MAX_BLOB_BYTES;
+    const truncated = bytes.length >= MAX_BLOB_BYTES;
     const stored = truncated ? bytes.subarray(0, MAX_BLOB_BYTES) : bytes;
     const blobHash = createHash('sha256').update(stored).digest('hex');
     this.pendingBlobs.set(blobHash, stored);
