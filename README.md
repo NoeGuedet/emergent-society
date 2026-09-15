@@ -10,13 +10,13 @@ Most multi-agent frameworks hard-code the organization (roles, workflows, budget
 
 Three properties we refuse to compromise on:
 
-1. **Perpetual** : the society runs continuously, asynchronously, without a blocking "waiting for human" state. Questions and answers are events, never `await`s.
-2. **Emergent** : memory, roles, tools and organization are built by the agents themselves, from a seed that deliberately includes a **Hole**: a naive, visible, incomplete starting point they must outgrow.
-3. **Directed** : the human's intent enters as a verbatim pinned *heading* (an event in the journal, ratified by the human), and its propagation is measured, not assumed.
+1. **Perpetual**: the society runs continuously, asynchronously, without a blocking "waiting for human" state. Questions and answers are events, never `await`s.
+2. **Emergent**: memory, roles, tools and organization are built by the agents themselves, from a seed that deliberately includes a **Hole**: a naive, visible, incomplete starting point they must outgrow.
+3. **Directed**: the human's intent enters as a verbatim pinned *heading* (an event in the journal, ratified by the human), and its propagation is measured, not assumed.
 
 ## Design principles
 
-- **The journal is the only truth.** Every action of every node is an event in an append-only, hash-chained log. Everything else : dashboards, metrics, agent memory, is a disposable projection.
+- **The journal is the only truth.** Every action of every node is an event in an append-only, hash-chained log. Everything else — dashboards, metrics, agent memory — is a disposable projection.
 - **Metrics are invisible to the agents.** Instrumentation lives outside the graph (anti-Goodhart). Fidelity is measured on acts, never on self-reports.
 - **Minimal raw tools.** Nodes get a handful of raw capabilities (shell, speech, web, self-extension) instead of business-shaped tools; the LLM does everything else.
 - **Replay is not re-execution.** The full state of the society can be reconstructed from the journal alone.

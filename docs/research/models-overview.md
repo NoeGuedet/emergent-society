@@ -1,7 +1,7 @@
 # State of the art — "smart and cheap" LLMs for long-horizon autonomous agents
 
 **Research date: 11 September 2026**
-**Context:** self-evolving agentic harness (emergent agent organization, continuously running, directed by a human chat). Main criterion: **intelligence/price ratio**, because token cost is the primary budget (several agents running continuously). A local Qwen model on an RTX 3090 is available but not a constraint.
+**Context:** self-evolving agentic harness (emergent agent organization, continuously running, directed by a human chat). Main criterion: **intelligence/price ratio**, because token cost is the main budget item (several agents running continuously). A local Qwen model on an RTX 3090 is available but not a constraint.
 
 > ⚠️ **Method and limits.** All the data below comes from web research on 11/09/2026 (Artificial Analysis, pricing aggregators, dated technical articles). Prices and benchmarks change **every week** in this segment: re-check the official pages before committing any budget. "Vendor" scores are reported by the lab itself, with no independent replication — they are marked **[vendor]**. Scores marked **[AA]** come from Artificial Analysis (independent). Inconsistencies between sources are flagged explicitly. Models released less than ~2 weeks ago (DeepSeek V4.1 Flash: **yesterday**) have **no independent evaluation**.
 
@@ -75,7 +75,7 @@ Prices in USD per million tokens. "Cache" = cached input on a cache hit. Ctx = m
 
 ### GLM-5.3-Flash — 26 August 2026 (the cheapest of the "smart" models)
 - **$0.075 input / $0.250 output / $0.011 cache**, 1M ctx, 58 tok/s, vision, 20 providers.
-- **[AA] Agentic Index 58.2** — on par with Qwen3.8 Max (58.4) and GPT-5.6 Sol (57.8) — and Intelligence 41.9 (98th percentile) for an order of magnitude less in price.
+- **[AA] Agentic Index 58.2** — on par with Qwen3.8 Max (58.4) and GPT-5.6 Sol (57.8) — and Intelligence 41.9 (98th percentile) at an order of magnitude lower price.
 - Source: [pricepertoken.com, 10/09/2026](https://pricepertoken.com/pricing-page/model/z-ai-glm-5.3-flash); [everylocalai.com (AA data, 27/08/2026)](https://everylocalai.com/model/qwen3-6-27b).
 
 ### Older generations

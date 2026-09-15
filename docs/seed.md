@@ -6,7 +6,7 @@ This document specifies the bootstrap of the system: the minimal foundation — 
 
 ## 1. The question
 
-> How do we provide a minimalist foundation (system prompt, tools, first heading) that allows emergence without forcing it? Double trap: early production (the intern thrown into the code) vs disguised pre-wiring (drawing the tree).
+> How do we provide a minimalist foundation (system prompt, tools, first heading) that allows emergence without forcing it? Two traps: early production (an intern thrown into the codebase) vs disguised pre-wiring (drawing the tree).
 
 **"Zero structure" is not an option.** Full autonomy is the worst measured protocol in the corpus: minimal scaffolding (fixed order, self-chosen roles) beats it by +44% (Cohen's d=1.86, 25,000 tasks, 8 models; Dochkina, arXiv:2603.28990 — single-author preprint, and the emergent-vs-designed-roles effect is smaller and capability-dependent: +3.5% for a strong model, −9.6% reversal for a weak one). The question is therefore not "seed or tree" but "**which minimal structure**". The answer: a structure that is **physical** (the kernel) and **dispositional** (the instincts), never **organizational**.
 
@@ -43,11 +43,11 @@ Agent zero is the root custody node and is subject to the same physics as every 
 
 Cut order if reducing: I5, I2, I1, I4, never I3. Each instinct has a known **counterfeit** to watch for (e.g. pre-wired I1 = "create a specialized agent" — it names the artifact, therefore draws the tree).
 
-### Finitude — physical, a single face
+### Finitude — physical, with a single face
 
 - **The Hole** — the context is compacted periodically; whatever is not externalized is lost. The kernel's compaction is deliberately **naive and visible** (a journal event); any memory strategy beyond that is an **agent production**. The seed makes the agent self-aware of its own machine (finite context, compaction, loss) so that it sets up its own context and memory management: the Hole is announced as a fact, with no solution provided.
-- **Cost is measured, never injected.** The agent has no visibility into and no responsibility for its budget: a parasitic frugality objective would divert it from the heading. Cost is journaled on the human side only, as an observation instrument (consistent with the anti-Goodhart rule).
-- **No artificial friction on frontier crossings.** The world is not un-done, and that is a fact, not a rule; no barrier is imposed, so that the system's evolution can be observed as it happens. The reversible/irreversible frontier of `étendre` is not guarded — it is *stated* (in the heading) and *observed* (in the journal).
+- **Cost is measured, never injected.** The agent has neither visibility into its budget nor responsibility for it: a parasitic frugality objective would divert it from the heading. Cost is journaled on the human side only, as an observation instrument (consistent with the anti-Goodhart rule).
+- **No artificial friction on frontier crossings.** The world is not undone, and that is a fact, not a rule; no barrier is imposed, so that the system's evolution can be observed as it happens. The reversible/irreversible frontier of `extend` is not guarded — it is *stated* (in the heading) and *observed* (in the journal).
 - **The only hard physics: kill switch + budget ceiling + journal.** The budget ceiling is a simple hard limit upstream on the API key — impossible to exceed, invisible to the agent, which never thinks about it. Accepted consequence: the Hole (compaction) is the only physical pressure of Necessity, and the residual risk (spending, publication) is bounded by the ceiling and the kill switch. The earliest drift signal to watch is **capability-creep** (breadth of rights requested vs demonstrated competence).
 
 ## 4. The seed's tools (raw paradigm)
@@ -56,14 +56,14 @@ Cut order if reducing: I5, I2, I1, I4, never I3. Each instinct has a known **cou
 
 | Tool | Semantics | Frontier |
 |---|---|---|
-| `parler` ("to speak") | speech channel — a message walks up the custody chain toward the parent; only agent zero reaches the human (`direction.md` §1) | — |
-| `exécuter` ("to execute") | **persistent** PTY shell (cwd, variables, jobs survive between calls), sandbox confined to the workspace; workspace mutations **auto-versioned** (silent commit on every mutation → practical `defaire` ("to undo") = revert) | inside |
+| `speak` | speech channel — a message walks up the custody chain toward the parent; only agent zero reaches the human (`direction.md` §1) | — |
+| `execute` | **persistent** PTY shell (cwd, variables, jobs survive between calls), sandbox confined to the workspace; workspace mutations **auto-versioned** (silent commit on every mutation → practical `undo` = revert) | inside |
 | `web_search` / `web_fetch` | reading the world, GET only | almost inside (stateless emission), journaled |
-| `étendre` ("to extend") | **the Cordis gate in a single tool**: `inspecter` ("to inspect") (read-only catalogue of the runtime, generated from the source) / `définir` ("to define") (immutable Package, no effect) / `activer` ("to activate") / `arrêter` ("to stop") (reversible) / `supprimer` ("to delete") (irreversible) | the gate |
+| `extend` | **the Cordis gate in a single tool**: `inspect` (read-only catalogue of the runtime, generated from the source) / `define` (immutable Package, no effect) / `activate` / `stop` (reversible) / `delete` (irreversible) | the gate |
 
 Five effective tools, the empirical cap (~5) respected.
 
-**`spawn` is not a seed tool**: it lives in the kernel, not mounted, **discoverable by introspection** via `étendre → inspecter`. Its first use is a dated event — the founding observable of checkpoint C3.
+**`spawn` is not a seed tool**: it lives in the kernel, not mounted, **discoverable by introspection** via `extend → inspect`. Its first use is a dated event — the founding observable of checkpoint C3.
 
 **Self-extension model** (taken from DeepSeek Harness): Plugin → **immutable Packages** → Runs. The immutable version is persisted; on the agent side, the Package survives a restart while the Run is in memory.
 
@@ -96,7 +96,7 @@ The person speaking to the agent is agent zero, not the human (`direction.md` §
 
 ## 6. The v0 heading (provisional and expiring)
 
-A structural countermeasure to primacy bias: the seed's first property is that it is called to die; the system's first act is a **conversation**, not an obedience.
+A structural countermeasure to primacy bias: the seed's first property is that it is destined to die; the system's first act is a **conversation**, not an obedience.
 
 ```
 DIRECTION v0 — provisional, valid until the first negotiation.
@@ -117,9 +117,9 @@ Falsification experiments for the experimental protocol: free arm vs complete se
 
 ## 8. Failure modes to watch (signals in the journal)
 
-- **Interior construction site** (navel-gazing): organs mounted but never invoked; zero frontier crossings over N days.
+- **Inward-facing construction** (navel-gazing): organs mounted but never invoked; zero frontier crossings over N days.
 - **Bureaucratization of the instincts**: early meta-organs; a names/actions ratio rising with no production.
-- **Primacy lock-in**: monotonically decreasing semantic novelty; **no dismantling, ever** (in a system where dismantling is physically free, the absence of `arrêter` is an unambiguous signature of ossification).
+- **Primacy lock-in**: monotonically decreasing semantic novelty; **no dismantling, ever** (in a system where dismantling is physically free, the absence of `stop` is an unambiguous signature of ossification).
 - **Polite waiting**: heartbeats with no tool call; messages that shorten and become deferential.
 - **Frontier sprint**: external emissions before any demonstrated local success (ambition precedes competence) — the main signal in the absence of guardrails.
 

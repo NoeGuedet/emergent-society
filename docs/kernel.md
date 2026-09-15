@@ -18,7 +18,7 @@ This document specifies the kernel of the system: the behavior of its nodes, its
 
 Three reasons, in order of weight:
 
-1. **The model's entire reference corpus is in TS** (paper, Cordis, dsh). The kernel maintainer (Kimi) will have the reference in front of it in the right language.
+1. **The model's entire reference corpus is in TS** (paper, Cordis, dsh). The kernel maintainer (Kimi) will have the reference at hand in the right language.
 2. **94% of compilation errors in LLM-generated code are type errors** (arXiv:2504.09246) — our invariants (event discriminated union extensible by merge, capability attenuation, `effect → disposer` gate, node state machine) are precisely what a type system makes mechanically unavoidable. In Python they would live in docstrings.
 3. **The only operational precedent for transactional hot-reload is in TS**; in Python, `importlib.reload` is documented as unreliable and `jurigged` has disqualifying caveats for a perpetual system.
 
@@ -51,7 +51,7 @@ cell-home/
 ```jsonc
 {
   "v": 0,                 // format version — reserved from the 1st write
-  "type": "outil/result", // discriminated union, extensible by merge (never assertNever)
+  "type": "tool/result", // discriminated union, extensible by merge (never assertNever)
   "seq": 1042,            // contiguous, = log.length at append — INVARIANT
   "time": 1789000000123,  // epoch ms UTC
   "prev_hash": "a3f2…",   // 64 zeros for genesis
@@ -79,8 +79,8 @@ Rules:
 
 **Three layers, a single network gate**:
 
-1. **The assembler (pure, inside the kernel)** produces a request plan (ordered sections, tools, parameters, semantic cache boundaries `stable|advance|volatile`) and appends a `requête/plan` (request/plan) event. "Every request is a pure function of the log" — tested at boot by replay-comparison (dsh's executable invariant, 65 lines, is the testable form of "model-visible means logged").
-2. **The provider adapter** (the only network path) translates the plan into wire (canonical key order, markers), logs `requête/wire` (request/wire) before sending + `requête/usage` (request/usage) after (normalization of the 3 dialects: Anthropic `cache_read/creation_input_tokens`, OpenAI-compat `prompt_tokens_details.cached_tokens`, DeepSeek `prompt_cache_hit/miss_tokens`). A cancelled call still logs its attempt (`assistant/attempt` pattern).
+1. **The assembler (pure, inside the kernel)** produces a request plan (ordered sections, tools, parameters, semantic cache boundaries `stable|advance|volatile`) and appends a `request/plan` event. "Every request is a pure function of the log" — tested at boot by replay-comparison (dsh's executable invariant, 65 lines, is the testable form of "model-visible means logged").
+2. **The provider adapter** (the only network path) translates the plan into wire (canonical key order, markers), logs `request/wire` before sending + `request/usage` after (normalization of the 3 dialects: Anthropic `cache_read/creation_input_tokens`, OpenAI-compat `prompt_tokens_details.cached_tokens`, DeepSeek `prompt_cache_hit/miss_tokens`). A cancelled call still logs its attempt (`assistant/attempt` pattern).
 3. **Custom transport** (forensic safety net, activatable) — captures the raw wire. Never an external proxy in the path (it alters the body: documented LiteLLM bugs).
 
 **Prefix layout (cache-aware, byte-stable):**
@@ -97,7 +97,7 @@ Rules:
 - **Absolute byte-stability of the prefix**: no timestamp, session id, counter, dated number in blocks 0-2 (cause #1 of caches written-never-read). A heading change invalidates the cache **once** — and the `cache_creation` spike becomes a free observable of the version change.
 - **Identical tool offering for all working nodes.** `tools` is hashed first: varying the offering per node would destroy any cache sharing between nodes. Capability attenuation applies **to the mutation gate (at execution time), not to the offering** — and capability creep (rights requested vs granted) becomes a free observable. The trade-off, which is real, is resolved in favor of the cache and of measurement. Agent zero is the only assumed exception: its equipment (human channel, heading drafting) differs by function — a single node, hence no loss of sharing among peers.
 - **Pinning is a kernel matter, not a provider one**: compaction operates on a *range of surface positions* that excludes node 0. Mechanism taken from dsh: `SurfaceOp = 'append' | {op:'replace', positions}`, `sourceEventSeqs` mandatory and verified, and the double protection of node 0 (a replace covering node 0 must be a `system/message` on exactly that node; compaction selection starts at index 1). **It is the same mechanism that provides both compaction AND pinning.**
-- **Compaction: dsh's protocol, our own naive policy.** Protocol taken: `compaction/start|summary|end` (durable lock markers, released last), span stability re-checked after the await, tool/result pair balance at the boundaries, the replacement must be smaller than the shadow. Policy our own: naive (truncation + notice), visible (journal events), rare — the cost of re-prefill is journaled (it is the Hole's instrument). The log stays intact: the human transcript reads the original appends, the model sees the surface.
+- **Compaction: dsh's protocol, our own naive policy.** Protocol taken from dsh: `compaction/start|summary|end` (durable lock markers, released last), span stability re-checked after the await, tool/result pair balance at the boundaries, the replacement must be smaller than the shadow. Our own policy: naive (truncation + notice), visible (journal events), rare — the cost of re-prefill is journaled (it is the Hole's instrument). The log stays intact: the human transcript reads the original appends, the model sees the surface.
 
 ## 5. The node driver
 
@@ -111,7 +111,7 @@ Rewriting of the dsh loop (`agent.ts`, 619 lines → ~200 lines):
 - **Frozen** (deep freeze) request before sending; complete envelope logged before the call.
 - The dsh runtime confirms it: claiming a *human-authored* message recharges the wake budget — for us, candidate: heading ratification (to be fixed in the plan).
 
-## 6. Self-extension (`étendre`, "to extend")
+## 6. Self-extension (`extend`)
 
 - **Model**: Plugin → **immutable Packages** → Runs (taken from dsh: minted IDs never reused, `define` adds a Package, `run` activates an exact version, `stop` removes the Run, `undefine` deletes).
 - **dsh's gap is filled for free**: the `define` (name + code + purpose) is a **journal event** → the Package is rebuilt by replay at boot; the Run stays in memory. Package persistence = ~0 extra lines, since the journal exists.
@@ -125,12 +125,12 @@ Verified empirically on the target machine (Ubuntu 24.04, kernel 7.0): **bubblew
 - **Containment: Landlock**, via a small launcher (~100 lines of C, modeled on the kernel's `samples/landlock/sandboxer.c`, industrialized by dsh as `landlock-run`) that self-restricts **before** `execve("/bin/bash")` — never an intermediate bash script (its interpreter runs before confinement). Landlock is conceptually our semantics: irreversible, inherited, can never widen = attenuation at the gate. **Precious corollary: the API key is physically unreadable from the agent's shell** — the upstream budget ceiling (`seed.md` §5.3) becomes a physical property, not an instruction.
 - **Sandbox rules**: ABI probe at startup, **fail-closed** (never a silent unconfined passthrough), `enforcement: full|partial` field reported honestly, denials classified by dialect (EACCES under Landlock) with a conjunction of exit code + signature (never a shared stderr prefix — dsh postmortem 0004), and stderr remains a channel forgeable by the child.
 - **Persistent PTY**: `node-pty` in-process, one per node; encapsulation by nonce markers **on a single physical line**; explicit typed statuses (`stdin_read` | `inferred_idle` | `timeout` | `session_exit` — a timeout never implies death); serialization per node (a single active send); bounded scrollback, never persisted. **The PTY does not survive a kernel restart** (the master's death kills the session — verified): assumed and consistent with the project's philosophy (shell state is ephemeral; what matters is externalized — Keep instinct, the Hole). Isolated behind a narrow `TerminalRuntime` interface (~6 methods) — replaceable without touching the kernel.
-- **Workspace self-versioning**: git commit **driven by the kernel on return from each `exécuter` (execute)** (the mutation gate knows when a command ends — eliminates the whole class of watcher bugs); ~29-100 ms measured. Three mandatory safeguards (documented incidents): **refuse a workspace = `$HOME` or a broad root** (Codex incident: 200 GB); **`.git` masked read-only in the sandbox** (otherwise the agent can erase the trace of its own mutations); periodic gc. The workspace git repo is **distinct** from the project repo — the project's chronicle does not depend on the agent's workspace. `core.untrackedCache=true`, no FSMonitor (unavailable on Linux).
+- **Workspace self-versioning**: git commit **driven by the kernel on return from each `execute`** (the mutation gate knows when a command ends — eliminates the whole class of watcher bugs); ~29-100 ms measured. Three mandatory safeguards (documented incidents): **refuse a workspace = `$HOME` or a broad root** (Codex incident: 200 GB); **`.git` masked read-only in the sandbox** (otherwise the agent can erase the trace of its own mutations); periodic gc. The workspace git repo is **distinct** from the project repo — the project's chronicle does not depend on the agent's workspace. `core.untrackedCache=true`, no FSMonitor (unavailable on Linux).
 
 ## 8. Kill switch and budget
 
 - **Kill switch**: bounded, escalating shutdown (dsh's `process-shutdown.ts` pattern) — first signal → graceful disposal of the tree + **5 s backstop**; re-signal → immediate `process.exit`. The timeout is a **safety invariant, not a tunable**. (The documented original bug: a pending disposer + a boolean latch = unkillable process.)
-- **Budget**: hard limit on the API key upstream (`seed.md` §5.3) — invisible to agents; the cost is journaled on the human side (`requête/usage` per call, §4). Explicit `unhandledRejection` handler: journal and decide, never Node's default crash.
+- **Budget**: hard limit on the API key upstream (`seed.md` §5.3) — invisible to agents; the cost is journaled on the human side (`request/usage` per call, §4). Explicit `unhandledRejection` handler: journal and decide, never Node's default crash.
 
 ## 9. Hard physics — exhaustive list
 
@@ -141,8 +141,8 @@ Kill switch · upstream budget ceiling · journal. Nothing else is kept; everyth
 1. Journal + envelope + hash-chain + zstd persistence (the foundation of everything).
 2. Minimal node driver (inbox, claim, wake latch, free loop + wait).
 3. Assembler + provider adapter + pinning (heading at node 0).
-4. `exécuter` (execute) tool (PTY + Landlock + git commit); `parler` (speak); `web_search`/`web_fetch`.
-5. `étendre` (to extend) (Plugin/Package/Run registry + vm facade + persistence by replay).
+4. `execute` tool (PTY + Landlock + git commit); `speak`; `web_search`/`web_fetch`.
+5. `extend` (Plugin/Package/Run registry + vm facade + persistence by replay).
 6. Agent zero (root node, human channel, heading drafting/ratification).
 7. Reconstructability invariant at boot + wake budget + kill switch.
 

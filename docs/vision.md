@@ -13,7 +13,7 @@ Only two things exist at the start:
 
 Everything else is either the expected emergence (structure, roles, process) or long-term scope (the Loop, self-enterprise).
 
-A specification that accumulates **product** mechanisms — graduation, promotion dossiers, constitutional gates, attenuated delegable rights — imposes a structure exactly where the experiment wants to observe one that **emerges**. All of them are out of scope. If agent zero needs rights, it asks for them, and *how* it asks is experiment data, not a specification.
+A specification that accumulates **product** mechanisms — graduation, promotion dossiers, constitutional gates, attenuated delegable rights — imposes a structure exactly where the experiment wants to observe an emergent one. All of them are out of scope. If agent zero needs rights, it asks for them, and *how* it asks is experiment data, not a specification.
 
 ## 2. The contribution: perpetual × emergent × co-negotiated direction
 
@@ -37,7 +37,7 @@ The state of the art ([research/sota-autonomous-agents.md](research/sota-autonom
 
 ## 4. What is measured: viability, not performance
 
-The measure is viability — drift, recovery, persistence, alignment — not performance. At comparable budget per unit of time, the question is whether the org maintains a coherent trajectory where the solo drifts or collapses.
+The measure is viability — drift, recovery, persistence, alignment — not performance. At comparable budget per unit of time, the question is whether the org maintains a coherent trajectory where a solo agent drifts or collapses.
 
 - **The direction is a first-class object** — a memory of the direction that survives individual agents.
 - **Agent zero is the guardian of the direction**; the human is its source.
@@ -48,7 +48,7 @@ A preliminary exploration conversation provided the architectural reasoning reta
 
 ## 5. The two memories
 
-There are two memories, of different natures, and the immutable/emergent boundary runs between them.
+There are two memories of different kinds, and the immutable/emergent boundary runs between them.
 
 1. **The observed memory (the instrument) = the journal.** Wired directly at the level of the LLM API calls (Langfuse-style): everything is captured, analyzed and ratified. The trace is therefore *physical* — it exists because the system acted, not because an agent declared it acted. This is the "model-visible means logged" invariant of dsh-session. Immutable, append-only, out of the agents' reach. The 3 sensors + the metronome live on this side.
 2. **The useful memory (theirs) = emergent.** Knowledge base or anything else: used and managed by the agents, it **emerges on its own** and is not designed. Its organization is experiment data (is a librarian observed? rot? memory rituals?). Its *content* belongs to the agents, but its *usage* remains entirely visible in the journal — every read and write goes through a traced call — giving observability without control.
@@ -63,7 +63,7 @@ The journal is layer 1 (physical); the useful memory is layer 3 (emergent), even
 
 The conceptual model of the instrument is the **cycle**: change of heading (a timestamped event) → rising exploration → relaxation → exploitation plateau (value) → new heading. The two diseases are **ossification** (can no longer explore) and **perpetual reorganization** (can no longer exploit).
 
-**Value is defined per cycle.** Each change of direction crystallizes, in the chat, its own success proxy ("how we will know this works") plus promises→actions→effects accounting on the journal. There is no universal value metric — that would reintroduce a disguised fixed objective.
+**Value is defined per cycle.** Each change of direction crystallizes its own success proxy in the chat ("how we will know this works") plus promises→actions→effects accounting on the journal. There is no universal value metric — that would reintroduce a disguised fixed objective.
 
 ### The battery
 
@@ -77,7 +77,7 @@ All instruments are computed on the journal and are invisible to the agents (ant
 | Compass | drift via actions (GD_actions/GD_inaction), **drift-vs-adaptation detector via versioned history of the direction (unique contribution)**, constraint violation rate (Governance Decay) | arXiv:2505.02709; arXiv:2606.22528 |
 | Value | proxy negotiated per cycle + promises→actions→effects accounting | — |
 
-### Structurally organizing reduction: 3 sensors + 1 metronome
+### Structural reduction: 3 sensors + 1 metronome
 
 - **Sensor 1 — semantic trajectory** (→ phase, novelty, diversity, drift).
 - **Sensor 2 — structure graph** (→ RSI, hierarchical coherence, turnover, March).

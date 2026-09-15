@@ -4,7 +4,7 @@ A web-verification pass (arXiv full text, official pricing pages, Artificial Ana
 
 ## Overall verdict
 
-**The 9 verified references really exist with the correct arXiv identifiers.** The corpus is reliable as a whole. Three corrections to make, only one of which touches a figure used in the reasoning (Kim et al.).
+**The 9 verified references do exist, with the correct arXiv identifiers.** The corpus is reliable as a whole. Three corrections to make, only one of which touches a figure used in the reasoning (Kim et al.).
 
 ## Scientific references
 
@@ -40,7 +40,7 @@ A web-verification pass (arXiv full text, official pricing pages, Artificial Ana
 ## Files to correct
 
 - `docs/research/devils-advocate.md` §2.3: 180→260 configurations; β=-0.408 (p<0.001)→β=-0.236 (p=0.004); affiliation → Google Research/DeepMind/MIT
-- `docs/research/devils-advocate.md` §2.6 and `../vision.md` l. 124: Governance Decay → specify mechanism = context compaction
+- `docs/research/devils-advocate.md` §2.6 and `../vision.md` line 124: Governance Decay → specify mechanism = context compaction
 - `docs/research/models-overview.md`: GLM-5.3-Flash expired promo rates → list; cache 0.011→0.03 $; GLM-5.3 score 45→60, tied with K3; redo the cache savings calculation
 
 *Method: reading arXiv HTML full text when available (Dochkina, Kim, Arike), abstracts otherwise (Inherited Goal Drift, Governance Decay) — flagged on a case-by-case basis. Working files: /Users/noe/projects/cell/tmp_verif/ (to be deleted after correction).*

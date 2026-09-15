@@ -97,7 +97,7 @@ Primary source: `docs/subsystems/session.md` (package `core/session`, `ctx.sessi
 
 ### 2.6 The 4 run modes (= agent presets)
 
-Beware of the vocabulary: the August press talks about "Standard, Code, Minimal, Creator"; **in the current repository these are agent presets** and "Code mode" was renamed **PTC** (decision note `2026-08-25-rename-code-mode-to-ptc`). Presets shipped in `packages/preset/agent-presets/presets/`: `standard`, `ptc`, `minimal`, `cordis`. [V — repository tree]
+A note on terminology: the August press talks about "Standard, Code, Minimal, Creator"; **in the current repository these are agent presets** and "Code mode" was renamed **PTC** (decision note `2026-08-25-rename-code-mode-to-ptc`). Presets shipped in `packages/preset/agent-presets/presets/`: `standard`, `ptc`, `minimal`, `cordis`. [V — repository tree]
 
 | Mode | Repository preset | Contents | Source |
 |---|---|---|---|
@@ -106,7 +106,7 @@ Beware of the vocabulary: the August press talks about "Standard, Code, Minimal,
 | **Minimal** | `minimal` | **A single fixed tool: a persistent `bash` (PTY)** — `str_replace_editor` was removed by commit `63795eaa` (03/09/2026, "remove str_replace_editor from minimal profiles"), to benchmark models in a bare environment (RL training config) | [V] preset dir + agent-presets README + commit `63795eaa` |
 | **Creator** | `cordis` | Runtime inspection, experimentation with in-memory Cordis plugins, preset authoring (skills `cordis-plugin-development`, `editing-cordis-compositions`) | [V] preset dir + [S] AgentHome https://agenthome.info/en/tools/deepseek-harness/ |
 
-Rules verified on the presets: a session can change preset only **as long as it has not produced anything** (otherwise the composition is frozen for life, because swapping the tools would leave logged tool calls that the new composition cannot perform); the switch is recorded in the log (`agent-preset/selected`); authoring is **copy-only** (creating a preset = copying an existing directory into the user root, never a composition text supplied by a caller). [V] https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/preset/agent-presets/README.md
+Rules verified on the presets: a session can change preset only **as long as it has not produced anything** (otherwise the composition is frozen permanently, because swapping the tools would leave logged tool calls that the new composition cannot perform); the switch is recorded in the log (`agent-preset/selected`); authoring is **copy-only** (creating a preset = copying an existing directory into the user root, never a composition text supplied by a caller). [V] https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/preset/agent-presets/README.md
 
 ### 2.7 Known limitations
 
@@ -119,7 +119,7 @@ Rules verified on the presets: a session can change preset only **as long as it 
 6. A hard process loss before settlement leaves no durable attempt stream. [V] architecture.md
 7. **[Added 14/09] Fiber unloading is parallel between sibling effects**: LIFO is guaranteed only *inside* a `ctx.effect`; between sibling effects of the same fiber, async disposers run in parallel (issue cordiverse/cordis#26, PR #144 open as of 14/09/2026). [V] fiber.ts `_unload` + upstream issue
 8. **[Added 14/09] The mutation gate is not watertight from the inside**: arbitrary Cordis code can call `ctx.effect`/`ctx.provide` directly and bypass any attenuation facade (paper §6.3: sandboxing untrusted code requires an *external* sandbox) — hence dsh's `node:vm` + whitelisted facade for dynamic Packages. [V]
-9. **[Added 14/09] No proper upstream documentation for Cordis v4**: the README points to dsh's cordis-primer; a support risk worth noting. [V]
+9. **[Added 14/09] No real upstream documentation for Cordis v4**: the README points to dsh's cordis-primer; a support risk worth noting. [V]
 
 **Secondary sources (to be taken with caution):**
 - SitePoint mentions a `HarnessPlugin` subclass, `agent.run()`, a `harness` CLI — **inconsistent with the repository** (CLI = `dsh`, plugins = Cordis functions/objects); consider these details **invented**. [?] https://www.sitepoint.com/deepseek-harness-developer-preview/
@@ -143,7 +143,7 @@ Rules verified on the presets: a session can change preset only **as long as it 
 
 Primary sources: paper §5 (core library), `docs/cordis-primer.md`, `docs/cordis-tutorial/02-lifecycle-and-effects.md` of the Harness repository.
 
-**Context.** The `ctx` is the single entity through which every interaction passes: a service container (named keys `ctx.tools`, `ctx.llm`…), carrier of effects and co-effects, structured as a **tree** (each plugin receives a child context derived from the parent). [V — paper §3.3.1, Def. 28]
+**Context.** The `ctx` is the single entity through which every interaction passes: a service container (named keys `ctx.tools`, `ctx.llm`…), carrying effects and co-effects, structured as a **tree** (each plugin receives a child context derived from the parent). [V — paper §3.3.1, Def. 28]
 
 **Plugin.** Three equivalent forms: function (`export function apply(ctx)` + optional `name`/`inject`), object (`{ name, inject, apply }`), or a class `extends Service` (to provide a service consumable by others). `ctx.plugin(fn)` mounts a plugin **from code** — the same operation the YAML loader applies to each config entry — and returns a **fiber**. [V] https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/cordis-tutorial/02-lifecycle-and-effects.md , https://findharness.com/blog/cordis-framework-explained
 
@@ -178,13 +178,13 @@ Primary sources: paper §5 (core library), `docs/cordis-primer.md`, `docs/cordis
 - **Confluence**: the quiescent state is a function of the final configuration alone, not of the order of the steps (Th. 80) → the loader can reconcile in any order.
 - **No load order to arrange**: a fiber whose keys are not yet provided waits; modules load **concurrently**.
 - **Dependency-ordered unloading**: a provider goes UNLOADING *before* its inverses run; its dependents recompute an unsatisfied view and start their own teardown while its bindings are still in place; the provider waits for each notified dependent to reach INACTIVE before reclaiming its effects.
-- **Transactional HMR** (`@cordisjs/hmr`, 3 phases: accepted/declined classification of modules, detection of stale entries, transactional reload with cache backup and full rollback if an import fails); **no need for `accept` annotations à la Webpack/Vite** because the fiber already bounds all the component's effects. [V — paper §5.2.2]
+- **Transactional HMR** (`@cordisjs/hmr`, 3 phases: accepted/declined classification of modules, detection of stale entries, transactional reload with cache backup and full rollback if an import fails); **no need for `accept` annotations as in Webpack/Vite** because the fiber already bounds all the component's effects. [V — paper §5.2.2]
 
 **Non-guarantees / author obligations** (explicit in the paper):
 - The runtime **does not check** that the supplied inverse actually reverts the effect (the "witness" is an author obligation, §5.1.1), nor that the operations of a key commute (§3.4.2).
 - **System boundary** (§6.1): only the locations the system modifies *exclusively* and can restore are reversible. An emission to the outside (network write, process fork…) crosses the boundary; recovery then requires *withholding* (delaying the emission) or application-level *compensation* (e.g. deleting the created file, refunding) — outside the theorems.
 - A cross-process request via a service broker must be designed **asynchronous** (latency, mid-flight failure). [V — §6.2]
-- Ecosystem: hot-reloading **stateful** services (pools, caches) remains a hard point in practice (manual `accept` API); communication between sibling contexts only via the common parent. [S] https://starlog.is/articles/developer-tools/cordiverse-cordis
+- Ecosystem: hot-reloading **stateful** services (pools, caches) remains difficult in practice (manual `accept` API); communication between sibling contexts only via the common parent. [S] https://starlog.is/articles/developer-tools/cordiverse-cordis
 
 ---
 
@@ -229,7 +229,7 @@ Primary sources: paper §5 (core library), `docs/cordis-primer.md`, `docs/cordis
 - **Component** = triple `(d, p, e)`: dependency specification, declared provision, witnessed effect function (Def. 48). **Fiber** = instantiation: `⟨d,p,e,π,σ,τ,θ⟩` with parent π, own table σ, retirement flag τ, state θ ∈ {Inactive, Reloading, Active, Unloading} (Def. 49).
 - **Committed view** ω: for each declared key, the name of the fiber that provided it at commit time. A fiber **reads the same bindings for as long as it is loaded, including during its own teardown** — this is what allows a component to unload cleanly while the dependency that triggered the teardown is itself on its way out (Th. 70, Algo. 6).
 - **Inertia** (§4.4, Algo. 5): reload and unload are *inertial* — a transition once started runs to completion before responding to a new target change, with chaining: at the end of a reload, if the target changed → unload; at the end of an unload, if the target has become satisfied again → reload. At the iteration level, the guard tests the target **at each iteration boundary** → partial rollback *intra*-transition.
-- **Unload scheduling**: `refresh` marks UNLOADING *before* creating the task (the fiber stops providing) → dependents recompute and go into teardown while the bindings are still there; `unload` **waits** for each notified dependent to reach INACTIVE before running its inverses. Termination comes from the fact that a fiber only waits on dependents that are already unsatisfiable (Th. 73) — the provider graph is traversed on demand, never analyzed globally.
+- **Unload scheduling**: `refresh` marks UNLOADING *before* creating the task (the fiber stops providing) → dependents recompute and go into teardown while the bindings are still there; `unload` **waits** for each notified dependent to reach INACTIVE before running its inverses. Termination holds because a fiber only waits on dependents that are already unsatisfiable (Th. 73) — the provider graph is traversed on demand, never analyzed globally.
 - Re-enabling: a reactivated entry instantiates a **fresh fiber** — the entry is the identity that survives revisions, the fiber the identity of one activation (§5 intro).
 
 ### 4.6 System boundary (§6.1) — what is NOT reversible

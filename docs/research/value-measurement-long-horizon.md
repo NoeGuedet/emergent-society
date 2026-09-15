@@ -241,7 +241,7 @@ The 2025–2026 literature has turned each *sub-problem* into an active field wi
 | Vending-Bench 2 / Arena (Andon Labs) | andonlabs.com/evals/vending-bench-2 | 2025–26 | lab leaderboard |
 | Project Vend (Anthropic × Andon Labs) | anthropic.com/research/project-vend-1 | 2025 | engineering blog |
 | TheAgentCompany (Xu et al., CMU) | arXiv:2412.14161 | 2024 | preprint |
-| METR time horizons (Kwa, West et al.) | arXiv:2503.14499 ; metr.org/time-horizons | 2025–26 | NeurIPS 2025 + dashboard |
+| METR time horizons (Kwa, West et al.) | arXiv:2503.14499; metr.org/time-horizons | 2025–26 | NeurIPS 2025 + dashboard |
 | GDPval (Patwardhan et al., OpenAI) | arXiv:2510.04374 | 2025 | lab preprint |
 | SWE-Lancer (Miserendino et al., OpenAI) | arXiv:2502.12115 | 2025 | ICML 2025 |
 | Remote Labor Index (Mazeika et al., Scale/CAIS) | arXiv:2510.26787 | 2025 | preprint + leaderboard |
