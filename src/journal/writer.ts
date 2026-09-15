@@ -55,7 +55,14 @@ export class JournalPoisonedError extends Error {
  */
 const MAX_WRITE_FAILURE_STREAK = 2;
 
-/** Upper bound on blob writes in flight, so a burst cannot exhaust fds. */
+/**
+ * Upper bound on blob writes in flight, so a burst cannot exhaust fds. This
+ * deliberately bounds file descriptors only, not memory: a burst of huge
+ * payloads is still held whole in `pendingBlobs`. That is accepted for C1.1 —
+ * the backpressure policy (bounded queue, shedding, or an ingest cap) is a
+ * C1.2+ decision, and forcing one here would freeze a policy the journal has
+ * no basis to choose yet.
+ */
 const MAX_CONCURRENT_BLOB_WRITES = 4;
 
 /**
@@ -201,8 +208,11 @@ export class JournalWriter {
     // bytes, so a caller mutating `data` afterwards cannot desynchronize the
     // persisted bytes from the hash that was chained.
     this.pending.push({ event: e, line: canonicalizeJson(envelopeJson(e)) });
-    // No debounce: the window starts with the first event of the burst.
+    // No debounce: the window starts with the first event of the burst. The
+    // guard makes a timer that outlives `close()` a no-op instead of a
+    // synchronous throw from `flush()` inside a callback nothing can catch.
     this.timer ??= setTimeout(() => {
+      if (this.closed) return;
       void this.flush().catch((err: unknown) => { this.recordAsyncFailure(err); });
     }, this.batchWindowMs);
     return e;
@@ -226,12 +236,18 @@ export class JournalWriter {
     return ref;
   }
 
-  /** The barrier: pending burst → one frame, one write, one fsync. */
-  flush(): Promise<void> {
+  /**
+   * The barrier: pending burst → one frame, one write, one fsync.
+   *
+   * Total in promise style: `async` so the closed guard becomes a rejection
+   * rather than a synchronous throw, which a caller reaching it through a
+   * callback (the write-behind timer) could not catch.
+   */
+  async flush(): Promise<void> {
     // Flushing a closed writer would have nothing to flush into: the handle is
     // gone, so the write would fail obscurely. Refuse it like an append.
     if (this.closed) throw new JournalClosedError();
-    return this.enqueueFlush();
+    await this.enqueueFlush();
   }
 
   private enqueueFlush(): Promise<void> {
@@ -246,7 +262,9 @@ export class JournalWriter {
    * Makes every outstanding blob durable, newest set first, at a bounded
    * concurrency. Entries leave the map only once their write has resolved, so a
    * failed `put` stays queued and the next flush retries it — the writer never
-   * commits an event whose blob is not on disk.
+   * commits an event whose blob is not on disk. A blob failure counts into the
+   * same poison streak as a log-write failure, so a permanently failing blob
+   * store ends in a typed terminal state rather than rejecting forever.
    */
   private async drainBlobs(): Promise<void> {
     while (this.pendingBlobs.size > 0) {
@@ -257,7 +275,11 @@ export class JournalWriter {
         succeeded.push(hash);
       });
       for (const hash of succeeded) this.pendingBlobs.delete(hash);
-      if (failure) throw failure;
+      if (failure) {
+        this.writeFailureStreak += 1;
+        if (this.writeFailureStreak >= MAX_WRITE_FAILURE_STREAK) this.poisoned = true;
+        throw failure;
+      }
     }
   }
 

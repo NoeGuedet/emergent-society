@@ -176,11 +176,70 @@ describe('length-prefix corruption', () => {
 });
 
 describe('writer lifecycle guards', () => {
-  it('refuses flush() after close()', async () => {
+  it('rejects (does not throw synchronously) when flush() is called after close()', async () => {
     const w = await JournalWriter.open(home, 'n1');
     w.append('test/ping', { n: 0 });
     await w.close();
-    expect(() => w.flush()).toThrow(JournalClosedError);
+    // Total in promise style: the guard is a rejection, never a sync throw.
+    let threw = false;
+    let promise: Promise<void>;
+    try {
+      promise = w.flush();
+    } catch {
+      threw = true;
+      promise = Promise.resolve();
+    }
+    expect(threw).toBe(false);
+    await expect(promise!).rejects.toThrow(JournalClosedError);
+  });
+  it('does not raise an uncaught exception when a stale timer fires after close()', async () => {
+    const uncaught: unknown[] = [];
+    const onUncaught = (err: unknown): void => { uncaught.push(err); };
+    process.on('uncaughtException', onUncaught);
+    const realPut = BlobStore.prototype.put;
+    try {
+      // The first blob write is slow, so the burst is still draining while a
+      // second append arms a fresh timer and close() sets `closed`.
+      let slow = true;
+      vi.spyOn(BlobStore.prototype, 'put').mockImplementation(async function (
+        this: BlobStore, content: Buffer,
+      ) {
+        if (slow) { slow = false; await new Promise((r) => setTimeout(r, 120)); }
+        return realPut.call(this, content);
+      });
+      const w = await JournalWriter.open(home, 'n1', { batchWindowMs: 20 });
+      w.append('test/big', { payload: 'a'.repeat(20000) });
+      const flushing = w.flush();
+      // Let flushOnce clear the first timer and start awaiting the slow blob.
+      await new Promise((r) => setTimeout(r, 5));
+      // A second append arms a fresh window whose timer outlives close().
+      w.append('test/big', { payload: 'b'.repeat(20000) });
+      const closing = w.close();
+      // Wait past the batch window for the stale timer to fire.
+      await new Promise((r) => setTimeout(r, 60));
+      await flushing.catch(() => {});
+      await closing.catch(() => {});
+      expect(uncaught).toEqual([]);
+    } finally {
+      process.off('uncaughtException', onUncaught);
+      vi.restoreAllMocks();
+    }
+  });
+  it('poisons the writer when a blob write keeps failing', async () => {
+    const real = BlobStore.prototype.put;
+    vi.spyOn(BlobStore.prototype, 'put').mockImplementation(async function (
+      this: BlobStore, _content: Buffer,
+    ) {
+      void real;
+      throw new Error('blob store is permanently unavailable');
+    });
+    const w = await JournalWriter.open(home, 'n1', { batchWindowMs: 60_000 });
+    w.append('test/big', { payload: 'a'.repeat(20000) });
+    await expect(w.flush()).rejects.toThrow('blob store is permanently unavailable');
+    await expect(w.flush()).rejects.toThrow('blob store is permanently unavailable');
+    expect(() => w.append('test/ping', { n: 1 })).toThrow(JournalPoisonedError);
+    await expect(w.flush()).rejects.toThrow(JournalPoisonedError);
+    await w.close().catch(() => {});
   });
   it.skipIf(process.getuid?.() === 0)('poisons the writer when the rollback truncate fails', async () => {
     const { chmod } = await import('node:fs/promises');
