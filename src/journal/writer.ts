@@ -4,7 +4,10 @@ import { join } from 'node:path';
 import { canonicalizeJson, sha256Hex, type JsonValue } from './canon.js';
 import { GENESIS_HASH, makeEvent, type EventEnvelope } from './envelope.js';
 import { BlobStore, CLAIM_CHECK_THRESHOLD } from './blobs.js';
-import { decodeBatch, encodeBatch, scanBatches } from './framing.js';
+import { encodeBatch, scanBatches } from './framing.js';
+import { isErrno, syncDir, syncFile } from './fsutil.js';
+import { HEAD_FILE, type Head } from './head.js';
+import { genesisState, verifyChain } from './verify.js';
 
 export class SessionAlreadyOwnedError extends Error {
   constructor(nodeUid: string) {
@@ -67,14 +70,6 @@ interface PendingEvent {
  */
 const systemClock = (): number => Date.now();
 
-/** Chain checkpoint — `journal.v0.head`. Disposable, rebuildable from the log. */
-export interface Head {
-  first_hash: string;
-  last_hash: string;
-  count: number;
-  ts: number;
-}
-
 export class JournalWriter {
   private seq = 0;
   private prevHash = GENESIS_HASH;
@@ -131,6 +126,9 @@ export class JournalWriter {
       opts.now ?? systemClock, opts.batchWindowMs ?? 200, opts.onError, log,
     );
     try {
+      // The log file was just created: fsync the directory so its entry is
+      // durable even if the process dies before the first flush.
+      await syncDir(dir);
       await w.resume();
     } catch (err) {
       await w.forceClose();
@@ -140,26 +138,34 @@ export class JournalWriter {
   }
 
   private get logPath(): string { return join(this.dir, 'journal.v0.jsonl.zstd'); }
-  private get headPath(): string { return join(this.dir, 'journal.v0.head'); }
+  private get headPath(): string { return join(this.dir, HEAD_FILE); }
   private get lockPath(): string { return join(this.dir, 'journal.v0.lock'); }
 
   private async resume(): Promise<void> {
     let raw: Buffer;
-    try { raw = await readFile(this.logPath); } catch { return; }
+    try {
+      raw = await readFile(this.logPath);
+    } catch (err) {
+      // A missing log is a brand-new journal. Any other read error (EACCES,
+      // EIO) must not be mistaken for genesis: forking the chain from seq 0
+      // over an existing log would corrupt it silently.
+      if (isErrno(err, 'ENOENT')) return;
+      throw err;
+    }
     // repair() must have run first (kernel.md §3: at boot, before the writer
     // opens). Appending after a torn fragment would bury the fragment inside
     // the log, where the reader — which stops at the first torn region —
     // could never see the events that follow it.
     const { batches, tornBytes } = scanBatches(raw);
     if (tornBytes > 0) throw new TornTailError(this.dir, tornBytes);
-    for (const frame of batches) {
-      for (const line of decodeBatch(frame)) {
-        const e = JSON.parse(line) as EventEnvelope;
-        this.seq = e.seq + 1;
-        this.prevHash = e.hash;
-        this.firstHash ??= e.hash;
-      }
+    // Verify the full chain exactly as the reader would, and refuse to append
+    // onto a tail that does not verify.
+    const state = genesisState();
+    for (const e of verifyChain(batches, null, state)) {
+      this.firstHash ??= e.hash;
     }
+    this.seq = state.seq;
+    this.prevHash = state.prevHash;
     this.committedBytes = raw.length;
     this.committedSeq = this.seq;
     this.committedLastHash = this.prevHash;
@@ -264,8 +270,11 @@ export class JournalWriter {
       ts: this.now(),
     };
     // Atomic replace: a crash can leave the previous head, never a torn one.
+    // The tmp file is fsynced before the rename, so the rename cannot become
+    // durable ahead of the contents it points at.
     const tmp = `${this.headPath}.${process.pid}.tmp`;
     await writeFile(tmp, JSON.stringify(head));
+    await syncFile(tmp);
     await rename(tmp, this.headPath);
     await syncDir(this.dir);
   }
@@ -321,27 +330,21 @@ async function writeAll(handle: FileHandle, buf: Buffer): Promise<void> {
   }
 }
 
-async function syncDir(dir: string): Promise<void> {
-  const handle = await openFile(dir, 'r');
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
-function isErrno(err: unknown, code: string): boolean {
-  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === code;
-}
-
 function lockPathFor(dir: string): string {
   return join(dir, 'journal.v0.lock');
 }
 
+interface LockRecord {
+  pid: number;
+  /** Process start time, so a recycled PID is detected as stale. */
+  startedAt: number | null;
+}
+
 async function acquireLock(dir: string, nodeUid: string): Promise<void> {
   const lockPath = lockPathFor(dir);
+  const record = JSON.stringify(await currentLockRecord());
   try {
-    await writeFile(lockPath, String(process.pid), { flag: 'wx' });
+    await writeFile(lockPath, record, { flag: 'wx' });
     return;
   } catch (err) {
     if (!isErrno(err, 'EEXIST')) throw err;
@@ -350,7 +353,7 @@ async function acquireLock(dir: string, nodeUid: string): Promise<void> {
   // Stale lock: the previous owner is gone.
   await rm(lockPath, { force: true });
   try {
-    await writeFile(lockPath, String(process.pid), { flag: 'wx' });
+    await writeFile(lockPath, record, { flag: 'wx' });
   } catch (err) {
     // Another writer won the race between the removal and this write.
     if (isErrno(err, 'EEXIST')) throw new SessionAlreadyOwnedError(nodeUid);
@@ -358,16 +361,79 @@ async function acquireLock(dir: string, nodeUid: string): Promise<void> {
   }
 }
 
-async function isLockHeldByLiveProcess(lockPath: string): Promise<boolean> {
-  const pid = Number((await readFile(lockPath, 'utf8')).trim());
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+async function currentLockRecord(): Promise<LockRecord> {
+  return { pid: process.pid, startedAt: await processStartTime(process.pid) };
+}
+
+/**
+ * Process start time in clock ticks since boot, read from `/proc/<pid>/stat`
+ * field 22 (the value after the command in parentheses and the state char).
+ * Together with the PID it identifies a process across PID reuse. Returns null
+ * where `/proc` is unavailable, falling back to pid-only behaviour.
+ */
+async function processStartTime(pid: number): Promise<number | null> {
+  let stat: string;
   try {
-    process.kill(pid, 0);
-    return true;
+    stat = await readFile(`/proc/${pid}/stat`, 'utf8');
+  } catch {
+    return null;
+  }
+  const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+  const field = rest[19];
+  if (field === undefined) return null;
+  const value = Number(field);
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * The PID range `process.kill` accepts. A value outside it names no process at
+ * all, so such a lock is stale rather than an unkillable live owner.
+ */
+const MAX_PID = 2 ** 31 - 1;
+
+function isPid(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= MAX_PID;
+}
+
+async function readLockRecord(lockPath: string): Promise<LockRecord | null> {
+  let raw: string;
+  try {
+    raw = await readFile(lockPath, 'utf8');
+  } catch {
+    return null;
+  }
+  // Tolerate the bare-PID lock written by an older writer.
+  const barePid = Number(raw.trim());
+  if (isPid(barePid)) return { pid: barePid, startedAt: null };
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!isPid(parsed['pid'])) return null;
+    const startedAt = parsed['startedAt'];
+    if (startedAt !== null && (typeof startedAt !== 'number' || !Number.isFinite(startedAt))) {
+      return null;
+    }
+    return { pid: parsed['pid'], startedAt: startedAt as number | null };
+  } catch {
+    return null;
+  }
+}
+
+async function isLockHeldByLiveProcess(lockPath: string): Promise<boolean> {
+  const record = await readLockRecord(lockPath);
+  // Unparseable contents do not identify a live owner, so the lock is stale.
+  if (record === null) return false;
+  try {
+    process.kill(record.pid, 0);
   } catch (err) {
     // EPERM means the process exists but is not ours — still a live owner.
     return !isErrno(err, 'ESRCH');
   }
+  // The PID is alive; check that it is the same process and not a recycled one.
+  if (record.startedAt === null) return true;
+  const actual = await processStartTime(record.pid);
+  // An unreadable start time cannot disprove ownership: treat it as live.
+  if (actual === null) return true;
+  return actual === record.startedAt;
 }
 
 async function releaseLock(dir: string): Promise<void> {

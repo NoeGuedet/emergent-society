@@ -1,8 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, rename, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { isErrno, syncDir } from './fsutil.js';
 
-/** Format constant — a payload at or beyond this size is stored as a blob. */
+/**
+ * Format constant — a payload whose canonical UTF-8 byte length is at or beyond
+ * this is stored as a blob (kernel.md §3: "~8-16 KB"). Changing it changes the
+ * format, i.e. it requires `v: 1`.
+ */
 export const CLAIM_CHECK_THRESHOLD = 16 * 1024;
 
 export class BlobStore {
@@ -52,18 +57,4 @@ export class BlobStore {
       throw err;
     }
   }
-}
-
-/** Makes a freshly created directory entry durable (rename targets are fsynced). */
-async function syncDir(dir: string): Promise<void> {
-  const handle = await open(dir, 'r');
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
-function isErrno(err: unknown, code: string): boolean {
-  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === code;
 }

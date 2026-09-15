@@ -3,7 +3,7 @@ import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JournalWriter, SessionAlreadyOwnedError, JournalClosedError, TornTailError } from '../writer.js';
-import { repair } from '../reader.js';
+import { repair, ChainBreakError } from '../reader.js';
 import { encodeBatch } from '../framing.js';
 import { verifyEvent } from '../envelope.js';
 import { CLAIM_CHECK_THRESHOLD } from '../blobs.js';
@@ -133,4 +133,70 @@ describe('JournalWriter durability and ownership', () => {
     const w = await JournalWriter.open(home, 'n1');
     await w.close();
   });
+  it('refuses to resume onto a forged but decodable tail', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    let w = await JournalWriter.open(home, 'n1');
+    w.append('test/ping', { n: 0 });
+    await w.close();
+    const path = join(home, 'nodes/n1/journal.v0.jsonl.zstd');
+    const { readFile } = await import('node:fs/promises');
+    const { scanBatches } = await import('../framing.js');
+    const { batches } = scanBatches(await readFile(path));
+    const lines = batches.flatMap((b) => b.lines);
+    const forged = JSON.stringify({
+      v: 0, type: 'test/ping', seq: 1, time: 1, prev_hash: 'f'.repeat(64),
+      hash: 'f'.repeat(64), data: {},
+    });
+    await writeFile(path, encodeBatch([...lines, forged]));
+    await expect(JournalWriter.open(home, 'n1')).rejects.toThrow(ChainBreakError);
+  });
+  it('refuses to resume when the log is unreadable instead of forking from genesis', async () => {
+    const { chmod } = await import('node:fs/promises');
+    const w = await JournalWriter.open(home, 'n1');
+    w.append('test/ping', { n: 0 });
+    await w.close();
+    await chmod(join(home, 'nodes/n1/journal.v0.jsonl.zstd'), 0o200);
+    try {
+      await expect(JournalWriter.open(home, 'n1')).rejects.toThrow();
+    } finally {
+      await chmod(join(home, 'nodes/n1/journal.v0.jsonl.zstd'), 0o600);
+    }
+  });
+  it('refuses a lock held by the current live process', async () => {
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const dir = join(home, 'nodes/n1');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'journal.v0.lock'), JSON.stringify({
+      pid: process.pid, startedAt: await currentProcessStartTime(),
+    }));
+    await expect(JournalWriter.open(home, 'n1')).rejects.toThrow(SessionAlreadyOwnedError);
+  });
+  it('takes over a lock whose PID was recycled by an unrelated process', async () => {
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const dir = join(home, 'nodes/n1');
+    await mkdir(dir, { recursive: true });
+    // The PID is alive (ours) but the recorded start time cannot match, so the
+    // lock belongs to a process that is gone.
+    await writeFile(join(dir, 'journal.v0.lock'), JSON.stringify({
+      pid: process.pid, startedAt: 1,
+    }));
+    const w = await JournalWriter.open(home, 'n1');
+    await w.close();
+  });
+  it('takes over a lock whose contents are garbage', async () => {
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const dir = join(home, 'nodes/n1');
+    await mkdir(dir, { recursive: true });
+    for (const garbage of ['', 'abc', '0', '-1', '9999999999999', '{"pid":']) {
+      await writeFile(join(dir, 'journal.v0.lock'), garbage);
+      const w = await JournalWriter.open(home, 'n1');
+      await w.close();
+    }
+  });
 });
+
+async function currentProcessStartTime(): Promise<number> {
+  const { readFile } = await import('node:fs/promises');
+  const stat = await readFile('/proc/self/stat', 'utf8');
+  return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]);
+}

@@ -1,15 +1,12 @@
-import { open as openFile, readFile, truncate } from 'node:fs/promises';
+import { readFile, rm, truncate } from 'node:fs/promises';
 import { join } from 'node:path';
-import { FORMAT_VERSION, GENESIS_HASH, assertKnownType, verifyEvent, type EventEnvelope } from './envelope.js';
-import { decodeBatch, scanBatches } from './framing.js';
-import type { Head } from './writer.js';
+import { scanBatches } from './framing.js';
+import { isErrno, syncDir, syncFile } from './fsutil.js';
+import { HEAD_FILE, type Head } from './head.js';
+import { HASH_RE, genesisState, verifyChain } from './verify.js';
+import type { EventEnvelope } from './envelope.js';
 
-export class ChainBreakError extends Error {
-  constructor(public readonly seq: number, reason: string) {
-    super(`hash chain broken at seq ${seq}: ${reason}`);
-    this.name = 'ChainBreakError';
-  }
-}
+export { ChainBreakError } from './verify.js';
 
 /** Read-only. The reader never repairs on its own: repair() is explicit. */
 export class JournalReader {
@@ -27,13 +24,21 @@ export class JournalReader {
   private get logPath(): string { return join(this.dir, 'journal.v0.jsonl.zstd'); }
 
   async head(): Promise<Head | null> {
+    // The head checkpoint is disposable: a missing, unreadable or malformed one
+    // means "rebuild from the log", which is what events() does anyway.
+    let parsed: unknown;
     try {
-      return JSON.parse(await readFile(join(this.dir, 'journal.v0.head'), 'utf8')) as Head;
+      parsed = JSON.parse(await readFile(join(this.dir, HEAD_FILE), 'utf8'));
     } catch {
-      // The head checkpoint is disposable: a missing one means "rebuild from
-      // the log", which is what events() does anyway.
       return null;
     }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    const h = parsed as Record<string, unknown>;
+    if (typeof h['first_hash'] !== 'string' || !HASH_RE.test(h['first_hash'])) return null;
+    if (typeof h['last_hash'] !== 'string' || !HASH_RE.test(h['last_hash'])) return null;
+    if (!Number.isSafeInteger(h['count']) || (h['count'] as number) < 0) return null;
+    if (typeof h['ts'] !== 'number' || !Number.isFinite(h['ts'])) return null;
+    return h as unknown as Head;
   }
 
   /**
@@ -42,44 +47,43 @@ export class JournalReader {
    */
   async *events(fromSeq = 0): AsyncGenerator<EventEnvelope> {
     let raw: Buffer;
-    try { raw = await readFile(this.logPath); } catch { return; }
+    try {
+      raw = await readFile(this.logPath);
+    } catch (err) {
+      // A missing log is an empty journal. Anything else (EACCES, EIO) must not
+      // be mistaken for genesis.
+      if (isErrno(err, 'ENOENT')) return;
+      throw err;
+    }
     const { batches } = scanBatches(raw);
-    let prevHash = GENESIS_HASH;
-    let expectedSeq = 0;
-    for (const frame of batches) {
-      for (const line of decodeBatch(frame)) {
-        const e = JSON.parse(line) as EventEnvelope;
-        // A format change (v: 1) is a different file, never an in-place
-        // mutation, so a v-mismatch means the reader must refuse to rebuild.
-        if (e.v !== FORMAT_VERSION) {
-          throw new ChainBreakError(e.seq, `unsupported format version ${e.v}`);
-        }
-        if (e.seq !== expectedSeq) throw new ChainBreakError(e.seq, `expected seq ${expectedSeq}`);
-        if (e.prev_hash !== prevHash) throw new ChainBreakError(e.seq, 'prev_hash mismatch');
-        if (!verifyEvent(e)) throw new ChainBreakError(e.seq, 'hash recomputation failed');
-        assertKnownType(e.type, e.ignorable ?? false, this.known);
-        prevHash = e.hash;
-        expectedSeq += 1;
-        if (e.seq >= fromSeq) yield e;
-      }
+    for (const e of verifyChain(batches, this.known, genesisState())) {
+      if (e.seq >= fromSeq) yield e;
     }
   }
 }
 
 /** Discards a physically torn trailing fragment. The only destructive path. */
 export async function repair(home: string, nodeUid: string): Promise<{ tornBytes: number }> {
-  const path = join(home, 'nodes', nodeUid, 'journal.v0.jsonl.zstd');
+  const dir = join(home, 'nodes', nodeUid);
+  const path = join(dir, 'journal.v0.jsonl.zstd');
   let raw: Buffer;
-  try { raw = await readFile(path); } catch { return { tornBytes: 0 }; }
+  try {
+    raw = await readFile(path);
+  } catch (err) {
+    if (isErrno(err, 'ENOENT')) return { tornBytes: 0 };
+    throw err;
+  }
+  // scanBatches throws CorruptFrameError on interior corruption: repair must
+  // never truncate through valid committed events, so that error propagates
+  // and nothing is deleted.
   const { tornBytes } = scanBatches(raw);
   if (tornBytes > 0) {
     await truncate(path, raw.length - tornBytes);
-    const handle = await openFile(path, 'r');
-    try {
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
+    await syncFile(path);
+    await syncDir(dir);
+    // The head checkpoint may now point past the truncation point; it is
+    // disposable, so it is removed and rebuilt from the log on the next flush.
+    await rm(join(dir, HEAD_FILE), { force: true });
   }
   return { tornBytes };
 }
