@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JournalWriter } from '../writer.js';
 import { JournalReader, ChainBreakError, repair } from '../reader.js';
-import { UnknownEventTypeError, computeHash, makeEvent, GENESIS_HASH } from '../envelope.js';
+import { UnknownEventTypeError, computeHash } from '../envelope.js';
 import { canonicalizeJson } from '../canon.js';
 import { encodeBatch, scanBatches, CorruptFrameError } from '../framing.js';
 
@@ -305,7 +305,6 @@ describe('JournalReader integrity', () => {
     w2.append('test/ping', { n: 1 });
     await w2.flush();
     await w2.close();
-    const headPath = join(home, 'nodes/n1/journal.v0.head');
     expect((await (await JournalReader.open(home, 'n1', KNOWN)).head())?.count).toBe(2);
     await appendFile(logPath(), encodeBatch(['{"torn":true}']).subarray(0, 9));
     await repair(home, 'n1');

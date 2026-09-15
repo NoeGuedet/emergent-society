@@ -140,7 +140,6 @@ export class JournalWriter {
 
   private get logPath(): string { return join(this.dir, 'journal.v0.jsonl.zstd'); }
   private get headPath(): string { return join(this.dir, HEAD_FILE); }
-  private get lockPath(): string { return join(this.dir, 'journal.v0.lock'); }
 
   private async resume(): Promise<void> {
     let raw: Buffer;

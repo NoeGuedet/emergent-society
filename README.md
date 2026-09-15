@@ -23,7 +23,7 @@ Three properties we refuse to compromise on:
 
 ## Status
 
-Design phase, no code yet. The design is complete (see the documents below); implementation of the kernel is next.
+Design phase, no product yet: the kernel is being implemented checkpoint by checkpoint. The C1.1 journal — hash-chained append-only event log, framed zstd persistence, claim-check blobs, write-behind with an explicit flush barrier, verifying reader and torn-tail repair — exists in `src/journal/` with a passing test suite.
 
 ## Documents
 
