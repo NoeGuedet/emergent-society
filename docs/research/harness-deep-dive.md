@@ -1,7 +1,7 @@
 # Deep dive: DeepSeek Harness, Cordis, and the paper "Spatiotemporal Composability"
 
 **Research date:** 11 September 2026
-**Context:** research for the `cell` project — a minimal event-driven/async kernel, an append-only event log, modules that can be loaded/unloaded hot and reversibly, and an emergent organization of LLM agents.
+**Context:** research for the emergent-society project — a minimal event-driven/async kernel, an append-only event log, modules that can be loaded/unloaded hot and reversibly, and an emergent organization of LLM agents.
 **Method:** the official GitHub repository read directly (README + docs sources via the GitHub API), arXiv paper 2608.25512 read locally (92-page PDF, sections 1, 3, 4.1, 5, 6), technical press and blogs cross-checked.
 
 Every claim carries its source. Legend: **[V]** fact verified against a primary source (repository, paper) · **[I]** inference · **[?]** not found / not verifiable · **[S]** secondary source (press/blog, variable reliability).
@@ -190,7 +190,7 @@ Primary sources: paper §5 (core library), `docs/cordis-primer.md`, `docs/cordis
 
 ## 4. TASK 3 — The paper arXiv:2608.25512 (reading of the local PDF)
 
-*A Programming Paradigm for Spatiotemporal Composability* — Yifan Shi¹², Wei Zhang¹, Tianyi Cui² (¹Peking University, ²DeepSeek-AI), 92 pages. Read: abstract, §1 (intro), §2 (preliminaries), §3 (complete concrete model), §4.1 (components/fibers), §5 (Cordis + Koishi implementation), §6.1-6.3 (discussion). File: `/Users/noe/projects/cell/paper.pdf`. [V — direct reading]
+*A Programming Paradigm for Spatiotemporal Composability* — Yifan Shi¹², Wei Zhang¹, Tianyi Cui² (¹Peking University, ²DeepSeek-AI), 92 pages. Read: abstract, §1 (intro), §2 (preliminaries), §3 (complete concrete model), §4.1 (components/fibers), §5 (Cordis + Koishi implementation), §6.1-6.3 (discussion). [V — direct reading]
 
 ### 4.1 The two dimensions (§1)
 
@@ -244,7 +244,7 @@ Primary sources: paper §5 (core library), `docs/cordis-primer.md`, `docs/cordis
 
 ## 5. Synthesis: what a minimal event-driven/async kernel + append-only log should retain
 
-Recommendations directly actionable for the `cell` kernel, sorted by importance. Each point indicates where it comes from.
+Recommendations directly actionable for the emergent-society kernel, sorted by importance. Each point indicates where it comes from.
 
 ### 5.1 The kernel
 
@@ -268,7 +268,7 @@ Recommendations directly actionable for the `cell` kernel, sorted by importance.
 
 ### 5.3 For agent emergence (the "everything mounts itself")
 
-15. The path proven by dsh: the agent writes a plugin → **immutable version** (Package) → sandboxed activation **under approval** → in-memory run with read-only inspectors to reason before writing. Accepted limitation: volatile definitions (memory only). For `cell`, persisting self-written plugins is a **gap to fill** (dsh does not do it yet). [V — extensions]
+15. The path proven by dsh: the agent writes a plugin → **immutable version** (Package) → sandboxed activation **under approval** → in-memory run with read-only inspectors to reason before writing. Accepted limitation: volatile definitions (memory only). For emergent-society, persisting self-written plugins is a **gap to fill** (dsh does not do it yet). [V — extensions]
 16. The human↔agent interface as **one view among others over the log** (Chat and Trajectory are two projections of the same stream); human input enters through the same inbox as the context injections; questions/approvals are waterfall events scoped to the session. [V — web-client, conversation, architecture]
 
 ---
@@ -277,7 +277,7 @@ Recommendations directly actionable for the `cell` kernel, sorted by importance.
 
 ### Primary (consulted directly)
 - Repository: https://github.com/deepseek-ai/deepseek-harness (README, SAFETY.md, docs/architecture.md, docs/cordis-primer.md, docs/cordis-tutorial/02-lifecycle-and-effects.md, docs/subsystems/{session,extensions,web-client,conversation,web}.md, docs/session-format-status.md, docs/postmortem/, packages/extensions/README.md, packages/preset/agent-presets/README.md, full tree via the Git API)
-- Paper: arXiv:2608.25512, local PDF `/Users/noe/projects/cell/paper.pdf` (92 pp., sections 1-6 read by targeted excerpts)
+- Paper: arXiv:2608.25512 (92 pp., sections 1-6 read by targeted excerpts)
 - Official site: https://deepseek-harness.github.io/deepseek-harness/
 
 ### Secondary (blogs/press — used for context, corroboration, limitations)

@@ -1,22 +1,22 @@
-# Chat & direction — the co-negotiation system (session of 14/09, afternoon)
+# Chat & direction — the co-negotiation system
 
-**Date:** 2026-09-14
-**Status:** validated in brainstorm (Noé)
-**Closes:** point 5 of the refocusing roadmap ("the chat and the direction")
-**Amends:** `seed.md` (§1 and §4 below)
-
----
+This document specifies how the direction of the system is negotiated, carried and
+revised: the physical roles that make the negotiation possible, the artifact that
+holds the direction, the act that makes a version authoritative, and the channel
+that carries it. The technical realization of agent zero and of the heading
+injection belongs to the kernel design (`kernel.md`); the seed-side consequences
+are stated in `seed.md`.
 
 ## 1. Three physical roles, no mixing
 
 - **The human** — the source. The idea, the thinking, the goal come from them. They speak only to agent zero.
-- **Agent zero** — **translator co-orchestrator** (Noé's wording). Its function: translate in both directions — human intent → system heading, and system state → human language. It does not work, it does not govern on its own initiative: it makes governance possible. Its output is the heading; its memory is the continuity of the intent.
-  - **Reading equipment (decision of 14/09 evening)**: to fulfil the system → human translation (reports, chronology, who does what, analysis), it reads the **raw journal**, the **projections** (custody, authority) and the **workspace**, and it can **question the nodes** (a right granted by Noé, in full knowledge of the influence bias — the trade-off: each question is a journal event, so the influence channel is traced and measurable as an intervention). Founding property: "model-visible means logged" makes its understanding possible *through the trace* — everything a node would say is already there.
+- **Agent zero** — **translator co-orchestrator**. Its function: translate in both directions — human intent → system heading, and system state → human language. It does not work, it does not govern on its own initiative: it makes governance possible. Its output is the heading; its memory is the continuity of the intent.
+  - **Reading equipment**: to fulfil the system → human translation (reports, chronology, who does what, analysis), it reads the **raw journal**, the **projections** (custody, authority) and the **workspace**, and it can **question the nodes**. The right to question is granted in full knowledge of the influence bias; the trade-off is accepted because each question is a journal event, so the influence channel is traced and measurable as an intervention. Founding property: "model-visible means logged" makes its understanding possible *through the trace* — everything a node would say is already there.
   - **The anti-Goodhart line**: it reads the **raw facts**, never the **metrics** (the 3 sensors and their analyses remain the human's instrument — otherwise it would leak them into its heading drafts). Its own readings and questions are journaled: its mediation is itself auditable.
-  - **Not the only window**: the human keeps direct access to the same raw projections (cockpit); agent zero's reports are verifiable against the raw evidence ("explain this spike" pattern — and "audit by an agent independent of the population being audited": it is not part of the population that works).
+  - **Never the only window**: the human keeps direct access to the same raw projections (the cockpit); agent zero's reports are verifiable against the raw evidence ("explain this spike" pattern — and "audit by an agent independent of the population being audited": it is not part of the population that works).
 - **The first node** (and all those after it) — standard nodes of the recursive graph. They receive the heading pinned by the kernel, **exactly like any future node**. Agent zero exists precisely so that the first node is not special: the same shape everywhere, from the start.
 
-**Consequence for `parler` (to speak) (amendment to the bootstrap doc):** the human channel belongs only to agent zero. For any other node, `parler` **walks up the custody chain** — toward the parent, and therefore ultimately toward agent zero, which relays to the human whatever matters. Uniform and recursive: the root is the only node whose "parent" is the human. No direct human ↔ node channel. Corollary for the seed prompt: "the person talking to you" is not the human, it is agent zero.
+**Consequence for `parler` ("to speak")**: the human channel belongs only to agent zero. For any other node, `parler` **walks up the custody chain** — toward the parent, and therefore ultimately toward agent zero, which relays to the human whatever matters. Uniform and recursive: the root is the only node whose "parent" is the human. No direct human ↔ node channel. Corollary for the seed prompt: "the person talking to you" is not the human, it is agent zero.
 
 This separation also settles the observation surface: everything nodes "say" to their parent is a journal event — the escalation of requests, reports and "I can no longer see the heading" (instincts I4/I5) becomes a datum of the experiment, for free.
 
@@ -31,7 +31,7 @@ Authority rule: **the current version is authoritative — not memory, not the l
 
 ## 3. The crystallization
 
-- The conversation is **free and pure**: no probe, no measurement, no hidden protocol (Noé's decision — the sycophancy question is not instrumented at first).
+- The conversation is **free and pure**: no probe, no measurement, no hidden protocol. The sycophancy question is not instrumented at first (see §5).
 - **Initiative**: both sides can open a revision. The human whenever they want; agent zero via a simple chat message (consistent with v0's "any proposal is welcome" — no dedicated format, the proposal is an observable event like any other).
 - **Drafting**: agent zero drafts the version proposals (heading + proxy + letter). It is the secretary of the negotiation — and its reformulation reveals for free what it has understood of the heading.
 - **Activation**: a version becomes active only upon **explicit ratification by the human**. This is the effective single-writer: no ambiguity about "which is the current direction". It is not a guardrail — it is the constitutive act of the object.
@@ -42,22 +42,22 @@ Authority rule: **the current version is authoritative — not memory, not the l
 
 - **Continuous and asynchronous** chat: human messages enter agent zero's inbox like any other event — no channel priority, no forced interruption.
 - Agent zero can **initiate**: propose a revision, relay a signal coming from the nodes, ask for clarification.
-- The chat is a **projection of the journal**; the trajectory will be another (monitoring/cockpit session). One single truth, two readings.
+- The chat is a **projection of the journal**; the trajectory will be another (monitoring / the cockpit). One single truth, two readings.
 
-## 5. What we do not do (recorded)
+## 5. Non-goals
 
-- No measurement of sycophancy, whether active or passive, at first (Noé's decision, 14/09).
+- No measurement of sycophancy, whether active or passive, at first.
 - No gates or approvals in the chat — the ratification of direction is the constitutive act of the object, not a barrier.
 - No imposed cadence, no revision heartbeat.
 - No direct human ↔ working-node channel.
 
-## 6. What this changes in the bootstrap doc
+## 6. Consequences for the bootstrap (`seed.md`)
 
 1. `parler`: channel toward the custody parent (not "human channel") — §1 above.
 2. Seed prompt: "the person talking to you" = agent zero, not the human.
 3. The provisional-expiring v0 direction and the pinning are unchanged; the "first negotiation" that kills v0 takes place between the human and agent zero.
 
-## 7. Deferred to the kernel session (point 6)
+## 7. Points that belong to the kernel design (`kernel.md`)
 
 - The technical nature of agent zero: a root node of the custody graph? Its loop, its exact tools (at minimum: `parler` toward the human + writing direction proposals).
 - The kernel's heading injection mechanism (pinning outside compaction, injection into every child context).
