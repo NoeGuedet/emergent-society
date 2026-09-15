@@ -20,6 +20,12 @@ export class JournalClosedError extends Error {
   }
 }
 
+/**
+ * The only wall-clock read in src/journal/. Everything else takes time through
+ * an injected `now()`, so C1.2's kernel clock can replace it wholesale.
+ */
+const systemClock = (): number => Date.now();
+
 /** Chain checkpoint — `journal.v0.head`. Disposable, rebuildable from the log. */
 export interface Head {
   first_hash: string;
@@ -65,7 +71,7 @@ export class JournalWriter {
     }
     const w = new JournalWriter(
       dir, new BlobStore(home),
-      opts.now ?? (() => Date.now()), opts.batchWindowMs ?? 200, log,
+      opts.now ?? systemClock, opts.batchWindowMs ?? 200, log,
     );
     try {
       await w.resume();
