@@ -2,6 +2,9 @@ import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib';
 
 const LEN_BYTES = 4;
 
+/** Every zstd frame begins with this magic number. */
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+
 /**
  * Format constant — a durable batch never decompresses to more than this. It
  * bounds the allocation a single frame can force (`maxOutputLength`), so a
@@ -61,15 +64,50 @@ export function decodeBatch(frame: Buffer): string[] {
 }
 
 /**
+ * Decides whether the region starting at `offset` is a torn tail (a partial
+ * write, which repair may discard) or corruption of a length prefix (which it
+ * must not).
+ *
+ * A length prefix whose announced frame overruns EOF is ambiguous on its own: a
+ * partial write and a bit-flipped prefix look the same. The discriminator is
+ * the payload behind the prefix. At the start of the region, a zstd frame always
+ * begins with the magic `28 B5 2F FD`; if the prefix is corrupt, whatever
+ * length it announces, the bytes there are still the start of a real frame,
+ * which decodes — or at least begins to — rather than failing cleanly. So:
+ *  - if the remaining bytes do not start with the magic, the region is not the
+ *    start of a frame at all → treat as torn (the "too short to tell" case,
+ *    fewer than 8 bytes, is accepted as torn for the same reason);
+ *  - if they do start with it and the whole available payload decodes, then a
+ *    complete frame was present and only the prefix lied → corruption;
+ *  - if they start with it but the payload is a strict, undecodable prefix of a
+ *    frame (`Z_BUF_ERROR` / truncated-input), it is a genuine partial write →
+ *    torn.
+ */
+function isTornTail(buf: Buffer, offset: number): boolean {
+  const payloadStart = offset + LEN_BYTES;
+  const available = buf.subarray(payloadStart);
+  if (available.length < ZSTD_MAGIC.length * 2) return true;
+  if (!available.subarray(0, ZSTD_MAGIC.length).equals(ZSTD_MAGIC)) return true;
+  try {
+    decompress(available);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Walks the length-prefixed frames of a log.
  *
- * Two different damage modes are distinguished, because only one may be
- * repaired destructively:
- *  - a frame whose announced length runs past the end of the file is a
- *    **torn tail** — reported as `tornBytes` and never thrown;
+ * Damage modes are distinguished, because only one may be repaired
+ * destructively:
+ *  - a frame whose announced length runs past the end of the file and whose
+ *    payload is a genuine partial write is a **torn tail** — reported as
+ *    `tornBytes` and never thrown;
  *  - a complete frame that fails to decode (or a zero-length frame, which is
- *    not a valid frame) is **interior corruption** — a hard `CorruptFrameError`,
- *    carrying the offset so the operator can inspect it.
+ *    not a valid frame, or an overrunning prefix whose payload decodes) is
+ *    **interior corruption** — a hard `CorruptFrameError`, carrying the offset
+ *    so the operator can inspect it.
  */
 export function scanBatches(buf: Buffer): { batches: ScannedBatch[]; tornBytes: number } {
   const batches: ScannedBatch[] = [];
@@ -81,6 +119,9 @@ export function scanBatches(buf: Buffer): { batches: ScannedBatch[]; tornBytes: 
     }
     const end = offset + LEN_BYTES + len;
     if (end > buf.length) {
+      if (!isTornTail(buf, offset)) {
+        throw new CorruptFrameError(offset, 'length prefix does not frame the bytes present');
+      }
       return { batches, tornBytes: buf.length - offset };
     }
     let lines: string[];

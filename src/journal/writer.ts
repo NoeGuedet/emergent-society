@@ -55,6 +55,9 @@ export class JournalPoisonedError extends Error {
  */
 const MAX_WRITE_FAILURE_STREAK = 2;
 
+/** Upper bound on blob writes in flight, so a burst cannot exhaust fds. */
+const MAX_CONCURRENT_BLOB_WRITES = 4;
+
 /**
  * An entry carries the canonical bytes captured at `append`, so `flush` writes
  * exactly the lines that were hashed even if the caller mutates the payload
@@ -76,7 +79,13 @@ export class JournalWriter {
   private prevHash = GENESIS_HASH;
   private firstHash: string | null = null;
   private pending: PendingEvent[] = [];
-  private pendingBlobs: Promise<unknown>[] = [];
+  /**
+   * Blobs that must be durable before the events referencing them. Keyed by
+   * content hash, so a burst referencing the same payload stores it once; an
+   * entry is removed only once its `put` resolves, so a failed write is retried
+   * by the next flush instead of leaving a dangling reference behind.
+   */
+  private pendingBlobs = new Map<string, Buffer>();
   private timer: NodeJS.Timeout | null = null;
   private closed = false;
   /** Serializes flushes so a burst can never be written twice. */
@@ -210,17 +219,22 @@ export class JournalWriter {
     // prefix and the reference says so (`truncated: true` + original size).
     const truncated = bytes.length > MAX_BLOB_BYTES;
     const stored = truncated ? bytes.subarray(0, MAX_BLOB_BYTES) : bytes;
-    this.pendingBlobs.push(this.blobs.put(stored));
-    const ref: Record<string, JsonValue> = {
-      blob: createHash('sha256').update(stored).digest('hex'),
-      size: bytes.length,
-    };
+    const blobHash = createHash('sha256').update(stored).digest('hex');
+    this.pendingBlobs.set(blobHash, stored);
+    const ref: Record<string, JsonValue> = { blob: blobHash, size: bytes.length };
     if (truncated) ref['truncated'] = true;
     return ref;
   }
 
   /** The barrier: pending burst → one frame, one write, one fsync. */
   flush(): Promise<void> {
+    // Flushing a closed writer would have nothing to flush into: the handle is
+    // gone, so the write would fail obscurely. Refuse it like an append.
+    if (this.closed) throw new JournalClosedError();
+    return this.enqueueFlush();
+  }
+
+  private enqueueFlush(): Promise<void> {
     const next = this.flushChain.then(() => this.flushOnce());
     // Keep the chain alive after a rejection so later flushes still run; the
     // caller of this call still sees the original rejection.
@@ -228,14 +242,31 @@ export class JournalWriter {
     return next;
   }
 
+  /**
+   * Makes every outstanding blob durable, newest set first, at a bounded
+   * concurrency. Entries leave the map only once their write has resolved, so a
+   * failed `put` stays queued and the next flush retries it — the writer never
+   * commits an event whose blob is not on disk.
+   */
+  private async drainBlobs(): Promise<void> {
+    while (this.pendingBlobs.size > 0) {
+      const entries = [...this.pendingBlobs];
+      const succeeded: string[] = [];
+      const failure = await runBounded(entries, MAX_CONCURRENT_BLOB_WRITES, async ([hash, bytes]) => {
+        await this.blobs.put(bytes);
+        succeeded.push(hash);
+      });
+      for (const hash of succeeded) this.pendingBlobs.delete(hash);
+      if (failure) throw failure;
+    }
+  }
+
   private async flushOnce(): Promise<void> {
     this.throwIfPoisoned();
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     // A blob must be durable before the events that reference it. An `append`
-    // can land during the await, so loop until no blob is left outstanding.
-    while (this.pendingBlobs.length > 0) {
-      await Promise.all(this.pendingBlobs.splice(0));
-    }
+    // can land during the await, so drain until nothing is outstanding.
+    await this.drainBlobs();
     if (this.pending.length === 0) {
       // Nothing to retry, but a failure recorded by a prior timer flush (e.g. a
       // failed head checkpoint write) must still surface to the caller.
@@ -255,8 +286,10 @@ export class JournalWriter {
       // the log back to the last durable byte, so the retry is clean.
       this.pending = batch.concat(this.pending);
       this.writeFailureStreak += 1;
-      await this.truncateToCommitted();
-      if (this.writeFailureStreak >= MAX_WRITE_FAILURE_STREAK) {
+      const rolledBack = await this.truncateToCommitted();
+      // A failed rollback leaves a partial frame in the log: retrying over it
+      // would bury the tear, so the writer is poisoned outright.
+      if (!rolledBack || this.writeFailureStreak >= MAX_WRITE_FAILURE_STREAK) {
         this.poisoned = true;
       }
       throw err;
@@ -269,12 +302,15 @@ export class JournalWriter {
     await this.writeHead();
   }
 
-  private async truncateToCommitted(): Promise<void> {
+  /** Rolls the log back to the last durable byte; false if the rollback failed. */
+  private async truncateToCommitted(): Promise<boolean> {
     try {
       await truncate(this.logPath, this.committedBytes);
+      return true;
     } catch {
-      // Best effort: if the rollback itself fails the poisoned path refuses
-      // further writes rather than appending over a partial frame.
+      // The caller poisons the writer: appending over a partial frame would
+      // hide the tear from every later reader.
+      return false;
     }
   }
 
@@ -287,11 +323,17 @@ export class JournalWriter {
     };
     // Atomic replace: a crash can leave the previous head, never a torn one.
     // The tmp file is fsynced before the rename, so the rename cannot become
-    // durable ahead of the contents it points at.
+    // durable ahead of the contents it points at; on failure it is removed so
+    // the directory cannot collect stale checkpoints.
     const tmp = `${this.headPath}.${process.pid}.tmp`;
-    await writeFile(tmp, JSON.stringify(head));
-    await syncFile(tmp);
-    await rename(tmp, this.headPath);
+    try {
+      await writeFile(tmp, JSON.stringify(head));
+      await syncFile(tmp);
+      await rename(tmp, this.headPath);
+    } catch (err) {
+      await rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
     await syncDir(this.dir);
   }
 
@@ -306,7 +348,7 @@ export class JournalWriter {
       // Attempt a final flush: a burst that failed on the write-behind path is
       // retried here, so close() rejects only when the events really could not
       // be committed.
-      await this.flush();
+      await this.enqueueFlush();
     } finally {
       await this.forceClose();
     }
@@ -344,6 +386,31 @@ async function writeAll(handle: FileHandle, buf: Buffer): Promise<void> {
     if (bytesWritten === 0) throw new Error('journal write made no progress');
     written += bytesWritten;
   }
+}
+
+/**
+ * Runs `fn` over `items` with at most `limit` in flight. It waits for every
+ * item to settle (so all side effects have completed) and returns the first
+ * error rather than rejecting early, letting the caller record the work that
+ * did succeed.
+ */
+async function runBounded<T>(
+  items: T[], limit: number, fn: (item: T) => Promise<void>,
+): Promise<Error | null> {
+  let next = 0;
+  let firstError: Error | null = null;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const item = items[next++]!;
+      try {
+        await fn(item);
+      } catch (err) {
+        firstError ??= err instanceof Error ? err : new Error(String(err));
+      }
+    }
+  });
+  await Promise.all(workers);
+  return firstError;
 }
 
 function lockPathFor(dir: string): string {

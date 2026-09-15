@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, stat } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isErrno, syncDir } from './fsutil.js';
 
@@ -52,16 +52,20 @@ export class BlobStore {
     // asked to store, so there is nothing to write.
     if (await this.has(hash)) return hash;
     // Write, fsync and rename a temporary file: a crash mid-write then cannot
-    // leave a torn blob under a name that later reads would trust.
+    // leave a torn blob under a name that later reads would trust. On any
+    // failure the temp file is removed, so failed writes leave nothing behind.
     const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
     const handle = await open(tmp, 'wx');
     try {
       await handle.write(content);
       await handle.sync();
-    } finally {
       await handle.close();
+      await rename(tmp, path);
+    } catch (err) {
+      await handle.close().catch(() => {});
+      await rm(tmp, { force: true }).catch(() => {});
+      throw err;
     }
-    await rename(tmp, path);
     await syncDir(dir);
     return hash;
   }
