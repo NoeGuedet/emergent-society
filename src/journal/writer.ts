@@ -1,4 +1,4 @@
-import { open as openFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { open as openFile, mkdir, readFile, rename, rm, truncate, writeFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { canonicalizeJson, sha256Hex, type JsonValue } from './canon.js';
@@ -33,6 +33,35 @@ export class TornTailError extends Error {
 }
 
 /**
+ * A batch failed to commit twice in a row. The batch is still pending, but the
+ * log may now carry a partial frame, so retrying over it is no longer safe:
+ * every further append/flush/close is refused instead of silently skipping the
+ * events the caller already believes are logged.
+ */
+export class JournalPoisonedError extends Error {
+  constructor(public readonly dir: string, reason: string) {
+    super(`${dir}: journal writer is poisoned — ${reason}`);
+    this.name = 'JournalPoisonedError';
+  }
+}
+
+/**
+ * A failed write restores the batch (retry semantics) rather than dropping it.
+ * This many consecutive failures for the same batch poison the writer.
+ */
+const MAX_WRITE_FAILURE_STREAK = 2;
+
+/**
+ * An entry carries the canonical bytes captured at `append`, so `flush` writes
+ * exactly the lines that were hashed even if the caller mutates the payload
+ * afterwards.
+ */
+interface PendingEvent {
+  event: EventEnvelope;
+  line: string;
+}
+
+/**
  * The only wall-clock read in src/journal/. Everything else takes time through
  * an injected `now()`, so C1.2's kernel clock can replace it wholesale.
  */
@@ -50,24 +79,40 @@ export class JournalWriter {
   private seq = 0;
   private prevHash = GENESIS_HASH;
   private firstHash: string | null = null;
-  private pending: EventEnvelope[] = [];
+  private pending: PendingEvent[] = [];
   private pendingBlobs: Promise<unknown>[] = [];
   private timer: NodeJS.Timeout | null = null;
   private closed = false;
   /** Serializes flushes so a burst can never be written twice. */
   private flushChain: Promise<void> = Promise.resolve();
+  /** Bytes durably committed; the truncate target after a failed write. */
+  private committedBytes = 0;
+  /** On-disk watermark, which lags `seq` while a batch is still pending. */
+  private committedSeq = 0;
+  private committedLastHash = GENESIS_HASH;
+  /** Streak of consecutive failed writes for the same batch. */
+  private writeFailureStreak = 0;
+  private poisoned = false;
+  /** A write-behind failure, rethrown on the next append/flush/close. */
+  private pendingFailure: Error | null = null;
 
   private constructor(
     private readonly dir: string,
     private readonly blobs: BlobStore,
     private readonly now: () => number,
     private readonly batchWindowMs: number,
+    private readonly onError: ((err: Error) => void) | undefined,
     private readonly log: FileHandle,
   ) {}
 
   static async open(
     home: string, nodeUid: string,
-    opts: { now?: () => number; batchWindowMs?: number } = {},
+    opts: {
+      now?: () => number;
+      batchWindowMs?: number;
+      /** Observes write-behind failures; the failure still surfaces on the next call. */
+      onError?: (err: Error) => void;
+    } = {},
   ): Promise<JournalWriter> {
     const dir = join(home, 'nodes', nodeUid);
     await mkdir(dir, { recursive: true });
@@ -83,7 +128,7 @@ export class JournalWriter {
     }
     const w = new JournalWriter(
       dir, new BlobStore(home),
-      opts.now ?? systemClock, opts.batchWindowMs ?? 200, log,
+      opts.now ?? systemClock, opts.batchWindowMs ?? 200, opts.onError, log,
     );
     try {
       await w.resume();
@@ -115,10 +160,16 @@ export class JournalWriter {
         this.firstHash ??= e.hash;
       }
     }
+    this.committedBytes = raw.length;
+    this.committedSeq = this.seq;
+    this.committedLastHash = this.prevHash;
   }
 
   /** Synchronous and in-memory: the hot path never blocks on I/O. */
   append(type: string, data: JsonValue, opts: { ignorable?: boolean } = {}): EventEnvelope {
+    // A write-behind failure must be seen before anything else is accepted:
+    // the caller has to know the previous burst is not durable.
+    this.throwIfFailed();
     if (this.closed) throw new JournalClosedError();
     const e = makeEvent({
       type, data: this.claimCheck(data), seq: this.seq, time: this.now(),
@@ -128,9 +179,14 @@ export class JournalWriter {
     this.seq += 1;
     this.prevHash = e.hash;
     this.firstHash ??= e.hash;
-    this.pending.push(e);
+    // The canonical line is captured here, once: `flush` writes these exact
+    // bytes, so a caller mutating `data` afterwards cannot desynchronize the
+    // persisted bytes from the hash that was chained.
+    this.pending.push({ event: e, line: canonicalizeJson(e as unknown as JsonValue) });
     // No debounce: the window starts with the first event of the burst.
-    this.timer ??= setTimeout(() => { void this.flush().catch(() => {}); }, this.batchWindowMs);
+    this.timer ??= setTimeout(() => {
+      void this.flush().catch((err: unknown) => { this.recordAsyncFailure(err); });
+    }, this.batchWindowMs);
     return e;
   }
 
@@ -151,23 +207,60 @@ export class JournalWriter {
   }
 
   private async flushOnce(): Promise<void> {
+    this.throwIfPoisoned();
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-    // A blob must be durable before the events that reference it.
-    await Promise.all(this.pendingBlobs.splice(0));
-    if (this.pending.length === 0) return;
-    const events = this.pending;
+    // A blob must be durable before the events that reference it. An `append`
+    // can land during the await, so loop until no blob is left outstanding.
+    while (this.pendingBlobs.length > 0) {
+      await Promise.all(this.pendingBlobs.splice(0));
+    }
+    if (this.pending.length === 0) {
+      // Nothing to retry, but a failure recorded by a prior timer flush (e.g. a
+      // failed head checkpoint write) must still surface to the caller.
+      if (this.pendingFailure) throw this.pendingFailure;
+      return;
+    }
+    // Captured synchronously (no await between the two statements), so the
+    // batch and its blob set are fixed together.
+    const batch = this.pending;
     this.pending = [];
-    const frame = encodeBatch(events.map((e) => canonicalizeJson(e as unknown as JsonValue)));
-    await writeAll(this.log, frame);
-    await this.log.sync();
+    const frame = encodeBatch(batch.map((p) => p.line));
+    try {
+      await writeAll(this.log, frame);
+      await this.log.sync();
+    } catch (err) {
+      // Restore the batch at the front of `pending` (order preserved) and roll
+      // the log back to the last durable byte, so the retry is clean.
+      this.pending = batch.concat(this.pending);
+      this.writeFailureStreak += 1;
+      await this.truncateToCommitted();
+      if (this.writeFailureStreak >= MAX_WRITE_FAILURE_STREAK) {
+        this.poisoned = true;
+      }
+      throw err;
+    }
+    this.committedBytes += frame.length;
+    this.committedSeq = batch[batch.length - 1]!.event.seq + 1;
+    this.committedLastHash = batch[batch.length - 1]!.event.hash;
+    this.writeFailureStreak = 0;
+    this.pendingFailure = null;
     await this.writeHead();
+  }
+
+  private async truncateToCommitted(): Promise<void> {
+    try {
+      await truncate(this.logPath, this.committedBytes);
+    } catch {
+      // Best effort: if the rollback itself fails the poisoned path refuses
+      // further writes rather than appending over a partial frame.
+    }
   }
 
   private async writeHead(): Promise<void> {
     const head: Head = {
       first_hash: this.firstHash ?? GENESIS_HASH,
-      last_hash: this.prevHash,
-      count: this.seq,
+      last_hash: this.committedLastHash,
+      count: this.committedSeq,
       ts: this.now(),
     };
     // Atomic replace: a crash can leave the previous head, never a torn one.
@@ -178,10 +271,37 @@ export class JournalWriter {
   }
 
   async close(): Promise<void> {
+    // `closed` is set on entry so an append racing the flush is refused rather
+    // than accepted and then dropped. `finally` guarantees the handle and lock
+    // are released even when the flush rejects.
     if (this.closed) return;
-    await this.flush();
     this.closed = true;
-    await this.forceClose();
+    try {
+      this.throwIfPoisoned();
+      // Attempt a final flush: a burst that failed on the write-behind path is
+      // retried here, so close() rejects only when the events really could not
+      // be committed.
+      await this.flush();
+    } finally {
+      await this.forceClose();
+    }
+  }
+
+  private throwIfPoisoned(): void {
+    if (this.poisoned) {
+      throw new JournalPoisonedError(this.dir, 'a batch failed to commit twice');
+    }
+  }
+
+  private throwIfFailed(): void {
+    this.throwIfPoisoned();
+    if (this.pendingFailure) throw this.pendingFailure;
+  }
+
+  private recordAsyncFailure(err: unknown): void {
+    const error = err instanceof Error ? err : new Error(String(err));
+    this.pendingFailure = error;
+    this.onError?.(error);
   }
 
   private async forceClose(): Promise<void> {

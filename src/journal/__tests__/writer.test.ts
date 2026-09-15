@@ -21,7 +21,8 @@ describe('JournalWriter', () => {
     expect(e0.seq).toBe(0);
     expect(e1.seq).toBe(1);
     expect(e1.prev_hash).toBe(e0.hash);
-    expect(verifyEvent(e0) && verifyEvent(e1)).toBe(true);
+    expect(verifyEvent(e0)).toBe(true);
+    expect(verifyEvent(e1)).toBe(true);
     await w.close();
   });
   it('persists events durably after flush', async () => {
