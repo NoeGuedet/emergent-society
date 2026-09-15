@@ -10,6 +10,25 @@ import { isErrno, syncDir } from './fsutil.js';
  */
 export const CLAIM_CHECK_THRESHOLD = 16 * 1024;
 
+/**
+ * Format constant — a claim-checked payload is never *stored* whole past this
+ * size. Beyond it the blob holds a prefix and the reference is marked
+ * `truncated: true` with the original byte size, so the loss is explicit
+ * (kernel.md §3: "truncation of giant payloads marked `truncated: true` +
+ * original size — never silent"). Changing it changes the format (`v: 1`).
+ */
+export const MAX_BLOB_BYTES = 4 * 1024 * 1024;
+
+/** A blob name is the lowercase hex SHA-256 of its content. */
+const BLOB_HASH_RE = /^[0-9a-f]{64}$/;
+
+export class InvalidBlobHashError extends Error {
+  constructor(hash: string) {
+    super(`not a blob hash: ${JSON.stringify(hash)}`);
+    this.name = 'InvalidBlobHashError';
+  }
+}
+
 export class BlobStore {
   constructor(private readonly home: string) {}
 
@@ -18,6 +37,9 @@ export class BlobStore {
   }
 
   private pathFor(hash: string): string {
+    // The hash names a path component, so it is validated before use: an
+    // unchecked value like `../secret` would escape `home` on the read path.
+    if (!BLOB_HASH_RE.test(hash)) throw new InvalidBlobHashError(hash);
     return join(this.dirFor(hash), hash);
   }
 

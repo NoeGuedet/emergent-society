@@ -6,7 +6,8 @@ import { JournalWriter, SessionAlreadyOwnedError, JournalClosedError, TornTailEr
 import { repair, ChainBreakError } from '../reader.js';
 import { encodeBatch } from '../framing.js';
 import { verifyEvent } from '../envelope.js';
-import { CLAIM_CHECK_THRESHOLD } from '../blobs.js';
+import { CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, BlobStore } from '../blobs.js';
+import { canonicalizeJson } from '../canon.js';
 
 let home: string;
 beforeEach(async () => { home = await mkdtemp(join(tmpdir(), 'cell-writer-')); });
@@ -54,6 +55,50 @@ describe('JournalWriter', () => {
     const data = e.data as { blob?: string; size?: number };
     expect(typeof data.blob).toBe('string');
     expect(data.size).toBeGreaterThanOrEqual(CLAIM_CHECK_THRESHOLD);
+    await w.close();
+  });
+  it('flips the claim-check branch exactly at the canonical byte threshold', async () => {
+    // The canonical form is `{"payload":"<s>"}`, 14 bytes of framing.
+    const framingBytes = Buffer.byteLength(canonicalizeJson({ payload: '' }), 'utf8');
+    for (const [delta, claimed] of [[-1, false], [0, true], [1, true]] as const) {
+      const payload = 'a'.repeat(CLAIM_CHECK_THRESHOLD - framingBytes + delta);
+      const w = await JournalWriter.open(home, `b${delta}`, { batchWindowMs: 60_000 });
+      const e = w.append('test/big', { payload });
+      expect(typeof (e.data as { blob?: unknown }).blob === 'string').toBe(claimed);
+      await w.close();
+    }
+  });
+  it('measures the threshold and the reported size in UTF-8 bytes, not code units', async () => {
+    const w = await JournalWriter.open(home, 'n1', { batchWindowMs: 60_000 });
+    // 6 000 code units but 18 000 UTF-8 bytes: over the 16 384-byte threshold.
+    const payload = '€'.repeat(6000);
+    const bytes = Buffer.byteLength(canonicalizeJson({ payload }), 'utf8');
+    expect(bytes).toBeGreaterThan(CLAIM_CHECK_THRESHOLD);
+    const e = w.append('test/big', { payload });
+    const data = e.data as { blob: string; size: number };
+    await w.flush();
+    await w.close();
+    const blob = await new BlobStore(home).get(data.blob);
+    expect(data.size).toBe(bytes);
+    expect(blob.length).toBe(bytes);
+  });
+  it('marks a payload past MAX_BLOB_BYTES truncated, with the original size', async () => {
+    const w = await JournalWriter.open(home, 'n1', { batchWindowMs: 60_000 });
+    const payload = 'a'.repeat(MAX_BLOB_BYTES + 10);
+    const e = w.append('test/big', { payload });
+    const data = e.data as { blob: string; size: number; truncated?: boolean };
+    const expectedSize = Buffer.byteLength(canonicalizeJson({ payload }), 'utf8');
+    expect(data.truncated).toBe(true);
+    expect(data.size).toBe(expectedSize);
+    await w.flush();
+    await w.close();
+    expect((await new BlobStore(home).get(data.blob)).length).toBe(MAX_BLOB_BYTES);
+  });
+  it('does not mark a payload between the threshold and MAX_BLOB_BYTES truncated', async () => {
+    const w = await JournalWriter.open(home, 'n1', { batchWindowMs: 60_000 });
+    const e = w.append('test/big', { payload: 'a'.repeat(CLAIM_CHECK_THRESHOLD * 2) });
+    const data = e.data as { blob: string; size: number; truncated?: boolean };
+    expect(data.truncated).toBeUndefined();
     await w.close();
   });
 });

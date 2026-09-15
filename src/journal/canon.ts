@@ -10,8 +10,8 @@ export type JsonValue =
   | { [k: string]: JsonValue };
 
 export class NonCanonicalizableError extends Error {
-  constructor(reason: string) {
-    super(`value is not canonicalizable: ${reason}`);
+  constructor(reason: string, options?: { cause?: unknown }) {
+    super(`value is not canonicalizable: ${reason}`, options);
     this.name = 'NonCanonicalizableError';
   }
 }
@@ -44,6 +44,14 @@ function assertJsonValue(value: unknown, path: string, seen: Set<object>): void 
       return;
   }
   if (value === null) return;
+  // Only plain objects and arrays have a JSON form. A `Date`, `Map`, `Set`,
+  // `RegExp` or class instance would be serialized to something else entirely
+  // (an ISO string, `{}`), i.e. silently lossy — the module's one forbidden
+  // outcome — so those are refused rather than coerced.
+  const proto: unknown = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && proto !== Object.prototype && proto !== null) {
+    throw new NonCanonicalizableError(`non-plain object (${constructorName(value)}) at ${path}`);
+  }
   if (seen.has(value)) throw new NonCanonicalizableError(`circular reference at ${path}`);
   seen.add(value);
   if (Array.isArray(value)) {
@@ -58,6 +66,10 @@ function assertJsonValue(value: unknown, path: string, seen: Set<object>): void 
   seen.delete(value);
 }
 
+function constructorName(value: object): string {
+  return value.constructor?.name ?? 'unknown';
+}
+
 export function canonicalizeJson(value: JsonValue): string {
   assertJsonValue(value, '$', new Set());
   let result: string | undefined;
@@ -66,6 +78,7 @@ export function canonicalizeJson(value: JsonValue): string {
   } catch (err) {
     throw new NonCanonicalizableError(
       err instanceof Error ? err.message : 'serialization failed',
+      { cause: err },
     );
   }
   // Unreachable for a plain object/array root, but the library's type allows

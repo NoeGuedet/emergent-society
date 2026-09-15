@@ -1,9 +1,10 @@
+import { createHash } from 'node:crypto';
 import { open as openFile, mkdir, readFile, rename, rm, truncate, writeFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
-import { canonicalizeJson, sha256Hex, type JsonValue } from './canon.js';
-import { GENESIS_HASH, makeEvent, type EventEnvelope } from './envelope.js';
-import { BlobStore, CLAIM_CHECK_THRESHOLD } from './blobs.js';
+import { canonicalizeJson, type JsonValue } from './canon.js';
+import { GENESIS_HASH, makeEvent, type EventDataFor, type EventEnvelope } from './envelope.js';
+import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from './blobs.js';
 import { encodeBatch, scanBatches } from './framing.js';
 import { isErrno, syncDir, syncFile } from './fsutil.js';
 import { HEAD_FILE, type Head } from './head.js';
@@ -172,6 +173,9 @@ export class JournalWriter {
   }
 
   /** Synchronous and in-memory: the hot path never blocks on I/O. */
+  append<T extends string>(
+    type: T, data: EventDataFor<T>, opts?: { ignorable?: boolean },
+  ): EventEnvelope<EventDataFor<T>>;
   append(type: string, data: JsonValue, opts: { ignorable?: boolean } = {}): EventEnvelope {
     // A write-behind failure must be seen before anything else is accepted:
     // the caller has to know the previous burst is not durable.
@@ -198,9 +202,22 @@ export class JournalWriter {
 
   private claimCheck(data: JsonValue): JsonValue {
     const canonical = canonicalizeJson(data);
-    if (canonical.length < CLAIM_CHECK_THRESHOLD) return data;
-    this.pendingBlobs.push(this.blobs.put(Buffer.from(canonical, 'utf8')));
-    return { blob: sha256Hex(canonical), size: canonical.length };
+    const bytes = Buffer.from(canonical, 'utf8');
+    // The threshold is a byte count, and so is the reported size: measuring in
+    // UTF-16 code units would let a multibyte payload far over 16 KB stay
+    // inline, and would understate the size of what was stored.
+    if (bytes.length < CLAIM_CHECK_THRESHOLD) return data;
+    // Past MAX_BLOB_BYTES the payload is not stored whole: the blob holds a
+    // prefix and the reference says so (`truncated: true` + original size).
+    const truncated = bytes.length > MAX_BLOB_BYTES;
+    const stored = truncated ? bytes.subarray(0, MAX_BLOB_BYTES) : bytes;
+    this.pendingBlobs.push(this.blobs.put(stored));
+    const ref: Record<string, JsonValue> = {
+      blob: createHash('sha256').update(stored).digest('hex'),
+      size: bytes.length,
+    };
+    if (truncated) ref['truncated'] = true;
+    return ref;
   }
 
   /** The barrier: pending burst → one frame, one write, one fsync. */

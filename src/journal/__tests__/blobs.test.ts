@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { BlobStore, CLAIM_CHECK_THRESHOLD } from '../blobs.js';
+import { BlobStore, CLAIM_CHECK_THRESHOLD, InvalidBlobHashError } from '../blobs.js';
 
 let home: string;
 beforeEach(async () => { home = await mkdtemp(join(tmpdir(), 'cell-blobs-')); });
@@ -36,5 +36,24 @@ describe('BlobStore', () => {
     const hash = await store.put(Buffer.from('stable'));
     await store.put(Buffer.from('stable'));
     expect((await store.get(hash)).toString('utf8')).toBe('stable');
+  });
+  it('rejects a hash that is not 64 lowercase hex characters', async () => {
+    const store = new BlobStore(home);
+    const bad = [
+      '../secret', 'A'.repeat(64), 'f'.repeat(63), 'f'.repeat(65),
+      'zz'.repeat(32), '', 'f/g'.repeat(21) + 'f',
+    ];
+    for (const hash of bad) {
+      await expect(store.get(hash)).rejects.toThrow(InvalidBlobHashError);
+      await expect(store.has(hash)).rejects.toThrow(InvalidBlobHashError);
+    }
+  });
+  it('cannot be escaped by a traversal-shaped hash', async () => {
+    const store = new BlobStore(home);
+    const outside = join(home, 'secret.txt');
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(outside, 'do not read me');
+    await expect(store.get('../secret.txt')).rejects.toThrow(InvalidBlobHashError);
+    await expect(store.has('../secret.txt')).rejects.toThrow(InvalidBlobHashError);
   });
 });

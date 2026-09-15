@@ -27,6 +27,29 @@ describe('canonicalizeJson (RFC 8785)', () => {
   it('rejects a lone surrogate', () => {
     expect(() => canonicalizeJson({ s: '\uD800' })).toThrow(NonCanonicalizableError);
   });
+  it('rejects non-plain objects that would canonicalize lossily', () => {
+    for (const value of [
+      new Date(0), new Map([['a', 1]]), new Set([1]), /re/,
+      new (class Widget { x = 1; })(),
+    ]) {
+      expect(() => canonicalizeJson({ v: value } as never)).toThrow(NonCanonicalizableError);
+    }
+  });
+  it('accepts a null-prototype object, whose keys are plain', () => {
+    const bare = Object.create(null) as Record<string, unknown>;
+    bare['a'] = 1;
+    expect(canonicalizeJson(bare as never)).toBe('{"a":1}');
+  });
+  it('carries the library failure as the error cause', () => {
+    let thrown: unknown;
+    try {
+      canonicalizeJson({ s: '\uD800' });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(NonCanonicalizableError);
+    expect((thrown as NonCanonicalizableError).cause).toBeInstanceOf(Error);
+  });
 });
 
 describe('sha256Hex', () => {
