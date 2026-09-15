@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { JournalWriter, SessionAlreadyOwnedError } from '../writer.js';
+import { JournalWriter, SessionAlreadyOwnedError, JournalClosedError, TornTailError } from '../writer.js';
+import { repair } from '../reader.js';
+import { encodeBatch } from '../framing.js';
 import { verifyEvent } from '../envelope.js';
 import { CLAIM_CHECK_THRESHOLD } from '../blobs.js';
 
@@ -107,7 +109,20 @@ describe('JournalWriter durability and ownership', () => {
   it('rejects appends after close', async () => {
     const w = await JournalWriter.open(home, 'n1');
     await w.close();
-    expect(() => w.append('test/ping', { n: 0 })).toThrow();
+    expect(() => w.append('test/ping', { n: 0 })).toThrow(JournalClosedError);
+  });
+  it('refuses to open over a torn tail instead of burying it', async () => {
+    const { appendFile } = await import('node:fs/promises');
+    let w = await JournalWriter.open(home, 'n1');
+    w.append('test/ping', { n: 0 });
+    await w.close();
+    await appendFile(join(home, 'nodes/n1/journal.v0.jsonl.zstd'), encodeBatch(['x']).subarray(0, 9));
+    await expect(JournalWriter.open(home, 'n1')).rejects.toThrow(TornTailError);
+    // The failed open releases its lock, so repair() + reopen recovers.
+    expect(await repair(home, 'n1')).toEqual({ tornBytes: 9 });
+    w = await JournalWriter.open(home, 'n1');
+    expect(w.append('test/ping', { n: 1 }).seq).toBe(1);
+    await w.close();
   });
   it('takes over a lock whose owner is dead', async () => {
     const { mkdir, writeFile } = await import('node:fs/promises');

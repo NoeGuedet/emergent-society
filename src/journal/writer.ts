@@ -21,6 +21,18 @@ export class JournalClosedError extends Error {
 }
 
 /**
+ * The log ends in a fragment that is not a whole batch. Appending on top of it
+ * would hide every later event from the reader, so the writer refuses and the
+ * caller runs `repair()` first.
+ */
+export class TornTailError extends Error {
+  constructor(public readonly dir: string, public readonly tornBytes: number) {
+    super(`${dir}: torn trailing fragment of ${tornBytes} bytes — run repair() before opening`);
+    this.name = 'TornTailError';
+  }
+}
+
+/**
  * The only wall-clock read in src/journal/. Everything else takes time through
  * an injected `now()`, so C1.2's kernel clock can replace it wholesale.
  */
@@ -89,8 +101,12 @@ export class JournalWriter {
   private async resume(): Promise<void> {
     let raw: Buffer;
     try { raw = await readFile(this.logPath); } catch { return; }
-    // A torn tail is repair()'s business, not ours: scanBatches stops there.
-    const { batches } = scanBatches(raw);
+    // repair() must have run first (kernel.md §3: at boot, before the writer
+    // opens). Appending after a torn fragment would bury the fragment inside
+    // the log, where the reader — which stops at the first torn region —
+    // could never see the events that follow it.
+    const { batches, tornBytes } = scanBatches(raw);
+    if (tornBytes > 0) throw new TornTailError(this.dir, tornBytes);
     for (const frame of batches) {
       for (const line of decodeBatch(frame)) {
         const e = JSON.parse(line) as EventEnvelope;
