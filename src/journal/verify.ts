@@ -51,12 +51,6 @@ function parseEnvelope(line: string, seq: number): EventEnvelope {
 }
 
 /**
- * Walks decoded batches, enforcing format version, seq contiguity, `prev_hash`
- * linkage and hash recomputation, and mutating `state` as it goes. The reader
- * and the writer's `resume` share it, so both apply identical rules; `known` is
- * null on the resume path, which only needs the chain itself to be intact.
- */
-/**
  * Chain state carried across a verification pass. `firstHash` is set on the
  * first event seen, so a caller resuming a journal learns the chain's root from
  * the same walk that verified it — there is no separate peek at the first line.
@@ -68,6 +62,12 @@ export interface ChainState {
   firstHash: string | null;
 }
 
+/**
+ * Walks decoded batches, enforcing format version, seq contiguity, `prev_hash`
+ * linkage and hash recomputation, and mutating `state` as it goes. The reader
+ * and the writer's `resume` share it, so both apply identical rules; `known` is
+ * null on the resume path, which only needs the chain itself to be intact.
+ */
 export function* verifyChain(
   batches: ScannedBatch[],
   known: ReadonlySet<string> | null,

@@ -13,7 +13,7 @@ export {
   TornTailError,
   type JournalWriterOptions,
 } from './writer.js';
-export { SessionAlreadyOwnedError } from './writer.js';
+export { SessionAlreadyOwnedError } from './lock.js';
 
 // Reading and repair.
 export { JournalReader, repair } from './reader.js';
@@ -46,7 +46,8 @@ export {
 } from './blobs.js';
 
 // Layout, for callers that need to address a journal directly.
-export { journalPath, headPath, nodeDir } from './layout.js';
+export { LOG_FILE, LOCK_FILE, journalPath, headPath, nodeDir } from './layout.js';
 
 // The typed error family.
 export { JournalError, isCorruption, isRetryable } from './errors.js';
+export { JournalWriteStalledError } from './fsutil.js';

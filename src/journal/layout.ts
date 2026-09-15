@@ -9,7 +9,9 @@ import { HASH_RE } from './canon.js';
  *
  * `nodeDir(home, uid)` builds a node's directory from the home; the `…Path(dir)`
  * helpers take that directory, which is what a writer or reader holds once it
- * has been resolved.
+ * has been resolved. The module also owns `Head` and `parseHead` — the shape of
+ * the one disposable checkpoint that sits beside the log — so that the reader
+ * and the writer share it without importing each other.
  */
 export const LOG_FILE = 'journal.v0.jsonl.zstd';
 export const LOCK_FILE = 'journal.v0.lock';

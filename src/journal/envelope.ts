@@ -10,6 +10,7 @@ import { JournalError } from './errors.js';
  * `EventDataMap`, which is what makes the event union a compile-time contract
  * rather than a convention.
  */
+
 /**
  * The envelope format version. It is frozen from the genesis event: a change to
  * the field set or the hashing formula means `v: 1` in a *new* file, never an
