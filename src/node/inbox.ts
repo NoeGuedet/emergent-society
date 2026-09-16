@@ -10,8 +10,12 @@ import type { Message } from './message.js';
 export class Inbox {
   private readonly pending = new Map<string, Message>();
 
-  /** Feeds one journaled event; idempotent by message id. */
-  apply(e: EventEnvelope): void {
+  /**
+   * Feeds one journaled event; idempotent by message id. Only `type` and
+   * `data` are read: the live path applies the original delivery fields, since
+   * the envelope it journaled may carry a claim-check reference instead.
+   */
+  apply(e: Pick<EventEnvelope, 'type' | 'data'>): void {
     if (e.type === 'message/received') {
       const d = e.data as {
         id: string; from: string; kind: Message['kind']; body: string; replyTo?: string;

@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { CLAIM_CHECK_THRESHOLD, isBlobRef } from '../../journal/blobs.js';
+import { JournalWriter } from '../../journal/index.js';
 import { collectEvents, useTempHome } from '../../journal/__tests__/helpers.js';
 import { NodeDriver, type Router, type TurnTrigger } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
@@ -161,5 +163,97 @@ describe('NodeDriver run loop', () => {
     d.stop();
     await running;
     expect(maintenanceCalls).toBe(1);
+  });
+
+  it('delivers, claims and serves a claim-checked body intact', async () => {
+    const body = 'b'.repeat(CLAIM_CHECK_THRESHOLD);
+    const seen: string[] = [];
+    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
+      seen.push(...ctx.messages.map((m) => m.body));
+      return 'waiting' as const;
+    }, new DropRouter());
+    const running = d.run();
+    await vi.waitFor(() => expect(d.state).toBe('waiting'));
+    await d.deliver(msg('x/m1', body));
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    d.stop();
+    await running;
+    expect(seen[0]).toBe(body);
+    const events = await log();
+    // The envelope is claim-checked, but the claim names the real message id —
+    // not the `undefined` an inbox fed the blob reference would have stored.
+    expect(isBlobRef(events.find((e) => e.type === 'message/received')?.data ?? null))
+      .toBe(true);
+    expect(events.find((e) => e.type === 'inbox/claim')?.data)
+      .toEqual({ turn: 1, messages: ['x/m1'] });
+  });
+
+  it('re-presents unclaimed mail after a resume, with trigger wakeup', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('node/boot', { reason: 'start' });
+    w.append('message/received', {
+      id: 'x/m1', from: 'x', kind: 'chat', wakeupRequested: false, body: 'held',
+    });
+    await w.close();
+    const seen: { trigger: TurnTrigger; bodies: string[] }[] = [];
+    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
+      seen.push({ trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
+      return 'waiting' as const;
+    }, new DropRouter());
+    expect(d.pendingCount).toBe(1);
+    const running = d.run();
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    d.stop();
+    await running;
+    expect(seen[0]).toEqual({ trigger: 'wakeup', bodies: ['held'] });
+  });
+
+  it('re-presents a claim-checked message after close and resume', async () => {
+    const body = 'b'.repeat(CLAIM_CHECK_THRESHOLD);
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('node/boot', { reason: 'start' });
+    w.append('message/received', {
+      id: 'x/m1', from: 'x', kind: 'chat', wakeupRequested: false, body,
+    });
+    await w.close();
+    const seen: { trigger: TurnTrigger; bodies: string[] }[] = [];
+    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
+      seen.push({ trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
+      return 'waiting' as const;
+    }, new DropRouter());
+    expect(d.pendingCount).toBe(1);
+    const running = d.run();
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    d.stop();
+    await running;
+    expect(seen[0]).toEqual({ trigger: 'wakeup', bodies: [body] });
+  });
+
+  it('rejects a run() called out of order', async () => {
+    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
+    const running = d.run();
+    await vi.waitFor(() => expect(d.state).toBe('waiting'));
+    await expect(d.run()).rejects.toThrow('run() out of order');
+    d.stop();
+    await running;
+  });
+
+  it('stops cleanly with node/shutdown journaled when stop() precedes run()', async () => {
+    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
+    d.stop();
+    await d.run();
+    expect(d.state).toBe('stopped');
+    const events = await log();
+    expect(events.map((e) => e.type)).toEqual(['node/boot', 'node/shutdown']);
+    expect(events[1]?.data).toEqual({ reason: 'stop-requested' });
+  });
+
+  it('shuts down with reason maintenance-error when the maintenance hook throws', async () => {
+    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter(), {
+      onMaintenance: () => { throw new Error('maint boom'); },
+    });
+    await expect(d.run()).rejects.toThrow('maint boom');
+    expect(d.state).toBe('stopped');
+    expect((await log()).at(-1)?.data).toEqual({ reason: 'maintenance-error' });
   });
 });

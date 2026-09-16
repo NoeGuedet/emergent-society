@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { JournalWriter, type EventEnvelope } from '../../journal/index.js';
+import {
+  JournalWriter, UnknownEventTypeError, type EventEnvelope,
+} from '../../journal/index.js';
 import { appendTear, collectEvents, useTempHome } from '../../journal/__tests__/helpers.js';
 import { NodeDriver, type Router } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
@@ -65,5 +67,20 @@ describe('NodeDriver boot and resume', () => {
     const d = await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
     expect(d.pendingCount).toBe(1);
     expect(d.nextMessageId()).toBe('n1/m2');
+  });
+
+  it('releases the writer lock when resume fails on an unknown event type', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('node/boot', { reason: 'start' });
+    // Known to the writer (it checks no types) but not to the node registry:
+    // the driver's replay must refuse it.
+    w.append('future/thing', { n: 0 });
+    await w.close();
+    await expect(NodeDriver.open(home(), 'n1', noOp, new DropRouter()))
+      .rejects.toThrow(UnknownEventTypeError);
+    // The failed open released its lock: a fresh writer can take the node over
+    // instead of hitting SessionAlreadyOwnedError forever.
+    const w2 = await JournalWriter.open(home(), 'n1');
+    await w2.close();
   });
 });

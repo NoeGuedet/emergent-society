@@ -67,7 +67,18 @@ export class NodeDriver {
       writer = await JournalWriter.open(home, uid, opts);
     }
     const driver = new NodeDriver(writer, uid, handler, router, opts);
-    await driver.resume(home);
+    try {
+      await driver.resume(home);
+    } catch (err) {
+      // Mirror the writer's own failed-open force-close: a driver whose replay
+      // failed must not keep the node locked behind the live pid, or every
+      // in-process retry hits SessionAlreadyOwnedError. The close is
+      // best-effort — the resume failure is the one that propagates.
+      try {
+        await writer.close();
+      } catch { /* the resume error stands */ }
+      throw err;
+    }
     return driver;
   }
 
@@ -92,11 +103,18 @@ export class NodeDriver {
     }
     const wakeupRequested =
       msg.wakeup && this.nodeState === 'waiting' && this.latch.request();
-    this.inbox.apply(this.writer.append('message/received', {
+    const data = {
       id: msg.id, from: msg.from, kind: msg.kind, wakeupRequested,
       body: msg.body,
       ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
-    }));
+    };
+    // A body at or past CLAIM_CHECK_THRESHOLD is claim-checked in the journaled
+    // envelope; feeding that envelope to the inbox would store the blob
+    // reference as if it were the message. The projection gets the original
+    // fields, which the driver already holds; replay resolves the reference
+    // instead (resume opens its reader with resolveBlobs).
+    this.writer.append('message/received', data);
+    this.inbox.apply({ type: 'message/received', data });
     // Deliveries flush eagerly: a journaled `sent` whose `received` was lost to
     // write-behind would be an effect without a trace on the recipient side.
     await this.writer.flush();
@@ -220,7 +238,12 @@ export class NodeDriver {
    * before any turn effect can exist.
    */
   private async resume(home: string): Promise<void> {
-    const reader = await JournalReader.open(home, this.uid, { knownTypes: NODE_EVENT_TYPES });
+    const reader = await JournalReader.open(home, this.uid, {
+      knownTypes: NODE_EVENT_TYPES,
+      // Projections replay the original payloads, not claim-check references:
+      // a message/received with a large body must rebuild as the message.
+      resolveBlobs: true,
+    });
     let sawAny = false;
     let openTurn: number | null = null;
     for await (const e of reader.events()) {
