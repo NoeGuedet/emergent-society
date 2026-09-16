@@ -132,6 +132,25 @@ describe('NodeDriver run loop', () => {
     expect(d.state).toBe('stopped');
   });
 
+  it('propagates the handler error and still stops when close() fails', async () => {
+    const d = await NodeDriver.open(home(), 'n1', () => {
+      throw new Error('boom');
+    }, new DropRouter());
+    // Same fault-injection technique as the shutdown-append test: the writer is
+    // private, so the field is reached through an annotated cast.
+    type LooseClose = () => Promise<unknown>;
+    const writer = (d as unknown as { writer: { close: LooseClose } }).writer;
+    const realClose = writer.close.bind(writer);
+    writer.close = async () => {
+      // Release the lock and handle for real, then fail the way a poisoned
+      // writer's close does: the run must survive it.
+      await realClose();
+      throw new Error('close dead');
+    };
+    await expect(d.run()).rejects.toThrow('boom');
+    expect(d.state).toBe('stopped');
+  });
+
   it('runs maintenance once per park', async () => {
     let maintenanceCalls = 0;
     const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter(), {
