@@ -2,3 +2,6 @@
 node_modules/
 *.log
 .env
+
+# Implementation plans are local working documents, not published docs
+docs/plans/
