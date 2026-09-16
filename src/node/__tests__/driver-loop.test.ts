@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, isBlobRef } from '../../journal/blobs.js';
-import { JournalWriter } from '../../journal/index.js';
+import { JournalWriter, canonicalizeJson } from '../../journal/index.js';
 import { collectEvents, useTempHome, withFailingWrite } from '../../journal/__tests__/helpers.js';
 import { NodeDriver, type Router, type TurnTrigger } from '../driver.js';
 import { MessageTooLargeError } from '../errors.js';
@@ -387,6 +387,43 @@ describe('NodeDriver run loop', () => {
     expect((await log()).filter((e) => e.type === 'message/received')).toEqual([]);
     d.stop();
     await d.run();
+  });
+
+  it('refuses a body that only the recipient envelope pushes past the bound', async () => {
+    // The window between the two measures: `message/received` is a few bytes
+    // larger than `message/sent`, so a body can canonicalize under the bound in
+    // the sent shape and over it in the received one. Measuring the sent shape
+    // would journal that body here and let the recipient's deliver() refuse it —
+    // MessageTooLargeError out of route(), the sender dying with a handler-error
+    // and no `message/undeliverable`: an effect without a trace. The sender
+    // measures the recipient's shape instead, so this must be refused at send().
+    const sentBytes = (body: string) => Buffer.byteLength(canonicalizeJson(
+      { id: 'n1/m1', to: 'peer', kind: 'chat', wakeup: true, body },
+    ), 'utf8');
+    const receivedBytes = (body: string) => Buffer.byteLength(canonicalizeJson(
+      // `false` is the larger of the two wakeupRequested values, so this is the
+      // worst case any recipient can measure.
+      { id: 'n1/m1', from: 'n1', kind: 'chat', wakeupRequested: false, body },
+    ), 'utf8');
+    const body = 'b'.repeat(MAX_BLOB_BYTES - 1025 - sentBytes(''));
+    // The premise: the sent measure accepts this body, the received one does not.
+    expect(sentBytes(body)).toBe(MAX_BLOB_BYTES - 1025);
+    expect(sentBytes(body)).toBeLessThan(MAX_BLOB_BYTES - 1024);
+    expect(receivedBytes(body)).toBeGreaterThanOrEqual(MAX_BLOB_BYTES - 1024);
+
+    const sent: string[] = [];
+    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
+      await expect(ctx.send(body, 'peer')).rejects.toBeInstanceOf(MessageTooLargeError);
+      sent.push('survived');
+      return 'waiting' as const;
+    }, new DropRouter());
+    const running = d.run();
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    d.stop();
+    await running;
+    const events = await log();
+    expect(events.filter((e) => e.type === 'message/sent')).toEqual([]);
+    expect(events.filter((e) => e.type === 'message/undeliverable')).toEqual([]);
   });
 
   it('accepts a near-bound body and serves the exact body after a resume', async () => {

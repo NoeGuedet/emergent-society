@@ -175,9 +175,13 @@ export class NodeDriver {
    * and mark the reference `truncated: true`, and a truncated reference is
    * refused at resume — one such message would brick the node's replay. The
    * driver rejects before journaling anything instead of writing a message it
-   * could never read back. The margin covers the envelope's own fixed overhead
-   * (the `message/received` framing plus hash and type, ~74 bytes), so every
-   * accepted message resolves losslessly.
+   * could never read back. `claimCheck` measures the payload alone and truncates
+   * at `MAX_BLOB_BYTES`, so the 1024-byte margin below the bound is pure
+   * conservatism, not a cover for framing overhead — and what makes it hold
+   * across the two nodes is the shape each side measures: `send` measures the
+   * recipient's `message/received` shape (the larger of the two), exactly what
+   * the recipient's `deliver` measures, so no body it accepts can be refused
+   * downstream.
    *
    * @throws MessageTooLargeError with the canonical byte count and the bound.
    */
@@ -323,14 +327,25 @@ export class NodeDriver {
       body,
       ...(opts.replyTo !== undefined ? { replyTo: opts.replyTo } : {}),
     };
-    // The exact payload `message/sent` will carry, measured before the append:
-    // an oversize send must leave the outgoing counter untouched, so nothing
-    // has been mutated yet.
+    // The exact payload `message/sent` will carry, built before the append so an
+    // oversize send leaves the outgoing counter untouched — nothing has been
+    // mutated yet.
     const data = {
       id: msg.id, to, kind: msg.kind, wakeup: msg.wakeup, body,
       ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
     };
-    this.assertLossless(data);
+    // Measured on the RECIPIENT's shape, not `data`: `message/received` is the
+    // larger envelope (`from` plus `wakeupRequested` against `to` plus `wakeup`),
+    // so a body in that window would be journaled here and then refused by the
+    // recipient's deliver() — MessageTooLargeError out of route(), the sender
+    // dying with a handler-error and no `message/undeliverable`, exactly the
+    // effect without a trace B2 eliminated. `false` is the larger of the two
+    // wakeupRequested values, so this is the worst case any recipient can
+    // measure and anything accepted here is acceptable to any deliver().
+    this.assertLossless({
+      id: msg.id, from: this.uid, kind: msg.kind, wakeupRequested: false, body,
+      ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
+    });
     this.outgoing += 1;
     this.writer.append('message/sent', data);
     await this.writer.flush();
