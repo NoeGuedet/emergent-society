@@ -208,6 +208,31 @@ describe('NodeDriver run loop', () => {
     expect(seen[0]).toEqual({ trigger: 'wakeup', bodies: ['held'] });
   });
 
+  it('re-presents mail claimed by an interrupted turn after a resume', async () => {
+    // The crash shape: the turn claimed m1 and opened, no turn/end was ever
+    // journaled. Resume appends the synthetic interrupted closer, which is what
+    // releases the claim — no event carries the release itself.
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('node/boot', { reason: 'start' });
+    w.append('message/received', {
+      id: 'x/m1', from: 'x', kind: 'chat', wakeupRequested: false, body: 'held',
+    });
+    w.append('inbox/claim', { turn: 0, messages: ['x/m1'] });
+    w.append('turn/start', { turn: 0, trigger: 'boot' });
+    await w.close();
+    const seen: { trigger: TurnTrigger; bodies: string[] }[] = [];
+    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
+      seen.push({ trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
+      return 'waiting' as const;
+    }, new DropRouter());
+    expect(d.pendingCount).toBe(1);
+    const running = d.run();
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    d.stop();
+    await running;
+    expect(seen[0]).toEqual({ trigger: 'wakeup', bodies: ['held'] });
+  });
+
   it('re-presents a claim-checked message after close and resume', async () => {
     const body = 'b'.repeat(CLAIM_CHECK_THRESHOLD);
     const w = await JournalWriter.open(home(), 'n1');

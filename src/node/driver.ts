@@ -274,7 +274,12 @@ export class NodeDriver {
       }
     }
     if (openTurn !== null) {
-      this.writer.append('turn/end', { turn: openTurn, outcome: 'interrupted', synthetic: true });
+      // Fed back through the projection, like every replayed event above: the
+      // closer is what releases the interrupted turn's claim (inbox.ts), so
+      // generating it without applying it would leave the mail eaten.
+      this.inbox.apply(this.writer.append(
+        'turn/end', { turn: openTurn, outcome: 'interrupted', synthetic: true },
+      ));
     }
     this.writer.append('node/boot', { reason: sawAny ? 'resume' : 'start' });
     await this.writer.flush();
