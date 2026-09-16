@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   JournalWriter, UnknownEventTypeError, type EventEnvelope,
 } from '../../journal/index.js';
 import { appendTear, collectEvents, useTempHome } from '../../journal/__tests__/helpers.js';
 import { NodeDriver, type Router } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
+import { Hub } from '../hub.js';
 import type { RoutedMessage } from '../message.js';
 
 const home = useTempHome('node-boot-');
@@ -82,5 +83,52 @@ describe('NodeDriver boot and resume', () => {
     // instead of hitting SessionAlreadyOwnedError forever.
     const w2 = await JournalWriter.open(home(), 'n1');
     await w2.close();
+  });
+
+  it('resumes a journal whose extra type the caller declared known', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('node/boot', { reason: 'start' });
+    // `ignorable: false` is the required form: without the option the replay
+    // refuses it (the test above), with it the event is understood here.
+    w.append('future/thing', { n: 0 }, { ignorable: false });
+    await w.close();
+    const known = new Set([...NODE_EVENT_TYPES, 'future/thing']);
+    const d = await NodeDriver.open(home(), 'n1', noOp, new DropRouter(), { knownTypes: known });
+    expect(d.state).toBe('booting');
+    d.stop();
+    await d.run();
+    expect(d.state).toBe('stopped');
+    // Read back with the same widened vocabulary: the extra type is understood
+    // here, which is exactly what the option declares.
+    const events = await collectEvents(home(), known, 'n1');
+    expect(events.map((e) => e.type)).toEqual([
+      'node/boot', 'future/thing', 'node/boot', 'node/shutdown',
+    ]);
+  });
+
+  it('accepts a receipt while still booting and serves it on the first turn', async () => {
+    const hub = new Hub(home());
+    const seen: { trigger: string; bodies: string[] }[] = [];
+    // Booted but not yet run: the receipt is journaled now, and the loop's
+    // first turn is a wakeup because the inbox is already non-empty.
+    const n1 = await hub.boot('n1', (ctx) => {
+      seen.push({ trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
+      return 'waiting' as const;
+    });
+    const n2 = await hub.boot('n2', async (ctx) => {
+      if (ctx.trigger === 'boot') await ctx.send('early', 'n1');
+      return 'waiting' as const;
+    });
+    const sender = n2.run();
+    // n2's first turn routes into a node that has not started its loop yet.
+    await vi.waitFor(() => expect(n1.pendingCount).toBe(1));
+    expect(n1.state).toBe('booting');
+    n2.stop();
+    await sender;
+    const n1Running = n1.run();
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    n1.stop();
+    await n1Running;
+    expect(seen[0]).toEqual({ trigger: 'wakeup', bodies: ['early'] });
   });
 });

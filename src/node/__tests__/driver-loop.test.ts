@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CLAIM_CHECK_THRESHOLD, isBlobRef } from '../../journal/blobs.js';
+import { CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, isBlobRef } from '../../journal/blobs.js';
 import { JournalWriter } from '../../journal/index.js';
-import { collectEvents, useTempHome } from '../../journal/__tests__/helpers.js';
+import { collectEvents, useTempHome, withFailingWrite } from '../../journal/__tests__/helpers.js';
 import { NodeDriver, type Router, type TurnTrigger } from '../driver.js';
+import { MessageTooLargeError } from '../errors.js';
 import { NODE_EVENT_TYPES } from '../events.js';
+import { Hub } from '../hub.js';
 import type { RoutedMessage } from '../message.js';
 
 const home = useTempHome('node-loop-');
@@ -18,6 +20,9 @@ const wait = () => 'waiting' as const;
 function msg(id: string, body: string, over: Partial<RoutedMessage> = {}): RoutedMessage {
   return { id, from: 'x', to: 'n1', kind: 'chat', wakeup: true, body, ...over };
 }
+
+/** A minimal typed view of the driver's private writer, for fault injection. */
+type LooseWriter = { append: (...args: unknown[]) => unknown; close(): Promise<unknown> };
 
 function log() {
   return collectEvents(home(), NODE_EVENT_TYPES, 'n1');
@@ -91,7 +96,7 @@ describe('NodeDriver run loop', () => {
     await expect(d.run()).rejects.toThrow('boom');
     const events = await log();
     expect(events.at(-2)?.data).toMatchObject({ outcome: 'error', error: 'Error: boom' });
-    expect(events.at(-1)?.data).toEqual({ reason: 'handler-error' });
+    expect(events.at(-1)?.data).toEqual({ reason: 'handler-error', error: 'Error: boom' });
     expect(d.state).toBe('stopped');
   });
 
@@ -279,6 +284,108 @@ describe('NodeDriver run loop', () => {
     });
     await expect(d.run()).rejects.toThrow('maint boom');
     expect(d.state).toBe('stopped');
-    expect((await log()).at(-1)?.data).toEqual({ reason: 'maintenance-error' });
+    expect((await log()).at(-1)?.data)
+      .toEqual({ reason: 'maintenance-error', error: 'Error: maint boom' });
+  });
+
+  it('refuses an oversize body before journaling anything', async () => {
+    const sent: string[] = [];
+    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
+      // At the bound exactly: the writer would claim-check-truncate this, and a
+      // truncated reference is refused at resume — so send() must reject first.
+      await expect(ctx.send('b'.repeat(MAX_BLOB_BYTES), 'peer')).rejects
+        .toBeInstanceOf(MessageTooLargeError);
+      sent.push('survived');
+      return 'waiting' as const;
+    }, new DropRouter());
+    const running = d.run();
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    d.stop();
+    await running;
+    const events = await log();
+    expect(events.filter((e) => e.type === 'message/sent')).toEqual([]);
+    expect(events.filter((e) => e.type === 'message/undeliverable')).toEqual([]);
+  });
+
+  it('refuses an oversize delivery before journaling anything', async () => {
+    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
+    await expect(d.deliver(msg('x/m1', 'b'.repeat(MAX_BLOB_BYTES))))
+      .rejects.toBeInstanceOf(MessageTooLargeError);
+    expect(d.pendingCount).toBe(0);
+    expect((await log()).filter((e) => e.type === 'message/received')).toEqual([]);
+  });
+
+  it('journals an undeliverable message and lets the turn end normally', async () => {
+    // The real transport: no node owns 'ghost', so the Hub refuses the route.
+    const hub = new Hub(home());
+    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
+      // The handler is never told: send() resolves and the fact is in the log.
+      await ctx.send('boo', 'ghost');
+      return 'waiting' as const;
+    }, hub);
+    const running = d.run();
+    await vi.waitFor(() => expect(d.state).toBe('waiting'));
+    d.stop();
+    await running;
+    const events = await log();
+    const sent = events.find((e) => e.type === 'message/sent');
+    const undeliverable = events.find((e) => e.type === 'message/undeliverable');
+    expect(sent?.data).toMatchObject({ id: 'n1/m1', to: 'ghost' });
+    expect(undeliverable?.data)
+      .toEqual({ id: 'n1/m1', to: 'ghost', reason: 'unknown-node' });
+    // The sender's turn consumed itself normally: no error outcome at all.
+    expect(events.filter((e) => e.type === 'turn/end').map((e) => (e.data as { outcome: string }).outcome))
+      .toEqual(['waiting']);
+  });
+
+  it('journals not-accepting when the recipient is stopped', async () => {
+    const hub = new Hub(home());
+    const peer = await hub.boot('peer', wait);
+    peer.stop();
+    await peer.run();
+    expect(peer.state).toBe('stopped');
+    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
+      await ctx.send('late', 'peer');
+      return 'waiting' as const;
+    }, hub);
+    const running = d.run();
+    await vi.waitFor(() => expect(d.state).toBe('waiting'));
+    d.stop();
+    await running;
+    const undeliverable = (await log())
+      .find((e) => e.type === 'message/undeliverable');
+    expect(undeliverable?.data)
+      .toEqual({ id: 'n1/m1', to: 'peer', reason: 'not-accepting' });
+  });
+
+  it('labels a loop death outside the handler as driver-error, with its error', async () => {
+    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
+    // Fault injection: the flush barrier after the claim must fail so the loop
+    // dies outside the handler — a handler-error would be a lie in the journal.
+    const writer = (d as unknown as { writer: LooseWriter }).writer;
+    const realAppend = writer.append.bind(writer);
+    writer.append = (type: unknown, ...rest: unknown[]) => {
+      if (type === 'turn/start') throw new Error('barrier dead');
+      return realAppend(type, ...rest);
+    };
+    await expect(d.run()).rejects.toThrow('barrier dead');
+    expect(d.state).toBe('stopped');
+    const shutdown = (await log()).find((e) => e.type === 'node/shutdown');
+    expect(shutdown?.data)
+      .toEqual({ reason: 'driver-error', error: 'Error: barrier dead' });
+  });
+
+  it('journals driver-error when the flush barrier itself rejects', async () => {
+    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
+    // The recorded-write-behind shape: append() accepts, the barrier flush
+    // fails. The failure is injected at the fs primitive the writer uses, so
+    // nothing in the driver can be blamed for it.
+    await withFailingWrite(home(), async () => {
+      await expect(d.run()).rejects.toThrow('injected EIO');
+    });
+    expect(d.state).toBe('stopped');
+    const shutdown = (await log()).find((e) => e.type === 'node/shutdown');
+    expect(shutdown?.data)
+      .toEqual({ reason: 'driver-error', error: 'Error: injected EIO' });
   });
 });

@@ -1,9 +1,9 @@
 import {
-  JournalReader, JournalWriter, TornTailError, repair,
+  JournalReader, JournalWriter, MAX_BLOB_BYTES, TornTailError, repair,
   type JournalWriterOptions,
 } from '../journal/index.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
-import { NodeStateError } from './errors.js';
+import { MessageTooLargeError, NodeStateError, UnknownNodeError } from './errors.js';
 import { Inbox } from './inbox.js';
 import { WakeLatch } from './latch.js';
 import { messageId, type Message, type MessageKind, type RoutedMessage } from './message.js';
@@ -46,6 +46,12 @@ export interface Router {
 
 export interface NodeDriverOptions extends JournalWriterOptions {
   onMaintenance?: () => Promise<void> | void;
+  /**
+   * The event types this driver's replay understands, defaulting to its own
+   * `NODE_EVENT_TYPES`. Later checkpoints boot a driver with their types unioned
+   * in, so a journal written by a richer node still resumes here.
+   */
+  knownTypes?: ReadonlySet<string>;
 }
 
 export class NodeDriver {
@@ -111,11 +117,29 @@ export class NodeDriver {
     return messageId(this.uid, this.outgoing + 1);
   }
 
-  /** The transport's only entry point: one message enters the node. */
+  /**
+   * The transport's only entry point: one message enters the node.
+   *
+   * Receipts are accepted as soon as the journal is open — every state but
+   * `stopping`/`stopped` — so a delivery to a node still in `booting` is not
+   * lost: it is journaled now and the loop claims it on its first turn, whose
+   * trigger the non-empty inbox already makes `wakeup` rather than `boot`.
+   *
+   * @throws NodeStateError once the driver is stopping or stopped — a journal
+   * that is closing cannot take a durable `received`.
+   * @throws MessageTooLargeError when the body would be journaled lossily.
+   */
   async deliver(msg: RoutedMessage): Promise<void> {
-    if (this.nodeState !== 'active' && this.nodeState !== 'waiting') {
+    if (this.nodeState === 'stopping' || this.nodeState === 'stopped') {
       throw new NodeStateError(`cannot deliver to ${this.uid}: state is ${this.nodeState}`);
     }
+    // A body at the blob bound would be claim-check-truncated by the writer (it
+    // stores a prefix past MAX_BLOB_BYTES), and a truncated reference is refused
+    // at resume — one such delivery would brick the node's replay. The driver
+    // rejects before journaling anything instead of writing a message it could
+    // never read back; the margin covers the envelope's own overhead.
+    const bytes = Buffer.byteLength(msg.body, 'utf8');
+    if (bytes >= MAX_BLOB_BYTES - 1024) throw new MessageTooLargeError(bytes, MAX_BLOB_BYTES);
     const wakeupRequested =
       msg.wakeup && this.nodeState === 'waiting' && this.latch.request();
     const data = {
@@ -203,32 +227,70 @@ export class NodeDriver {
       }
     } catch (err) {
       failure = err;
-    } finally {
-      this.nodeState = 'stopping';
-      try {
-        this.writer.append('node/shutdown', { reason: this.stopReason });
-      } catch (err) {
-        // Neither shutdown step may displace the error that ended the run: the
-        // append can fail (poisoned writer, recorded write-behind failure) and
-        // so can close(). When both exist, the handler/maintenance error is the
-        // one that propagates.
-        failure ??= err;
-      }
-      try {
-        await this.writer.close();
-      } catch (err) {
-        failure ??= err;
-      } finally {
-        // Reached even when close() fails: a driver whose writer cannot be
-        // closed is still stopped, never left in 'stopping'.
-        this.nodeState = 'stopped';
-      }
+      // The loop died outside the handler's contract (a failed flush barrier, a
+      // maintenance hook that rejected) — an error the caller never asked for.
+      // A reason set by stop() or by the handler's own turn must not be
+      // overwritten, so only the untouched default is relabelled.
+      if (this.stopReason === 'stop-requested') this.stopReason = 'driver-error';
     }
+    const shutdownFailure = await this.shutdown(failure);
+    failure ??= shutdownFailure;
     if (failure !== null) throw failure;
   }
 
-  /** Journals the intent, makes it durable, then routes — never the reverse. */
+  /**
+   * The one shutdown path: mark the stop, journal the reason, release the
+   * writer, and land in `stopped` no matter which step failed.
+   *
+   * The run's `prior` failure is journaled with the shutdown and outranks any
+   * error these steps raise: the append can fail (poisoned writer, recorded
+   * write-behind failure) and so can close(), and neither may displace the
+   * error that actually ended the run. The step errors are still returned so a
+   * clean run is told about them — the caller keeps whichever it holds first.
+   *
+   * @param prior the error that ended the run, or null on a clean stop.
+   * @returns the first shutdown-step error, or null when both steps succeeded.
+   */
+  private async shutdown(prior: unknown): Promise<unknown> {
+    let failure: unknown = null;
+    this.nodeState = 'stopping';
+    try {
+      this.writer.append('node/shutdown', {
+        reason: this.stopReason,
+        ...(prior !== null && prior !== undefined ? { error: String(prior) } : {}),
+      });
+    } catch (err) {
+      failure ??= err;
+    }
+    try {
+      await this.writer.close();
+    } catch (err) {
+      failure ??= err;
+    } finally {
+      // Reached even when close() fails: a driver whose writer cannot be closed
+      // is still stopped, never left in 'stopping'.
+      this.nodeState = 'stopped';
+    }
+    return failure;
+  }
+
+  /**
+   * Journals the intent, makes it durable, then routes — never the reverse.
+   *
+   * A transport failure is a journaled fact, not a death: the sender's `sent`
+   * is durable before the route is attempted, so an undeliverable message is
+   * recorded as `message/undeliverable` next to it and the handler is told
+   * nothing — it asked to send, and the journal now says what became of that.
+   * Only an unexpected error escapes.
+   *
+   * @throws MessageTooLargeError when the body would be journaled lossily.
+   * @throws any error the router raises that is not a known delivery refusal.
+   */
   private async send(body: string, to: string, opts: SendOptions = {}): Promise<void> {
+    // Same bound as deliver(): a body the writer would claim-check-truncate can
+    // never be resolved at resume, so it is refused before anything is journaled.
+    const bytes = Buffer.byteLength(body, 'utf8');
+    if (bytes >= MAX_BLOB_BYTES - 1024) throw new MessageTooLargeError(bytes, MAX_BLOB_BYTES);
     const msg: RoutedMessage = {
       id: messageId(this.uid, this.outgoing + 1),
       from: this.uid,
@@ -244,7 +306,19 @@ export class NodeDriver {
       ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
     });
     await this.writer.flush();
-    await this.router.route(msg);
+    try {
+      await this.router.route(msg);
+    } catch (err) {
+      // The two refusals the transport can mean: no node owns the uid, or the
+      // node exists but is stopping. Both are recorded against the `sent` that
+      // already exists, then swallowed — the turn goes on.
+      let reason: 'unknown-node' | 'not-accepting';
+      if (err instanceof UnknownNodeError) reason = 'unknown-node';
+      else if (err instanceof NodeStateError) reason = 'not-accepting';
+      else throw err;
+      this.writer.append('message/undeliverable', { id: msg.id, to, reason });
+      await this.writer.flush();
+    }
   }
 
   /**
@@ -254,7 +328,7 @@ export class NodeDriver {
    */
   private async resume(home: string): Promise<void> {
     const reader = await JournalReader.open(home, this.uid, {
-      knownTypes: NODE_EVENT_TYPES,
+      knownTypes: this.opts.knownTypes ?? NODE_EVENT_TYPES,
       // Projections replay the original payloads, not claim-check references:
       // a message/received with a large body must rebuild as the message.
       resolveBlobs: true,
