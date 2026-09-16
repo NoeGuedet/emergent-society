@@ -30,8 +30,11 @@ export {
   type AnyEvent,
 } from './envelope.js';
 
-// Canonicalization.
-export { NonCanonicalizableError, type JsonValue } from './canon.js';
+// Canonicalization. `canonicalizeJson` is exported because it is the exact
+// measure the writer applies before claim-checking: a caller that must stay
+// under a size bound (the node's lossless-message limit) has to measure the
+// same bytes the writer will, not the raw input.
+export { NonCanonicalizableError, canonicalizeJson, type JsonValue } from './canon.js';
 
 // Verification and framing damage.
 export { ChainBreakError } from './verify.js';

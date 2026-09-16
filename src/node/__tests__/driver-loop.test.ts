@@ -315,6 +315,46 @@ describe('NodeDriver run loop', () => {
     expect((await log()).filter((e) => e.type === 'message/received')).toEqual([]);
   });
 
+  it('refuses a within-raw-bound body whose canonical form overshoots', async () => {
+    // JSON escaping inflates `"` to `\"` (2x), so this body is ~2.1 MB raw —
+    // under the raw-byte guard the old check applied — but ~4.19 MB canonical,
+    // past MAX_BLOB_BYTES. The writer would store a truncated prefix and refuse
+    // it at resume, so the canonical measure is what the driver must enforce.
+    const body = '"'.repeat(MAX_BLOB_BYTES - 2048);
+    expect(Buffer.byteLength(body, 'utf8')).toBeLessThan(MAX_BLOB_BYTES - 1024);
+    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
+    await expect(d.deliver(msg('x/m1', body))).rejects.toBeInstanceOf(MessageTooLargeError);
+    expect(d.pendingCount).toBe(0);
+    expect((await log()).filter((e) => e.type === 'message/received')).toEqual([]);
+  });
+
+  it('accepts a near-bound body and serves the exact body after a resume', async () => {
+    // The accepted side must be genuinely lossless: half the canonical budget
+    // is an ordinary body that fits, and it has to survive close() + resume
+    // byte-for-byte (the blob round trip), not merely be accepted.
+    const body = 'b'.repeat(MAX_BLOB_BYTES / 2);
+    const seen: string[] = [];
+    const first = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
+    // Delivered while booting (A4) and stopped before any turn claims it, so
+    // the message is still unclaimed when the second driver replays the log.
+    await first.deliver(msg('x/m1', body));
+    expect(first.pendingCount).toBe(1);
+    first.stop();
+    await first.run();
+    expect(first.state).toBe('stopped');
+
+    const second = await NodeDriver.open(home(), 'n1', (ctx) => {
+      seen.push(...ctx.messages.map((m) => m.body));
+      return 'waiting' as const;
+    }, new DropRouter());
+    expect(second.pendingCount).toBe(1);
+    const resumed = second.run();
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    second.stop();
+    await resumed;
+    expect(seen[0]).toBe(body);
+  });
+
   it('journals an undeliverable message and lets the turn end normally', async () => {
     // The real transport: no node owns 'ghost', so the Hub refuses the route.
     const hub = new Hub(home());

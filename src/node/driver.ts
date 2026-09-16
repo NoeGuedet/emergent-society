@@ -1,6 +1,6 @@
 import {
-  JournalReader, JournalWriter, MAX_BLOB_BYTES, TornTailError, repair,
-  type JournalWriterOptions,
+  JournalReader, JournalWriter, MAX_BLOB_BYTES, TornTailError, canonicalizeJson, repair,
+  type JournalWriterOptions, type JsonValue,
 } from '../journal/index.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
 import { MessageTooLargeError, NodeStateError, UnknownNodeError } from './errors.js';
@@ -133,20 +133,25 @@ export class NodeDriver {
     if (this.nodeState === 'stopping' || this.nodeState === 'stopped') {
       throw new NodeStateError(`cannot deliver to ${this.uid}: state is ${this.nodeState}`);
     }
-    // A body at the blob bound would be claim-check-truncated by the writer (it
-    // stores a prefix past MAX_BLOB_BYTES), and a truncated reference is refused
-    // at resume — one such delivery would brick the node's replay. The driver
-    // rejects before journaling anything instead of writing a message it could
-    // never read back; the margin covers the envelope's own overhead.
-    const bytes = Buffer.byteLength(msg.body, 'utf8');
-    if (bytes >= MAX_BLOB_BYTES - 1024) throw new MessageTooLargeError(bytes, MAX_BLOB_BYTES);
-    const wakeupRequested =
-      msg.wakeup && this.nodeState === 'waiting' && this.latch.request();
-    const data = {
-      id: msg.id, from: msg.from, kind: msg.kind, wakeupRequested,
+    const data: {
+      id: string; from: string; kind: MessageKind; wakeupRequested: boolean;
+      body: string; replyTo?: string;
+    } = {
+      id: msg.id, from: msg.from, kind: msg.kind,
+      wakeupRequested: this.nodeState === 'waiting' && msg.wakeup,
       body: msg.body,
       ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
     };
+    // Before the latch: a refused delivery must leave no trace, not even a
+    // spurious wake, and `deliver` throws before anything is journaled.
+    this.assertLossless(data);
+    // The latch is armed synchronously here, before the first await, so two
+    // deliveries cannot both observe an unarmed latch. `request()` reports
+    // whether this was the one that armed it: the coalescence fact the journal
+    // records, which the plain `msg.wakeup` above would mislabel on the second.
+    if (msg.wakeup && this.nodeState === 'waiting') {
+      data.wakeupRequested = this.latch.request();
+    }
     // A body at or past CLAIM_CHECK_THRESHOLD is claim-checked in the journaled
     // envelope; feeding that envelope to the inbox would store the blob
     // reference as if it were the message. The projection gets the original
@@ -157,6 +162,28 @@ export class NodeDriver {
     // Deliveries flush eagerly: a journaled `sent` whose `received` was lost to
     // write-behind would be an effect without a trace on the recipient side.
     await this.writer.flush();
+  }
+
+  /**
+   * The lossless-message bound. It measures the canonical bytes of the exact
+   * payload object that will be appended — `canonicalizeJson(data)`, the same
+   * measure `JournalWriter.claimCheck` applies — never the raw body.
+   *
+   * Raw bytes cannot stand in for that measure: JSON escaping inflates a body
+   * on the way to its canonical form, so a quote-heavy body well under the
+   * bound can canonicalize well past it. The writer would then store a prefix
+   * and mark the reference `truncated: true`, and a truncated reference is
+   * refused at resume — one such message would brick the node's replay. The
+   * driver rejects before journaling anything instead of writing a message it
+   * could never read back. The margin covers the envelope's own fixed overhead
+   * (the `message/received` framing plus hash and type, ~74 bytes), so every
+   * accepted message resolves losslessly.
+   *
+   * @throws MessageTooLargeError with the canonical byte count and the bound.
+   */
+  private assertLossless(data: JsonValue): void {
+    const bytes = Buffer.byteLength(canonicalizeJson(data), 'utf8');
+    if (bytes >= MAX_BLOB_BYTES - 1024) throw new MessageTooLargeError(bytes, MAX_BLOB_BYTES);
   }
 
   stop(reason: ShutdownReason = 'stop-requested'): void {
@@ -287,10 +314,6 @@ export class NodeDriver {
    * @throws any error the router raises that is not a known delivery refusal.
    */
   private async send(body: string, to: string, opts: SendOptions = {}): Promise<void> {
-    // Same bound as deliver(): a body the writer would claim-check-truncate can
-    // never be resolved at resume, so it is refused before anything is journaled.
-    const bytes = Buffer.byteLength(body, 'utf8');
-    if (bytes >= MAX_BLOB_BYTES - 1024) throw new MessageTooLargeError(bytes, MAX_BLOB_BYTES);
     const msg: RoutedMessage = {
       id: messageId(this.uid, this.outgoing + 1),
       from: this.uid,
@@ -300,11 +323,16 @@ export class NodeDriver {
       body,
       ...(opts.replyTo !== undefined ? { replyTo: opts.replyTo } : {}),
     };
-    this.outgoing += 1;
-    this.writer.append('message/sent', {
+    // The exact payload `message/sent` will carry, measured before the append:
+    // an oversize send must leave the outgoing counter untouched, so nothing
+    // has been mutated yet.
+    const data = {
       id: msg.id, to, kind: msg.kind, wakeup: msg.wakeup, body,
       ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
-    });
+    };
+    this.assertLossless(data);
+    this.outgoing += 1;
+    this.writer.append('message/sent', data);
     await this.writer.flush();
     try {
       await this.router.route(msg);
