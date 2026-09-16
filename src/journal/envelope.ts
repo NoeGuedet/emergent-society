@@ -23,8 +23,9 @@ export const FORMAT_VERSION = 0;
 export const GENESIS_HASH = '0'.repeat(64);
 
 /**
- * Extended by declaration merging in later plans, e.g.
- * `declare module './envelope.js' { interface EventDataMap { 'node/boot': { … } } }`.
+ * Extended by declaration merging from the consuming module, which names the
+ * specifier it imports, e.g. in `src/node/events.ts`:
+ * `declare module '../journal/envelope.js' { interface EventDataMap extends NodeEventDataMap {} }`
  */
 export interface EventDataMap {}
 

@@ -37,7 +37,9 @@ export class JournalReader {
    *
    * `knownTypes` is required: a reader that cannot say which event types it
    * understands cannot honour the "refuse to rebuild" rule, so there is no
-   * correct default. (Deriving it from a runtime registry is C1.2 design.)
+   * correct default. Registries compose per module — each module exports the
+   * runtime set for its own event map (`NODE_EVENT_TYPES` for the node driver)
+   * — and a caller passes the union of the types it can replay.
    *
    * @throws never — the log is read lazily by `events()`.
    */
