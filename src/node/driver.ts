@@ -174,6 +174,12 @@ export class NodeDriver {
       this.nodeState = 'stopping';
       try {
         this.writer.append('node/shutdown', { reason: this.stopReason });
+      } catch (err) {
+        // The shutdown append can itself fail (poisoned writer, recorded
+        // write-behind failure). It must not displace the error that ended the
+        // run: when both exist, the handler/maintenance error is the one that
+        // propagates.
+        failure ??= err;
       } finally {
         await this.writer.close();
         this.nodeState = 'stopped';

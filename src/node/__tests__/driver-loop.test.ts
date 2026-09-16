@@ -114,6 +114,24 @@ describe('NodeDriver run loop', () => {
     expect(sentDurableInRoute).toBe(true);
   });
 
+  it('propagates the handler error when the shutdown append also fails', async () => {
+    const d = await NodeDriver.open(home(), 'n1', () => {
+      throw new Error('boom');
+    }, new DropRouter());
+    // Fault injection: nothing outside the driver can reach the writer, so the
+    // private field is patched to fail exactly where a poisoned writer or a
+    // recorded write-behind failure would — the shutdown append.
+    type LooseAppend = (...args: unknown[]) => unknown;
+    const writer = (d as unknown as { writer: { append: LooseAppend } }).writer;
+    const realAppend = writer.append.bind(writer);
+    writer.append = (type: unknown, ...rest: unknown[]) => {
+      if (type === 'node/shutdown') throw new Error('append dead');
+      return realAppend(type, ...rest);
+    };
+    await expect(d.run()).rejects.toThrow('boom');
+    expect(d.state).toBe('stopped');
+  });
+
   it('runs maintenance once per park', async () => {
     let maintenanceCalls = 0;
     const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter(), {
