@@ -20,16 +20,24 @@ function bootlog(): Promise<EventEnvelope[]> {
   return collectEvents(home(), NODE_EVENT_TYPES, 'n1');
 }
 
-// The drivers opened here are never run nor closed (the loop is Task 6):
-// resume effects are journaled and flushed by open() itself, the reader
-// needs no lock, and the suite's temp home is removed after each test.
+/** Releases a booting driver's writer handle without adding a live turn. */
+async function closeIdle(d: NodeDriver): Promise<void> {
+  d.stop();
+  await d.run();
+}
+
+// Every driver here is stopped and run once its journal assertions are made:
+// open() journals and flushes the resume effects itself, so the reader needs no
+// live loop, and running to the clean close keeps no writer's FileHandle open
+// to GC (a driver left 'booting' leaks its handle — DEP0137).
 describe('NodeDriver boot and resume', () => {
   it('journals node/boot with reason start on a fresh node', async () => {
-    await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
+    const d = await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
     const events = await bootlog();
     expect(events.map((e) => [e.type, e.data])).toEqual([
       ['node/boot', { reason: 'start' }],
     ]);
+    await closeIdle(d);
   });
 
   it('closes an interrupted turn synthetically and resumes', async () => {
@@ -37,13 +45,14 @@ describe('NodeDriver boot and resume', () => {
     w.append('node/boot', { reason: 'start' });
     w.append('turn/start', { turn: 0, trigger: 'boot' });
     await w.close(); // clean fs, logically unclosed turn: the crash shape
-    await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
+    const d = await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
     const events = await bootlog();
     expect(events.map((e) => e.type)).toEqual([
       'node/boot', 'turn/start', 'turn/end', 'node/boot',
     ]);
     expect(events[2]?.data).toEqual({ turn: 0, outcome: 'interrupted', synthetic: true });
     expect(events[3]?.data).toEqual({ reason: 'resume' });
+    await closeIdle(d);
   });
 
   it('repairs a torn tail before resuming', async () => {
@@ -51,10 +60,11 @@ describe('NodeDriver boot and resume', () => {
     w.append('node/boot', { reason: 'start' });
     await w.close();
     await appendTear(home());
-    await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
+    const d = await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
     const events = await bootlog();
     expect(events.map((e) => e.type)).toEqual(['node/boot', 'node/boot']);
     expect(events[1]?.data).toEqual({ reason: 'resume' });
+    await closeIdle(d);
   });
 
   it('rebuilds the unclaimed inbox and the outgoing counter from the journal', async () => {
@@ -68,6 +78,7 @@ describe('NodeDriver boot and resume', () => {
     const d = await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
     expect(d.pendingCount).toBe(1);
     expect(d.nextMessageId()).toBe('n1/m2');
+    await closeIdle(d);
   });
 
   it('releases the writer lock when resume fails on an unknown event type', async () => {

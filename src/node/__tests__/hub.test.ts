@@ -49,8 +49,12 @@ describe('Hub', () => {
 
   it('rejects booting a uid twice on the same hub', async () => {
     const hub = new Hub(home());
-    await hub.boot('dup', () => 'waiting');
+    const booted = await hub.boot('dup', () => 'waiting');
+    // The duplicate rejection must stand on its own; the booted driver is still
+    // stopped and run so its writer's FileHandle is closed, not left to GC.
     await expect(hub.boot('dup', () => 'waiting')).rejects.toThrow(NodeAlreadyBootedError);
+    booted.stop();
+    await booted.run();
   });
 
   it('rejects routing to a stopped node', async () => {

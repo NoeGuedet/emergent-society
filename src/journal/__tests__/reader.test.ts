@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { appendFile, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, readFile, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { JournalWriter } from '../writer.js';
 import { JournalReader, repair } from '../reader.js';
 import { ChainBreakError } from '../verify.js';
@@ -95,6 +96,20 @@ describe('JournalReader blob resolution', () => {
     const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES, resolveBlobs: true });
     await expect(collect(r)).rejects.toThrow(TruncatedBlobError);
   });
+  it('rejects resolving a reference whose blob is gone', async () => {
+    // The reference is in the journal but the blob it names was deleted. The
+    // data is unrecoverable, so resolution surfaces the store's own ENOENT
+    // rather than serving the reference as if it were the payload.
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/big', payloadOfCanonicalBytes(CLAIM_CHECK_THRESHOLD));
+    await w.close();
+    const raw = await collect(await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES }));
+    if (!isBlobRef(raw[0]!.data)) throw new Error('expected a claim-check reference');
+    const { blob } = raw[0]!.data;
+    await rm(join(home(), 'blobs', blob.slice(0, 2), blob));
+    const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES, resolveBlobs: true });
+    await expect(collect(r)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
 });
 
 describe('JournalReader verification and repair edges', () => {
@@ -131,6 +146,27 @@ describe('JournalReader verification and repair edges', () => {
     await w.close();
     const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN });
     expect((await collect(r, 1)).map((e) => e.seq)).toEqual([1, 2]);
+  });
+  it('rejects a watermark over a chain whose earlier event was corrupted', async () => {
+    // The reader is asked only for seq >= 1, but seq 0 was rewritten while its
+    // own `prev_hash` stayed intact (so it reads as self-consistent in
+    // isolation). Verification must still walk it as part of the whole chain.
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/ping', { n: 0 });
+    w.append('test/ping', { n: 1 });
+    await w.close();
+    await rewriteLog(logPath(home()), (lines) => {
+      const e = JSON.parse(lines[0]!) as Record<string, unknown>;
+      e['data'] = { n: 999 };
+      return [canonicalizeJson(e as never), lines[1]!];
+    });
+    const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN });
+    const err = await collectFailure(r, 1);
+    expect(err.name).toBe('ChainBreakError');
+    // The break is at seq 0 — the event the watermark skips past — so the
+    // reader verified it anyway; seq 1's own hash was never touched.
+    expect((err as ChainBreakError).seq).toBe(0);
+    expect(err.message).toContain('hash recomputation failed');
   });
   it('treats a negative fromSeq as 0 and a beyond-end fromSeq as empty', async () => {
     const w = await JournalWriter.open(home(), 'n1');

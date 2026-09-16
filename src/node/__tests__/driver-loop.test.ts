@@ -70,6 +70,60 @@ describe('NodeDriver run loop', () => {
       .toEqual({ turn: 1, messages: ['x/m1'] });
   });
 
+  it('does not arm the latch for a delivery that lands mid-turn', async () => {
+    // Turn 0 parks on an external gate, so the delivery below arrives while the
+    // driver is `active` — the one state where `wakeupRequested` is false. The
+    // loop then finds the mail through the inbox check, not through the latch.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let blocked = false;
+    const seen: { turn: number; trigger: TurnTrigger; bodies: string[] }[] = [];
+    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
+      seen.push({ turn: ctx.turn, trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
+      if (ctx.turn === 0) { blocked = true; await gate; }
+      return 'waiting' as const;
+    }, new DropRouter());
+    const running = d.run();
+    await vi.waitFor(() => expect(blocked).toBe(true));
+    expect(d.state).toBe('active');
+    await d.deliver(msg('x/m1', 'midturn'));
+    release();
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
+    d.stop();
+    await running;
+    expect(seen[1]).toEqual({ turn: 1, trigger: 'wakeup', bodies: ['midturn'] });
+    const events = await log();
+    expect(events.find((e) => e.type === 'message/received')?.data)
+      .toMatchObject({ id: 'x/m1', wakeupRequested: false });
+    expect(events.find((e) => e.type === 'inbox/claim')?.data)
+      .toEqual({ turn: 1, messages: ['x/m1'] });
+  });
+
+  it('counts the live turn from 1 after a synthetic interrupted closer', async () => {
+    // The crash shape: turn 0 opened and never closed. Resume appends the
+    // synthetic closer for it, so the first turn the handler really sees is
+    // turn 1 — and, with no mail re-presented, that turn is a boot.
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('node/boot', { reason: 'start' });
+    w.append('turn/start', { turn: 0, trigger: 'boot' });
+    await w.close();
+    const seen: { turn: number; trigger: TurnTrigger }[] = [];
+    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
+      seen.push({ turn: ctx.turn, trigger: ctx.trigger });
+      return 'waiting' as const;
+    }, new DropRouter());
+    const running = d.run();
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    d.stop();
+    await running;
+    expect(seen[0]).toEqual({ turn: 1, trigger: 'boot' });
+    const starts = (await log()).filter((e) => e.type === 'turn/start');
+    expect(starts.map((e) => e.data)).toEqual([
+      { turn: 0, trigger: 'boot' },
+      { turn: 1, trigger: 'boot' },
+    ]);
+  });
+
   it('coalesces the wake: only the first delivery arms the latch', async () => {
     const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
     const running = d.run();
@@ -225,9 +279,9 @@ describe('NodeDriver run loop', () => {
     w.append('inbox/claim', { turn: 0, messages: ['x/m1'] });
     w.append('turn/start', { turn: 0, trigger: 'boot' });
     await w.close();
-    const seen: { trigger: TurnTrigger; bodies: string[] }[] = [];
+    const seen: { turn: number; trigger: TurnTrigger; bodies: string[] }[] = [];
     const d = await NodeDriver.open(home(), 'n1', (ctx) => {
-      seen.push({ trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
+      seen.push({ turn: ctx.turn, trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
       return 'waiting' as const;
     }, new DropRouter());
     expect(d.pendingCount).toBe(1);
@@ -235,7 +289,9 @@ describe('NodeDriver run loop', () => {
     await vi.waitFor(() => expect(seen).toHaveLength(1));
     d.stop();
     await running;
-    expect(seen[0]).toEqual({ trigger: 'wakeup', bodies: ['held'] });
+    // The synthetic closer ends turn 0, so the re-presented mail is claimed by
+    // turn 1, with the wakeup trigger the non-empty inbox already set.
+    expect(seen[0]).toEqual({ turn: 1, trigger: 'wakeup', bodies: ['held'] });
   });
 
   it('re-presents a claim-checked message after close and resume', async () => {
@@ -313,6 +369,9 @@ describe('NodeDriver run loop', () => {
       .rejects.toBeInstanceOf(MessageTooLargeError);
     expect(d.pendingCount).toBe(0);
     expect((await log()).filter((e) => e.type === 'message/received')).toEqual([]);
+    // A driver opened but never run would leak the writer's FileHandle to GC.
+    d.stop();
+    await d.run();
   });
 
   it('refuses a within-raw-bound body whose canonical form overshoots', async () => {
@@ -326,6 +385,8 @@ describe('NodeDriver run loop', () => {
     await expect(d.deliver(msg('x/m1', body))).rejects.toBeInstanceOf(MessageTooLargeError);
     expect(d.pendingCount).toBe(0);
     expect((await log()).filter((e) => e.type === 'message/received')).toEqual([]);
+    d.stop();
+    await d.run();
   });
 
   it('accepts a near-bound body and serves the exact body after a resume', async () => {
