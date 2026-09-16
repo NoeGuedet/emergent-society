@@ -4,6 +4,23 @@ This document specifies the kernel of the system: the behavior of its nodes, its
 
 ---
 
+## Derivation — from research constraints to mechanisms
+
+Every mechanism in this document exists to satisfy a research constraint stated in `vision.md` or `seed.md`. The rejected alternative is recorded because it is the choice a conventional engineering reading would make.
+
+| Research constraint | Mechanism (section) | Rejected alternative |
+|---|---|---|
+| Provable provenance: every claim about the society must be checkable against a tamper-evident record | Append-only, hash-chained journal (§3) | Mutable database: an update rewrites history without trace |
+| Facts must outlive their interpretation: the analysis will be revised as the research progresses | Raw event content; interpretation lives in disposable projections (§3) | Interpreted events: meaning frozen at write time cannot be revised without losing the facts |
+| Metrics must stay invisible to the agents (anti-Goodhart, `vision.md` §3) | Only the kernel emits events, at boundaries the agents cannot avoid (§3) | Agent-side or in-tool instrumentation: rewritable by the observed |
+| Observation must not perturb the observed system | Cockpit and sensors are read-side projections, outside the loop (§11) | Tracing-style instrumentation of agent code: sampling, expiry, and mutation of the measured system |
+| Replay must be exact, because metrology depends on it | Byte-pinned assembler; replay serves recorded responses, never re-executes (§3, §4) | Reconstructed approximately-equal contexts: silent drift, unverifiable comparisons |
+| Every effect an agent produces must be observable | A mutation gate in front of every model call and every tool effect (§1.6, §9) | Open shell or network paths: unlogged effects make claims unprovable |
+| A perpetual system must survive interruption without losing a turn | Durability before effect (flush barrier), reader-side repair, synthetic closers (§3) | Truncate-on-crash: an interrupted turn becomes deniable |
+| Direction changes must propagate without interrupting the society | Verbatim pinned heading in every context; the propagation delay is the measurement (§1.3-1.4, §4) | Forced interruption: destroys the relaxation signal it claims to enforce |
+
+---
+
 ## 1. Behavior
 
 1. **Async, event-native, non-blocking.** Everything is an event: human message, shell completion, LLM response, timer, Package activation, heading ratification. There is **no "waiting for the human" state** — raising a problem = emitting an event, life goes on; the human response, when it arrives, is an event absorbed along the way. (Documented counter-model: dsh's `ask_user_question` / `ctx.approval` path **blocks** a turn on the human — forbidden here.)
@@ -34,6 +51,12 @@ Three reasons, in order of weight:
 Documented fallback (if TS becomes untenable): Python 3.14 + anyio, strict typing from the first line, hot-reload = clean shutdown + Package remount (never `importlib.reload`).
 
 ## 3. The journal (single truth)
+
+Three rules decide what the journal contains and who writes it:
+
+1. **An event type exists iff it records a fact that is not reconstructible from the rest of the journal.** What can be re-derived — intermediate computation inside a Package, recomputable state — is not an event. What cannot — the exact bytes of a model request and its response, the moment a message was delivered and when it woke its recipient, a crash boundary — is. Content is always raw; interpretation is always projection.
+2. **Only the kernel emits.** Events are produced by the kernel and the driver at the boundaries an agent cannot avoid crossing: model calls, tool effects, message transport, lifecycle transitions. The agent has no write access to the recording apparatus. Thinking is calling the model, and calling the model crosses the gate, so deliberation is recorded regardless of whatever channels the agents build for themselves: their own protocols may become semantically opaque, their reasoning cannot.
+3. **No unlogged effect channel exists.** Any path through which an agent can produce an effect crosses the mutation gate and is journaled. A capability that cannot be journaled is not a restricted capability — it is not provided at all.
 
 **Storage schema** — one readable canonical log, everything else is a disposable index:
 
@@ -134,7 +157,7 @@ Verified empirically on the target machine (Ubuntu 24.04, kernel 7.0): **bubblew
 
 ## 9. Hard physics — exhaustive list
 
-Kill switch · upstream budget ceiling · journal. Nothing else is kept; everything else is stated (in the direction, `direction.md`) and observed (in the journal).
+Kill switch · upstream budget ceiling · journal — where "journal" includes the mutation gate: no effect channel exists that does not cross it (§3). Nothing else is kept; everything else is stated (in the direction, `direction.md`) and observed (in the journal).
 
 ## 10. Suggested implementation order (for plan C1)
 
