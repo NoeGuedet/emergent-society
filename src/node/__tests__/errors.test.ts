@@ -32,6 +32,9 @@ describe('the inbox projection', () => {
       type: 'message/received',
       data: { id: 'a/m1', from: 'a', kind: 'chat', body: 'one' },
     });
+    // Without this, a dropped insert leaves pendingMessages() empty and
+    // Object.isFrozen(undefined) === true would pass the test vacuously.
+    expect(inbox.size).toBe(1);
     expect(Object.isFrozen(inbox.pendingMessages()[0])).toBe(true);
   });
 
@@ -50,6 +53,8 @@ describe('the inbox projection', () => {
       type: 'message/received',
       data: { id: 'a/m1', from: 'a', kind: 'chat', body: 'one', blob: 'ab'.repeat(32) },
     });
+    // Same reason as the freeze test above: the message must actually be there.
+    expect(inbox.size).toBe(1);
     expect(Object.isFrozen(inbox.pendingMessages()[0])).toBe(true);
   });
 });
