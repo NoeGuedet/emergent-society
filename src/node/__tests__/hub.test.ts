@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { collectEvents, useTempHome } from '../../journal/__tests__/helpers.js';
 import { NODE_EVENT_TYPES } from '../events.js';
 import { Hub } from '../hub.js';
-import { UnknownNodeError } from '../index.js';
+import { NodeAlreadyBootedError, NodeStateError, UnknownNodeError } from '../index.js';
 import type { Message, RoutedMessage } from '../message.js';
 
 const home = useTempHome('node-hub-');
@@ -45,6 +45,24 @@ describe('Hub', () => {
       id: 'x/m1', from: 'x', to: 'ghost', kind: 'chat', wakeup: true, body: 'boo',
     };
     await expect(hub.route(ghost)).rejects.toThrow(UnknownNodeError);
+  });
+
+  it('rejects booting a uid twice on the same hub', async () => {
+    const hub = new Hub(home());
+    await hub.boot('dup', () => 'waiting');
+    await expect(hub.boot('dup', () => 'waiting')).rejects.toThrow(NodeAlreadyBootedError);
+  });
+
+  it('rejects routing to a stopped node', async () => {
+    const hub = new Hub(home());
+    const driver = await hub.boot('halted', () => 'waiting');
+    driver.stop();
+    await driver.run();
+
+    const msg: RoutedMessage = {
+      id: 'x/m1', from: 'x', to: 'halted', kind: 'chat', wakeup: true, body: 'late',
+    };
+    await expect(hub.route(msg)).rejects.toThrow(NodeStateError);
   });
 
   it('resumes a node through a new Hub, ids continuing', async () => {

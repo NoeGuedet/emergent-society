@@ -8,6 +8,11 @@ import type { RoutedMessage } from './message.js';
  * Delivery crosses no channel that is not journaled — `sent` in the sender's
  * log (durable before routing), `received` in the recipient's (kernel.md §3,
  * rule 3). Single-process by design; there is no network transport in C1.
+ *
+ * A route that fails leaves the sender's durable `sent` standing next to a
+ * journaled `message/undeliverable`: a one-sided `sent` with its outcome
+ * recorded is the honest record of a failed delivery, never a delivery that
+ * silently never happened.
  */
 export class Hub implements Router {
   private readonly nodes = new Map<string, NodeDriver>();
