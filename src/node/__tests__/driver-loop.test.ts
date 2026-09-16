@@ -426,6 +426,39 @@ describe('NodeDriver run loop', () => {
     expect(events.filter((e) => e.type === 'message/undeliverable')).toEqual([]);
   });
 
+  it('refuses a long `to` that only the sent payload pushes past the bound', async () => {
+    // The other half of the two-payload check: `to` is handler-chosen and
+    // unbounded, and only the sent payload carries it. Measuring the recipient's
+    // shape alone would let a long `to` push the journaled `message/sent` past
+    // the bound while the body passed — the writer stores a truncated prefix,
+    // send() resolves, and the sender's own replay dies with TruncatedBlobError.
+    // This body alone is tiny, so only the `to` can be what refuses it.
+    const to = 'p'.repeat(MAX_BLOB_BYTES + 1000);
+    const sentBytes = (body: string) => Buffer.byteLength(canonicalizeJson(
+      { id: 'n1/m1', to, kind: 'chat', wakeup: true, body },
+    ), 'utf8');
+    const body = 'b'.repeat(100);
+    // The premise: the received measure is tiny, the sent one far past the bound.
+    expect(sentBytes(body)).toBeGreaterThan(MAX_BLOB_BYTES);
+    expect(Buffer.byteLength(canonicalizeJson(
+      { id: 'n1/m1', from: 'n1', kind: 'chat', wakeupRequested: false, body },
+    ), 'utf8')).toBeLessThan(MAX_BLOB_BYTES - 1024);
+
+    const sent: string[] = [];
+    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
+      await expect(ctx.send(body, to)).rejects.toBeInstanceOf(MessageTooLargeError);
+      sent.push('survived');
+      return 'waiting' as const;
+    }, new DropRouter());
+    const running = d.run();
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    d.stop();
+    await running;
+    const events = await log();
+    expect(events.filter((e) => e.type === 'message/sent')).toEqual([]);
+    expect(events.filter((e) => e.type === 'message/undeliverable')).toEqual([]);
+  });
+
   it('accepts a near-bound body and serves the exact body after a resume', async () => {
     // The accepted side must be genuinely lossless: half the canonical budget
     // is an ordinary body that fits, and it has to survive close() + resume

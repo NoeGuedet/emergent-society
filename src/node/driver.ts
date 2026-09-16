@@ -165,9 +165,9 @@ export class NodeDriver {
   }
 
   /**
-   * The lossless-message bound. It measures the canonical bytes of the exact
-   * payload object that will be appended — `canonicalizeJson(data)`, the same
-   * measure `JournalWriter.claimCheck` applies — never the raw body.
+   * The lossless-message bound. It measures the canonical bytes of a payload
+   * object — `canonicalizeJson(data)`, the same measure `JournalWriter.claimCheck`
+   * applies — never the raw body.
    *
    * Raw bytes cannot stand in for that measure: JSON escaping inflates a body
    * on the way to its canonical form, so a quote-heavy body well under the
@@ -177,11 +177,14 @@ export class NodeDriver {
    * driver rejects before journaling anything instead of writing a message it
    * could never read back. `claimCheck` measures the payload alone and truncates
    * at `MAX_BLOB_BYTES`, so the 1024-byte margin below the bound is pure
-   * conservatism, not a cover for framing overhead — and what makes it hold
-   * across the two nodes is the shape each side measures: `send` measures the
-   * recipient's `message/received` shape (the larger of the two), exactly what
-   * the recipient's `deliver` measures, so no body it accepts can be refused
-   * downstream.
+   * conservatism, not a cover for framing overhead.
+   *
+   * No single shape carries the invariant, so `send` checks both payloads it is
+   * about to cause: the `message/sent` payload exactly as it will be journaled
+   * (the only one carrying `to`, and the one this node replays) and the
+   * recipient's `message/received` shape, which is what the recipient's `deliver`
+   * will measure before accepting it. Together they mean nothing `send` accepts
+   * can truncate on its own journal or be refused downstream.
    *
    * @throws MessageTooLargeError with the canonical byte count and the bound.
    */
@@ -264,7 +267,11 @@ export class NodeDriver {
       // check is by value: only a still-default 'stop-requested' is relabelled.
       // Adjudicated: an explicit stop() carrying the default reason shares that
       // value, so a death after one is relabelled here too — accepted, since a
-      // stop WAS requested and the error still reaches the caller.
+      // stop WAS requested and the error still reaches the caller. One path does
+      // keep the plain label: an explicit stop() whose loop exits cleanly keeps
+      // 'stop-requested' (and journals no `error` field, the run having failed
+      // nowhere) when closing the writer then fails — run() rejects with that
+      // close error, the failure shutdown() returns rather than the append's.
       if (this.stopReason === 'stop-requested') this.stopReason = 'driver-error';
     }
     const shutdownFailure = await this.shutdown(failure);
@@ -337,12 +344,22 @@ export class NodeDriver {
       id: msg.id, to, kind: msg.kind, wakeup: msg.wakeup, body,
       ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
     };
-    // Measured on the RECIPIENT's shape, not `data`: `message/received` is the
-    // larger envelope (`from` plus `wakeupRequested` against `to` plus `wakeup`),
-    // so a body in that window would be journaled here and then refused by the
-    // recipient's deliver() — MessageTooLargeError out of route(), the sender
-    // dying with a handler-error and no `message/undeliverable`, exactly the
-    // effect without a trace B2 eliminated. `false` is the larger of the two
+    // BOTH appends are measured, because they are two different payloads and
+    // either one truncating is fatal to this node's own replay.
+    //
+    // `data` is what the journal actually stores (and what this node reads back
+    // at resume), and only it carries `to` — handler-chosen, unvalidated and
+    // unbounded, so measuring the recipient's shape alone would let a long `to`
+    // push the journaled `message/sent` past the bound while the body passed,
+    // leaving a truncated reference and bricking the sender's replay with
+    // TruncatedBlobError.
+    this.assertLossless(data);
+    // The recipient's shape: `message/received` (`from` plus `wakeupRequested`)
+    // can be larger than `data` (`to` plus `wakeup`), and whatever `deliver`
+    // would measure there is what can refuse the message after `message/sent` is
+    // already durable — MessageTooLargeError out of route(), the sender dying
+    // with a handler-error and no `message/undeliverable`, exactly the effect
+    // without a trace B2 eliminated. `false` is the larger of the two
     // wakeupRequested values, so this is the worst case any recipient can
     // measure and anything accepted here is acceptable to any deliver().
     this.assertLossless({
