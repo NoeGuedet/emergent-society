@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { collectEvents, useTempHome } from '../../journal/__tests__/helpers.js';
 import { NODE_EVENT_TYPES } from '../events.js';
-import { Hub, UnknownNodeError } from '../hub.js';
+import { Hub } from '../hub.js';
+import { UnknownNodeError } from '../index.js';
 import type { Message, RoutedMessage } from '../message.js';
 
 const home = useTempHome('node-hub-');

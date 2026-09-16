@@ -1,13 +1,7 @@
 import { NodeDriver, type NodeDriverOptions, type Router, type TurnHandler } from './driver.js';
+import { NodeAlreadyBootedError, UnknownNodeError } from './errors.js';
 import type { ShutdownReason } from './events.js';
 import type { RoutedMessage } from './message.js';
-
-export class UnknownNodeError extends Error {
-  constructor(public readonly uid: string) {
-    super(`unknown node: ${uid}`);
-    this.name = 'UnknownNodeError';
-  }
-}
 
 /**
  * The transport: a registry of live nodes and the single route between them.
@@ -24,7 +18,7 @@ export class Hub implements Router {
   ) {}
 
   async boot(uid: string, handler: TurnHandler): Promise<NodeDriver> {
-    if (this.nodes.has(uid)) throw new Error(`node already booted: ${uid}`);
+    if (this.nodes.has(uid)) throw new NodeAlreadyBootedError(uid);
     const driver = await NodeDriver.open(this.home, uid, handler, this, this.opts);
     this.nodes.set(uid, driver);
     return driver;

@@ -15,6 +15,9 @@ export {
   type TurnOutcome,
   type TurnTrigger,
 } from './driver.js';
-export { Hub, UnknownNodeError } from './hub.js';
+export { Hub } from './hub.js';
+export {
+  NodeError, UnknownNodeError, NodeAlreadyBootedError, NodeStateError, MessageTooLargeError,
+} from './errors.js';
 export { messageId, type Message, type MessageKind, type RoutedMessage } from './message.js';
 export { NODE_EVENT_TYPES } from './events.js';

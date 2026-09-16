@@ -3,11 +3,19 @@ import {
   type JournalWriterOptions,
 } from '../journal/index.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
+import { NodeStateError } from './errors.js';
 import { Inbox } from './inbox.js';
 import { WakeLatch } from './latch.js';
 import { messageId, type Message, type MessageKind, type RoutedMessage } from './message.js';
 
 export type NodeState = 'booting' | 'active' | 'waiting' | 'stopping' | 'stopped';
+
+/**
+ * The driver's default clock, mirroring the journal's own `systemClock`: the
+ * driver resolves it once, so every turn heals the same `now` the caller
+ * injected (or the wall clock when none was given).
+ */
+const systemClock = (): number => Date.now();
 
 // The turn/shutdown vocabulary lives in events.ts (single home); re-exported so
 // the node's public surface (`index.ts`) keeps naming these types.
@@ -19,7 +27,7 @@ export interface SendOptions {
   wakeup?: boolean;
 }
 
-/** The handler's whole world: no writer, no clock, no transport — kernel.md §3 rule 2. */
+/** The handler's whole world: no writer, no transport — the clock is the injected `now`. */
 export interface TurnContext {
   readonly turn: number;
   readonly trigger: TurnTrigger;
@@ -48,6 +56,8 @@ export class NodeDriver {
   private stopReason: ShutdownReason = 'stop-requested';
   private readonly inbox = new Inbox();
   private readonly latch = new WakeLatch();
+  /** Resolved once in the constructor, like the writer's `systemClock`. */
+  private readonly now: () => number;
 
   private constructor(
     private readonly writer: JournalWriter,
@@ -55,7 +65,9 @@ export class NodeDriver {
     private readonly handler: TurnHandler,
     private readonly router: Router,
     private readonly opts: NodeDriverOptions,
-  ) {}
+  ) {
+    this.now = opts.now ?? systemClock;
+  }
 
   static async open(
     home: string, uid: string, handler: TurnHandler, router: Router,
@@ -102,7 +114,7 @@ export class NodeDriver {
   /** The transport's only entry point: one message enters the node. */
   async deliver(msg: RoutedMessage): Promise<void> {
     if (this.nodeState !== 'active' && this.nodeState !== 'waiting') {
-      throw new Error(`cannot deliver to ${this.uid}: state is ${this.nodeState}`);
+      throw new NodeStateError(`cannot deliver to ${this.uid}: state is ${this.nodeState}`);
     }
     const wakeupRequested =
       msg.wakeup && this.nodeState === 'waiting' && this.latch.request();
@@ -132,7 +144,7 @@ export class NodeDriver {
 
   async run(): Promise<void> {
     if (this.nodeState !== 'booting') {
-      throw new Error(`run() out of order: state is ${this.nodeState}`);
+      throw new NodeStateError(`run() out of order: state is ${this.nodeState}`);
     }
     this.nodeState = 'active';
     let trigger: TurnTrigger = this.inbox.size > 0 ? 'wakeup' : 'boot';
@@ -156,7 +168,7 @@ export class NodeDriver {
             trigger,
             messages: claimed,
             send: (body, to, opts) => this.send(body, to, opts),
-            now: () => (this.opts.now ?? Date.now)(),
+            now: () => this.now(),
           });
         } catch (err) {
           this.writer.append('turn/end', {
