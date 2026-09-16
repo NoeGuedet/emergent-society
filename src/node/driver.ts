@@ -109,9 +109,97 @@ export class NodeDriver {
     if (this.nodeState === 'waiting') this.latch.request();
   }
 
-  /** Filled in by Task 6. */
   async run(): Promise<void> {
-    throw new Error('not implemented');
+    if (this.nodeState !== 'booting') {
+      throw new Error(`run() out of order: state is ${this.nodeState}`);
+    }
+    this.nodeState = 'active';
+    let trigger: TurnTrigger = this.inbox.size > 0 ? 'wakeup' : 'boot';
+    let failure: unknown = null;
+    try {
+      while (!this.stopRequested) {
+        const claimed = this.inbox.pendingMessages();
+        if (claimed.length > 0) {
+          this.inbox.apply(this.writer.append('inbox/claim', {
+            turn: this.turn, messages: claimed.map((m) => m.id),
+          }));
+        }
+        this.writer.append('turn/start', { turn: this.turn, trigger });
+        // Barrier: the claim and the turn's opening are durable before the
+        // handler can produce any effect (kernel.md §3).
+        await this.writer.flush();
+        let outcome: TurnOutcome;
+        try {
+          outcome = await this.handler({
+            turn: this.turn,
+            trigger,
+            messages: claimed,
+            send: (body, to, opts) => this.send(body, to, opts),
+            now: () => (this.opts.now ?? Date.now)(),
+          });
+        } catch (err) {
+          this.writer.append('turn/end', {
+            turn: this.turn, outcome: 'error', error: String(err),
+          });
+          this.stopReason = 'handler-error';
+          throw err;
+        }
+        this.writer.append('turn/end', { turn: this.turn, outcome });
+        if (outcome === 'chained') {
+          trigger = 'chain';
+          this.turn += 1;
+          continue;
+        }
+        this.nodeState = 'waiting';
+        try {
+          await this.opts.onMaintenance?.();
+        } catch (err) {
+          this.stopReason = 'maintenance-error';
+          throw err;
+        }
+        if (this.stopRequested) break;
+        // A delivery that landed mid-turn never touches the latch: the inbox
+        // check covers it, and a stale request is dropped instead of causing
+        // a spurious wake.
+        if (this.inbox.size === 0) await this.latch.wait();
+        else this.latch.clear();
+        if (this.stopRequested) break;
+        this.nodeState = 'active';
+        trigger = 'wakeup';
+        this.turn += 1;
+      }
+    } catch (err) {
+      failure = err;
+    } finally {
+      this.nodeState = 'stopping';
+      try {
+        this.writer.append('node/shutdown', { reason: this.stopReason });
+      } finally {
+        await this.writer.close();
+        this.nodeState = 'stopped';
+      }
+    }
+    if (failure !== null) throw failure;
+  }
+
+  /** Journals the intent, makes it durable, then routes — never the reverse. */
+  private async send(body: string, to: string, opts: SendOptions = {}): Promise<void> {
+    const msg: RoutedMessage = {
+      id: messageId(this.uid, this.outgoing + 1),
+      from: this.uid,
+      to,
+      kind: opts.kind ?? 'chat',
+      wakeup: opts.wakeup ?? true,
+      body,
+      ...(opts.replyTo !== undefined ? { replyTo: opts.replyTo } : {}),
+    };
+    this.outgoing += 1;
+    this.writer.append('message/sent', {
+      id: msg.id, to, kind: msg.kind, wakeup: msg.wakeup, body,
+      ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
+    });
+    await this.writer.flush();
+    await this.router.route(msg);
   }
 
   /**
