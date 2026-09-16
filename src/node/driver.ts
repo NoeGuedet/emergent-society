@@ -2,13 +2,16 @@ import {
   JournalReader, JournalWriter, TornTailError, repair,
   type JournalWriterOptions,
 } from '../journal/index.js';
-import { NODE_EVENT_TYPES } from './events.js';
+import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
 import { Inbox } from './inbox.js';
 import { WakeLatch } from './latch.js';
 import { messageId, type Message, type MessageKind, type RoutedMessage } from './message.js';
 
 export type NodeState = 'booting' | 'active' | 'waiting' | 'stopping' | 'stopped';
-export type TurnTrigger = 'boot' | 'chain' | 'wakeup';
+
+// The turn/shutdown vocabulary lives in events.ts (single home); re-exported so
+// the node's public surface (`index.ts`) keeps naming these types.
+export type { ShutdownReason, TurnEndOutcome, TurnTrigger } from './events.js';
 
 export interface SendOptions {
   kind?: MessageKind;
@@ -42,7 +45,7 @@ export class NodeDriver {
   private turn = 0;
   private outgoing = 0;
   private stopRequested = false;
-  private stopReason = 'stop-requested';
+  private stopReason: ShutdownReason = 'stop-requested';
   private readonly inbox = new Inbox();
   private readonly latch = new WakeLatch();
 
@@ -120,7 +123,7 @@ export class NodeDriver {
     await this.writer.flush();
   }
 
-  stop(reason = 'stop-requested'): void {
+  stop(reason: ShutdownReason = 'stop-requested'): void {
     if (this.nodeState === 'stopping' || this.nodeState === 'stopped') return;
     this.stopReason = reason;
     this.stopRequested = true;

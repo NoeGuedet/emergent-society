@@ -6,9 +6,9 @@ import { collectEvents, useTempHome } from '../../journal/__tests__/helpers.js';
 const home = useTempHome('node-events-');
 
 describe('node event types', () => {
-  it('registers exactly the seven driver types', () => {
+  it('registers exactly the eight driver types', () => {
     expect([...NODE_EVENT_TYPES].sort()).toEqual([
-      'inbox/claim', 'message/received', 'message/sent',
+      'inbox/claim', 'message/received', 'message/sent', 'message/undeliverable',
       'node/boot', 'node/shutdown', 'turn/end', 'turn/start',
     ]);
   });

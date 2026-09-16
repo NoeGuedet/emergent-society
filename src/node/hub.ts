@@ -1,4 +1,5 @@
 import { NodeDriver, type NodeDriverOptions, type Router, type TurnHandler } from './driver.js';
+import type { ShutdownReason } from './events.js';
 import type { RoutedMessage } from './message.js';
 
 export class UnknownNodeError extends Error {
@@ -40,7 +41,7 @@ export class Hub implements Router {
   }
 
   /** Asks every node to stop; the caller awaits the `run()` promises it holds. */
-  stopAll(reason = 'stop-requested'): void {
+  stopAll(reason: ShutdownReason = 'stop-requested'): void {
     for (const driver of this.nodes.values()) driver.stop(reason);
   }
 }
