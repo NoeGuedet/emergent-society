@@ -29,6 +29,44 @@ export class InvalidBlobHashError extends JournalError {
   }
 }
 
+/**
+ * The reference `JournalWriter.claimCheck` substitutes for a payload whose
+ * canonical size is at or past CLAIM_CHECK_THRESHOLD: `data` becomes
+ * `{ blob, size }` (plus `truncated: true` past MAX_BLOB_BYTES) and the
+ * canonical bytes of the original payload go to the blob store.
+ */
+export interface BlobRef {
+  blob: string;
+  size: number;
+  truncated?: boolean;
+}
+
+/**
+ * A claim-checked payload past MAX_BLOB_BYTES is stored as a prefix only. The
+ * reference is honest about the loss, so resolving it is refused outright
+ * rather than served as if whole (kernel.md §3: never silent).
+ */
+export class TruncatedBlobError extends JournalError {
+  constructor(public readonly hash: string, public readonly size: number) {
+    super(`blob ${hash} is a truncated prefix of a ${size}-byte payload — the original is unrecoverable`);
+  }
+}
+
+/**
+ * Recognizes the exact shape claimCheck writes. The key set must match exactly:
+ * a caller's own `{ blob, size, … }` payload must never be mistaken for a
+ * reference and rewritten under it.
+ */
+export function isBlobRef(data: unknown): data is BlobRef {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
+  const keys = Object.keys(data).sort();
+  const expected = 'truncated' in data ? ['blob', 'size', 'truncated'] : ['blob', 'size'];
+  if (keys.length !== expected.length || !keys.every((k, i) => k === expected[i])) return false;
+  const ref = data as Record<string, unknown>;
+  return typeof ref['blob'] === 'string' && typeof ref['size'] === 'number'
+    && (ref['truncated'] === undefined || ref['truncated'] === true);
+}
+
 export class BlobStore {
   constructor(private readonly home: string) {}
 

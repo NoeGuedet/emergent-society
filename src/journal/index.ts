@@ -16,7 +16,7 @@ export {
 export { SessionAlreadyOwnedError } from './lock.js';
 
 // Reading and repair.
-export { JournalReader, repair } from './reader.js';
+export { JournalReader, repair, type JournalReaderOptions } from './reader.js';
 export type { Head } from './layout.js';
 
 // The envelope and its event union.
@@ -43,6 +43,9 @@ export {
   CLAIM_CHECK_THRESHOLD,
   MAX_BLOB_BYTES,
   InvalidBlobHashError,
+  TruncatedBlobError,
+  isBlobRef,
+  type BlobRef,
 } from './blobs.js';
 
 // Layout, for callers that need to address a journal directly.

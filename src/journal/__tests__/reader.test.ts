@@ -8,8 +8,11 @@ import { canonicalizeJson } from '../canon.js';
 import { encodeBatch, scanBatches, CorruptFrameError } from '../framing.js';
 import { headPath, nodeDir } from '../layout.js';
 import {
-  appendTear, collectFailure, EPOCH, forgedEnvelope,
-  logPath, rewriteLog, useTempHome, WRONG_HASH,
+  CLAIM_CHECK_THRESHOLD, isBlobRef, MAX_BLOB_BYTES, TruncatedBlobError,
+} from '../blobs.js';
+import {
+  appendTear, collectFailure, EPOCH, forgedEnvelope, KNOWN_TYPES,
+  logPath, payloadOfCanonicalBytes, rewriteLog, useTempHome, WRONG_HASH,
 } from './helpers.js';
 
 const home = useTempHome('cell-reader-');
@@ -57,6 +60,40 @@ describe('JournalReader', () => {
     expect((await readFile(path)).length).toBe(before);
     const events = await collect(await JournalReader.open(home(), 'n1', { knownTypes: KNOWN }));
     expect(events).toHaveLength(1);
+  });
+});
+
+describe('JournalReader blob resolution', () => {
+  it('serves the raw claim-check reference by default', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/big', payloadOfCanonicalBytes(CLAIM_CHECK_THRESHOLD));
+    await w.close();
+    const events = await collect(await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES }));
+    expect(isBlobRef(events[0]!.data)).toBe(true);
+  });
+  it('resolves the reference to the original payload when resolveBlobs is set', async () => {
+    const input = payloadOfCanonicalBytes(CLAIM_CHECK_THRESHOLD);
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/big', input);
+    await w.close();
+    const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES, resolveBlobs: true });
+    const events = await collect(r);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.data).toEqual(input);
+  });
+  it('leaves inline payloads untouched when resolveBlobs is set', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/ping', { n: 0 });
+    await w.close();
+    const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES, resolveBlobs: true });
+    expect((await collect(r))[0]?.data).toEqual({ n: 0 });
+  });
+  it('refuses a truncated reference rather than serving a prefix as if whole', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/big', payloadOfCanonicalBytes(MAX_BLOB_BYTES));
+    await w.close();
+    const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES, resolveBlobs: true });
+    await expect(collect(r)).rejects.toThrow(TruncatedBlobError);
   });
 });
 

@@ -1,9 +1,22 @@
 import { readFile, rm, truncate } from 'node:fs/promises';
+import { BlobStore, isBlobRef, TruncatedBlobError } from './blobs.js';
+import type { JsonValue } from './canon.js';
 import { scanBatches } from './framing.js';
 import { readFileOrNull, syncPath } from './fsutil.js';
 import { headPath, journalPath, nodeDir, parseHead, type Head } from './layout.js';
 import { genesisState, verifyChain } from './verify.js';
 import type { EventEnvelope } from './envelope.js';
+
+/** Options for `JournalReader.open`. */
+export interface JournalReaderOptions {
+  knownTypes: ReadonlySet<string>;
+  /**
+   * Resolve claim-checked `data` references through the blob store, so a caller
+   * replaying into projections sees the original payloads. Defaults to false:
+   * events are served raw, exactly as journaled.
+   */
+  resolveBlobs?: boolean;
+}
 
 /**
  * The read side of the journal: verification and crash repair.
@@ -16,6 +29,7 @@ export class JournalReader {
   private constructor(
     private readonly dir: string,
     private readonly known: ReadonlySet<string>,
+    private readonly blobs: BlobStore | null,
   ) {}
 
   /**
@@ -28,9 +42,12 @@ export class JournalReader {
    * @throws never — the log is read lazily by `events()`.
    */
   static async open(
-    home: string, nodeUid: string, opts: { knownTypes: ReadonlySet<string> },
+    home: string, nodeUid: string, opts: JournalReaderOptions,
   ): Promise<JournalReader> {
-    return new JournalReader(nodeDir(home, nodeUid), opts.knownTypes);
+    return new JournalReader(
+      nodeDir(home, nodeUid), opts.knownTypes,
+      opts.resolveBlobs === true ? new BlobStore(home) : null,
+    );
   }
 
   /**
@@ -58,7 +75,9 @@ export class JournalReader {
    *
    * @throws ChainBreakError on a broken link, a seq gap, a hash mismatch, a
    * non-v0 envelope or a malformed line; CorruptFrameError on interior damage;
-   * UnknownEventTypeError on an unknown non-ignorable type.
+   * UnknownEventTypeError on an unknown non-ignorable type; with
+   * `resolveBlobs`, TruncatedBlobError on a truncated reference and the blob
+   * store's own errors on a missing or unreadable blob.
    */
   async *events(fromSeq = 0): AsyncGenerator<EventEnvelope> {
     // A missing log is an empty journal. Anything else (EACCES, EIO) must not
@@ -67,8 +86,22 @@ export class JournalReader {
     if (raw === null) return;
     const { batches } = scanBatches(raw);
     for (const e of verifyChain(batches, this.known, genesisState())) {
-      if (e.seq >= fromSeq) yield e;
+      if (e.seq >= fromSeq) yield await this.resolveData(e);
     }
+  }
+
+  /**
+   * Substitutes the original payload for a claim-check reference. Resolution
+   * happens after verification: the chain always verifies the bytes exactly as
+   * journaled, reference and all.
+   */
+  private async resolveData(e: EventEnvelope): Promise<EventEnvelope> {
+    if (this.blobs === null || !isBlobRef(e.data)) return e;
+    const ref = e.data;
+    if (ref.truncated === true) throw new TruncatedBlobError(ref.blob, ref.size);
+    // The blob holds the canonical UTF-8 bytes of the payload as appended.
+    const data = JSON.parse((await this.blobs.get(ref.blob)).toString('utf8')) as JsonValue;
+    return { ...e, data };
   }
 }
 
