@@ -23,7 +23,7 @@ Three properties we refuse to compromise on:
 
 ## Status
 
-Implementation phase, no product yet: the design is settled and the kernel is being implemented checkpoint by checkpoint, in the order given in [`docs/kernel.md`](docs/kernel.md) §10. The C1.1 journal — hash-chained append-only event log, framed zstd persistence, claim-check blobs, write-behind with an explicit flush barrier, verifying reader and torn-tail repair — exists in `src/journal/`. The C1.2 node driver — one `send` entry point into the inbox, atomic claim of mail into a durable projection, an in-memory wake latch, the free loop with explicit wait, and the journaled turn and shutdown vocabulary — exists in `src/node/`. Both are covered by a passing test suite under a strict typecheck.
+Implementation phase, no product yet: the design is settled and the kernel is being implemented checkpoint by checkpoint, in the order given in [`docs/kernel.md`](docs/kernel.md) §10. The C1.1 journal — hash-chained append-only event log, framed zstd persistence, claim-check blobs, write-behind with an explicit flush barrier, verifying reader and torn-tail repair — exists in `src/journal/`. The C1.2 node driver — the single `send` primitive for outbound mail, one `deliver` entry point for inbound, atomic claim of mail into a durable projection, an in-memory wake latch, the free loop with explicit wait, and the journaled turn and shutdown vocabulary — exists in `src/node/`. Both are covered by a passing test suite under a strict typecheck.
 
 ## Documents
 

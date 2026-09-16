@@ -260,8 +260,11 @@ export class NodeDriver {
       failure = err;
       // The loop died outside the handler's contract (a failed flush barrier, a
       // maintenance hook that rejected) — an error the caller never asked for.
-      // A reason set by stop() or by the handler's own turn must not be
-      // overwritten, so only the untouched default is relabelled.
+      // A reason set by the handler's own turn must not be overwritten, so the
+      // check is by value: only a still-default 'stop-requested' is relabelled.
+      // Adjudicated: an explicit stop() carrying the default reason shares that
+      // value, so a death after one is relabelled here too — accepted, since a
+      // stop WAS requested and the error still reaches the caller.
       if (this.stopReason === 'stop-requested') this.stopReason = 'driver-error';
     }
     const shutdownFailure = await this.shutdown(failure);

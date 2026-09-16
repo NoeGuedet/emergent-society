@@ -81,7 +81,7 @@ describe('Inbox', () => {
     expect(Object.isFrozen(released)).toBe(true);
   });
 
-  it('re-presents a released message before a later arrival, preserving the tail policy', () => {
+  it('re-presents a released message after a later arrival, preserving the tail policy', () => {
     const inbox = new Inbox();
     inbox.apply(env('message/received', { id: 'a/m1', from: 'a', kind: 'chat', body: 'one' }));
     inbox.apply(env('inbox/claim', { turn: 0, messages: ['a/m1'] }));

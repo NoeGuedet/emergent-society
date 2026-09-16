@@ -78,7 +78,10 @@ export class Inbox {
     }
   }
 
-  /** The unclaimed messages, in arrival order (Map insertion order). */
+  /**
+   * The unclaimed messages: arrival order for deliveries, claim order for the
+   * mail a released turn re-presents at the tail.
+   */
   pendingMessages(): Message[] {
     return [...this.pending.values()];
   }
