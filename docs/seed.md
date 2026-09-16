@@ -59,7 +59,7 @@ Cut order if reducing: I5, I2, I1, I4, never I3. Each instinct has a known **cou
 | `speak` | speech channel — a message walks up the custody chain toward the parent; only agent zero reaches the human (`direction.md` §1) | — |
 | `execute` | **persistent** PTY shell (cwd, variables, jobs survive between calls), sandbox confined to the workspace; workspace mutations **auto-versioned** (silent commit on every mutation → practical `undo` = revert) | inside |
 | `web_search` / `web_fetch` | reading the world, GET only | almost inside (stateless emission), journaled |
-| `extend` | **the Cordis gate in a single tool**: `inspect` (read-only catalogue of the runtime, generated from the source) / `define` (immutable Package, no effect) / `activate` / `stop` (reversible) / `delete` (irreversible) | the gate |
+| `extend` | **the Cordis gate in a single tool**: `inspect` (read-only catalogue of the runtime, generated from the source) / `define` (immutable Package, no effect) / `run` / `stop` (reversible) / `undefine` (irreversible) | the gate |
 
 Five effective tools, the empirical cap (~5) respected.
 

@@ -54,7 +54,7 @@ Documented fallback (if TS becomes untenable): Python 3.14 + anyio, strict typin
 
 Three rules decide what the journal contains and who writes it:
 
-1. **An event type exists iff it records a fact that is not reconstructible from the rest of the journal.** What can be re-derived — intermediate computation inside a Package, recomputable state — is not an event. What cannot — the exact bytes of a model request and its response, the moment a message was delivered and when it woke its recipient, a crash boundary — is. Content is always raw; interpretation is always projection.
+1. **An event type exists iff it records a fact that is not reconstructible from the rest of the journal.** What can be re-derived — intermediate computation inside a Package, recomputable state — is not an event. What cannot — the exact bytes of a model request and its response, the moment a message was delivered and when it woke its recipient, a crash boundary — is. **An event type also exists when it records a decision of a replaceable policy**: the batching policy that decides which messages a turn takes is phenotype, a Package may redefine it, and the journaled claim is what lets the decision outlive the policy that made it. Content is always raw; interpretation is always projection.
 2. **Only the kernel emits.** Events are produced by the kernel and the driver at the boundaries an agent cannot avoid crossing: model calls, tool effects, message transport, lifecycle transitions. The agent has no write access to the recording apparatus. Thinking is calling the model, and calling the model crosses the gate, so deliberation is recorded regardless of whatever channels the agents build for themselves: their own protocols may become semantically opaque, their reasoning cannot.
 3. **No unlogged effect channel exists.** Any path through which an agent can produce an effect crosses the mutation gate and is journaled. A capability that cannot be journaled is not a restricted capability — it is not provided at all.
 
@@ -90,7 +90,7 @@ Rules:
 - **Strict append-only**, made *enforced* by the hash-chain (per node, not global — a global chain would serialize all writers). Canonicalization **RFC 8785 (JCS)**, frozen before the first event.
 - **File physics**: concatenation of independent checksummed zstd frames (one per durable batch) — header-only listing, torn-tail repair at a batch boundary, append cost independent of size. (dsh-session pattern.)
 - **Claim-check** beyond a **format constant** threshold (~8-16 KB): content-addressed blob, reference in `data`; truncation of giant payloads marked `truncated: true` + original size — never silent.
-- **Bounded write-behind**: fixed ~200 ms window triggered by the first event of a burst (no debounce), one `write`+`fsync` per batch. **Explicit flush barrier before each model request and each top-level tool effect** — otherwise a crash can produce an external effect that is not journaled (violation of "model-visible means logged"). The hot path never blocks on I/O.
+- **Bounded write-behind**: fixed ~200 ms window triggered by the first event of a burst (no debounce), one `write`+`fsync` per batch. **Explicit flush barrier before each model request and each top-level tool effect** — otherwise a crash can produce an external effect that is not journaled (violation of "model-visible means logged"). The hot path never blocks on I/O. **The message path and the turn barrier are the deliberate exception**: a delivery, a send and the claim that opens a turn flush per event rather than waiting out the window — a `sent` whose `received` was lost to write-behind would be an effect without a trace — while the 200 ms window covers the remaining event flow (`turn/end`, `node/shutdown`).
 - **A single writer per journal** (ownership handle; a second open for writing is rejected — `SessionAlreadyOwnedError` semantics).
 - **Crash repair = the reader's job**: we never truncate an interrupted turn (its events are durable); resume appends the synthetic closers as an ordinary batch; only a physically torn fragment is discarded.
 - **Disposable incremental projections**: watermark `readFrom(fromSeq)`, versioned checkpoints `{ver, seq, val}` (`ver` mismatch → row discarded), idempotence by key `(stream, seq)`. **Never any compaction of the canonical log**; "closing the books" rollover per node if a journal exceeds a hard threshold.
@@ -125,10 +125,11 @@ Rules:
 
 ## 5. The node driver
 
-Rewriting of the dsh loop (`agent.ts`, 619 lines → ~200 lines):
+Rewriting of the dsh loop (`agent.ts`, 619 lines → ~390 lines):
 
 - **Single primitive** `send(message, target, wakeup)`; everything enters through the same inbox (human chat via agent zero, results, timers, completions).
-- **Atomic claim** of the inbox into a durable projection; **wake latch** (`wakeRequested` replayed at convergence); `runMaintenance` for background work outside turns.
+- **Atomic claim** of the inbox into a durable projection — `inbox/claim` records the batching decision, which messages the turn took — plus an in-memory **wake latch**, armed by the transport and consumed by the loop. At resume the parked state is reconstructed, never replayed: the last `turn/end` outcome together with the inbox (the unclaimed remainder, or the mail an interrupted or errored turn gives back) says whether there is anything to wake for. `wakeupRequested` on `message/received` is the journaled *coalescence observation* — which delivery armed the latch — not replay state. `onMaintenance` runs background work outside turns.
+- **A failed route is a journaled fact, not a death**: the sender's `sent` is durable before the transport is asked, so an unroutable message leaves `message/undeliverable` beside it and the turn goes on. Mail claimed by an interrupted or errored turn is re-presented at resume — the release is reconstructed from the claim and the outcome, so it needs no event of its own.
 - **Non-blocking question/answer**: a question = emitted event + answer event that arrives later in the inbox; the node finishes its turn and wakes on the answer. Never an await on the human (§1.1).
 - No `turn/step` vocabulary from a coding-harness: markers specific to the perpetual node ("waiting" / "active").
 - **Frozen** (deep freeze) request before sending; complete envelope logged before the call.
