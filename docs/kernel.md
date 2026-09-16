@@ -137,7 +137,7 @@ Rewriting of the dsh loop (`agent.ts`, 619 lines → ~200 lines):
 
 - **Model**: Plugin → **immutable Packages** → Runs (taken from dsh: minted IDs never reused, `define` adds a Package, `run` activates an exact version, `stop` removes the Run, `undefine` deletes).
 - **The behavior layer is made of Packages** (§1.6): the loop, context and compaction policies ship as seed Packages, so `extend` can redefine the node's own functioning — the gate and the journal stay in the kernel, below the reachable floor.
-- **dsh's gap is filled for free**: the `define` (name + code + purpose) is a **journal event** → the Package is rebuilt by replay at boot; the Run stays in memory. Package persistence = ~0 extra lines, since the journal exists.
+- **dsh's gap is filled for free**: `define` (name + code + purpose), `run`, `stop` and `undefine` are all **journal events** → the registry and each Package are rebuilt by replay at boot; only the live Run stays in memory. Package persistence = ~0 extra lines, since the journal exists. A destruction keeps its history: `undefine` removes the Package from the current registry, never from the journal or the blob store — which is what makes self-reorganization (turnover) measurable.
 - **Package execution**: `node:vm` + restricted `ctx` facade (allowlist, no `ctx.provide`) — the mutation gate remains non-bypassable (§2). Assumed posture: containment, not a security boundary ("treat a dynamic package like bash access").
 - **Composition traps documented by dsh, not to be rediscovered**: superseded generation never reclaimed (watcher leak); health audit ≠ importability; a change of tooling mid-conversation that orphans calls.
 
