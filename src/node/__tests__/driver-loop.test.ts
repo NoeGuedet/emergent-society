@@ -1,46 +1,34 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, isBlobRef } from '../../journal/blobs.js';
-import { JournalWriter, canonicalizeJson } from '../../journal/index.js';
-import { collectEvents, useTempHome, withFailingWrite } from '../../journal/__tests__/helpers.js';
-import { NodeDriver, type Router, type TurnTrigger } from '../driver.js';
-import { MessageTooLargeError } from '../errors.js';
+import { collectEvents, withFailingWrite } from '../../journal/__tests__/helpers.js';
+import { NodeDriver, type TurnContext, type TurnTrigger } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
-import { Hub } from '../hub.js';
-import type { RoutedMessage } from '../message.js';
+import { useWorld } from './helpers.js';
 
-const home = useTempHome('node-loop-');
+const fixture = useWorld('node-loop-');
 
-class DropRouter implements Router {
-  routed: RoutedMessage[] = [];
-  async route(msg: RoutedMessage): Promise<void> { this.routed.push(msg); }
-}
-
-const wait = () => 'waiting' as const;
-
-function msg(id: string, body: string, over: Partial<RoutedMessage> = {}): RoutedMessage {
-  return { id, from: 'x', to: 'n1', kind: 'chat', wakeup: true, body, ...over };
-}
+const wait = (): { outcome: 'waiting'; toolCalls: boolean } => ({ outcome: 'waiting', toolCalls: false });
 
 /** A minimal typed view of the driver's private writer, for fault injection. */
 type LooseWriter = { append: (...args: unknown[]) => unknown; close(): Promise<unknown> };
 
-function log() {
-  return collectEvents(home(), NODE_EVENT_TYPES, 'n1');
+function log(home: string) {
+  return collectEvents(home, NODE_EVENT_TYPES, 'n1');
 }
 
 describe('NodeDriver run loop', () => {
   it('chains turns with trigger chain until the handler waits', async () => {
+    const { home, world } = fixture();
     const triggers: TurnTrigger[] = [];
-    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
+    const d = await NodeDriver.open(home, 'n1', (ctx) => {
       triggers.push(ctx.trigger);
-      return triggers.length < 3 ? 'chained' : 'waiting';
-    }, new DropRouter());
+      return { outcome: triggers.length < 3 ? 'chained' : 'waiting', toolCalls: true };
+    }, world, { worldPollMs: 0 });
     const running = d.run();
     await vi.waitFor(() => expect(d.state).toBe('waiting'));
     d.stop();
     await running;
     expect(triggers).toEqual(['boot', 'chain', 'chain']);
-    expect((await log()).map((e) => e.type)).toEqual([
+    expect((await log(home)).map((e) => e.type)).toEqual([
       'node/boot',
       'turn/start', 'turn/end',
       'turn/start', 'turn/end',
@@ -50,135 +38,41 @@ describe('NodeDriver run loop', () => {
     expect(d.state).toBe('stopped');
   });
 
-  it('wakes a parked node on delivery and claims the message', async () => {
-    const seen: { trigger: TurnTrigger; bodies: string[] }[] = [];
-    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
-      seen.push({ trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
-      return 'waiting';
-    }, new DropRouter());
+  it('opens every turn on the world range it perceives', async () => {
+    const { home, world } = fixture();
+    const ranges: unknown[] = [];
+    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+      ranges.push(ctx.world);
+      return wait();
+    }, world, { worldPollMs: 0 });
     const running = d.run();
     await vi.waitFor(() => expect(d.state).toBe('waiting'));
-    await d.deliver(msg('x/m1', 'hello'));
-    await vi.waitFor(() => expect(seen).toHaveLength(2));
     d.stop();
     await running;
-    expect(seen[1]).toEqual({ trigger: 'wakeup', bodies: ['hello'] });
-    const events = await log();
-    expect(events.find((e) => e.type === 'message/received')?.data)
-      .toMatchObject({ id: 'x/m1', wakeupRequested: true });
-    expect(events.find((e) => e.type === 'inbox/claim')?.data)
-      .toEqual({ turn: 1, messages: ['x/m1'] });
-  });
-
-  it('does not arm the latch for a delivery that lands mid-turn', async () => {
-    // Turn 0 parks on an external gate, so the delivery below arrives while the
-    // driver is `active` — the one state where `wakeupRequested` is false. The
-    // loop then finds the mail through the inbox check, not through the latch.
-    let release!: () => void;
-    const gate = new Promise<void>((r) => { release = r; });
-    let blocked = false;
-    const seen: { turn: number; trigger: TurnTrigger; bodies: string[] }[] = [];
-    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
-      seen.push({ turn: ctx.turn, trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
-      if (ctx.turn === 0) { blocked = true; await gate; }
-      return 'waiting' as const;
-    }, new DropRouter());
-    const running = d.run();
-    await vi.waitFor(() => expect(blocked).toBe(true));
-    expect(d.state).toBe('active');
-    await d.deliver(msg('x/m1', 'midturn'));
-    release();
-    await vi.waitFor(() => expect(seen).toHaveLength(2));
-    d.stop();
-    await running;
-    expect(seen[1]).toEqual({ turn: 1, trigger: 'wakeup', bodies: ['midturn'] });
-    const events = await log();
-    expect(events.find((e) => e.type === 'message/received')?.data)
-      .toMatchObject({ id: 'x/m1', wakeupRequested: false });
-    expect(events.find((e) => e.type === 'inbox/claim')?.data)
-      .toEqual({ turn: 1, messages: ['x/m1'] });
-  });
-
-  it('counts the live turn from 1 after a synthetic interrupted closer', async () => {
-    // The crash shape: turn 0 opened and never closed. Resume appends the
-    // synthetic closer for it, so the first turn the handler really sees is
-    // turn 1 — and, with no mail re-presented, that turn is a boot.
-    const w = await JournalWriter.open(home(), 'n1');
-    w.append('node/boot', { reason: 'start' });
-    w.append('turn/start', { turn: 0, trigger: 'boot' });
-    await w.close();
-    const seen: { turn: number; trigger: TurnTrigger }[] = [];
-    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
-      seen.push({ turn: ctx.turn, trigger: ctx.trigger });
-      return 'waiting' as const;
-    }, new DropRouter());
-    const running = d.run();
-    await vi.waitFor(() => expect(seen).toHaveLength(1));
-    d.stop();
-    await running;
-    expect(seen[0]).toEqual({ turn: 1, trigger: 'boot' });
-    const starts = (await log()).filter((e) => e.type === 'turn/start');
-    expect(starts.map((e) => e.data)).toEqual([
-      { turn: 0, trigger: 'boot' },
-      { turn: 1, trigger: 'boot' },
-    ]);
-  });
-
-  it('coalesces the wake: only the first delivery arms the latch', async () => {
-    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
-    const running = d.run();
-    await vi.waitFor(() => expect(d.state).toBe('waiting'));
-    // Un-awaited: both synchronous prefixes run before the loop can resume,
-    // so the second delivery deterministically observes the armed latch.
-    const p1 = d.deliver(msg('x/m1', 'one'));
-    const p2 = d.deliver(msg('x/m2', 'two'));
-    await Promise.all([p1, p2]);
-    d.stop();
-    await running;
-    const events = await log();
-    const received = events.filter((e) => e.type === 'message/received');
-    expect(received.map((e) => (e.data as { wakeupRequested: boolean }).wakeupRequested))
-      .toEqual([true, false]);
-    expect(events.find((e) => e.type === 'inbox/claim')?.data)
-      .toEqual({ turn: 1, messages: ['x/m1', 'x/m2'] });
+    // An unborn world: the watermark is null and HEAD is null, and the range
+    // says so rather than pretending the node has seen a commit.
+    expect(ranges).toEqual([{ from: null, to: null }]);
+    expect((await log(home)).find((e) => e.type === 'turn/start')?.data)
+      .toEqual({ turn: 0, trigger: 'boot', world: { from: null, to: null } });
   });
 
   it('journals an error turn and shuts down when the handler throws', async () => {
-    const d = await NodeDriver.open(home(), 'n1', () => {
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', () => {
       throw new Error('boom');
-    }, new DropRouter());
+    }, world, { worldPollMs: 0 });
     await expect(d.run()).rejects.toThrow('boom');
-    const events = await log();
+    const events = await log(home);
     expect(events.at(-2)?.data).toMatchObject({ outcome: 'error', error: 'Error: boom' });
     expect(events.at(-1)?.data).toEqual({ reason: 'handler-error', error: 'Error: boom' });
     expect(d.state).toBe('stopped');
   });
 
-  it('makes message/sent durable before routing', async () => {
-    let sentDurableInRoute = false;
-    class CheckingRouter implements Router {
-      async route(m: RoutedMessage): Promise<void> {
-        const events = await log();
-        sentDurableInRoute = events.some(
-          (e) => e.type === 'message/sent' && (e.data as { id: string }).id === m.id,
-        );
-      }
-    }
-    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
-      await ctx.send('hello', 'peer');
-      return 'waiting' as const;
-    }, new CheckingRouter());
-    const running = d.run();
-    await vi.waitFor(() => expect(d.state).toBe('waiting'));
-    d.stop();
-    await running;
-    expect(sentDurableInRoute).toBe(true);
-  });
-
   it('propagates the handler error when the shutdown append also fails', async () => {
-    const d = await NodeDriver.open(home(), 'n1', () => {
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', () => {
       throw new Error('boom');
-    }, new DropRouter());
+    }, world, { worldPollMs: 0 });
     // Fault injection: nothing outside the driver can reach the writer, so the
     // private field is patched to fail exactly where a poisoned writer or a
     // recorded write-behind failure would — the shutdown append.
@@ -194,9 +88,10 @@ describe('NodeDriver run loop', () => {
   });
 
   it('propagates the handler error and still stops when close() fails', async () => {
-    const d = await NodeDriver.open(home(), 'n1', () => {
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', () => {
       throw new Error('boom');
-    }, new DropRouter());
+    }, world, { worldPollMs: 0 });
     // Same fault-injection technique as the shutdown-append test: the writer is
     // private, so the field is reached through an annotated cast.
     type LooseClose = () => Promise<unknown>;
@@ -213,9 +108,10 @@ describe('NodeDriver run loop', () => {
   });
 
   it('runs maintenance once per park', async () => {
+    const { home, world } = fixture();
     let maintenanceCalls = 0;
-    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter(), {
-      onMaintenance: () => { maintenanceCalls += 1; },
+    const d = await NodeDriver.open(home, 'n1', wait, world, {
+      worldPollMs: 0, onMaintenance: () => { maintenanceCalls += 1; },
     });
     const running = d.run();
     await vi.waitFor(() => expect(d.state).toBe('waiting'));
@@ -224,99 +120,9 @@ describe('NodeDriver run loop', () => {
     expect(maintenanceCalls).toBe(1);
   });
 
-  it('delivers, claims and serves a claim-checked body intact', async () => {
-    const body = 'b'.repeat(CLAIM_CHECK_THRESHOLD);
-    const seen: string[] = [];
-    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
-      seen.push(...ctx.messages.map((m) => m.body));
-      return 'waiting' as const;
-    }, new DropRouter());
-    const running = d.run();
-    await vi.waitFor(() => expect(d.state).toBe('waiting'));
-    await d.deliver(msg('x/m1', body));
-    await vi.waitFor(() => expect(seen).toHaveLength(1));
-    d.stop();
-    await running;
-    expect(seen[0]).toBe(body);
-    const events = await log();
-    // The envelope is claim-checked, but the claim names the real message id —
-    // not the `undefined` an inbox fed the blob reference would have stored.
-    expect(isBlobRef(events.find((e) => e.type === 'message/received')?.data ?? null))
-      .toBe(true);
-    expect(events.find((e) => e.type === 'inbox/claim')?.data)
-      .toEqual({ turn: 1, messages: ['x/m1'] });
-  });
-
-  it('re-presents unclaimed mail after a resume, with trigger wakeup', async () => {
-    const w = await JournalWriter.open(home(), 'n1');
-    w.append('node/boot', { reason: 'start' });
-    w.append('message/received', {
-      id: 'x/m1', from: 'x', kind: 'chat', wakeupRequested: false, body: 'held',
-    });
-    await w.close();
-    const seen: { trigger: TurnTrigger; bodies: string[] }[] = [];
-    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
-      seen.push({ trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
-      return 'waiting' as const;
-    }, new DropRouter());
-    expect(d.pendingCount).toBe(1);
-    const running = d.run();
-    await vi.waitFor(() => expect(seen).toHaveLength(1));
-    d.stop();
-    await running;
-    expect(seen[0]).toEqual({ trigger: 'wakeup', bodies: ['held'] });
-  });
-
-  it('re-presents mail claimed by an interrupted turn after a resume', async () => {
-    // The crash shape: the turn claimed m1 and opened, no turn/end was ever
-    // journaled. Resume appends the synthetic interrupted closer, which is what
-    // releases the claim — no event carries the release itself.
-    const w = await JournalWriter.open(home(), 'n1');
-    w.append('node/boot', { reason: 'start' });
-    w.append('message/received', {
-      id: 'x/m1', from: 'x', kind: 'chat', wakeupRequested: false, body: 'held',
-    });
-    w.append('inbox/claim', { turn: 0, messages: ['x/m1'] });
-    w.append('turn/start', { turn: 0, trigger: 'boot' });
-    await w.close();
-    const seen: { turn: number; trigger: TurnTrigger; bodies: string[] }[] = [];
-    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
-      seen.push({ turn: ctx.turn, trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
-      return 'waiting' as const;
-    }, new DropRouter());
-    expect(d.pendingCount).toBe(1);
-    const running = d.run();
-    await vi.waitFor(() => expect(seen).toHaveLength(1));
-    d.stop();
-    await running;
-    // The synthetic closer ends turn 0, so the re-presented mail is claimed by
-    // turn 1, with the wakeup trigger the non-empty inbox already set.
-    expect(seen[0]).toEqual({ turn: 1, trigger: 'wakeup', bodies: ['held'] });
-  });
-
-  it('re-presents a claim-checked message after close and resume', async () => {
-    const body = 'b'.repeat(CLAIM_CHECK_THRESHOLD);
-    const w = await JournalWriter.open(home(), 'n1');
-    w.append('node/boot', { reason: 'start' });
-    w.append('message/received', {
-      id: 'x/m1', from: 'x', kind: 'chat', wakeupRequested: false, body,
-    });
-    await w.close();
-    const seen: { trigger: TurnTrigger; bodies: string[] }[] = [];
-    const d = await NodeDriver.open(home(), 'n1', (ctx) => {
-      seen.push({ trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
-      return 'waiting' as const;
-    }, new DropRouter());
-    expect(d.pendingCount).toBe(1);
-    const running = d.run();
-    await vi.waitFor(() => expect(seen).toHaveLength(1));
-    d.stop();
-    await running;
-    expect(seen[0]).toEqual({ trigger: 'wakeup', bodies: [body] });
-  });
-
   it('rejects a run() called out of order', async () => {
-    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
     const running = d.run();
     await vi.waitFor(() => expect(d.state).toBe('waiting'));
     await expect(d.run()).rejects.toThrow('run() out of order');
@@ -325,213 +131,42 @@ describe('NodeDriver run loop', () => {
   });
 
   it('stops cleanly with node/shutdown journaled when stop() precedes run()', async () => {
-    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
     d.stop();
     await d.run();
     expect(d.state).toBe('stopped');
-    const events = await log();
+    const events = await log(home);
     expect(events.map((e) => e.type)).toEqual(['node/boot', 'node/shutdown']);
     expect(events[1]?.data).toEqual({ reason: 'stop-requested' });
   });
 
+  it('wakes a parked node when stop() is called', async () => {
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const running = d.run();
+    await vi.waitFor(() => expect(d.state).toBe('waiting'));
+    d.stop();
+    await running;
+    expect(d.state).toBe('stopped');
+    expect((await log(home)).filter((e) => e.type === 'turn/start')).toHaveLength(1);
+  });
+
   it('shuts down with reason maintenance-error when the maintenance hook throws', async () => {
-    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter(), {
-      onMaintenance: () => { throw new Error('maint boom'); },
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', wait, world, {
+      worldPollMs: 0, onMaintenance: () => { throw new Error('maint boom'); },
     });
     await expect(d.run()).rejects.toThrow('maint boom');
     expect(d.state).toBe('stopped');
-    expect((await log()).at(-1)?.data)
+    expect((await log(home)).at(-1)?.data)
       .toEqual({ reason: 'maintenance-error', error: 'Error: maint boom' });
   });
 
-  it('refuses an oversize body before journaling anything', async () => {
-    const sent: string[] = [];
-    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
-      // At the bound exactly: the writer would claim-check-truncate this, and a
-      // truncated reference is refused at resume — so send() must reject first.
-      await expect(ctx.send('b'.repeat(MAX_BLOB_BYTES), 'peer')).rejects
-        .toBeInstanceOf(MessageTooLargeError);
-      sent.push('survived');
-      return 'waiting' as const;
-    }, new DropRouter());
-    const running = d.run();
-    await vi.waitFor(() => expect(sent).toHaveLength(1));
-    d.stop();
-    await running;
-    const events = await log();
-    expect(events.filter((e) => e.type === 'message/sent')).toEqual([]);
-    expect(events.filter((e) => e.type === 'message/undeliverable')).toEqual([]);
-  });
-
-  it('refuses an oversize delivery before journaling anything', async () => {
-    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
-    await expect(d.deliver(msg('x/m1', 'b'.repeat(MAX_BLOB_BYTES))))
-      .rejects.toBeInstanceOf(MessageTooLargeError);
-    expect(d.pendingCount).toBe(0);
-    expect((await log()).filter((e) => e.type === 'message/received')).toEqual([]);
-    // A driver opened but never run would leak the writer's FileHandle to GC.
-    d.stop();
-    await d.run();
-  });
-
-  it('refuses a within-raw-bound body whose canonical form overshoots', async () => {
-    // JSON escaping inflates `"` to `\"` (2x), so this body is ~2.1 MB raw —
-    // under the raw-byte guard the old check applied — but ~4.19 MB canonical,
-    // past MAX_BLOB_BYTES. The writer would store a truncated prefix and refuse
-    // it at resume, so the canonical measure is what the driver must enforce.
-    const body = '"'.repeat(MAX_BLOB_BYTES - 2048);
-    expect(Buffer.byteLength(body, 'utf8')).toBeLessThan(MAX_BLOB_BYTES - 1024);
-    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
-    await expect(d.deliver(msg('x/m1', body))).rejects.toBeInstanceOf(MessageTooLargeError);
-    expect(d.pendingCount).toBe(0);
-    expect((await log()).filter((e) => e.type === 'message/received')).toEqual([]);
-    d.stop();
-    await d.run();
-  });
-
-  it('refuses a body that only the recipient envelope pushes past the bound', async () => {
-    // The window between the two measures: `message/received` is a few bytes
-    // larger than `message/sent`, so a body can canonicalize under the bound in
-    // the sent shape and over it in the received one. Measuring the sent shape
-    // would journal that body here and let the recipient's deliver() refuse it —
-    // MessageTooLargeError out of route(), the sender dying with a handler-error
-    // and no `message/undeliverable`: an effect without a trace. The sender
-    // measures the recipient's shape instead, so this must be refused at send().
-    const sentBytes = (body: string) => Buffer.byteLength(canonicalizeJson(
-      { id: 'n1/m1', to: 'peer', kind: 'chat', wakeup: true, body },
-    ), 'utf8');
-    const receivedBytes = (body: string) => Buffer.byteLength(canonicalizeJson(
-      // `false` is the larger of the two wakeupRequested values, so this is the
-      // worst case any recipient can measure.
-      { id: 'n1/m1', from: 'n1', kind: 'chat', wakeupRequested: false, body },
-    ), 'utf8');
-    const body = 'b'.repeat(MAX_BLOB_BYTES - 1025 - sentBytes(''));
-    // The premise: the sent measure accepts this body, the received one does not.
-    expect(sentBytes(body)).toBe(MAX_BLOB_BYTES - 1025);
-    expect(sentBytes(body)).toBeLessThan(MAX_BLOB_BYTES - 1024);
-    expect(receivedBytes(body)).toBeGreaterThanOrEqual(MAX_BLOB_BYTES - 1024);
-
-    const sent: string[] = [];
-    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
-      await expect(ctx.send(body, 'peer')).rejects.toBeInstanceOf(MessageTooLargeError);
-      sent.push('survived');
-      return 'waiting' as const;
-    }, new DropRouter());
-    const running = d.run();
-    await vi.waitFor(() => expect(sent).toHaveLength(1));
-    d.stop();
-    await running;
-    const events = await log();
-    expect(events.filter((e) => e.type === 'message/sent')).toEqual([]);
-    expect(events.filter((e) => e.type === 'message/undeliverable')).toEqual([]);
-  });
-
-  it('refuses a long `to` that only the sent payload pushes past the bound', async () => {
-    // The other half of the two-payload check: `to` is handler-chosen and
-    // unbounded, and only the sent payload carries it. Measuring the recipient's
-    // shape alone would let a long `to` push the journaled `message/sent` past
-    // the bound while the body passed — the writer stores a truncated prefix,
-    // send() resolves, and the sender's own replay dies with TruncatedBlobError.
-    // This body alone is tiny, so only the `to` can be what refuses it.
-    const to = 'p'.repeat(MAX_BLOB_BYTES + 1000);
-    const sentBytes = (body: string) => Buffer.byteLength(canonicalizeJson(
-      { id: 'n1/m1', to, kind: 'chat', wakeup: true, body },
-    ), 'utf8');
-    const body = 'b'.repeat(100);
-    // The premise: the received measure is tiny, the sent one far past the bound.
-    expect(sentBytes(body)).toBeGreaterThan(MAX_BLOB_BYTES);
-    expect(Buffer.byteLength(canonicalizeJson(
-      { id: 'n1/m1', from: 'n1', kind: 'chat', wakeupRequested: false, body },
-    ), 'utf8')).toBeLessThan(MAX_BLOB_BYTES - 1024);
-
-    const sent: string[] = [];
-    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
-      await expect(ctx.send(body, to)).rejects.toBeInstanceOf(MessageTooLargeError);
-      sent.push('survived');
-      return 'waiting' as const;
-    }, new DropRouter());
-    const running = d.run();
-    await vi.waitFor(() => expect(sent).toHaveLength(1));
-    d.stop();
-    await running;
-    const events = await log();
-    expect(events.filter((e) => e.type === 'message/sent')).toEqual([]);
-    expect(events.filter((e) => e.type === 'message/undeliverable')).toEqual([]);
-  });
-
-  it('accepts a near-bound body and serves the exact body after a resume', async () => {
-    // The accepted side must be genuinely lossless: half the canonical budget
-    // is an ordinary body that fits, and it has to survive close() + resume
-    // byte-for-byte (the blob round trip), not merely be accepted.
-    const body = 'b'.repeat(MAX_BLOB_BYTES / 2);
-    const seen: string[] = [];
-    const first = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
-    // Delivered while booting (A4) and stopped before any turn claims it, so
-    // the message is still unclaimed when the second driver replays the log.
-    await first.deliver(msg('x/m1', body));
-    expect(first.pendingCount).toBe(1);
-    first.stop();
-    await first.run();
-    expect(first.state).toBe('stopped');
-
-    const second = await NodeDriver.open(home(), 'n1', (ctx) => {
-      seen.push(...ctx.messages.map((m) => m.body));
-      return 'waiting' as const;
-    }, new DropRouter());
-    expect(second.pendingCount).toBe(1);
-    const resumed = second.run();
-    await vi.waitFor(() => expect(seen).toHaveLength(1));
-    second.stop();
-    await resumed;
-    expect(seen[0]).toBe(body);
-  });
-
-  it('journals an undeliverable message and lets the turn end normally', async () => {
-    // The real transport: no node owns 'ghost', so the Hub refuses the route.
-    const hub = new Hub(home());
-    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
-      // The handler is never told: send() resolves and the fact is in the log.
-      await ctx.send('boo', 'ghost');
-      return 'waiting' as const;
-    }, hub);
-    const running = d.run();
-    await vi.waitFor(() => expect(d.state).toBe('waiting'));
-    d.stop();
-    await running;
-    const events = await log();
-    const sent = events.find((e) => e.type === 'message/sent');
-    const undeliverable = events.find((e) => e.type === 'message/undeliverable');
-    expect(sent?.data).toMatchObject({ id: 'n1/m1', to: 'ghost' });
-    expect(undeliverable?.data)
-      .toEqual({ id: 'n1/m1', to: 'ghost', reason: 'unknown-node' });
-    // The sender's turn consumed itself normally: no error outcome at all.
-    expect(events.filter((e) => e.type === 'turn/end').map((e) => (e.data as { outcome: string }).outcome))
-      .toEqual(['waiting']);
-  });
-
-  it('journals not-accepting when the recipient is stopped', async () => {
-    const hub = new Hub(home());
-    const peer = await hub.boot('peer', wait);
-    peer.stop();
-    await peer.run();
-    expect(peer.state).toBe('stopped');
-    const d = await NodeDriver.open(home(), 'n1', async (ctx) => {
-      await ctx.send('late', 'peer');
-      return 'waiting' as const;
-    }, hub);
-    const running = d.run();
-    await vi.waitFor(() => expect(d.state).toBe('waiting'));
-    d.stop();
-    await running;
-    const undeliverable = (await log())
-      .find((e) => e.type === 'message/undeliverable');
-    expect(undeliverable?.data)
-      .toEqual({ id: 'n1/m1', to: 'peer', reason: 'not-accepting' });
-  });
-
   it('labels a loop death outside the handler as driver-error, with its error', async () => {
-    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
-    // Fault injection: the flush barrier after the claim must fail so the loop
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    // Fault injection: the append that opens the turn must fail so the loop
     // dies outside the handler — a handler-error would be a lie in the journal.
     const writer = (d as unknown as { writer: LooseWriter }).writer;
     const realAppend = writer.append.bind(writer);
@@ -541,22 +176,36 @@ describe('NodeDriver run loop', () => {
     };
     await expect(d.run()).rejects.toThrow('barrier dead');
     expect(d.state).toBe('stopped');
-    const shutdown = (await log()).find((e) => e.type === 'node/shutdown');
-    expect(shutdown?.data)
-      .toEqual({ reason: 'driver-error', error: 'Error: barrier dead' });
+    const shutdown = (await log(home)).find((e) => e.type === 'node/shutdown');
+    expect(shutdown?.data).toEqual({ reason: 'driver-error', error: 'Error: barrier dead' });
   });
 
   it('journals driver-error when the flush barrier itself rejects', async () => {
-    const d = await NodeDriver.open(home(), 'n1', wait, new DropRouter());
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
     // The recorded-write-behind shape: append() accepts, the barrier flush
     // fails. The failure is injected at the fs primitive the writer uses, so
     // nothing in the driver can be blamed for it.
-    await withFailingWrite(home(), async () => {
+    await withFailingWrite(home, async () => {
       await expect(d.run()).rejects.toThrow('injected EIO');
     });
     expect(d.state).toBe('stopped');
-    const shutdown = (await log()).find((e) => e.type === 'node/shutdown');
-    expect(shutdown?.data)
-      .toEqual({ reason: 'driver-error', error: 'Error: injected EIO' });
+    const shutdown = (await log(home)).find((e) => e.type === 'node/shutdown');
+    expect(shutdown?.data).toEqual({ reason: 'driver-error', error: 'Error: injected EIO' });
+  });
+
+  it('serves the handler a turn context with no writer and no commit', async () => {
+    const { home, world } = fixture();
+    let keys: string[] = [];
+    const d = await NodeDriver.open(home, 'n1', (ctx: TurnContext) => {
+      keys = Object.keys(ctx).sort();
+      return wait();
+    }, world, { worldPollMs: 0 });
+    const running = d.run();
+    await vi.waitFor(() => expect(d.state).toBe('waiting'));
+    d.stop();
+    await running;
+    // The handler cannot journal and cannot commit: the driver owns both.
+    expect(keys).toEqual(['now', 'trigger', 'turn', 'world']);
   });
 });

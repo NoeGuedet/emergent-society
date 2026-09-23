@@ -1,6 +1,6 @@
 /**
- * The node driver's public surface — what C1.3 and later checkpoints may
- * build on. Everything not re-exported here (Inbox, WakeLatch) is an
+ * The node driver's public surface — what C1.3 and later checkpoints may build
+ * on. Everything not re-exported here (WakeLatch, HeadWatcher) is an
  * implementation detail and may change.
  */
 
@@ -8,16 +8,14 @@ export {
   NodeDriver,
   type NodeDriverOptions,
   type NodeState,
-  type Router,
-  type SendOptions,
   type TurnContext,
   type TurnHandler,
   type TurnOutcome,
+  type TurnResult,
   type TurnTrigger,
 } from './driver.js';
-export { Hub } from './hub.js';
+export { WorldRepo, type WorldCommitInfo, type WorldRange } from './world.js';
 export {
-  NodeError, UnknownNodeError, NodeAlreadyBootedError, NodeStateError, MessageTooLargeError,
+  GitCommandError, NodeError, NodeStateError, UnsafeWorldPathError, WorldNotARepoError,
 } from './errors.js';
-export { messageId, type Message, type MessageKind, type RoutedMessage } from './message.js';
 export { NODE_EVENT_TYPES } from './events.js';

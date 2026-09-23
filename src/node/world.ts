@@ -40,14 +40,18 @@ export interface WorldCommitInfo {
 
 /**
  * A range of the world's history: `from` is a node's wake watermark (the last
- * commit it had seen; null before it has ever perceived the world), `to` is
+ * commit it has seen; null before it has ever perceived the world), `to` is
  * HEAD. It is what the journal records about a turn's perception and what the
  * C1.3 assembler turns into the diff a wake presents (kernel.md §4, §5.2).
+ *
+ * A type alias rather than an interface, deliberately: this shape is journaled
+ * in `turn/start` data, and only a type alias is assignable to the `JsonValue`
+ * index signature the envelope requires.
  */
-export interface WorldRange {
+export type WorldRange = {
   readonly from: string | null;
   readonly to: string | null;
-}
+};
 
 /**
  * Runs one git command in the world and returns its stdout.

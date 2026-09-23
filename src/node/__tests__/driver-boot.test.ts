@@ -1,23 +1,18 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
   JournalWriter, UnknownEventTypeError, type EventEnvelope,
 } from '../../journal/index.js';
-import { appendTear, collectEvents, useTempHome } from '../../journal/__tests__/helpers.js';
-import { NodeDriver, type Router } from '../driver.js';
+import { appendTear, collectEvents } from '../../journal/__tests__/helpers.js';
+import { NodeDriver, type TurnResult } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
-import { Hub } from '../hub.js';
-import type { RoutedMessage } from '../message.js';
+import { useWorld } from './helpers.js';
 
-const home = useTempHome('node-boot-');
+const fixture = useWorld('node-boot-');
 
-class DropRouter implements Router {
-  async route(_msg: RoutedMessage): Promise<void> { /* drops */ }
-}
+const wait = (): TurnResult => ({ outcome: 'waiting', toolCalls: false });
 
-const noOp = () => 'waiting' as const;
-
-function bootlog(): Promise<EventEnvelope[]> {
-  return collectEvents(home(), NODE_EVENT_TYPES, 'n1');
+function bootlog(home: string): Promise<EventEnvelope[]> {
+  return collectEvents(home, NODE_EVENT_TYPES, 'n1');
 }
 
 /** Releases a booting driver's writer handle without adding a live turn. */
@@ -32,8 +27,9 @@ async function closeIdle(d: NodeDriver): Promise<void> {
 // to GC (a driver left 'booting' leaks its handle — DEP0137).
 describe('NodeDriver boot and resume', () => {
   it('journals node/boot with reason start on a fresh node', async () => {
-    const d = await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
-    const events = await bootlog();
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const events = await bootlog(home);
     expect(events.map((e) => [e.type, e.data])).toEqual([
       ['node/boot', { reason: 'start' }],
     ]);
@@ -41,105 +37,75 @@ describe('NodeDriver boot and resume', () => {
   });
 
   it('closes an interrupted turn synthetically and resumes', async () => {
-    const w = await JournalWriter.open(home(), 'n1');
+    const { home, world } = fixture();
+    const w = await JournalWriter.open(home, 'n1');
     w.append('node/boot', { reason: 'start' });
-    w.append('turn/start', { turn: 0, trigger: 'boot' });
+    w.append('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
     await w.close(); // clean fs, logically unclosed turn: the crash shape
-    const d = await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
-    const events = await bootlog();
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const events = await bootlog(home);
     expect(events.map((e) => e.type)).toEqual([
       'node/boot', 'turn/start', 'turn/end', 'node/boot',
     ]);
+    // Nothing was written, so the resume commit has nothing to record and the
+    // closer carries no hash.
     expect(events[2]?.data).toEqual({ turn: 0, outcome: 'interrupted', synthetic: true });
     expect(events[3]?.data).toEqual({ reason: 'resume' });
     await closeIdle(d);
   });
 
   it('repairs a torn tail before resuming', async () => {
-    const w = await JournalWriter.open(home(), 'n1');
+    const { home, world } = fixture();
+    const w = await JournalWriter.open(home, 'n1');
     w.append('node/boot', { reason: 'start' });
     await w.close();
-    await appendTear(home());
-    const d = await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
-    const events = await bootlog();
+    await appendTear(home);
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const events = await bootlog(home);
     expect(events.map((e) => e.type)).toEqual(['node/boot', 'node/boot']);
     expect(events[1]?.data).toEqual({ reason: 'resume' });
     await closeIdle(d);
   });
 
-  it('rebuilds the unclaimed inbox and the outgoing counter from the journal', async () => {
-    const w = await JournalWriter.open(home(), 'n1');
-    w.append('node/boot', { reason: 'start' });
-    w.append('message/sent', { id: 'n1/m1', to: 'x', kind: 'chat', wakeup: true, body: 'out' });
-    w.append('message/received', {
-      id: 'x/m1', from: 'x', kind: 'chat', wakeupRequested: false, body: 'in',
-    });
-    await w.close();
-    const d = await NodeDriver.open(home(), 'n1', noOp, new DropRouter());
-    expect(d.pendingCount).toBe(1);
-    expect(d.nextMessageId()).toBe('n1/m2');
-    await closeIdle(d);
-  });
-
   it('releases the writer lock when resume fails on an unknown event type', async () => {
-    const w = await JournalWriter.open(home(), 'n1');
+    const { home, world } = fixture();
+    const w = await JournalWriter.open(home, 'n1');
     w.append('node/boot', { reason: 'start' });
     // Known to the writer (it checks no types) but not to the node registry:
-    // the driver's replay must refuse it.
+    // the driver's replay must refuse it. The retired `message/*` vocabulary
+    // fails this way too, which is what makes a C1.2-era journal unreadable here
+    // rather than silently misread.
     w.append('future/thing', { n: 0 });
     await w.close();
-    await expect(NodeDriver.open(home(), 'n1', noOp, new DropRouter()))
+    await expect(NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 }))
       .rejects.toThrow(UnknownEventTypeError);
     // The failed open released its lock: a fresh writer can take the node over
     // instead of hitting SessionAlreadyOwnedError forever.
-    const w2 = await JournalWriter.open(home(), 'n1');
+    const w2 = await JournalWriter.open(home, 'n1');
     await w2.close();
   });
 
   it('resumes a journal whose extra type the caller declared known', async () => {
-    const w = await JournalWriter.open(home(), 'n1');
+    const { home, world } = fixture();
+    const w = await JournalWriter.open(home, 'n1');
     w.append('node/boot', { reason: 'start' });
     // `ignorable: false` is the required form: without the option the replay
     // refuses it (the test above), with it the event is understood here.
     w.append('future/thing', { n: 0 }, { ignorable: false });
     await w.close();
     const known = new Set([...NODE_EVENT_TYPES, 'future/thing']);
-    const d = await NodeDriver.open(home(), 'n1', noOp, new DropRouter(), { knownTypes: known });
+    const d = await NodeDriver.open(home, 'n1', wait, world, {
+      worldPollMs: 0, knownTypes: known,
+    });
     expect(d.state).toBe('booting');
     d.stop();
     await d.run();
     expect(d.state).toBe('stopped');
     // Read back with the same widened vocabulary: the extra type is understood
     // here, which is exactly what the option declares.
-    const events = await collectEvents(home(), known, 'n1');
+    const events = await collectEvents(home, known, 'n1');
     expect(events.map((e) => e.type)).toEqual([
       'node/boot', 'future/thing', 'node/boot', 'node/shutdown',
     ]);
-  });
-
-  it('accepts a receipt while still booting and serves it on the first turn', async () => {
-    const hub = new Hub(home());
-    const seen: { trigger: string; bodies: string[] }[] = [];
-    // Booted but not yet run: the receipt is journaled now, and the loop's
-    // first turn is a wakeup because the inbox is already non-empty.
-    const n1 = await hub.boot('n1', (ctx) => {
-      seen.push({ trigger: ctx.trigger, bodies: ctx.messages.map((m) => m.body) });
-      return 'waiting' as const;
-    });
-    const n2 = await hub.boot('n2', async (ctx) => {
-      if (ctx.trigger === 'boot') await ctx.send('early', 'n1');
-      return 'waiting' as const;
-    });
-    const sender = n2.run();
-    // n2's first turn routes into a node that has not started its loop yet.
-    await vi.waitFor(() => expect(n1.pendingCount).toBe(1));
-    expect(n1.state).toBe('booting');
-    n2.stop();
-    await sender;
-    const n1Running = n1.run();
-    await vi.waitFor(() => expect(seen).toHaveLength(1));
-    n1.stop();
-    await n1Running;
-    expect(seen[0]).toEqual({ trigger: 'wakeup', bodies: ['early'] });
   });
 });

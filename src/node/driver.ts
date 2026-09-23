@@ -1,12 +1,12 @@
 import {
-  JournalReader, JournalWriter, MAX_BLOB_BYTES, TornTailError, canonicalizeJson, repair,
-  type JournalWriterOptions, type JsonValue,
+  JournalReader, JournalWriter, TornTailError, repair,
+  type JournalWriterOptions,
 } from '../journal/index.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
-import { MessageTooLargeError, NodeStateError, UnknownNodeError } from './errors.js';
-import { Inbox } from './inbox.js';
+import { NodeStateError } from './errors.js';
 import { WakeLatch } from './latch.js';
-import { messageId, type Message, type MessageKind, type RoutedMessage } from './message.js';
+import { HeadWatcher } from './watcher.js';
+import type { WorldRange, WorldRepo } from './world.js';
 
 export type NodeState = 'booting' | 'active' | 'waiting' | 'stopping' | 'stopped';
 
@@ -21,28 +21,40 @@ const systemClock = (): number => Date.now();
 // the node's public surface (`index.ts`) keeps naming these types.
 export type { ShutdownReason, TurnEndOutcome, TurnTrigger } from './events.js';
 
-export interface SendOptions {
-  kind?: MessageKind;
-  replyTo?: string;
-  wakeup?: boolean;
+/** How a turn ended, as the handler chose to end it. */
+export type TurnOutcome = 'chained' | 'waiting';
+
+/**
+ * What the handler reports back. The driver decides what the turn *meant*: it
+ * is the only one that knows what the world did, and the handler is the only
+ * one that knows what it did with its tools.
+ */
+export interface TurnResult {
+  readonly outcome: TurnOutcome;
+  /**
+   * Whether the turn invoked at least one tool. It is the half of the
+   * empty-turn rule (kernel.md §5.4) the driver cannot observe by itself; the
+   * other half is whether the turn's commit changed anything.
+   */
+  readonly toolCalls: boolean;
 }
 
-/** The handler's whole world: no writer, no transport — the clock is the injected `now`. */
+/** The handler's whole world: no writer, no commit — the clock is the injected `now`. */
 export interface TurnContext {
   readonly turn: number;
   readonly trigger: TurnTrigger;
-  readonly messages: readonly Message[];
-  send(body: string, to: string, opts?: SendOptions): Promise<void>;
+  /**
+   * The world range this turn opened on (kernel.md §4): `from` is the node's
+   * wake watermark — the last commit it has been shown, null before it has ever
+   * perceived the world — and `to` is HEAD when the turn opened. The C1.3
+   * assembler turns it into the diff the turn must perceive; the driver only
+   * records it.
+   */
+  readonly world: WorldRange;
   now(): number;
 }
 
-export type TurnOutcome = 'chained' | 'waiting';
-export type TurnHandler = (ctx: TurnContext) => Promise<TurnOutcome> | TurnOutcome;
-
-/** The transport the driver hands routed messages to; the Hub implements it (Task 7). */
-export interface Router {
-  route(msg: RoutedMessage): Promise<void>;
-}
+export type TurnHandler = (ctx: TurnContext) => Promise<TurnResult> | TurnResult;
 
 export interface NodeDriverOptions extends JournalWriterOptions {
   onMaintenance?: () => Promise<void> | void;
@@ -52,16 +64,39 @@ export interface NodeDriverOptions extends JournalWriterOptions {
    * in, so a journal written by a richer node still resumes here.
    */
   knownTypes?: ReadonlySet<string>;
+  /**
+   * HEAD re-read cadence in ms for the world's shared watcher; 0 disables the
+   * interval. The first driver of a world repo sets it — the watcher is one per
+   * repo, since HEAD is one value.
+   */
+  worldPollMs?: number;
 }
 
+/**
+ * The breathing loop of one node (kernel.md §5): boot and resume, the turn
+ * ritual, the commit that closes every turn, and the wait.
+ *
+ * There is no transport. A node communicates by writing files in the world, the
+ * driver commits them with the node's uid as git author, and a node wakes on the
+ * commits it did not author — so a static world spends nothing, a dialogue is
+ * alternating commits, and a node's own commits never wake it.
+ */
 export class NodeDriver {
   private nodeState: NodeState = 'booting';
   private turn = 0;
-  private outgoing = 0;
+  /**
+   * The last world commit this node has been shown (§5.2), null before it has
+   * ever perceived the world. It advances when a turn opens, not when a commit
+   * lands: what a turn perceives is fixed at its opening, and a commit made
+   * while the turn ran is part of the *next* turn's range — otherwise a foreign
+   * write landing mid-turn would be absorbed into this node's own commit and
+   * never presented.
+   */
+  private watermark: string | null = null;
   private stopRequested = false;
   private stopReason: ShutdownReason = 'stop-requested';
-  private readonly inbox = new Inbox();
   private readonly latch = new WakeLatch();
+  private readonly watcher: HeadWatcher;
   /** Resolved once in the constructor, like the writer's `systemClock`. */
   private readonly now: () => number;
 
@@ -69,14 +104,15 @@ export class NodeDriver {
     private readonly writer: JournalWriter,
     readonly uid: string,
     private readonly handler: TurnHandler,
-    private readonly router: Router,
+    private readonly world: WorldRepo,
     private readonly opts: NodeDriverOptions,
   ) {
     this.now = opts.now ?? systemClock;
+    this.watcher = HeadWatcher.for(world, opts.worldPollMs);
   }
 
   static async open(
-    home: string, uid: string, handler: TurnHandler, router: Router,
+    home: string, uid: string, handler: TurnHandler, world: WorldRepo,
     opts: NodeDriverOptions = {},
   ): Promise<NodeDriver> {
     let writer: JournalWriter;
@@ -87,7 +123,7 @@ export class NodeDriver {
       await repair(home, uid);
       writer = await JournalWriter.open(home, uid, opts);
     }
-    const driver = new NodeDriver(writer, uid, handler, router, opts);
+    const driver = new NodeDriver(writer, uid, handler, world, opts);
     try {
       await driver.resume(home);
     } catch (err) {
@@ -107,92 +143,6 @@ export class NodeDriver {
     return this.nodeState;
   }
 
-  /** Visible for resume assertions; the loop consumes the inbox itself. */
-  get pendingCount(): number {
-    return this.inbox.size;
-  }
-
-  /** The id the next sent message will carry (replay-safe). */
-  nextMessageId(): string {
-    return messageId(this.uid, this.outgoing + 1);
-  }
-
-  /**
-   * The transport's only entry point: one message enters the node.
-   *
-   * Receipts are accepted as soon as the journal is open — every state but
-   * `stopping`/`stopped` — so a delivery to a node still in `booting` is not
-   * lost: it is journaled now and the loop claims it on its first turn, whose
-   * trigger the non-empty inbox already makes `wakeup` rather than `boot`.
-   *
-   * @throws NodeStateError once the driver is stopping or stopped — a journal
-   * that is closing cannot take a durable `received`.
-   * @throws MessageTooLargeError when the body would be journaled lossily.
-   */
-  async deliver(msg: RoutedMessage): Promise<void> {
-    if (this.nodeState === 'stopping' || this.nodeState === 'stopped') {
-      throw new NodeStateError(`cannot deliver to ${this.uid}: state is ${this.nodeState}`);
-    }
-    const data: {
-      id: string; from: string; kind: MessageKind; wakeupRequested: boolean;
-      body: string; replyTo?: string;
-    } = {
-      id: msg.id, from: msg.from, kind: msg.kind,
-      wakeupRequested: this.nodeState === 'waiting' && msg.wakeup,
-      body: msg.body,
-      ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
-    };
-    // Before the latch: a refused delivery must leave no trace, not even a
-    // spurious wake, and `deliver` throws before anything is journaled.
-    this.assertLossless(data);
-    // The latch is armed synchronously here, before the first await, so two
-    // deliveries cannot both observe an unarmed latch. `request()` reports
-    // whether this was the one that armed it: the coalescence fact the journal
-    // records, which the plain `msg.wakeup` above would mislabel on the second.
-    if (msg.wakeup && this.nodeState === 'waiting') {
-      data.wakeupRequested = this.latch.request();
-    }
-    // A body at or past CLAIM_CHECK_THRESHOLD is claim-checked in the journaled
-    // envelope; feeding that envelope to the inbox would store the blob
-    // reference as if it were the message. The projection gets the original
-    // fields, which the driver already holds; replay resolves the reference
-    // instead (resume opens its reader with resolveBlobs).
-    this.writer.append('message/received', data);
-    this.inbox.apply({ type: 'message/received', data });
-    // Deliveries flush eagerly: a journaled `sent` whose `received` was lost to
-    // write-behind would be an effect without a trace on the recipient side.
-    await this.writer.flush();
-  }
-
-  /**
-   * The lossless-message bound. It measures the canonical bytes of a payload
-   * object — `canonicalizeJson(data)`, the same measure `JournalWriter.claimCheck`
-   * applies — never the raw body.
-   *
-   * Raw bytes cannot stand in for that measure: JSON escaping inflates a body
-   * on the way to its canonical form, so a quote-heavy body well under the
-   * bound can canonicalize well past it. The writer would then store a prefix
-   * and mark the reference `truncated: true`, and a truncated reference is
-   * refused at resume — one such message would brick the node's replay. The
-   * driver rejects before journaling anything instead of writing a message it
-   * could never read back. `claimCheck` measures the payload alone and truncates
-   * at `MAX_BLOB_BYTES`, so the 1024-byte margin below the bound is pure
-   * conservatism, not a cover for framing overhead.
-   *
-   * No single shape carries the invariant, so `send` checks both payloads it is
-   * about to cause: the `message/sent` payload exactly as it will be journaled
-   * (the only one carrying `to`, and the one this node replays) and the
-   * recipient's `message/received` shape, which is what the recipient's `deliver`
-   * will measure before accepting it. Together they mean nothing `send` accepts
-   * can truncate on its own journal or be refused downstream.
-   *
-   * @throws MessageTooLargeError with the canonical byte count and the bound.
-   */
-  private assertLossless(data: JsonValue): void {
-    const bytes = Buffer.byteLength(canonicalizeJson(data), 'utf8');
-    if (bytes >= MAX_BLOB_BYTES - 1024) throw new MessageTooLargeError(bytes, MAX_BLOB_BYTES);
-  }
-
   stop(reason: ShutdownReason = 'stop-requested'): void {
     if (this.nodeState === 'stopping' || this.nodeState === 'stopped') return;
     this.stopReason = reason;
@@ -205,38 +155,43 @@ export class NodeDriver {
       throw new NodeStateError(`run() out of order: state is ${this.nodeState}`);
     }
     this.nodeState = 'active';
-    let trigger: TurnTrigger = this.inbox.size > 0 ? 'wakeup' : 'boot';
     let failure: unknown = null;
     try {
+      // A first turn is a wakeup when the world holds commits this node has not
+      // been shown — a node joining a populated world, or one that was down
+      // while the world moved — and a boot otherwise.
+      let trigger: TurnTrigger = (await this.wakeNeeded()) ? 'wakeup' : 'boot';
       while (!this.stopRequested) {
-        const claimed = this.inbox.pendingMessages();
-        if (claimed.length > 0) {
-          this.inbox.apply(this.writer.append('inbox/claim', {
-            turn: this.turn, messages: claimed.map((m) => m.id),
-          }));
-        }
-        this.writer.append('turn/start', { turn: this.turn, trigger });
-        // Barrier: the claim and the turn's opening are durable before the
-        // handler can produce any effect (kernel.md §3).
+        const world = await this.worldRange();
+        this.watermark = world.to;
+        this.writer.append('turn/start', { turn: this.turn, trigger, world });
+        // Barrier: the turn's opening is durable before the handler can produce
+        // any effect (kernel.md §3).
         await this.writer.flush();
-        let outcome: TurnOutcome;
+        let result: TurnResult;
         try {
-          outcome = await this.handler({
-            turn: this.turn,
-            trigger,
-            messages: claimed,
-            send: (body, to, opts) => this.send(body, to, opts),
-            now: () => this.now(),
+          result = await this.handler({
+            turn: this.turn, trigger, world, now: () => this.now(),
           });
         } catch (err) {
-          this.writer.append('turn/end', {
-            turn: this.turn, outcome: 'error', error: String(err),
-          });
+          await this.endFailedTurn(this.turn, err);
           this.stopReason = 'handler-error';
           throw err;
         }
-        this.writer.append('turn/end', { turn: this.turn, outcome });
-        if (outcome === 'chained') {
+        // The world is committed before the closer is journaled, so the closer
+        // can carry the hash that joins the journal to the world's history
+        // (kernel.md §3, §5.2).
+        const commit = await this.commitWorld(this.turn);
+        const end = {
+          turn: this.turn, outcome: result.outcome,
+          ...(commit !== null ? { commit } : {}),
+        };
+        // Empty (kernel.md §5.4): no tool call and nothing committed. It is
+        // still a turn — the fact of a node that woke and changed nothing — and
+        // the envelope marks it so a reader may skip it without loss.
+        if (!result.toolCalls && commit === null) this.writer.append('turn/end', end, { ignorable: true });
+        else this.writer.append('turn/end', end);
+        if (result.outcome === 'chained') {
           trigger = 'chain';
           this.turn += 1;
           continue;
@@ -249,11 +204,7 @@ export class NodeDriver {
           throw err;
         }
         if (this.stopRequested) break;
-        // A delivery that landed mid-turn never touches the latch: the inbox
-        // check covers it, and a stale request is dropped instead of causing
-        // a spurious wake.
-        if (this.inbox.size === 0) await this.latch.wait();
-        else this.latch.clear();
+        await this.park();
         if (this.stopRequested) break;
         this.nodeState = 'active';
         trigger = 'wakeup';
@@ -262,21 +213,113 @@ export class NodeDriver {
     } catch (err) {
       failure = err;
       // The loop died outside the handler's contract (a failed flush barrier, a
-      // maintenance hook that rejected) — an error the caller never asked for.
-      // A reason set by the handler's own turn must not be overwritten, so the
-      // check is by value: only a still-default 'stop-requested' is relabelled.
-      // Adjudicated: an explicit stop() carrying the default reason shares that
-      // value, so a death after one is relabelled here too — accepted, since a
-      // stop WAS requested and the error still reaches the caller. One path does
-      // keep the plain label: an explicit stop() whose loop exits cleanly keeps
-      // 'stop-requested' (and journals no `error` field, the run having failed
-      // nowhere) when closing the writer then fails — run() rejects with that
-      // close error, the failure shutdown() returns rather than the append's.
+      // maintenance hook that rejected, a git failure on the turn's commit) — an
+      // error the caller never asked for. A reason set by the handler's own turn
+      // must not be overwritten, so the check is by value: only a still-default
+      // 'stop-requested' is relabelled. Adjudicated: an explicit stop() carrying
+      // the default reason shares that value, so a death after one is relabelled
+      // here too — accepted, since a stop WAS requested and the error still
+      // reaches the caller. One path does keep the plain label: an explicit
+      // stop() whose loop exits cleanly keeps 'stop-requested' (and journals no
+      // `error` field, the run having failed nowhere) when closing the writer
+      // then fails — run() rejects with that close error, the failure shutdown()
+      // returns rather than the append's.
       if (this.stopReason === 'stop-requested') this.stopReason = 'driver-error';
     }
     const shutdownFailure = await this.shutdown(failure);
     failure ??= shutdownFailure;
     if (failure !== null) throw failure;
+  }
+
+  /**
+   * Parks until the world moves with a commit this node did not author, or until
+   * `stop()`.
+   *
+   * The subscription is taken *before* the predicate is checked, so a commit
+   * landing between the two cannot be lost: the watcher arms the latch and the
+   * wait returns at once instead of parking on a wake that already happened.
+   */
+  private async park(): Promise<void> {
+    const unsubscribe = this.watcher.subscribe(() => { void this.evaluateWake(); });
+    try {
+      if (await this.wakeNeeded()) this.latch.request();
+      await this.latch.wait();
+    } finally {
+      unsubscribe();
+    }
+  }
+
+  /**
+   * The listener the watcher calls when HEAD moved. It re-evaluates this node's
+   * own predicate — the watcher announces movement, not wakeups — and arms the
+   * latch when the movement concerns this node.
+   */
+  private async evaluateWake(): Promise<void> {
+    try {
+      if (await this.wakeNeeded()) this.latch.request();
+    } catch {
+      // A failed HEAD read leaves the node parked; the next tick retries, so a
+      // transient git failure delays a wake rather than losing it. A rejection
+      // here would have no caller: the watcher's notification is fire-and-forget.
+    }
+  }
+
+  /**
+   * The wake predicate (kernel.md §5.2): HEAD has advanced with at least one
+   * commit this node did not author. A static world is silent, a node's own
+   * commits never wake it, and several foreign commits landing before the node
+   * looks again are one list, hence one wake.
+   */
+  private async wakeNeeded(): Promise<boolean> {
+    const commits = await this.world.commitsSince(this.watermark);
+    return commits.some((commit) => commit.author !== this.uid);
+  }
+
+  /** The range a turn opening now would present: the watermark to HEAD. */
+  private async worldRange(): Promise<WorldRange> {
+    return { from: this.watermark, to: await this.world.headHash() };
+  }
+
+  /**
+   * Commits the world as this node. Committing is kernel mechanism, not a tool:
+   * an agent cannot end a turn without its effects being committed and
+   * attributed (kernel.md §5.2).
+   *
+   * @returns the commit hash, or null when the turn changed nothing.
+   * @throws GitCommandError when git fails; an unattributed effect is not a fact
+   * to shrug off, so the loop dies on it (driver-error).
+   */
+  private async commitWorld(turn: number): Promise<string | null> {
+    const commit = await this.world.commitAll(this.uid, `turn ${turn}`);
+    if (commit === null) return null;
+    // The nodes parked on this world learn at once rather than at the next
+    // interval tick: a dialogue is alternating commits, and the interval would
+    // otherwise be its latency.
+    this.watcher.poke();
+    return commit.hash;
+  }
+
+  /**
+   * Closes a turn whose handler threw. The turn's writes are in the world's
+   * working tree even though the turn failed, so they are committed here — with
+   * this node's authorship — rather than left to be swept into the next
+   * committer's commit (§5.3: an effect is never left unattributed).
+   *
+   * A commit failure must not displace the handler's error, which is the one
+   * that ended the run: it is caught, and the writes then stay in the tree for
+   * the next commit — the resume commit of a later boot — to pick up.
+   */
+  private async endFailedTurn(turn: number, err: unknown): Promise<void> {
+    let commit: string | null = null;
+    try {
+      commit = await this.commitWorld(turn);
+    } catch {
+      commit = null;
+    }
+    this.writer.append('turn/end', {
+      turn, outcome: 'error', error: String(err),
+      ...(commit !== null ? { commit } : {}),
+    });
   }
 
   /**
@@ -316,107 +359,43 @@ export class NodeDriver {
   }
 
   /**
-   * Journals the intent, makes it durable, then routes — never the reverse.
-   *
-   * A transport failure is a journaled fact, not a death: the sender's `sent`
-   * is durable before the route is attempted, so an undeliverable message is
-   * recorded as `message/undeliverable` next to it and the handler is told
-   * nothing — it asked to send, and the journal now says what became of that.
-   * Only an unexpected error escapes.
-   *
-   * @throws MessageTooLargeError when the body would be journaled lossily.
-   * @throws any error the router raises that is not a known delivery refusal.
-   */
-  private async send(body: string, to: string, opts: SendOptions = {}): Promise<void> {
-    const msg: RoutedMessage = {
-      id: messageId(this.uid, this.outgoing + 1),
-      from: this.uid,
-      to,
-      kind: opts.kind ?? 'chat',
-      wakeup: opts.wakeup ?? true,
-      body,
-      ...(opts.replyTo !== undefined ? { replyTo: opts.replyTo } : {}),
-    };
-    // The exact payload `message/sent` will carry, built before the append so an
-    // oversize send leaves the outgoing counter untouched — nothing has been
-    // mutated yet.
-    const data = {
-      id: msg.id, to, kind: msg.kind, wakeup: msg.wakeup, body,
-      ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
-    };
-    // BOTH appends are measured, because they are two different payloads and
-    // either one truncating is fatal to this node's own replay.
-    //
-    // `data` is what the journal actually stores (and what this node reads back
-    // at resume), and only it carries `to` — handler-chosen, unvalidated and
-    // unbounded, so measuring the recipient's shape alone would let a long `to`
-    // push the journaled `message/sent` past the bound while the body passed,
-    // leaving a truncated reference and bricking the sender's replay with
-    // TruncatedBlobError.
-    this.assertLossless(data);
-    // The recipient's shape: `message/received` (`from` plus `wakeupRequested`)
-    // can be larger than `data` (`to` plus `wakeup`), and whatever `deliver`
-    // would measure there is what can refuse the message after `message/sent` is
-    // already durable — MessageTooLargeError out of route(), the sender dying
-    // with a handler-error and no `message/undeliverable`, exactly the effect
-    // without a trace B2 eliminated. `false` is the larger of the two
-    // wakeupRequested values, so this is the worst case any recipient can
-    // measure and anything accepted here is acceptable to any deliver().
-    this.assertLossless({
-      id: msg.id, from: this.uid, kind: msg.kind, wakeupRequested: false, body,
-      ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
-    });
-    this.outgoing += 1;
-    this.writer.append('message/sent', data);
-    await this.writer.flush();
-    try {
-      await this.router.route(msg);
-    } catch (err) {
-      // The two refusals the transport can mean: no node owns the uid, or the
-      // node exists but is stopping. Both are recorded against the `sent` that
-      // already exists, then swallowed — the turn goes on.
-      let reason: 'unknown-node' | 'not-accepting';
-      if (err instanceof UnknownNodeError) reason = 'unknown-node';
-      else if (err instanceof NodeStateError) reason = 'not-accepting';
-      else throw err;
-      this.writer.append('message/undeliverable', { id: msg.id, to, reason });
-      await this.writer.flush();
-    }
-  }
-
-  /**
-   * The resume protocol (kernel.md §3): rebuild every projection by replay,
-   * close an interrupted turn synthetically, then journal the boot — durable
-   * before any turn effect can exist.
+   * The resume protocol (kernel.md §3): rebuild the durable state by replay,
+   * close an interrupted turn synthetically — committing the world state its
+   * writes left in the working tree, with this node's authorship — then journal
+   * the boot, durable before any turn effect can exist.
    */
   private async resume(home: string): Promise<void> {
     const reader = await JournalReader.open(home, this.uid, {
       knownTypes: this.opts.knownTypes ?? NODE_EVENT_TYPES,
-      // Projections replay the original payloads, not claim-check references:
-      // a message/received with a large body must rebuild as the message.
+      // Projections replay the original payloads, not claim-check references.
       resolveBlobs: true,
     });
     let sawAny = false;
     let openTurn: number | null = null;
     for await (const e of reader.events()) {
       sawAny = true;
-      this.inbox.apply(e);
       if (e.type === 'turn/start') {
-        openTurn = (e.data as { turn: number }).turn;
-        this.turn = openTurn + 1;
+        const d = e.data as unknown as { turn: number; world: WorldRange };
+        openTurn = d.turn;
+        this.turn = d.turn + 1;
+        // The watermark is the HEAD the last turn opened on: what the node has
+        // been shown, not what it wrote. Rebuilding it from the journal, never
+        // from the current HEAD, is what makes a node that was down while the
+        // world moved wake on the commits it missed.
+        this.watermark = d.world.to;
       } else if (e.type === 'turn/end') {
         openTurn = null;
-      } else if (e.type === 'message/sent') {
-        this.outgoing += 1;
       }
     }
     if (openTurn !== null) {
-      // Fed back through the projection, like every replayed event above: the
-      // closer is what releases the interrupted turn's claim (inbox.ts), so
-      // generating it without applying it would leave the mail eaten.
-      this.inbox.apply(this.writer.append(
-        'turn/end', { turn: openTurn, outcome: 'interrupted', synthetic: true },
-      ));
+      // The interrupted turn never closed, so its writes are still in the
+      // world's working tree: they are committed here with the node's
+      // authorship, and the closer carries the hash (§5.3).
+      const commit = await this.commitWorld(openTurn);
+      this.writer.append('turn/end', {
+        turn: openTurn, outcome: 'interrupted', synthetic: true,
+        ...(commit !== null ? { commit } : {}),
+      });
     }
     this.writer.append('node/boot', { reason: sawAny ? 'resume' : 'start' });
     await this.writer.flush();

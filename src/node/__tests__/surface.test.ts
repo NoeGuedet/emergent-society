@@ -1,22 +1,28 @@
 import { describe, expect, it } from 'vitest';
 import * as node from '../index.js';
-import {
-  Hub, NODE_EVENT_TYPES, NodeDriver, UnknownNodeError, messageId,
-} from '../index.js';
+import { NODE_EVENT_TYPES, NodeDriver, UnsafeWorldPathError, WorldRepo } from '../index.js';
 
 describe('the node public surface', () => {
-  it('exposes the driver, the hub, the event registry and message minting', () => {
+  it('exposes the driver, the world repo and the event registry', () => {
     expect(typeof NodeDriver.open).toBe('function');
-    expect(typeof Hub).toBe('function');
-    expect(UnknownNodeError.prototype).toBeInstanceOf(Error);
+    expect(typeof WorldRepo.open).toBe('function');
+    expect(typeof WorldRepo.init).toBe('function');
+    expect(UnsafeWorldPathError.prototype).toBeInstanceOf(Error);
     expect(NODE_EVENT_TYPES).toBeInstanceOf(Set);
-    expect(typeof messageId).toBe('function');
   });
 
   it('keeps the implementation details out of the namespace', () => {
-    // Inbox and WakeLatch are internals the driver owns and may change; the
-    // public surface deliberately does not name them (index.ts).
-    expect('Inbox' in node).toBe(false);
+    // The latch and the HEAD watcher are internals the driver owns and may
+    // change; the public surface deliberately does not name them (index.ts).
     expect('WakeLatch' in node).toBe(false);
+    expect('HeadWatcher' in node).toBe(false);
+  });
+
+  it('names no transport', () => {
+    // Retired by kernel.md §5.1: the world is the filesystem, so there is no
+    // hub, no inbox and no message to mint an id for.
+    expect('Hub' in node).toBe(false);
+    expect('Inbox' in node).toBe(false);
+    expect('messageId' in node).toBe(false);
   });
 });

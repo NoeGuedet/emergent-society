@@ -1,7 +1,7 @@
 /**
- * The wake latch: the coalescing signal from the transport to a parked loop.
- * It is in-memory only — after a restart its state is reconstructed (a node
- * whose journal ends on `waiting` with unclaimed mail wakes immediately).
+ * The wake latch: the coalescing signal from the world's watcher to a parked
+ * loop. It is in-memory only — after a restart its state is reconstructed from
+ * the journal: a node whose watermark is behind HEAD wakes on its first turn.
  */
 export class WakeLatch {
   private requested = false;
@@ -10,7 +10,8 @@ export class WakeLatch {
   /**
    * Arms the latch and releases any parked waiter.
    * @returns whether this call was the one that armed the latch — the
-   * coalescence fact the transport journals as `wakeupRequested`.
+   * coalescence fact: several wakes landing before the loop looks again are one
+   * turn, not one turn per wake.
    */
   request(): boolean {
     const first = !this.requested;
@@ -32,7 +33,7 @@ export class WakeLatch {
     this.requested = false;
   }
 
-  /** Drops an unconsumed request (the loop observed the inbox directly). */
+  /** Drops an unconsumed request, for a caller that learned of the world by another route. */
   clear(): void {
     this.requested = false;
   }
