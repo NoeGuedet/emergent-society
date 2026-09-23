@@ -188,9 +188,15 @@ export class NodeDriver {
         };
         // Empty (kernel.md §5.4): no tool call and nothing committed. It is
         // still a turn — the fact of a node that woke and changed nothing — and
-        // the envelope marks it so a reader may skip it without loss.
+        // the closer is the skip unit: emptiness is knowable only once the turn
+        // has ended, so `turn/end` is the only event that can carry the marker.
         if (!result.toolCalls && commit === null) this.writer.append('turn/end', end, { ignorable: true });
         else this.writer.append('turn/end', end);
+        // The closer is durable per event, never left to the write-behind window
+        // (kernel.md §3): a crash right after it would otherwise orphan the
+        // world commit — a hash in the world's history that the journal, the
+        // only record of which turn produced it, does not reference.
+        await this.writer.flush();
         if (result.outcome === 'chained') {
           trigger = 'chain';
           this.turn += 1;
@@ -307,7 +313,8 @@ export class NodeDriver {
    *
    * A commit failure must not displace the handler's error, which is the one
    * that ended the run: it is caught, and the writes then stay in the tree for
-   * the next commit — the resume commit of a later boot — to pick up.
+   * the next commit of this world — a later turn's, whoever ends it — to pick
+   * up.
    */
   private async endFailedTurn(turn: number, err: unknown): Promise<void> {
     let commit: string | null = null;
@@ -320,6 +327,10 @@ export class NodeDriver {
       turn, outcome: 'error', error: String(err),
       ...(commit !== null ? { commit } : {}),
     });
+    // The same per-event barrier as the success path: this closer carries the
+    // hash of the commit the failed turn did land, and a crash before the
+    // write-behind window elapsed would orphan it (kernel.md §3).
+    await this.writer.flush();
   }
 
   /**
@@ -396,6 +407,10 @@ export class NodeDriver {
         turn: openTurn, outcome: 'interrupted', synthetic: true,
         ...(commit !== null ? { commit } : {}),
       });
+      // A closer is a closer, synthetic or not: durable before the boot is
+      // journaled on top of it, so a crash between the two still leaves the
+      // commit it names attributable (kernel.md §3).
+      await this.writer.flush();
     }
     this.writer.append('node/boot', { reason: sawAny ? 'resume' : 'start' });
     await this.writer.flush();

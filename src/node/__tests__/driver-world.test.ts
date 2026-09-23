@@ -115,6 +115,44 @@ describe('the world as the only channel', () => {
   });
 });
 
+describe('the turn closer', () => {
+  it('is durable before the turn ends, commit hash and all', async () => {
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', async () => {
+      await writeWorldFile(world, 'n1/notes.md', 'hello');
+      return acted();
+    }, world, { worldPollMs: 0, batchWindowMs: 10_000 });
+    const running = d.run();
+    await parked(d, world);
+    // Read the log while the writer is still open and its write-behind window
+    // has not elapsed: the closer is on disk only because it is flushed per
+    // event (kernel.md §3). A crash here must not leave a world commit that the
+    // journal — the only record of which turn produced it — never names.
+    const end = (await readNode(home)).find((e) => e.type === 'turn/end');
+    expect((end?.data as { commit?: string }).commit).toBe(await world.headHash());
+    d.stop();
+    await running;
+  });
+
+  it('is flushed before the loop unwinds on a failed turn', async () => {
+    const { home, world } = fixture();
+    const d = await NodeDriver.open(home, 'n1', () => {
+      throw new Error('boom');
+    }, world, { worldPollMs: 0 });
+    type LooseWriter = { flush(): Promise<void> };
+    const writer = (d as unknown as { writer: LooseWriter }).writer;
+    const real = writer.flush.bind(writer);
+    let flushes = 0;
+    writer.flush = async () => { flushes += 1; await real(); };
+    await expect(d.run()).rejects.toThrow('boom');
+    // The turn/start barrier and the closer — not the closer and then close():
+    // the write-behind window would only be flushed by a process that lived.
+    expect(flushes).toBe(2);
+    const end = (await readNode(home)).find((e) => e.type === 'turn/end');
+    expect(end?.data).toMatchObject({ outcome: 'error' });
+  });
+});
+
 describe('the wake predicate', () => {
   it('does not wake on a static world', async () => {
     const { home, world } = fixture();
