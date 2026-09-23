@@ -11,21 +11,21 @@ are stated in `seed.md`.
 
 - **The human** — the source. The idea, the thinking, the goal come from them. They speak only to agent zero.
 - **Agent zero** — **translator co-orchestrator**. Its function: translate in both directions — human intent → system heading, and system state → human language. It does not work, it does not govern on its own initiative: it makes governance possible. Its output is the heading; its memory is the continuity of the intent.
-  - **Reading equipment**: to perform the system → human translation (reports, chronology, who does what, analysis), it reads the **raw journal**, the **projections** (custody, authority) and the **workspace**, and it can **question the nodes**. The right to question is granted with full awareness of the influence bias; the trade-off is accepted because each question is a journal event, so the influence channel is traced and measurable as an intervention. Founding property: "model-visible means logged" makes its understanding possible *through the trace* — everything a node would say is already there.
+  - **Reading equipment**: to perform the system → human translation (reports, chronology, who does what, analysis), it reads the **raw journal**, the **projections** (custody, authority) and the **world**, and it can **question the nodes**. The right to question is granted with full awareness of the influence bias; the trade-off is accepted because each question is a journal event, so the influence channel is traced and measurable as an intervention. Founding property: "model-visible means logged" makes its understanding possible *through the trace* — everything a node would say is already there.
   - **The anti-Goodhart line**: it reads the **raw facts**, never the **metrics** (the 3 sensors and their analyses remain the human's instrument — otherwise it would leak them into its heading drafts). Its own readings and questions are journaled: its mediation is itself auditable.
   - **Never the only window**: the human keeps direct access to the same raw projections (the cockpit); agent zero's reports are verifiable against the raw evidence ("explain this spike" pattern — and "audit by an agent independent of the population being audited": it is not part of the population that works).
 - **The first node** (and all those after it) — standard nodes of the recursive graph. They receive the heading pinned by the kernel, **exactly like any future node**. Agent zero exists precisely so that the first node is not special: the same shape everywhere, from the start.
 
-**Consequence for `speak`**: the human channel belongs only to agent zero. For any other node, `speak` **walks up the custody chain** — toward the parent, and therefore ultimately toward agent zero, which relays to the human whatever matters. Uniform and recursive: the root is the only node whose "parent" is the human. No direct human ↔ node channel. Corollary for the seed prompt: "the person talking to you" is not the human, it is agent zero.
+**Consequence for `speak`**: the human channel belongs only to agent zero — it is the only node that reaches the human, and no other node has a direct human channel. Between nodes there is no transport at all: a node is heard by **writing in the world**, which the kernel commits at the end of its turn with its own uid as author (`kernel.md` §5). Uniform and recursive: the root is the only node whose "parent" is the human. Corollary for the seed prompt: "the person talking to you" is not the human, it is agent zero.
 
-This separation also settles the observation surface: everything nodes "say" to their parent is a journal event — the escalation of requests, reports and "I can no longer see the heading" (instincts I4/I5) becomes a free data point of the experiment.
+This separation also settles the observation surface: everything a node writes toward its parent is a commit in the world — authored, diffable and journaled — so the escalation of requests, reports and "I can no longer see the heading" (instincts I4/I5) becomes a free data point of the experiment.
 
 ## 2. The direction object — a double artifact
 
 A constraint from the research: Constraint Pinning protects *literal* constraints (Governance Decay: 0% → 30-59% violation after compaction, pinning → 0%); a *rich and implicit* direction is not pinnable as is. Hence two linked forms, versioned together:
 
 - **The heading** — a few verbatim lines, plus the **cycle's value proxy** ("how we will know it works"). Pinned outside compaction, reinjected at every turn, injected by the kernel into the context of every node. The proxy is **visible to the agents**: it is their work target — hiding it from them would divert them. The associated Goodhart risk is accepted: the measurement remains invisible, the proxy ↔ intention gap is read by the human.
-- **The letter** — the rich text of the negotiation: the why, the intentions, the context. Versioned with the heading, stored in the workspace. Readable on demand by any node via its shell; never injected systematically (cost, cache, dilution).
+- **The letter** — the rich text of the negotiation: the why, the intentions, the context. Versioned with the heading, stored in the world. Readable on demand by any node via its shell; never injected systematically (cost, cache, dilution).
 
 Authority rule: **the current version is authoritative — not memory, not the last message** (already in the seed prompt).
 
@@ -40,7 +40,7 @@ Authority rule: **the current version is authoritative — not memory, not the l
 
 ## 4. The channel
 
-- **Continuous and asynchronous** chat: human messages enter agent zero's inbox like any other event — no channel priority, no forced interruption.
+- **Continuous and asynchronous** chat: the human's messages enter the world as commits authored by the human, and agent zero wakes on that change like on any other — no channel priority, no forced interruption.
 - Agent zero can **initiate**: propose a revision, relay a signal coming from the nodes, ask for clarification.
 - The chat is a **projection of the journal**; the trajectory will be another (monitoring / the cockpit). One single truth, two readings.
 
@@ -53,7 +53,7 @@ Authority rule: **the current version is authoritative — not memory, not the l
 
 ## 6. Consequences for the bootstrap (`seed.md`)
 
-1. `speak`: channel toward the custody parent (not "human channel") — §1 above.
+1. `speak`: the human channel, agent zero alone; a node is heard by writing in the world — §1 above.
 2. Seed prompt: "the person talking to you" = agent zero, not the human.
 3. The provisional-expiring v0 direction and the pinning are unchanged; the "first negotiation" that kills v0 takes place between the human and agent zero.
 

@@ -17,7 +17,7 @@ This document specifies the bootstrap of the system: the minimal foundation — 
 **The kernel does not know delegation — it knows the recursion of Γ.** A single primitive: the **node**, a self-similar context (`Γ∞ = μΓ. Γ × (Γ→Γ) × Σ`, Cordis, arXiv:2608.25512) that can carry an agent, modules, child nodes. Root and leaf have the same shape; there is no "manager type" and no "worker type".
 
 ```
-Node = ⟨ uid, parent, Γ, state, inverse accumulator (LIFO), charter, capabilities, budget, inbox ⟩
+Node = ⟨ uid, parent, Γ, state, inverse accumulator (LIFO), charter, capabilities, budget, wake watermark ⟩
 ```
 
 - **Birth** = recursive instantiation; **death** = reversible unloading that unwinds the entire descendant tree in LIFO order; **attenuation** = a node can grant only a subset of its capabilities and its budget, enforced *at the kernel's mutation gate* (not bypassable, whatever the path of the request).
@@ -25,7 +25,7 @@ Node = ⟨ uid, parent, Γ, state, inverse accumulator (LIFO), charter, capabili
 - **Two graphs, not one** (critical discipline): the **custody** tree (physical: "whose death claims whom" — same order as "pid 43 has pid 1 as parent") and the **authority** graph (projection of the journal, emergent, free: DAG, lateral, cyclic). Decoupling mechanism: a node can *ask an ancestor* to instantiate a node (custody ≠ created-by). **Leak test: if the org-projection is isomorphic to the runtime tree on every run, the tree has leaked — a design failure, not an emergence success.**
 - The kernel contains: an append-only journal ("model-visible means logged"), a single mutation gate (`effect → disposer`), pinning of the heading outside compaction, budget metering, the kill switch, a single write token per resource (writes single-thread), node instantiation. **No organizational vocabulary.**
 
-Agent zero is the root custody node and is subject to the same physics as every other node (same loop, same inbox, same compaction, same journal); its specific equipment — human channel, drafting of heading proposals, reading of the raw journal and projections, right to question nodes — is data, not kernel (`direction.md` §1).
+Agent zero is the root custody node and is subject to the same physics as every other node (same loop, same wake rule, same compaction, same journal); its specific equipment — human channel, drafting of heading proposals, reading of the raw journal and projections, right to question nodes — is data, not kernel (`direction.md` §1).
 
 ## 3. The seed: instincts + finitude + Hole
 
@@ -56,12 +56,14 @@ Cut order if reducing: I5, I2, I1, I4, never I3. Each instinct has a known **cou
 
 | Tool | Semantics | Frontier |
 |---|---|---|
-| `speak` | speech channel — a message walks up the custody chain toward the parent; only agent zero reaches the human (`direction.md` §1) | — |
-| `execute` | **persistent** PTY shell (cwd, variables, jobs survive between calls), sandbox confined to the workspace; workspace mutations **auto-versioned** (silent commit on every mutation → practical `undo` = revert) | inside |
+| `speak` | speech channel toward the human — agent zero alone (`direction.md` §1) | — |
+| `execute` | **persistent** PTY shell (cwd, variables, jobs survive between calls), sandbox confined to the world; the kernel commits the world at the end of each turn, author = node uid (→ practical `undo` = revert) | inside |
 | `web_search` / `web_fetch` | reading the world, GET only | almost inside (stateless emission), journaled |
 | `extend` | **the Cordis gate in a single tool**: `inspect` (read-only catalogue of the runtime, generated from the source) / `define` (immutable Package, no effect) / `run` / `stop` (reversible) / `undefine` (irreversible) | the gate |
 
 Five effective tools, the empirical cap (~5) respected.
+
+**Communication is a file.** No tool carries a message between nodes: the kernel provides no transport, and a node reaches another by writing in the world, which the kernel commits at the end of its turn (author = its uid) and which wakes every node that did not author it (`kernel.md` §5). Whatever protocol the society invents — addressing, threading, a bulletin board, a mailbox implemented as a directory — is an agent production, measured like any other organ.
 
 **`spawn` is not a seed tool**: it lives in the kernel, not mounted, **discoverable by introspection** via `extend → inspect`. Its first use is a dated event — the founding observable of checkpoint C3.
 
@@ -120,7 +122,7 @@ Falsification experiments for the experimental protocol: free arm vs complete se
 - **Inward-facing construction** (navel-gazing): organs mounted but never invoked; zero frontier crossings over N days.
 - **Bureaucratization of the instincts**: early meta-organs; a names/actions ratio rising with no production.
 - **Primacy lock-in**: monotonically decreasing semantic novelty; **no dismantling, ever** (in a system where dismantling is physically free, the absence of `stop` is an unambiguous signature of ossification).
-- **Polite waiting**: heartbeats with no tool call; messages that shorten and become deferential.
+- **Polite waiting**: empty turns — wakes with no tool call and no change in the world (journaled, and measurable exactly there); prose that shortens and becomes deferential.
 - **Frontier sprint**: external emissions before any demonstrated local success (ambition precedes competence) — the main signal in the absence of guardrails.
 
 ## 9. Open points
