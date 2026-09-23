@@ -210,13 +210,23 @@ describe('the world repo', () => {
 
   it('survives a second process committing to the same world', async () => {
     const { world } = fixture();
+    // One commit before the peer exists, so the invariant "the kernel's own
+    // commit is in the world" holds whatever the race does to the rest.
+    await writeWorldFile(world, 'n1/before.md', 'before');
+    const first = await world.commitAll('n1', 'turn -1');
+    expect(first?.author).toBe('n1');
+    if (first === null) throw new Error('the world refused its first commit');
+    const mine = [first];
+
     const script = join(dirname(world.path), 'peer.mjs');
     await writeFile(script, PEER_SCRIPT);
     const peer = spawn(process.execPath, [script, world.path, 'peer', '30'], { stdio: 'ignore' });
-    const exited = new Promise<void>((resolvePromise) => { peer.on('exit', () => resolvePromise()); });
+    const exited = new Promise<void>((resolvePromise, rejectPromise) => {
+      peer.on('exit', () => { resolvePromise(); });
+      peer.on('error', rejectPromise);
+    });
 
     // Ten turns' worth of commits, racing the peer for the index and the ref.
-    const mine: { hash: string; author: string }[] = [];
     for (let i = 0; i < 10; i += 1) {
       await writeWorldFile(world, `n1/${i}.md`, String(i));
       const commit = await world.commitAll('n1', `turn ${i}`);
