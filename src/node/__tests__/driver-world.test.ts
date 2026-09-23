@@ -3,7 +3,7 @@ import { JournalWriter } from '../../journal/index.js';
 import { NodeDriver, type TurnResult, type TurnTrigger } from '../driver.js';
 import type { EventEnvelope } from '../../journal/index.js';
 import { HeadWatcher } from '../watcher.js';
-import type { WorldRange, WorldRepo } from '../world.js';
+import { WorldRepo, type WorldRange } from '../world.js';
 import {
   commitAs, committedContent, readNode, useWorld, worldLog, writeWorldFile,
 } from './helpers.js';
@@ -250,6 +250,102 @@ describe('the wake predicate', () => {
     await commitAs(world, 'human', { 'human/hello.md': 'hello' });
     await vi.waitFor(() => expect(seen).toHaveLength(2), { timeout: 3000 });
     expect(seen[1]).toBe('wakeup');
+    d.stop();
+    await running;
+  });
+
+  it('does not let a stale evaluation wake the node on an unmoved world', async () => {
+    const { home, world } = fixture();
+    const triggers: TurnTrigger[] = [];
+    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+      triggers.push(ctx.trigger);
+      return wait();
+    }, world, { worldPollMs: 0 });
+    const running = d.run();
+    await parked(d, world);
+    expect(triggers).toEqual(['boot']);
+
+    // Stall the next predicate read. That evaluation captured its input before
+    // its git call, so it will still be in flight — and still answering about
+    // the world as it was — when the wake it belongs to has been consumed by
+    // the evaluation that follows it.
+    const real = WorldRepo.prototype.commitsSince;
+    let stall = true;
+    vi.spyOn(WorldRepo.prototype, 'commitsSince').mockImplementation(
+      async function (this: WorldRepo, from: string | null) {
+        const stalled = stall;
+        stall = false;
+        if (stalled) await quiet(150);
+        return real.call(this, from);
+      },
+    );
+
+    await commitAs(world, 'n2', { 'n2/a.md': 'a' });
+    await HeadWatcher.for(world).check(); // notification one: the stalled evaluation
+    const head = await commitAs(world, 'n3', { 'n3/b.md': 'b' });
+    await HeadWatcher.for(world).check(); // notification two: the wake that lands
+
+    await vi.waitFor(() => expect(triggers).toHaveLength(2));
+    expect(triggers[1]).toBe('wakeup');
+    const start = (await readNode(home))
+      .find((e) => e.type === 'turn/start' && (e.data as { turn: number }).turn === 1);
+    expect((start?.data as { world: WorldRange }).world).toEqual({ from: null, to: head });
+
+    // The stalled evaluation resolves after that park ended: it must not arm the
+    // latch of the park that follows, or the node would take a `wakeup` turn on
+    // a world that has not moved since it looked.
+    await parked(d, world);
+    await quiet(250);
+    expect(triggers).toEqual(['boot', 'wakeup']);
+    expect(d.state).toBe('waiting');
+    d.stop();
+    await running;
+  });
+
+  it('parks instead of dying when the check a park opens with fails', async () => {
+    const { home, world } = fixture();
+    const seen: number[] = [];
+    const spy = vi.spyOn(WorldRepo.prototype, 'commitsSince');
+    const d = await NodeDriver.open(home, 'n1', (ctx) => { seen.push(ctx.turn); return wait(); }, world, {
+      worldPollMs: 0,
+      // Runs after the turn closed and before the park: the read that fails is
+      // the park's own pre-check.
+      onMaintenance: () => { spy.mockRejectedValue(new Error('git dead')); },
+    });
+    const running = d.run();
+    await parked(d, world);
+    expect(seen).toEqual([0]);
+    expect(d.state).toBe('waiting');
+
+    // The failure delayed the wake, it did not lose it: the next movement lands.
+    spy.mockRestore();
+    await commitAs(world, 'n2', { 'n2/a.md': 'a' });
+    await HeadWatcher.for(world).check();
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
+    d.stop();
+    await running;
+  });
+
+  it('parks instead of dying when the watcher’s evaluation fails', async () => {
+    const { home, world } = fixture();
+    const seen: number[] = [];
+    const d = await NodeDriver.open(home, 'n1', (ctx) => { seen.push(ctx.turn); return wait(); },
+      world, { worldPollMs: 0 });
+    const running = d.run();
+    await parked(d, world);
+
+    const spy = vi.spyOn(WorldRepo.prototype, 'commitsSince')
+      .mockRejectedValue(new Error('git dead'));
+    await commitAs(world, 'n2', { 'n2/a.md': 'a' });
+    await HeadWatcher.for(world).check(); // the listener's read fails
+    await quiet();
+    expect(seen).toEqual([0]);
+    expect(d.state).toBe('waiting');
+
+    spy.mockRestore();
+    await commitAs(world, 'n3', { 'n3/b.md': 'b' });
+    await HeadWatcher.for(world).check();
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
     d.stop();
     await running;
   });

@@ -93,6 +93,11 @@ export class NodeDriver {
    * never presented.
    */
   private watermark: string | null = null;
+  /**
+   * Which park the node is in. Bumped on entry and on exit, so an evaluation
+   * started under one park can never arm the latch of another (see `park`).
+   */
+  private parkEpoch = 0;
   private stopRequested = false;
   private stopReason: ShutdownReason = 'stop-requested';
   private readonly latch = new WakeLatch();
@@ -159,8 +164,11 @@ export class NodeDriver {
     try {
       // A first turn is a wakeup when the world holds commits this node has not
       // been shown — a node joining a populated world, or one that was down
-      // while the world moved — and a boot otherwise.
-      let trigger: TurnTrigger = (await this.wakeNeeded()) ? 'wakeup' : 'boot';
+      // while the world moved — and a boot otherwise. A read that fails here is
+      // the wake path's policy too (see `armIfAwake`): it reads as "no wake",
+      // and the turn's own world read is what surfaces a world that really
+      // cannot be read.
+      let trigger: TurnTrigger = (await this.wakeDue()) ? 'wakeup' : 'boot';
       while (!this.stopRequested) {
         const world = await this.worldRange();
         this.watermark = world.to;
@@ -244,29 +252,54 @@ export class NodeDriver {
    * The subscription is taken *before* the predicate is checked, so a commit
    * landing between the two cannot be lost: the watcher arms the latch and the
    * wait returns at once instead of parking on a wake that already happened.
+   *
+   * Each park is an epoch. An evaluation started under one park can resolve
+   * after that park has ended — it read the predicate's input before its git
+   * call, so its verdict is stale by then — and the latch it would arm would be
+   * the *next* park's: the node would wake on an unmoved world with a `wakeup`
+   * trigger it cannot justify. The epoch is what forbids it.
    */
   private async park(): Promise<void> {
-    const unsubscribe = this.watcher.subscribe(() => { void this.evaluateWake(); });
+    this.parkEpoch += 1;
+    const epoch = this.parkEpoch;
+    const unsubscribe = this.watcher.subscribe(() => { void this.armIfAwake(epoch); });
     try {
-      if (await this.wakeNeeded()) this.latch.request();
+      await this.armIfAwake(epoch);
       await this.latch.wait();
     } finally {
       unsubscribe();
+      // The park is over: an evaluation still in flight for it must not arm the
+      // latch of the park that follows.
+      this.parkEpoch += 1;
     }
   }
 
   /**
-   * The listener the watcher calls when HEAD moved. It re-evaluates this node's
-   * own predicate — the watcher announces movement, not wakeups — and arms the
-   * latch when the movement concerns this node.
+   * Arms the latch when the world has moved with a commit this node did not
+   * author. Both wake paths — the check a park opens with, and the watcher's
+   * notification — come through here, so they cannot drift into two policies.
+   *
+   * **The wake path's failure policy, once: a read that fails delays a wake, it
+   * never kills the node.** The predicate is a question, and a question that
+   * cannot be answered leaves the node parked; the next tick or poke asks again.
+   * Fatal stays reserved for durability — the commit that closes a turn, and the
+   * journal itself — where losing the answer would lose a fact.
+   *
+   * @param epoch the park this evaluation belongs to.
    */
-  private async evaluateWake(): Promise<void> {
+  private async armIfAwake(epoch: number): Promise<void> {
+    if ((await this.wakeDue()) && epoch === this.parkEpoch) this.latch.request();
+  }
+
+  /**
+   * Whether a wake is due, with the wake path's failure policy applied (see
+   * `armIfAwake`). The predicate itself is `wakeNeeded`.
+   */
+  private async wakeDue(): Promise<boolean> {
     try {
-      if (await this.wakeNeeded()) this.latch.request();
+      return await this.wakeNeeded();
     } catch {
-      // A failed HEAD read leaves the node parked; the next tick retries, so a
-      // transient git failure delays a wake rather than losing it. A rejection
-      // here would have no caller: the watcher's notification is fire-and-forget.
+      return false;
     }
   }
 
