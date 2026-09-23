@@ -394,13 +394,15 @@ describe('two nodes on one world', () => {
     await Promise.all(runs);
 
     // No commit failed on the index lock, and no write was left out of the
-    // world: the loser of the race found the tree already committed.
+    // world: the loser of the race found the tree already committed, or had its
+    // writes swept into the winner's commit — which is the commit-granular
+    // attribution kernel.md §5.2 documents, not a lost effect.
     const history = await worldLog(world);
     expect(history.length).toBeGreaterThanOrEqual(1);
     expect(await committedContent(world, 'n1/file.md')).toBe('n1');
     expect(await committedContent(world, 'n2/file.md')).toBe('n2');
     // Every hash a journal claims is a commit of the world, and every commit is
-    // authored by one of the two nodes — whoever won the race for the tree.
+    // authored by one of the two nodes — the one whose turn closed it.
     const hashes = new Set(history.map((line) => line.split(' ')[0]));
     for (const uid of ['n1', 'n2']) {
       const ends = (await readNode(home, uid)).filter((e) => e.type === 'turn/end');
