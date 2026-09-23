@@ -12,10 +12,11 @@ export {
   type TurnHandler,
   type TurnOutcome,
   type TurnResult,
-  type TurnTrigger,
 } from './driver.js';
 export { WorldRepo, type WorldCommitInfo, type WorldRange } from './world.js';
 export {
   GitCommandError, NodeError, NodeStateError, UnsafeWorldPathError, WorldNotARepoError,
 } from './errors.js';
-export { NODE_EVENT_TYPES } from './events.js';
+export {
+  NODE_EVENT_TYPES, type ShutdownReason, type TurnEndOutcome, type TurnTrigger,
+} from './events.js';

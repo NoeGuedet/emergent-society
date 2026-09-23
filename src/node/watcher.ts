@@ -1,5 +1,7 @@
 import type { WorldRepo } from './world.js';
 
+const NOOP = (): void => {};
+
 /**
  * HEAD is re-read at this cadence while at least one node is parked on the
  * world. It costs a process spawn, never a token: a node waiting on an
@@ -33,6 +35,8 @@ export class HeadWatcher {
 
   /** The HEAD last announced; `undefined` until the first read. */
   private lastHead: string | null | undefined;
+  /** The tail of the check queue: one read at a time (see `check`). */
+  private checking: Promise<void> | null = null;
   private readonly listeners = new Set<() => void>();
   private timer: NodeJS.Timeout | null = null;
   private scheduled = false;
@@ -41,8 +45,9 @@ export class HeadWatcher {
 
   /**
    * The watcher of `world`. The first caller sets the cadence — the watcher is
-   * one per repo, and its interval is a property of the world, not of a node.
-   * `pollMs` 0 disables the interval (the in-process poke and an explicit
+   * one per repo, and its interval is a property of the world, not of a node —
+   * so a later caller's `pollMs` is deliberately ignored rather than fought
+   * over. `pollMs` 0 disables the interval (the in-process poke and an explicit
    * `check()` remain the only sources).
    */
   static for(world: WorldRepo, pollMs: number = DEFAULT_POLL_MS): HeadWatcher {
@@ -53,6 +58,7 @@ export class HeadWatcher {
     return watcher;
   }
 
+  /** How many listeners are parked on this world — a test seam, not an API. */
   get subscriberCount(): number {
     return this.listeners.size;
   }
@@ -91,11 +97,25 @@ export class HeadWatcher {
   /**
    * Reads HEAD and notifies every listener if it moved since the last read.
    *
+   * Checks are serialized: two reads in flight at once — the interval's tick
+   * and a poke's, say — would both find the same movement against the same
+   * un-updated `lastHead` and announce it twice, which is two wake evaluations
+   * for one commit. Queued, the second read runs after the first and sees an
+   * unmoved HEAD. A poke arriving during a read is therefore not swallowed: it
+   * is served by the check that follows.
+   *
    * A failed read leaves the last announced HEAD in place and returns: the next
    * tick retries, so a transient git failure delays a wake instead of losing
    * it, and a timer callback has no caller to reject into.
    */
   async check(): Promise<void> {
+    const previous = this.checking ?? Promise.resolve();
+    const next = previous.then(() => this.readHead(), () => this.readHead());
+    this.checking = next.then(NOOP, NOOP);
+    return next;
+  }
+
+  private async readHead(): Promise<void> {
     let head: string | null;
     try {
       head = await this.world.headHash();
@@ -119,8 +139,11 @@ export class HeadWatcher {
   private startTimer(): void {
     if (this.timer !== null || this.pollMs <= 0) return;
     this.timer = setInterval(() => { void this.check(); }, this.pollMs);
-    // A parked node's promise keeps nothing alive on its own; the kernel holds
-    // the loop. The watcher must not be the handle that keeps the process up.
+    // Unref'd on purpose: a library must not decide a process's lifetime, and a
+    // driver that parks has no other pending handle — so a process that runs a
+    // parked driver and nothing else exits, silently. Holding the loop is the
+    // host's job (the kernel's main, C1.3+); this comment is the whole of the
+    // watcher's opinion about it.
     this.timer.unref();
   }
 

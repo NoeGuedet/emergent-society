@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import * as node from '../index.js';
-import { NODE_EVENT_TYPES, NodeDriver, UnsafeWorldPathError, WorldRepo } from '../index.js';
+import {
+  NODE_EVENT_TYPES, NodeDriver, UnsafeWorldPathError, WorldRepo,
+  type ShutdownReason, type TurnEndOutcome,
+} from '../index.js';
 
 describe('the node public surface', () => {
   it('exposes the driver, the world repo and the event registry', () => {
@@ -9,6 +12,14 @@ describe('the node public surface', () => {
     expect(typeof WorldRepo.init).toBe('function');
     expect(UnsafeWorldPathError.prototype).toBeInstanceOf(Error);
     expect(NODE_EVENT_TYPES).toBeInstanceOf(Set);
+  });
+
+  it('names the vocabulary its public methods take', () => {
+    // Type-level: `stop()` takes a ShutdownReason and a closer carries a
+    // TurnEndOutcome, so both belong to the surface a caller can name.
+    const reason: ShutdownReason = 'stop-requested';
+    const outcome: TurnEndOutcome = 'waiting';
+    expect([reason, outcome]).toEqual(['stop-requested', 'waiting']);
   });
 
   it('keeps the implementation details out of the namespace', () => {

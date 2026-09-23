@@ -17,8 +17,10 @@ export type NodeState = 'booting' | 'active' | 'waiting' | 'stopping' | 'stopped
  */
 const systemClock = (): number => Date.now();
 
-// The turn/shutdown vocabulary lives in events.ts (single home); re-exported so
-// the node's public surface (`index.ts`) keeps naming these types.
+// The turn/shutdown vocabulary lives in events.ts (single home); re-exported
+// here for consumers of the driver's own signatures. The public surface
+// (`index.ts`) names it from that home too, since `stop()` takes a
+// ShutdownReason and a closer takes a TurnEndOutcome.
 export type { ShutdownReason, TurnEndOutcome, TurnTrigger } from './events.js';
 
 /** How a turn ended, as the handler chose to end it. */
@@ -35,6 +37,10 @@ export interface TurnResult {
    * Whether the turn invoked at least one tool. It is the half of the
    * empty-turn rule (kernel.md §5.4) the driver cannot observe by itself; the
    * other half is whether the turn's commit changed anything.
+   *
+   * Deferred (C1.4): this is the handler's self-report until the mutation gate
+   * journals tool effects. The `ignorable` flag must then be derived from the
+   * gate's record instead of a declaration — fidelity is measured on acts.
    */
   readonly toolCalls: boolean;
 }
@@ -331,9 +337,6 @@ export class NodeDriver {
   private async commitWorld(turn: number): Promise<string | null> {
     const commit = await this.world.commitAll(this.uid, `turn ${turn}`);
     if (commit === null) return null;
-    // The nodes parked on this world learn at once rather than at the next
-    // interval tick: a dialogue is alternating commits, and the interval would
-    // otherwise be its latency.
     this.watcher.poke();
     return commit.hash;
   }

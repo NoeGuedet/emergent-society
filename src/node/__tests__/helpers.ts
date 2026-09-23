@@ -124,13 +124,3 @@ export async function committedContent(world: WorldRepo, rel: string): Promise<s
 export function readNode(home: string, uid = 'n1'): Promise<EventEnvelope[]> {
   return collectEvents(home, NODE_EVENT_TYPES, uid);
 }
-
-/** The events of one type, typed loosely enough for assertions. */
-export function eventsOf(events: readonly EventEnvelope[], type: string): EventEnvelope[] {
-  return events.filter((e) => e.type === type);
-}
-
-/** The data of every event of one type. */
-export function dataOf(events: readonly EventEnvelope[], type: string): unknown[] {
-  return eventsOf(events, type).map((e) => e.data);
-}

@@ -34,26 +34,23 @@ describe('WakeLatch', () => {
     expect(await raceYield(latch.wait())).toBe(WOKEN);
   });
 
-  it('coalesces: only the first request reports itself', () => {
+  it('coalesces several requests into one wake', async () => {
     const latch = new WakeLatch();
-    expect(latch.request()).toBe(true);
-    expect(latch.request()).toBe(false);
+    latch.request();
+    latch.request();
+    // One consume takes them all: a burst of wakes is one turn.
+    expect(await raceYield(latch.wait())).toBe(WOKEN);
+    // And the consumed burst leaves nothing behind to wake the next park.
+    expect(await raceYield(latch.wait())).toBe(PARKED);
   });
 
   it('re-arms after a consume cycle', async () => {
     const latch = new WakeLatch();
     latch.request();
     await latch.wait(); // consumes the request
-    // The consumed request must not leave the latch stuck reporting false:
-    // the next request is again the one that arms it.
-    expect(latch.request()).toBe(true);
-    await latch.wait();
-  });
-
-  it('clear() drops an unconsumed request', async () => {
-    const latch = new WakeLatch();
+    // The consumed request must not leave the latch stuck: the next request is
+    // again the one that wakes the next park.
     latch.request();
-    latch.clear();
-    expect(await raceYield(latch.wait())).toBe(PARKED);
+    expect(await raceYield(latch.wait())).toBe(WOKEN);
   });
 });

@@ -8,19 +8,16 @@ export class WakeLatch {
   private waiter: (() => void) | null = null;
 
   /**
-   * Arms the latch and releases any parked waiter.
-   * @returns whether this call was the one that armed the latch — the
-   * coalescence fact: several wakes landing before the loop looks again are one
-   * turn, not one turn per wake.
+   * Arms the latch and releases any parked waiter. Several wakes landing before
+   * the loop looks again are one turn, not one turn per wake: the request is a
+   * flag, so it carries no count to consume.
    */
-  request(): boolean {
-    const first = !this.requested;
+  request(): void {
     this.requested = true;
     if (this.waiter !== null) {
       this.waiter();
       this.waiter = null;
     }
-    return first;
   }
 
   /** Consumes a pending request at once, or parks until the next one. */
@@ -30,11 +27,6 @@ export class WakeLatch {
       return;
     }
     await new Promise<void>((resolve) => { this.waiter = resolve; });
-    this.requested = false;
-  }
-
-  /** Drops an unconsumed request, for a caller that learned of the world by another route. */
-  clear(): void {
     this.requested = false;
   }
 }

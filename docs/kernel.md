@@ -154,6 +154,7 @@ Consequences, all of them load-bearing:
 - **Wakes coalesce.** Several commits landing before a turn opens are one diff and one turn.
 - **The two records are cross-referenced.** The journal and the world's git history record the same facts from two sides, joined by the commit hash in `turn/end`: for any journal `seq` the exact world state is known, and for any commit the turn that produced it is known. Neither record alone suffices; together they are the reconstructability invariant of §3 applied to the world.
 - **Idleness is a fact, not a gap.** A node that never wakes leaves no event for the time it did not act — the journal records acts, and the absence of acts is read as an absence of change in the world. The "polite waiting" failure mode of `seed.md` §8 is visible as empty turns (§5.4).
+- **Holding the event loop is the host's job** (deferred to C1.3+): a parked node has no pending handle, so a process that runs one and nothing else exits silently. The watcher deliberately does not unilaterally keep the process up — the kernel's main, with its daemon, PTY and cockpit, is what keeps a perpetual node alive.
 
 ### 5.3 The turn ritual
 
@@ -168,7 +169,8 @@ The turn ritual is a rewriting of dsh's loop (`agent.ts`, 619 lines → ~390 lin
 ### 5.4 The empty turn
 
 - **A turn with no tool call and no filesystem change is still a turn**: it is journaled, like everything else, and it commits nothing. The journal never lies, and an empty turn is not a null — it is the fact of a node that woke and changed nothing.
-- Its events carry the envelope's **`ignorable` marker** (§3): a reader that does not model empty turns may skip them and still rebuild; a reader that does — the context assembler, the metrology — sees them.
+- Its **closer** — the `turn/end` — carries the envelope's **`ignorable` marker** (§3): emptiness is knowable only once the turn has ended, so the closer is the skip unit, and a reader that does not model empty turns may skip it and still rebuild; a reader that does — the context assembler, the metrology — sees it.
+- **The marker is the handler's self-report for now** (deferred to C1.4): the handler says whether it called a tool, and the driver settles the other half from the world. Once the mutation gate journals tool effects, the flag must be derived from the gate's record rather than from a declaration — the same reason fidelity is measured on acts.
 - **The context assembler excludes empty turns from the next wake's context.** A turn that changed nothing produces no diff; exclusion is a property of the projection, never of the record.
 - **Empty turns are a measurable signal**, and the journal is the only place they can be seen: a run of empty turns is "polite waiting" (`seed.md` §8) — a node woken repeatedly by the world and acting on nothing. A change-only record would have erased exactly the phenomenon the measurement is looking for.
 

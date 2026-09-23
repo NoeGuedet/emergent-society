@@ -6,7 +6,7 @@ export abstract class NodeError extends Error {
   }
 }
 
-/** The node's state contract was violated (a second `run()`, a commit while stopping). */
+/** The node's state contract was violated (a `run()` out of order, or a second one). */
 export class NodeStateError extends NodeError {}
 
 /** The configured world directory is `$HOME` or a broad root (kernel.md §7). */
