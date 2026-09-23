@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { describe, expect, it, vi } from 'vitest';
+import { spawn } from 'node:child_process';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { GitCommandError, UnsafeWorldPathError, WorldNotARepoError } from '../errors.js';
 import { WorldRepo } from '../world.js';
 import {
@@ -9,6 +10,39 @@ import {
 } from './helpers.js';
 
 const fixture = useWorld('node-world-');
+
+const delay = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
+
+/** The index lock path of a world repo. */
+function indexLock(world: WorldRepo): string {
+  return join(world.path, '.git', 'index.lock');
+}
+
+/**
+ * A second writer in a second process: the shape of another kernel, or of a
+ * hand at a terminal. It writes and commits in a loop, tolerating a lock the
+ * kernel holds — its files are picked up by a later round or by the kernel's
+ * final commit, which is what "no lost commit" means here.
+ */
+const PEER_SCRIPT = `
+import { execFile } from 'node:child_process';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
+const [dir, uid, rounds] = process.argv.slice(2);
+const email = uid + '@world.local';
+const env = { ...process.env,
+  GIT_AUTHOR_NAME: uid, GIT_AUTHOR_EMAIL: email,
+  GIT_COMMITTER_NAME: uid, GIT_COMMITTER_EMAIL: email };
+const run = (args, options = {}) => new Promise((resolve) => {
+  execFile('git', args, { cwd: dir, ...options }, () => resolve());
+});
+for (let i = 0; i < Number(rounds); i += 1) {
+  await writeFile(join(dir, uid + '-' + i + '.md'), uid + ' ' + i + '\\n');
+  await run(['add', '--all']);
+  await run(['-c', 'commit.gpgsign=false', 'commit', '--no-verify', '--quiet', '-m', uid + ' ' + i], { env });
+}
+`;
 
 describe('the world repo', () => {
   it('starts unborn and holds no commit', async () => {
@@ -23,7 +57,6 @@ describe('the world repo', () => {
     const commit = await world.commitAll('n1', 'turn 0');
     expect(commit).not.toBeNull();
     expect(commit?.author).toBe('n1');
-    expect(commit?.parent).toBeNull();
     expect(await world.headHash()).toBe(commit?.hash);
     expect(await committedPaths(world)).toEqual(['notes/a.md']);
     expect(await committedContent(world, 'notes/a.md')).toBe('hello');
@@ -69,9 +102,9 @@ describe('the world repo', () => {
     const third = await commitAs(world, 'n3', { 'c.txt': 'three' });
 
     expect(await world.commitsSince(null)).toEqual([
-      { hash: first?.hash, author: 'n1', parent: null },
-      { hash: second, author: 'n2', parent: first?.hash },
-      { hash: third, author: 'n3', parent: second },
+      { hash: first?.hash, author: 'n1' },
+      { hash: second, author: 'n2' },
+      { hash: third, author: 'n3' },
     ]);
     // The range is exclusive of the watermark: what HEAD has that it does not.
     expect((await world.commitsSince(first?.hash ?? null)).map((c) => c.author)).toEqual(['n2', 'n3']);
@@ -111,6 +144,107 @@ describe('the world repo', () => {
     expect(await worldLog(world)).toHaveLength(1);
   });
 
+  it('waits out a lock another process holds, and commits once it frees', async () => {
+    const { world } = fixture();
+    await writeWorldFile(world, 'a.txt', 'one');
+    // A peer's turn-end in flight: git refuses to create the index lock.
+    await writeFile(indexLock(world), '');
+    const committing = world.commitAll('n1', 'turn 0');
+    await delay(15);
+    await rm(indexLock(world));
+    const commit = await committing;
+    expect(commit?.author).toBe('n1');
+    expect(await worldLog(world)).toEqual([`${commit?.hash} n1`]);
+  });
+
+  it('reports a lock held past the bounded retries instead of retrying forever', async () => {
+    const { world } = fixture();
+    await writeWorldFile(world, 'a.txt', 'one');
+    await writeFile(indexLock(world), '');
+    await expect(world.commitAll('n1', 'turn 0')).rejects.toThrow(/index\.lock/);
+    await rm(indexLock(world));
+    expect(await world.headHash()).toBeNull();
+  });
+
+  it('names its own commit when another process commits behind it', async () => {
+    const { world } = fixture();
+    await writeWorldFile(world, 'n1/a.md', 'mine');
+    type Loose = { commitsSince(from: string | null): Promise<unknown> };
+    const loose = world as unknown as Loose;
+    const real = loose.commitsSince.bind(world);
+    // A peer commits between our commit and our read of HEAD: the newest commit
+    // is not ours any more. Naming it would join this turn's journal entry to
+    // another node's turn.
+    const spy = vi.spyOn(loose, 'commitsSince').mockImplementation(async (from: string | null) => {
+      await commitAs(world, 'n2', { 'n2/theirs.md': 'theirs' });
+      spy.mockRestore();
+      return real(from);
+    });
+    const commit = await world.commitAll('n1', 'turn 0');
+    expect(commit?.author).toBe('n1');
+    const log = await worldLog(world);
+    expect(log.map((line) => line.split(' ')[1])).toEqual(['n1', 'n2']);
+    expect(log.some((line) => line.startsWith(commit?.hash ?? 'nope'))).toBe(true);
+  });
+
+  it('records no commit when a peer takes the staged tree first', async () => {
+    const { world } = fixture();
+    await writeWorldFile(world, 'n1/a.md', 'mine');
+    type Loose = { nothingStaged(): Promise<boolean> };
+    const loose = world as unknown as Loose;
+    const real = loose.nothingStaged.bind(world);
+    // The peer commits the very tree we staged, between our check and our
+    // commit: `git commit` then exits 1 with an empty stderr.
+    const spy = vi.spyOn(loose, 'nothingStaged').mockImplementation(async () => {
+      const staged = await real();
+      await commitAs(world, 'n2', {});
+      spy.mockRestore();
+      return staged;
+    });
+    expect(await world.commitAll('n1', 'turn 0')).toBeNull();
+    expect((await worldLog(world)).map((line) => line.split(' ')[1])).toEqual(['n2']);
+    // The effect is in the world all the same: attribution is commit-granular
+    // (kernel.md §5.2), and the journal still records that this turn wrote it.
+    expect(await committedContent(world, 'n1/a.md')).toBe('mine');
+  });
+
+  it('survives a second process committing to the same world', async () => {
+    const { world } = fixture();
+    const script = join(dirname(world.path), 'peer.mjs');
+    await writeFile(script, PEER_SCRIPT);
+    const peer = spawn(process.execPath, [script, world.path, 'peer', '30'], { stdio: 'ignore' });
+    const exited = new Promise<void>((resolvePromise) => { peer.on('exit', () => resolvePromise()); });
+
+    // Ten turns' worth of commits, racing the peer for the index and the ref.
+    const mine: { hash: string; author: string }[] = [];
+    for (let i = 0; i < 10; i += 1) {
+      await writeWorldFile(world, `n1/${i}.md`, String(i));
+      const commit = await world.commitAll('n1', `turn ${i}`);
+      if (commit !== null) mine.push(commit);
+    }
+    await exited;
+    // Whatever the peer left staged is still the world's: the kernel's own
+    // commit picks it up rather than leaving it unattributed.
+    await world.commitAll('n1', 'final');
+
+    // No death, and never a foreign hash: every commit this node named is one it
+    // authored, and every commit it named is really in the world's history.
+    expect(mine.length).toBeGreaterThan(0);
+    const history = await worldLog(world);
+    const hashes = new Set(history.map((line) => line.split(' ')[0]));
+    for (const commit of mine) {
+      expect(commit.author).toBe('n1');
+      expect(hashes.has(commit.hash)).toBe(true);
+    }
+    expect(history.every((line) => line.endsWith(' n1') || line.endsWith(' peer'))).toBe(true);
+
+    // No lost commit: every file either writer produced is in HEAD's tree.
+    const tree = new Set((await gitIn(world.path, ['ls-tree', '-r', '--name-only', 'HEAD']))
+      .split('\n').filter((line) => line !== ''));
+    for (let i = 0; i < 10; i += 1) expect(tree.has(`n1/${i}.md`)).toBe(true);
+    for (let i = 0; i < 30; i += 1) expect(tree.has(`peer-${i}.md`)).toBe(true);
+  }, 30_000);
+
   it('surfaces a git failure as a typed error', async () => {
     const { world } = fixture();
     await writeWorldFile(world, 'a.txt', 'one');
@@ -131,10 +265,41 @@ describe('the world repo', () => {
     await rm(plain, { recursive: true, force: true });
   });
 
+  it('reports a missing world directory in the node error family', async () => {
+    const absent = join(tmpdir(), `node-absent-${process.pid}-${Date.now()}`);
+    await expect(WorldRepo.open(absent)).rejects.toBeInstanceOf(WorldNotARepoError);
+    await expect(WorldRepo.init(absent)).resolves.toBeInstanceOf(WorldRepo);
+    await rm(absent, { recursive: true, force: true });
+  });
+
   it('refuses $HOME and a broad root as the world', async () => {
     await expect(WorldRepo.open(homedir())).rejects.toBeInstanceOf(UnsafeWorldPathError);
     await expect(WorldRepo.open('/')).rejects.toBeInstanceOf(UnsafeWorldPathError);
     await expect(WorldRepo.open(tmpdir())).rejects.toBeInstanceOf(UnsafeWorldPathError);
+  });
+
+  it('refuses a symlink that resolves to $HOME, before anything is written', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'node-link-'));
+    const link = join(root, 'world');
+    await symlink(homedir(), link);
+    // The safeguard is about the directory the kernel would really commit, not
+    // about the string it was handed: `init` must refuse before `git init`.
+    await expect(WorldRepo.open(link)).rejects.toBeInstanceOf(UnsafeWorldPathError);
+    await expect(WorldRepo.init(link)).rejects.toBeInstanceOf(UnsafeWorldPathError);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('follows a symlink to a dedicated directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'node-link-'));
+    const target = join(root, 'real-world');
+    await WorldRepo.init(target);
+    const link = join(root, 'linked-world');
+    await symlink(target, link);
+    const world = await WorldRepo.open(link);
+    // The repo is addressed by its canonical path, which is also the key the
+    // commit queue and the watcher are shared by.
+    expect(world.path).toBe(await realpath(target));
+    await rm(root, { recursive: true, force: true });
   });
 
   it('initializes a repo with the untracked cache enabled', async () => {
