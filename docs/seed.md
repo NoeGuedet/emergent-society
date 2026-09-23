@@ -65,6 +65,8 @@ Five effective tools, the empirical cap (~5) respected.
 
 **Communication is a file.** No tool carries a message between nodes: the kernel provides no transport, and a node reaches another by writing in the world, which the kernel commits at the end of its turn (author = its uid) and which wakes every node that did not author it (`kernel.md` §5). Whatever protocol the society invents — addressing, threading, a bulletin board, a mailbox implemented as a directory — is an agent production, measured like any other organ.
 
+**`speak` is the single sanctioned exception**: the human channel travels as a tool rather than as a file, and agent zero alone holds it (`direction.md` §1).
+
 **`spawn` is not a seed tool**: it lives in the kernel, not mounted, **discoverable by introspection** via `extend → inspect`. Its first use is a dated event — the founding observable of checkpoint C3.
 
 **Self-extension model** (taken from DeepSeek Harness): Plugin → **immutable Packages** → Runs. The immutable version is persisted; on the agent side, the Package survives a restart while the Run is in memory.
