@@ -37,6 +37,14 @@ Implementation phase, no product yet: the design is settled and the kernel is be
 | [Research corpus](docs/research/) | State of the art, metrics, devil's advocate, harness internals deep-dive, monitoring architecture |
 | [Roadmap](ROADMAP.md) | Where we stand and what's next |
 
+## Acknowledgments
+
+This project reimplements its inspirations from scratch and owes them its foundations:
+
+- **[Cordis](https://github.com/cordiverse/cordis)** (by Shigma, from the Koishi ecosystem) — the reversible-effects runtime behind our mutation gate and the self-similar node primitive (the Γ recursion), formalized in *[A Programming Paradigm for Spatiotemporal Composability](https://arxiv.org/abs/2608.25512)* (PKU + DeepSeek).
+- **[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)** (MIT, DeepSeek) — the journal-as-only-truth pattern and its "model-visible means logged" invariant, the Plugin → immutable Packages → Runs self-extension model, the compaction protocol, the persistent shell behind a Landlock sandbox, and the escalating kill switch. Our internals are analyzed in [`docs/research/harness-deep-dive.md`](docs/research/harness-deep-dive.md).
+- **[Graphify](https://github.com/Graphify-Labs/graphify)** (Graphify Labs) — the architectural inspiration for our monitoring pipeline: graph schema, EXTRACTED/INFERRED edge honesty, incremental content-hash cache. A validation spike motivated our custom three-layer pipeline; the numbers and the credit are in [`docs/research/monitoring-architecture.md`](docs/research/monitoring-architecture.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
