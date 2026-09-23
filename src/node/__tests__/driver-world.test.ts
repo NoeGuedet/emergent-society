@@ -266,7 +266,7 @@ describe('two nodes on one world', () => {
     expect(await committedContent(world, 'n1/file.md')).toBe('n1');
     expect(await committedContent(world, 'n2/file.md')).toBe('n2');
     // Every hash a journal claims is a commit of the world, and every commit is
-    // authored by the node whose turn closed it.
+    // authored by one of the two nodes — whoever won the race for the tree.
     const hashes = new Set(history.map((line) => line.split(' ')[0]));
     for (const uid of ['n1', 'n2']) {
       const ends = (await readNode(home, uid)).filter((e) => e.type === 'turn/end');
@@ -276,7 +276,9 @@ describe('two nodes on one world', () => {
         if (commit !== undefined) expect(hashes.has(commit)).toBe(true);
       }
     }
-    expect(history.some((line) => line.endsWith(' n1'))).toBe(true);
+    const authors = history.map((line) => line.split(' ')[1]);
+    expect(authors.every((author) => author === 'n1' || author === 'n2')).toBe(true);
+    expect(new Set(authors).size).toBe(authors.length);
   });
 
   it('wakes the peer when one node commits', async () => {
