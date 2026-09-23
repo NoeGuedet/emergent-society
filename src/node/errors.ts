@@ -29,3 +29,29 @@ export class MessageTooLargeError extends NodeError {
     super(`message body of ${bytes} bytes meets or exceeds the ${limit}-byte lossless bound`);
   }
 }
+
+/** The configured world directory is `$HOME` or a broad root (kernel.md §7). */
+export class UnsafeWorldPathError extends NodeError {
+  constructor(public readonly path: string) {
+    super(`refusing ${path} as the world repo: the world is a dedicated directory`);
+  }
+}
+
+/** The configured world directory is not the root of a git repository. */
+export class WorldNotARepoError extends NodeError {
+  constructor(public readonly path: string) {
+    super(`${path} is not the root of a git repository`);
+  }
+}
+
+/** A git invocation against the world failed. */
+export class GitCommandError extends NodeError {
+  constructor(
+    public readonly args: readonly string[],
+    public readonly exitCode: number | null,
+    public readonly stderr: string,
+  ) {
+    const exit = exitCode !== null ? ` (exit ${exitCode})` : '';
+    super(`git ${args.join(' ')} failed${exit}: ${stderr.trim()}`);
+  }
+}
