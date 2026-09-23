@@ -36,11 +36,8 @@ export interface TurnResult {
   /**
    * Whether the turn invoked at least one tool. It is the half of the
    * empty-turn rule (kernel.md §5.4) the driver cannot observe by itself; the
-   * other half is whether the turn's commit changed anything.
-   *
-   * Deferred (C1.4): this is the handler's self-report until the mutation gate
-   * journals tool effects. The `ignorable` flag must then be derived from the
-   * gate's record instead of a declaration — fidelity is measured on acts.
+   * other half is whether the turn's commit changed anything. Deferred to C1.4:
+   * the flag must come from the mutation gate's record, not from a declaration.
    */
   readonly toolCalls: boolean;
 }
@@ -232,18 +229,14 @@ export class NodeDriver {
       }
     } catch (err) {
       failure = err;
-      // The loop died outside the handler's contract (a failed flush barrier, a
-      // maintenance hook that rejected, a git failure on the turn's commit) — an
-      // error the caller never asked for. A reason set by the handler's own turn
-      // must not be overwritten, so the check is by value: only a still-default
-      // 'stop-requested' is relabelled. Adjudicated: an explicit stop() carrying
-      // the default reason shares that value, so a death after one is relabelled
-      // here too — accepted, since a stop WAS requested and the error still
-      // reaches the caller. One path does keep the plain label: an explicit
-      // stop() whose loop exits cleanly keeps 'stop-requested' (and journals no
-      // `error` field, the run having failed nowhere) when closing the writer
-      // then fails — run() rejects with that close error, the failure shutdown()
-      // returns rather than the append's.
+      // The loop died outside the handler's contract — a failed barrier, a
+      // maintenance hook that rejected, a git failure on the turn's commit — so
+      // the run's reason becomes 'driver-error' unless the handler's own turn
+      // already set one. The check is by value, so an explicit stop() (which
+      // carries the same default) is relabelled too: accepted, since a stop WAS
+      // requested and the error still reaches the caller. A clean stop keeps the
+      // plain label and journals no `error` field, the run having failed
+      // nowhere.
       if (this.stopReason === 'stop-requested') this.stopReason = 'driver-error';
     }
     const shutdownFailure = await this.shutdown(failure);
@@ -260,10 +253,9 @@ export class NodeDriver {
    * wait returns at once instead of parking on a wake that already happened.
    *
    * Each park is an epoch. An evaluation started under one park can resolve
-   * after that park has ended — it read the predicate's input before its git
-   * call, so its verdict is stale by then — and the latch it would arm would be
-   * the *next* park's: the node would wake on an unmoved world with a `wakeup`
-   * trigger it cannot justify. The epoch is what forbids it.
+   * after it ended — it read the predicate's input before its git call, so its
+   * verdict is stale — and would then arm the *next* park's latch: a `wakeup`
+   * turn on an unmoved world. The epoch is what forbids it.
    */
   private async park(): Promise<void> {
     this.parkEpoch += 1;
@@ -373,11 +365,10 @@ export class NodeDriver {
    * The one shutdown path: mark the stop, journal the reason, release the
    * writer, and land in `stopped` no matter which step failed.
    *
-   * The run's `prior` failure is journaled with the shutdown and outranks any
-   * error these steps raise: the append can fail (poisoned writer, recorded
-   * write-behind failure) and so can close(), and neither may displace the
-   * error that actually ended the run. The step errors are still returned so a
-   * clean run is told about them — the caller keeps whichever it holds first.
+   * The run's `prior` failure outranks any error these steps raise — the append
+   * can fail (poisoned writer, recorded write-behind failure) and so can
+   * close(), and neither may displace the error that ended the run. Step errors
+   * are still returned, so a clean run is told about them.
    *
    * @param prior the error that ended the run, or null on a clean stop.
    * @returns the first shutdown-step error, or null when both steps succeeded.
