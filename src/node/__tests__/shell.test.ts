@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { canonicalizeJson } from '../../journal/index.js';
 import {
-  DEFAULT_SHELL_ENV, renderShellText, runShell, shellArtifactBytes, shellFailure,
-  shellIsError, shellWrapper,
+  DEFAULT_SHELL_ENV, DRAIN_NOTICE, renderShellText, runShell, shellArtifactBytes,
+  shellFailure, shellIsError, shellWrapper,
 } from '../tools/shell.js';
 import type { ShellPolicy, ShellResult } from '../tools/shell.js';
 
@@ -172,6 +172,8 @@ describe('runShell: real shell fixtures', () => {
     expect(result.drainExpired).toBe(true);
     expect(result.truncated).toBe(true);
     expect(shellIsError(result)).toBe(true);
+    // The model-visible text states the escapee was not killed (no containment claim).
+    expect(renderShellText(result)).toContain(DRAIN_NOTICE);
 
     const pid = await readPid(pidFile);
     escapedPids.push(pid);
@@ -269,5 +271,14 @@ describe('runShell: failure classification and precedence', () => {
     expect(shellIsError(shellResult({ drainExpired: true, truncated: true }))).toBe(true);
     expect(shellFailure(shellResult({ drainExpired: true, truncated: true })))
       .toEqual({ code: 'output-limit', status: null });
+  });
+
+  it('emits the escaped-descendant not-killed notice only on drain expiry', () => {
+    expect(renderShellText(shellResult({ drainExpired: true, truncated: true })))
+      .toContain(DRAIN_NOTICE);
+    expect(renderShellText(shellResult({ truncated: true }))).not.toContain(DRAIN_NOTICE);
+    expect(renderShellText(shellResult({ timedOut: true }))).not.toContain(DRAIN_NOTICE);
+    expect(renderShellText(shellResult({ cancelled: true }))).not.toContain(DRAIN_NOTICE);
+    expect(renderShellText(shellResult())).not.toContain(DRAIN_NOTICE);
   });
 });

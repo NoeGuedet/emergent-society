@@ -102,6 +102,14 @@ function decodeUtf8(bytes: Uint8Array): string {
   return new TextDecoder('utf-8').decode(bytes);
 }
 
+/**
+ * The fixed notice appended when a descendant escaped the process group and the
+ * drain deadline expired: the shell did not kill it, so its output is incomplete
+ * and no containment is claimed.
+ */
+export const DRAIN_NOTICE =
+  'note: a descendant escaped the process group and was not killed; its output is incomplete';
+
 /** Fixed status/channel labels over the decoded channels. */
 export function renderShellText(result: ShellResult): string {
   const exitCode = result.exitCode === null ? 'null' : String(result.exitCode);
@@ -112,6 +120,7 @@ export function renderShellText(result: ShellResult): string {
     `timedOut ${result.timedOut} truncated ${result.truncated} `
       + `spawnFailed ${result.spawnFailed} cancelled ${result.cancelled} `
       + `drainExpired ${result.drainExpired}`,
+    ...(result.drainExpired ? [DRAIN_NOTICE] : []),
     'stdout:',
     decodeUtf8(result.stdout),
     'stderr:',

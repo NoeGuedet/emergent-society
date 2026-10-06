@@ -12,7 +12,7 @@ import { defaultAgentConfig } from '../../context/config.js';
 import { createBoundaryGate } from '../gate.js';
 import type { BoundaryGate, GateCallbacks, GateScope } from '../gate.js';
 import { dispatchCalls } from '../tools/dispatch.js';
-import { DEFAULT_SHELL_ENV } from '../tools/shell.js';
+import { DEFAULT_SHELL_ENV, DRAIN_NOTICE } from '../tools/shell.js';
 import type { ShellPolicy } from '../tools/shell.js';
 import { useWorld } from './helpers.js';
 import type {
@@ -122,6 +122,13 @@ async function wrapperOf(home: string): Promise<Record<string, unknown>> {
   return JSON.parse(Buffer.from(bytes).toString('utf8')) as Record<string, unknown>;
 }
 
+/** The `complete` flag of the first artifact's manifest. */
+async function artifactComplete(home: string): Promise<boolean> {
+  const durable = await events(home);
+  const end = ofType(durable, 'artifact/end')[0]!.data as unknown as { complete: boolean };
+  return end.complete;
+}
+
 /** Flush-proxy: fail the Nth `gate.flush` call, binding the rest to the target. */
 function flushFaultGate(gate: BoundaryGate, failOnCall: number): BoundaryGate {
   let flushes = 0;
@@ -161,6 +168,9 @@ describe('dispatchCalls: execute', () => {
       expect(data.message.tool_call_id).toBe('c1');
       const parsed = await wrapperOf(home);
       expect(parsed['exitCode']).toBe(0);
+      // A normal capture is complete, on the ref and on its manifest.
+      expect(data.raw!.complete).toBe(true);
+      expect(await artifactComplete(home)).toBe(true);
     } finally {
       await s.shutdown();
     }
@@ -182,14 +192,17 @@ describe('dispatchCalls: execute', () => {
     }
   }, 15000);
 
-  it('bounds the model-visible tool text and names the captured artifact', async () => {
+  it('bounds the model-visible tool text and marks an over-limit capture incomplete', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
     try {
       const policy = { ...defaultAgentConfig().policy, maxToolResultBytes: 256 };
       const proj = projection([call('c1', 'execute',
         JSON.stringify({ cmd: 'head -c 100000 /dev/zero | base64 -w 0' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config({ policy }), shellPolicy());
+      // A small shell capture cap forces the shell itself to truncate, so the
+      // raw artifact wrapper is an incomplete captured prefix.
+      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config({ policy }),
+        shellPolicy({ maxCaptureBytes: 1024 }));
       const data = await firstResult(home);
       expect(Buffer.byteLength(data.message.content, 'utf8')).toBeGreaterThan(256);
       const raw = data.raw!;
@@ -197,7 +210,35 @@ describe('dispatchCalls: execute', () => {
         `\\n\\[output truncated: showing (\\d+) of ${raw.bytes} bytes; raw sha256 ${raw.sha256}\\]$`,
       );
       expect(notice.test(data.message.content)).toBe(true);
+      // An over-limit capture is incomplete, on the ref and on its manifest.
+      expect(raw.complete).toBe(false);
+      expect(await artifactComplete(home)).toBe(false);
     } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('records complete=false plus the not-killed notice for drain expiry', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    const pidFile = join(repo.path, 'escaped.pid');
+    try {
+      const cmd = "setsid sh -c 'echo $$ > escaped.pid; sleep 30' & "
+        + 'until [ -s escaped.pid ]; do sleep 0.01; done';
+      const proj = projection([call('c1', 'execute', JSON.stringify({ cmd }))]);
+      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config(),
+        shellPolicy({ timeoutMs: 5000, drainDeadlineMs: 100 }));
+      expect(result).toEqual({ waited: false, called: 1 });
+
+      const data = await firstResult(home);
+      expect((await wrapperOf(home))['drainExpired']).toBe(true);
+      expect(data.raw!.complete).toBe(false);
+      expect(await artifactComplete(home)).toBe(false);
+      // The model-visible text states the escaped child was not killed.
+      expect(data.message.content).toContain(DRAIN_NOTICE);
+    } finally {
+      const pid = Number((await readFile(pidFile, 'utf8').catch(() => '0')).trim());
+      if (pid > 0) { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
       await s.shutdown();
     }
   }, 15000);
