@@ -20,13 +20,14 @@ describe('the HEAD watcher', () => {
     expect(HeadWatcher.for(world, 999)).toBe(HeadWatcher.for(world));
   });
 
-  it('notifies a listener when HEAD moved, and only then', async () => {
+  it('announces the first read, then notifies only when HEAD moved', async () => {
     const { world } = fixture();
     const watcher = HeadWatcher.for(world);
     let calls = 0;
     watcher.subscribe(() => { calls += 1; });
 
-    // No movement: the first read establishes HEAD, the second sees it unmoved.
+    // The first read has no prior HEAD, so it announces the value it finds;
+    // the second sees HEAD unmoved and stays silent.
     await watcher.check();
     await watcher.check();
     expect(calls).toBe(1);
@@ -151,9 +152,19 @@ describe('the HEAD watcher', () => {
     const unsubscribe = watcher.subscribe(listener);
     try {
       await watcher.check();
+      // The first read has no prior HEAD to compare against, so it announces
+      // the value it finds: that initial notification is not this test's
+      // subject, so clear it before watching for the interval's.
+      expect(listener).toHaveBeenCalledTimes(1);
+      listener.mockClear();
       // No poke at all: this is the human's commit, or another process's.
       await commitAs(world, 'human', { 'a.txt': 'from outside' });
       await vi.waitFor(() => expect(listener).toHaveBeenCalledTimes(1), { timeout: 2000 });
+      // waitFor only proves the count at one instant. Read HEAD again: it is
+      // now unmoved, so a deterministic unchanged read must stay silent and
+      // the count must hold — no extra notification is waiting behind it.
+      await watcher.check();
+      expect(listener).toHaveBeenCalledTimes(1);
     } finally {
       // Leaving the last subscriber in place would keep this world's interval
       // ticking into the next test.
