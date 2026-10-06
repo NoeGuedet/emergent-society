@@ -322,6 +322,7 @@ export class ProviderAdapter {
     if (!retryable || attempt + 1 >= policy.maxAttempts) return 'stop';
     gate.append('assistant/attempt', { id, attempt, failure, terminal: false });
     await gate.flush();
+    if (gate.signal.aborted) return 'stop';
     try {
       await this.policy.delay(policy.retryDelayMs, gate.signal);
     } catch {

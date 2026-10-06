@@ -527,6 +527,7 @@ describe('ProviderAdapter: transport failures', () => {
     ]);
     const adapter = new ProviderAdapter(transport, policies({
       delay: (_ms, signal) => new Promise<void>((_resolve, reject) => {
+        if (signal.aborted) { reject(new Error('cancelled')); return; }
         signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
       }),
     }));
@@ -538,6 +539,50 @@ describe('ProviderAdapter: transport failures', () => {
         expect(ofType(await events(), 'assistant/attempt')).toHaveLength(1);
       });
       session.controller.abort();
+      const result = await sending;
+      expect(result).toEqual({ kind: 'failure', failure: { code: 'cancelled', status: null } });
+      expect(transport.sends).toBe(1);
+      expect(ofType(await events(), 'request/wire')).toHaveLength(1);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('stops when the abort lands before the retry delay registers', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([
+      { status: 500, body: Buffer.from('{}'), complete: true, failure: null },
+      transportResult(validBody()),
+    ]);
+    // A listener-only delay (the original flake): if the abort already fired at
+    // entry, the listener never fires and the send never settles.
+    const adapter = new ProviderAdapter(transport, policies({
+      delay: (_ms, signal) => new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
+      }),
+    }));
+    // Abort the gate during the non-terminal attempt's flush, i.e. in the
+    // window between that flush resolving and the retry delay being entered.
+    const inner = session.gate('turn', 0);
+    let armed = false;
+    const guarded: BoundaryGate = {
+      get signal() { return inner.signal; },
+      append: (type, data) => {
+        if (type === 'assistant/attempt') armed = true;
+        return inner.append(type, data);
+      },
+      flush: async () => {
+        await inner.flush();
+        if (armed && !session.controller.signal.aborted) {
+          armed = false;
+          session.controller.abort();
+        }
+      },
+      capture: (bytes, encoding, complete) => inner.capture(bytes, encoding, complete),
+      store: (value) => inner.store(value),
+    };
+    try {
+      const sending = adapter.send(plan({ policy: seedPolicy({ maxAttempts: 2 }) }), guarded);
       const result = await sending;
       expect(result).toEqual({ kind: 'failure', failure: { code: 'cancelled', status: null } });
       expect(transport.sends).toBe(1);
