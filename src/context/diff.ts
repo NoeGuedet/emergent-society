@@ -76,10 +76,14 @@ export async function presentWorld(
     work += size;
     return true;
   };
+  // A deterministic LF precedes every notice, so a notice never glues onto
+  // already-captured patch bytes that were cut mid-line. The separator is an
+  // emitted byte and is counted inside maxBytes (against the tail reserve).
   const appendNotice = (text: string): void => {
-    const size = byteLength(text);
+    const chunk = `\n${text}`;
+    const size = byteLength(chunk);
     if (notices + size > TAIL_RESERVE) return;
-    parts.push(text);
+    parts.push(chunk);
     notices += size;
   };
 

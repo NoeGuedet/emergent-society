@@ -309,3 +309,39 @@ async function fastImportCommits(worldPath: string, count: number): Promise<void
     child.stdin.end(chunks.join(''));
   });
 }
+
+describe('presentWorld notice byte grammar', () => {
+  it('precedes a truncated-patch notice with an LF so it starts its own line', async () => {
+    const { world } = fixture();
+    // A single unterminated line guarantees the bounded patch is cut mid-line.
+    const c1 = await commitAs(world, 'n2', { 'big.txt': 'x'.repeat(100_000) });
+    const p = await presentWorld(world, 'n1', { from: null, to: c1 }, 4096, 4096);
+    expect(p.truncated).toBe(true);
+    // The patch is cut mid-line; the notice must begin with a deterministic LF
+    // and end with one, never gluing onto the cut patch tail.
+    expect(p.text).toMatch(/\npatch truncated after \d+ bytes\n/);
+    const noticeAt = p.text.indexOf('patch truncated after');
+    expect(p.text[noticeAt - 1]).toBe('\n');
+  });
+
+  it('precedes the aggregate omission notice with an LF', async () => {
+    const { world } = fixture();
+    const hashes: string[] = [];
+    for (let i = 0; i < 10; i += 1) {
+      hashes.push(await commitAs(world, 'n2', { [`f${i}.txt`]: 'y'.repeat(400) }));
+    }
+    const p = await presentWorld(world, 'n1', { from: null, to: hashes.at(-1) ?? null }, 512, 4096);
+    expect(p.text).toContain(AGGREGATE);
+    expect(p.text).toMatch(/\nrendering truncated; remaining selected commits not shown\n/);
+    const at = p.text.indexOf('rendering truncated');
+    expect(p.text[at - 1]).toBe('\n');
+  });
+
+  it('places each preamble notice on its own LF-terminated line', async () => {
+    const { world } = fixture();
+    const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
+    const p = await presentWorld(world, 'n1', { from: MISSING, to: c1 }, 4096, 4096);
+    expect(p.text.startsWith('fallback: from unreachable; full history shown\n')).toBe(true);
+    expect(p.text).toContain('\ncommit ');
+  });
+});
