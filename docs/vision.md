@@ -51,9 +51,9 @@ A preliminary exploration conversation provided the architectural reasoning reta
 There are two memories of different kinds, and the immutable/emergent boundary runs between them.
 
 1. **The observed memory (the instrument) = the journal.** Wired directly at the level of the LLM API calls (Langfuse-style): everything is captured, analyzed and ratified. The trace is therefore *physical* — it exists because the system acted, not because an agent declared it acted. This is the "model-visible means logged" invariant of dsh-session. Immutable, append-only, out of the agents' reach. The 3 sensors + the metronome live on this side.
-2. **The useful memory (theirs) = emergent.** Knowledge base or anything else: used and managed by the agents, it **emerges on its own** and is not designed. Its organization is experiment data (is a librarian observed? rot? memory rituals?). Its *content* belongs to the agents, but its *usage* remains entirely visible in the journal — every read and write goes through a traced call — giving observability without control.
+2. **The useful memory (theirs) = emergent.** Knowledge base or anything else: used and managed by the agents, it **emerges on its own** and is not designed. Its organization is experiment data (is a librarian observed? rot? memory rituals?). Its *content* belongs to the agents, but its *usage* remains visible in the journal through the journaled tool invocations and raw boundary events that record its effects — those **recorded effects**, not an exhaustive syscall-level or per-file-access trace — giving observability without control.
 
-The journal is layer 1 (physical); the useful memory is layer 3 (emergent), even though the kernel ships a minimal "private memory" tool in the starter kit. The cold-start constraint — what the seed must contain to become a tree without drawing the tree in advance — is specified in [seed.md](seed.md).
+The journal is layer 1 (physical); the useful memory is layer 3 (emergent). No managed memory mechanism is provided — no kernel-side "private memory" tool: [seed.md](seed.md) gives the agents the raw filesystem means, and any memory they build emerges on its own. The cold-start constraint — what the seed must contain to become a tree without drawing the tree in advance — is specified in [seed.md](seed.md).
 
 ## 6. The monitoring instrument
 

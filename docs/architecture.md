@@ -2,9 +2,9 @@
 
 This document is the **map between the concepts and the code**. It is the entry point for anyone who wants to understand how the software actually works before reading it: what the pieces are, how they relate, and where each concept of the design lives in the implementation. It stays deliberately **macro** — the micro level (every parameter, every error path) is the codebase's job, and the code is written to be read.
 
-The rest of the corpus answers different questions: [vision.md](vision.md) says *why* the project exists and *what* it demonstrates; [seed.md](seed.md) and [direction.md](direction.md) specify the cold start and the co-negotiated direction; [kernel.md](kernel.md) is the authoritative technical spec, written *before* the code, with the rejected alternatives; [research/](research/) holds the evidence base; [plans/](plans/) are the per-checkpoint construction logs. This document is the one that goes **from the running code back up to the concepts** — it is maintained at each checkpoint closure, because the code is hardened beyond what the plans sketched, and the plans are journals, not maps.
+The rest of the corpus answers different questions: [vision.md](vision.md) says *why* the project exists and *what* it demonstrates; [seed.md](seed.md) and [direction.md](direction.md) specify the cold start and the co-negotiated direction; [kernel.md](kernel.md) is the authoritative technical spec, written *before* the code, with the rejected alternatives; [research/](research/) holds the evidence base; the per-checkpoint construction plans live in `docs/plans/` — a local, git-ignored working directory that is intentionally not published. This document is the one that goes **from the running code back up to the concepts** — it is maintained at each checkpoint closure, because the code is hardened beyond what the plans sketched, and the plans are journals, not maps.
 
-Scope as of today: **C1.1 (the journal) and C1.2 (the node driver) are implemented and tested.** Everything beyond them is drawn here in dotted lines, as specified but not yet built.
+Scope as of today: **C1.1 (the journal) and C1.2 (the node driver) are implemented and tested.** Everything beyond them is drawn here in dotted lines, as specified but not yet built. There is no CLI, main process or running product yet — the implemented surface is the library source, not a launchable kernel.
 
 ---
 
@@ -119,7 +119,7 @@ How to read this map:
 - **The driver is the writer's only client.** The handler (the future assembler/LLM side) gets a narrow `TurnContext` — no journal, no commit. That is the guarantee that *only the kernel emits*.
 - **The driver also owns the world**: every turn ends in a commit → HEAD moves → the shared watcher (one per world) announces the movement → each parked node evaluates *its own* predicate (a commit I did not author?) → its latch wakes it.
 - **`verify.ts` is the meeting point** between write and read: the writer's `resume()` replays exactly the rules the reader applies — a log valid for one is valid for the other.
-- **On disk, one file truly matters**: `journal.v0.jsonl.zstd`. The head and the lock are disposable; blobs are shared across nodes (content addressing makes that safe); the world's git history is the second truth.
+- **On disk, the canonical records are the journal, the payload blobs it references, and the world's git history**: `journal.v0.jsonl.zstd` plus `blobs/…`. The head, the lock, the SQLite index and the projection snapshots are disposable; the blob store is not — it carries the original payloads the log only references, and is shared across nodes (content addressing makes that safe). The world's git history is the second truth, joined to the journal by the commit hash in `turn/end`.
 
 ---
 
@@ -209,11 +209,11 @@ The module's philosophy, everywhere: **refuse rather than guess** — unknown ve
 
 ### 3.3 Claim-check blobs
 
-A payload at or past 16 KiB of canonical bytes leaves the log: the event's `data` becomes a reference `{blob, size}` (plus `truncated: true` past 4 MiB — the loss is explicit), and the canonical bytes go to the blob store. The chain hashes the *reference*, so verification never needs the content; resolution happens afterwards, only when a reader asks (`resolveBlobs`).
+A payload at or past 16 KiB of canonical bytes leaves the log: the event's `data` becomes a reference `{blob, size}` (plus `truncated: true` past 4 MiB — the loss is explicit), and the canonical bytes go to the blob store. The chain hashes the *reference*, so verification of the log never needs the content; resolution happens afterwards, only when a reader asks (`resolveBlobs`). The chain's hash therefore covers the reference, **not the blob's bytes**: the current reader resolves a blob without re-hashing it. Automatic digest-and-size verification of every resolved blob is planned for C1.3's verified loader, not implemented today.
 
 The store is plain files under `blobs/<2 hex>/<sha256>`, **shared across all nodes**:
 
-- **Content addressing** — the file name *is* the content's SHA-256: deduplication is free (a repeated payload is stored once), integrity is free (re-hash and compare to the name), and sharing across nodes is safe.
+- **Content addressing** — the file name *is* the content's SHA-256: deduplication is free (a repeated payload is stored once), a blob's integrity is checkable by re-hashing against the name, and sharing across nodes is safe. The write path is content-addressed; the current read path does not perform that check automatically, which is why C1.3 adds a verified loader.
 - **Atomic writes** — temp file, fsync, rename: a crash cannot leave a torn blob under a trusted name.
 - **Blobs before events** — the flush drains pending blobs *before* writing the frame that references them; a blob failure counts in the same poison streak as a log failure.
 
@@ -245,7 +245,7 @@ Four event types only: `node/boot`, `node/shutdown`, `turn/start`, `turn/end`. A
 
 ### 4.2 Wake-on-change
 
-The watcher monitors the world's git **HEAD**, not the filesystem: no inotify, no partial-write races, nothing to debounce — HEAD moves exactly once per turn, at a kernel-controlled point. It announces *movement*, not *waking*: deciding whether a movement concerns a given node is that node's predicate.
+The watcher monitors the world's git **HEAD**, not the filesystem: no inotify, no partial-write races, nothing to debounce — HEAD moves exactly once per turn, at a kernel-controlled point. It announces *movement*, not *waking*: deciding whether a movement concerns a given node is that node's predicate. Its first read announces the HEAD it finds (including an unborn HEAD) to set a baseline; later reads announce only a change.
 
 ```mermaid
 flowchart LR
@@ -277,7 +277,7 @@ The design's load-bearing boundary (`kernel.md` §1.6, §5.5):
 | **Mechanism (physics)** — journal + hash chain, mutation gate, watcher, commit-per-turn, turn ritual, kill switch, sandbox, budget ceiling | the kernel | **No** — an organism that could rewrite these could rewrite the measurement apparatus |
 | **Policy (phenotype)** — when to wake, what enters the context, what is retained, loop/compaction policies, tools, instincts | behavior Packages (C1.5) | **Yes** — via `extend`, and every policy change is itself a journaled decision |
 
-Everything already implemented is mechanism. The first policy arrives with C1.3 (the assembler decides what the wake's diff presents — replaceable by the organism, journaled when replaced).
+Everything already implemented is mechanism. The first policy arrives with C1.3: the assembler decides what the wake's diff presents, but that policy lands in trusted kernel-side handlers, not yet as a replaceable behavior Package. Organism replaceability — loop, context and compaction policies shipping as Packages through `extend` — arrives with C1.5; until then every policy change is a journaled kernel-side decision, not an organism-rewritable one.
 
 ---
 
@@ -290,7 +290,7 @@ Implemented and tested:
 
 Next, in the order of `kernel.md` §10:
 
-- **C1.3** — context assembler (perception = the world's diff since last wake; byte-stable prefix `[tools, charter, heading]` for provider cache; empty-turn exclusion) + provider adapter + raw shell + snapshot hook.
+- **C1.3** — context assembler (perception = the world's diff since last wake; byte-stable prefix `[tools, charter, heading]` for provider cache; empty-turn exclusion; pinned heading and compaction over durable surface groups; full-history fold and recovery) + provider adapter (raw response journaled before projection; one canonical, non-streaming wire) + raw shell tool (experimental and not yet confined — C1.4 adds Landlock/PTY) + disposable snapshot storage (no snapshot-accelerated boot yet). The gate and its verified claim-check loader are trusted kernel-side code, not a replaceable Package.
 - **C1.4** — tools: `execute` (persistent PTY under a Landlock sandbox — the API key physically unreadable from the agent's shell), `speak`, `web_search`/`web_fetch`, and the **credential broker** (named providers held kernel-side, endpoint-bound placeholders substituted at the gate — third-party APIs without any secret entering the world).
 - **C1.5** — `extend`: Plugin → immutable Packages → Runs, persisted by journal replay, executed in `node:vm` behind a restricted facade.
 - **C1.6** — agent zero (root custody node, sole holder of the human channel, direction drafting) + chat + the disposable SQLite index and projections.
@@ -303,7 +303,7 @@ Next, in the order of `kernel.md` §10:
 
 | Concept | Where it lives |
 |---|---|
-| "The journal is the only truth" | all of `src/journal/`; head and blobs disposable, only the log counts |
+| "The journal is the only truth" | all of `src/journal/`; head, lock, SQLite index and snapshots disposable — the hash-chained log and the payload blobs it references are the canonical record |
 | Append-only / hash chain | `src/journal/envelope.ts` (`computeHash`, `makeEvent`, `verifyEvent`) |
 | Canonical bytes | `src/journal/canon.ts` (RFC 8785, refuse lossy values) |
 | "Model-visible means logged" | `flush()` barrier in `writer.ts`, called at `turn/start`/`turn/end` in `driver.ts` |

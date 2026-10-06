@@ -2,7 +2,7 @@
 
 **A research harness for observing the emergence of multi-agent LLM societies — and for measuring whether a human can steer them without breaking what makes them emergent.**
 
-This is a research project, not a product. The goal is to run long-lived, self-organizing societies of LLM agents, watch what emerges, and publish the findings. Everything is designed so that emergence can actually happen: no guardrails, no pre-built memory, no hidden scaffolding, and everything is recorded so that emergence can be studied.
+This is a research project, not a product. The goal is to run long-lived, self-organizing societies of LLM agents, watch what emerges, and publish the findings. Everything is designed so that emergence can actually happen: no organizational guardrails, no pre-built memory, no hidden scaffolding, and everything is recorded so that emergence can be studied.
 
 ## The thesis
 
@@ -20,11 +20,15 @@ Three properties we refuse to compromise on:
 - **Metrics are invisible to the agents.** Instrumentation lives outside the graph (anti-Goodhart). Fidelity is measured on acts, never on self-reports.
 - **The world is the filesystem.** The kernel imposes no message transport: nodes communicate by writing files, the kernel commits the world at the end of every turn with the node's uid as git author, and a node is woken by the changes it did not author.
 - **Minimal raw tools.** Nodes get a handful of raw capabilities (shell, speech, web, self-extension) instead of business-shaped tools; the LLM does everything else.
-- **Replay is not re-execution.** The full state of the society can be reconstructed from the journal alone.
+- **Replay is not re-execution.** The full state of the society is reconstructible from the durable records — the hash-chained journal, the canonical claim-check blobs it references (the original payloads, not a disposable index), and the world's Git history — with no model or tool call replayed.
 
 ## Status
 
-Implementation phase, no product yet: the design is settled and the kernel is being implemented checkpoint by checkpoint, in the order given in [`docs/kernel.md`](docs/kernel.md) §10. The C1.1 journal — hash-chained append-only event log, framed zstd persistence, claim-check blobs, write-behind with an explicit flush barrier, verifying reader and torn-tail repair — exists in `src/journal/`. The C1.2 node driver — the turn ritual, the commit-per-turn on the shared world repo with the node's uid as git author, wake-on-change over the world's HEAD, the free loop with explicit wait, the journaled turn and shutdown vocabulary — exists in `src/node/`; the kernel provides no message transport, since the world is the filesystem and nodes communicate by writing files ([`docs/kernel.md`](docs/kernel.md) §5). Both are covered by a passing test suite under a strict typecheck.
+Implementation phase, no product yet: the design is settled and the kernel is being implemented checkpoint by checkpoint, in the order given in [`docs/kernel.md`](docs/kernel.md) §10. The C1.1 journal — hash-chained append-only event log, framed zstd persistence, claim-check blobs, write-behind with an explicit flush barrier, verifying reader and torn-tail repair — exists in `src/journal/`. The C1.2 node driver — the turn ritual, the commit-per-turn on the shared world repo with the node's uid as git author, wake-on-change over the world's HEAD, the free loop with explicit wait, the journaled turn and shutdown vocabulary — exists in `src/node/`; the kernel provides no message transport, since the world is the filesystem and nodes communicate by writing files ([`docs/kernel.md`](docs/kernel.md) §5). Both are covered by a passing test suite under a strict typecheck. There is no CLI, main process or running product yet — what exists is the library source, not a launchable kernel.
+
+## Development
+
+Node 24 is required (`nvm use`, per [.nvmrc](.nvmrc)). Install with `npm install`, run the tests with `npm test`, and the strict typecheck with `npm run typecheck`. There is no build step.
 
 ## Documents
 
