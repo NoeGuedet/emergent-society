@@ -18,7 +18,7 @@ import { ProviderAdapter, type ProviderPolicy } from '../adapter.js';
 import { OpenAITransport } from '../transport.js';
 import type { SerializedTransport, TransportResult } from '../transport.js';
 import type {
-  ArtifactRef, CanonicalUsage, RequestId, RequestPlan, SeedPolicy, Source, Stored,
+  ArtifactRef, AssistantProjection, CanonicalUsage, RequestId, RequestPlan, SeedPolicy, Source, Stored,
 } from '../../context/contracts.js';
 
 /**
@@ -623,6 +623,132 @@ describe('ProviderAdapter: fatal flush faults are never swallowed', () => {
       // Flush #3 is the final projection barrier.
       const faulty = flushFaultGate(session.gate('turn', 0), 3);
       await expect(adapter.send(plan(), faulty)).rejects.toThrow('injected flush failure');
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+// --- assistant content bounding (artifact algorithm 7) ---------------------------
+
+/** The journaled assistant projection, resolving an inline or artifact-json value. */
+async function journaledProjection(): Promise<AssistantProjection> {
+  const durable = await events();
+  const event = ofType(durable, 'assistant/message')[0]!;
+  const value = (event.data as unknown as { value: Stored<AssistantProjection> }).value;
+  if (value.kind === 'inline') return value.value;
+  const bytes = resolveArtifact(durable, value.ref);
+  return JSON.parse(Buffer.from(bytes).toString('utf8')) as AssistantProjection;
+}
+
+/** The response/raw ArtifactRef the projection links, for the notice's digest/bytes. */
+async function rawRef(): Promise<ArtifactRef> {
+  const durable = await events();
+  return (ofType(durable, 'response/raw')[0]!.data as unknown as { body: ArtifactRef }).body;
+}
+
+const NOTICE = /^\[content truncated: showing (\d+) of (\d+) bytes; raw sha256 ([0-9a-f]{64})\]$/;
+
+describe('ProviderAdapter: assistant content bounding', () => {
+  it('truncates to maxAssistantBytes and appends a notice naming the raw artifact', async () => {
+    const session = await openSession();
+    const content = 'a'.repeat(1000);
+    try {
+      const adapter = new ProviderAdapter(
+        new ScriptedTransport([transportResult(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content } }],
+        }))]), policies(),
+      );
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxAssistantBytes: 256 }) }), session.gate('turn', 0),
+      );
+      expect(result.kind).toBe('response');
+      if (result.kind === 'response') expect(result.projection.contentTruncated).toBe(true);
+
+      const projection = await journaledProjection();
+      expect(projection.contentTruncated).toBe(true);
+      const raw = await rawRef();
+      const expectedNotice =
+        `\n[content truncated: showing 256 of ${raw.bytes} bytes; raw sha256 ${raw.sha256}]`;
+      expect(projection.message.content).toBe('a'.repeat(256) + expectedNotice);
+      // The notice matches the binding format and names the raw artifact exactly.
+      const match = NOTICE.exec(expectedNotice.slice(1));
+      expect(match).not.toBeNull();
+      expect(match![2]).toBe(String(raw.bytes));
+      expect(match![3]).toBe(raw.sha256);
+      // The truncated text (before the notice) is exactly maxAssistantBytes.
+      expect(Buffer.byteLength(projection.message.content!.slice(0, 256), 'utf8')).toBe(256);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('cuts only at a code-point boundary on a multibyte body (no U+FFFD)', async () => {
+    const session = await openSession();
+    // 255 'a' + 'é' (2 bytes) + filler: byte 256 lands mid-'é', so a naive slice
+    // at 256 would split the character; the boundary cut drops it whole.
+    const content = 'a'.repeat(255) + 'é' + 'b'.repeat(500);
+    try {
+      const adapter = new ProviderAdapter(
+        new ScriptedTransport([transportResult(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content } }],
+        }))]), policies(),
+      );
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxAssistantBytes: 256 }) }), session.gate('turn', 0),
+      );
+      expect(result.kind).toBe('response');
+
+      const projection = await journaledProjection();
+      expect(projection.contentTruncated).toBe(true);
+      const raw = await rawRef();
+      // The retained text is the 255 ASCII bytes, then the notice; no replacement.
+      expect(projection.message.content!.startsWith('a'.repeat(255) + '\n[content truncated:')).toBe(true);
+      expect(projection.message.content).not.toContain('\uFFFD');
+      expect(Buffer.byteLength(projection.message.content!.slice(0, 255), 'utf8')).toBe(255);
+      expect(projection.message.content).toContain(`showing 255 of ${raw.bytes} bytes`);
+      expect(Buffer.from(projection.message.content!.slice(0, 255), 'utf8').toString('utf8')).toBe('a'.repeat(255));
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('leaves content exactly at the limit untruncated', async () => {
+    const session = await openSession();
+    const content = 'a'.repeat(256);
+    try {
+      const adapter = new ProviderAdapter(
+        new ScriptedTransport([transportResult(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content } }],
+        }))]), policies(),
+      );
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxAssistantBytes: 256 }) }), session.gate('turn', 0),
+      );
+      expect(result.kind).toBe('response');
+      const projection = await journaledProjection();
+      expect(projection.contentTruncated).toBe(false);
+      expect(projection.message.content).toBe(content);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('leaves null content null and untruncated', async () => {
+    const session = await openSession();
+    try {
+      const adapter = new ProviderAdapter(
+        new ScriptedTransport([transportResult(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: null } }],
+        }))]), policies(),
+      );
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxAssistantBytes: 256 }) }), session.gate('turn', 0),
+      );
+      expect(result.kind).toBe('response');
+      const projection = await journaledProjection();
+      expect(projection.contentTruncated).toBe(false);
+      expect(projection.message.content).toBeNull();
     } finally {
       await session.shutdown();
     }

@@ -144,6 +144,39 @@ function project(body: Uint8Array, plan: RequestPlan): Projected {
   };
 }
 
+/**
+ * A prefix of `text` at most `maxBytes` UTF-8 bytes long, cut only at a code-point
+ * boundary. Continuation bytes (`10xxxxxx`) back the cut up over the character they
+ * belong to, so a multibyte character is never split and no U+FFFD is introduced.
+ */
+function truncateUtf8(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text, 'utf8');
+  if (bytes.length <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString('utf8');
+}
+
+/**
+ * Bounds the model-visible assistant content to `policy.maxAssistantBytes` UTF-8
+ * bytes (artifact algorithm 7). The raw record is never altered; only the
+ * projection changes. The notice names the captured raw response artifact's
+ * digest and byte count — the retained prefix's own facts when capture was
+ * incomplete, never the complete original's.
+ */
+function boundAssistant(
+  message: AssistantMessage, maxBytes: number, raw: ArtifactRef,
+): { readonly message: AssistantMessage; readonly contentTruncated: boolean } {
+  const content = message.content;
+  if (content === null) return { message, contentTruncated: false };
+  if (Buffer.byteLength(content, 'utf8') <= maxBytes) return { message, contentTruncated: false };
+  const retained = truncateUtf8(content, maxBytes);
+  const retainedBytes = Buffer.byteLength(retained, 'utf8');
+  const notice = `\n[content truncated: showing ${retainedBytes} of ${raw.bytes} bytes; `
+    + `raw sha256 ${raw.sha256}]`;
+  return { message: { ...message, content: retained + notice }, contentTruncated: true };
+}
+
 export class ProviderAdapter {
   constructor(
     private readonly transport: SerializedTransport,
@@ -214,8 +247,9 @@ export class ProviderAdapter {
           // failure after the raw fact is durable — never a fatal kernel error.
           return this.fail(gate, id, attempt, { code: 'malformed', status: result.status });
         }
+        const bounded = boundAssistant(projected.message, policy.maxAssistantBytes, rawRef);
         const projection: AssistantProjection = {
-          message: projected.message, contentTruncated: false, raw: rawRef,
+          message: bounded.message, contentTruncated: bounded.contentTruncated, raw: rawRef,
         };
         gate.append('request/usage', { id, attempt, value: normalizeUsage(projected.usageRaw) });
         gate.append('assistant/message', { id, value: await gate.store(projection) });
