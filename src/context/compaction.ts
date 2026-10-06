@@ -110,6 +110,17 @@ function mergeSources(existing: readonly Source[], incoming: readonly Source[]):
 }
 
 /**
+ * The receipts one selected group contributes to a transaction. A non-summary
+ * group cites its stored sources. A summary group is cited by its own summary
+ * receipt only: its transitive ancestry is resolved through that durable receipt
+ * at verification time, never recursively flattened into every later marker.
+ */
+function groupCitations(group: SurfaceGroup): Source[] {
+  if (group.kind === 'summary') return [{ seq: group.id.seq, hash: group.id.hash }];
+  return group.sources;
+}
+
+/**
  * Selects the next compaction, or null when none is warranted. Pure: it reads the
  * folded projection, journals nothing and performs no I/O.
  */
@@ -141,7 +152,7 @@ export function selectCompaction(state: ProjectionState): CompactionStart | null
   const sources: Source[] = [];
   for (const group of eligible) {
     if (!isBalanced(group)) return null;
-    const merged = mergeSources(sources, group.sources);
+    const merged = mergeSources(sources, groupCitations(group));
     if (merged.length > MAX_COMPACTION_SOURCES) break;
     chosen.push(group);
     sources.length = 0;
@@ -200,7 +211,7 @@ function transactionValid(state: ProjectionState, candidate: CompactionStart): b
   for (const group of groups) {
     if (!isBalanced(group)) return false;
     for (const message of group.messages) messages.push(message);
-    for (const source of group.sources) sources.push(source);
+    for (const source of groupCitations(group)) sources.push(source);
   }
   const ordered = sortUnique(sources);
   if (ordered.length !== candidate.sources.length) return false;

@@ -399,7 +399,22 @@ describe('selectCompaction and whole committed groups', () => {
       const sourceKeys = second!.sources.map((s) => `${s.seq}:${s.hash}`);
       expect(new Set(sourceKeys).size).toBe(sourceKeys.length);
       const committed = (beforeSecond.surface?.nodes ?? []).filter((node) => node.group.kind !== 'heading');
-      expect(second!.groupIds).toEqual(committed.slice(0, committed.length - 2).map((node) => node.group.id));
+      const span = committed.slice(0, committed.length - 2);
+      expect(second!.groupIds).toEqual(span.map((node) => node.group.id));
+
+      // A prior summary is cited by its own summary receipt, never by its inlined
+      // span sources: the transitive ancestry stays durable through the receipt.
+      const priorSummary = span.find((node) => node.group.kind === 'summary')?.group;
+      expect(priorSummary?.kind).toBe('summary');
+      const expectedSecondSources = sortUnique(span.flatMap((node) =>
+        node.group.kind === 'summary' ? [node.group.id] : node.group.sources));
+      expect(second!.sources).toEqual(expectedSecondSources);
+      expect(second!.sources.filter((s) => SAME(s, priorSummary!.id))).toHaveLength(1);
+      const priorInlined = priorSummary!.sources.filter((s) => !SAME(s, priorSummary!.id));
+      expect(priorInlined.length).toBeGreaterThan(0);
+      for (const inlined of priorInlined) {
+        expect(second!.sources.some((s) => SAME(s, inlined))).toBe(false);
+      }
 
       const gate2 = session.gate({ phase: 'turn', turn: 18 });
       try {

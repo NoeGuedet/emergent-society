@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { EventEnvelope } from '../../journal/index.js';
+import { sha256HexOf } from '../../journal/canon.js';
+import { canonicalBytes } from '../artifacts.js';
 import type {
   CompactionStart, CompactionSummary, Source, SurfaceGroup,
 } from '../contracts.js';
@@ -116,6 +118,12 @@ describe('Surface append provenance and membership', () => {
 });
 
 describe('Surface replaceCommitted', () => {
+  type CandidateFields = Omit<CompactionStart, 'id'>;
+  const candidateId = (fields: CandidateFields): string =>
+    sha256HexOf(Buffer.from(canonicalBytes(fields)));
+  const withId = (fields: CandidateFields): CompactionStart =>
+    ({ id: candidateId(fields), ...fields });
+
   function prepared(): {
     surface: Surface; heading: Source; perception: Source; dialogue: Source;
     summarySource: Source; candidate: CompactionStart; summary: CompactionSummary;
@@ -132,12 +140,15 @@ describe('Surface replaceCommitted', () => {
       sources: [dialogue],
     });
     const summarySource = add('compaction/summary', 3);
-    const candidate: CompactionStart = {
-      id: 'c1', revision: surface.currentRevision, groupIds: [dialogue],
-      sources: [dialogue], shadowHash: 'c'.repeat(64), shadowBytes: 1,
-    };
+    // A consistent baseline: the id is derived from the fields, the summary id and
+    // sources match the candidate exactly, and the replacement is strictly smaller
+    // than the shadow. Every rejection case below breaks exactly one property.
+    const candidate = withId({
+      revision: surface.currentRevision, groupIds: [dialogue],
+      sources: [dialogue], shadowHash: 'c'.repeat(64), shadowBytes: 100,
+    });
     const summary: CompactionSummary = {
-      id: 'c1', message: { role: 'user', content: 'Older committed context was removed.' },
+      id: candidate.id, message: { role: 'user', content: 'Older committed context was removed.' },
       sources: [dialogue], replacementBytes: 10,
     };
     return { surface, heading, perception, dialogue, summarySource, candidate, summary };
@@ -155,14 +166,50 @@ describe('Surface replaceCommitted', () => {
 
   it('refuses a stale candidate revision', () => {
     const { surface, summarySource, candidate, summary } = prepared();
-    const stale: CompactionStart = { ...candidate, revision: 'd'.repeat(64) };
-    expect(() => surface.replaceCommitted(stale, summary, summarySource)).toThrow(SurfacePolicyError);
+    const stale = withId({
+      revision: 'd'.repeat(64), groupIds: candidate.groupIds, sources: candidate.sources,
+      shadowHash: candidate.shadowHash, shadowBytes: candidate.shadowBytes,
+    });
+    expect(() => surface.replaceCommitted(stale, { ...summary, id: stale.id }, summarySource))
+      .toThrow(SurfacePolicyError);
+  });
+
+  it('refuses a candidate whose id does not match its fields', () => {
+    const { surface, summarySource, candidate, summary } = prepared();
+    const forged: CompactionStart = { ...candidate, shadowHash: 'f'.repeat(64) };
+    expect(() => surface.replaceCommitted(forged, summary, summarySource)).toThrow(SurfacePolicyError);
+  });
+
+  it('refuses a summary whose id does not match the candidate', () => {
+    const { surface, summarySource, candidate, summary } = prepared();
+    expect(() => surface.replaceCommitted(candidate, { ...summary, id: 'other' }, summarySource))
+      .toThrow(SurfacePolicyError);
+  });
+
+  it('refuses a summary whose sources do not match the candidate', () => {
+    const { surface, summarySource, candidate, summary } = prepared();
+    const foreign: Source = { seq: 999, hash: '9'.repeat(64) };
+    expect(() => surface.replaceCommitted(
+      candidate, { ...summary, sources: [foreign] }, summarySource,
+    )).toThrow(SurfacePolicyError);
+  });
+
+  it('refuses a replacement that is not strictly smaller than the shadow', () => {
+    const { surface, summarySource, candidate, summary } = prepared();
+    expect(() => surface.replaceCommitted(
+      candidate, { ...summary, replacementBytes: candidate.shadowBytes }, summarySource,
+    )).toThrow(SurfacePolicyError);
   });
 
   it('refuses a candidate that spans the heading pin', () => {
     const { surface, heading, summarySource, candidate, summary } = prepared();
-    const spanning: CompactionStart = { ...candidate, groupIds: [heading] };
-    expect(() => surface.replaceCommitted(spanning, summary, summarySource)).toThrow(SurfacePolicyError);
+    const spanning = withId({
+      revision: candidate.revision, groupIds: [heading], sources: [heading],
+      shadowHash: candidate.shadowHash, shadowBytes: candidate.shadowBytes,
+    });
+    expect(() => surface.replaceCommitted(
+      spanning, { ...summary, id: spanning.id, sources: [heading] }, summarySource,
+    )).toThrow(SurfacePolicyError);
   });
 
   it('refuses non-contiguous group ids', () => {
@@ -182,12 +229,12 @@ describe('Surface replaceCommitted', () => {
       });
     }
     const summarySource = add('compaction/summary', 4);
-    const candidate: CompactionStart = {
-      id: 'c1', revision: surface.currentRevision, groupIds: [a, c],
-      sources: [a, c], shadowHash: 'e'.repeat(64), shadowBytes: 1,
-    };
+    const candidate = withId({
+      revision: surface.currentRevision, groupIds: [a, c], sources: [a, c],
+      shadowHash: 'e'.repeat(64), shadowBytes: 100,
+    });
     const summary: CompactionSummary = {
-      id: 'c1', message: { role: 'user', content: 's' }, sources: [a, c], replacementBytes: 1,
+      id: candidate.id, message: { role: 'user', content: 's' }, sources: [a, c], replacementBytes: 1,
     };
     expect(() => surface.replaceCommitted(candidate, summary, summarySource))
       .toThrow(SurfacePolicyError);

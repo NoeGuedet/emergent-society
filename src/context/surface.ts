@@ -45,6 +45,25 @@ function sortUnique(sources: readonly Source[]): Source[] {
   return out;
 }
 
+/** Order-insensitive set equality of two receipt lists, compared canonically. */
+function sameSourceSet(a: readonly Source[], b: readonly Source[]): boolean {
+  const left = sortUnique(a);
+  const right = sortUnique(b);
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) {
+    if (!SAME(left[i]!, right[i]!)) return false;
+  }
+  return true;
+}
+
+/** The transaction identity: the hash of the durable start's own five fields. */
+function candidateIdentity(candidate: CompactionStart): string {
+  return sha256HexOf(Buffer.from(canonicalBytes({
+    revision: candidate.revision, groupIds: candidate.groupIds, sources: candidate.sources,
+    shadowHash: candidate.shadowHash, shadowBytes: candidate.shadowBytes,
+  })));
+}
+
 function headingText(group: SurfaceGroup): string {
   const first = group.messages[0];
   return first !== undefined && first.role === 'system' ? first.content : '';
@@ -139,13 +158,30 @@ export class Surface {
    * Applies a completed compaction: the contiguous run of committed groups named
    * by `candidate.groupIds` (never node 0, the pin) is replaced by one summary
    * group and positions are reindexed. The candidate's revision must still equal
-   * the surface revision at apply time — a stale candidate is refused.
+   * the surface revision at apply time, its id must be the hash of its own
+   * fields, the summary must name the same id and cite exactly the candidate's
+   * sources, and the replacement must be strictly smaller than the shadow — a
+   * durable end that fails any of these is refused and nothing is replaced.
    */
   replaceCommitted(
     candidate: CompactionStart, summary: CompactionSummary, summarySource: Source,
   ): void {
     if (candidate.revision !== this.revision()) {
       throw new SurfacePolicyError('replaceCommitted: candidate revision is stale');
+    }
+    if (candidate.id !== candidateIdentity(candidate)) {
+      throw new SurfacePolicyError('replaceCommitted: candidate id does not match its fields');
+    }
+    if (summary.id !== candidate.id) {
+      throw new SurfacePolicyError('replaceCommitted: summary id does not match the candidate');
+    }
+    if (!sameSourceSet(summary.sources, candidate.sources)) {
+      throw new SurfacePolicyError('replaceCommitted: summary sources do not match the candidate');
+    }
+    if (summary.replacementBytes >= candidate.shadowBytes) {
+      throw new SurfacePolicyError(
+        'replaceCommitted: replacement is not strictly smaller than the shadow',
+      );
     }
     const summaryReceipt = this.receipt(summarySource, 'replaceCommitted.summary');
     if (summaryReceipt.type !== 'compaction/summary') {

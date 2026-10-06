@@ -11,6 +11,7 @@ import { useWorld } from '../../node/__tests__/helpers.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../events.js';
 import { defaultAgentConfig } from '../config.js';
 import { ContextFold } from '../fold.js';
+import { SurfacePolicyError } from '../surface.js';
 import { loadVerifiedEvents } from '../loader.js';
 import { canonicalBytes } from '../artifacts.js';
 import type {
@@ -321,7 +322,7 @@ describe('fold: compaction applies only after a verified end', () => {
     const s = await openSession(home());
     try {
       const cfg = await startConfig(s);
-      const t0 = await pipeline(s, 0, cfg, { perceptionText: 'external evidence', calls: [] });
+      const t0 = await pipeline(s, 0, cfg, { perceptionText: 'external evidence '.repeat(20), calls: [] });
       await t0.gate.flush();
       s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' }, { ignorable: true });
       await s.writer.flush();
@@ -364,6 +365,48 @@ describe('fold: compaction applies only after a verified end', () => {
 
       const again = await foldOf(home());
       expect(again.snapshot()).toEqual(after.snapshot());
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects a durable end whose replacement is not strictly smaller than the shadow', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const t0 = await pipeline(s, 0, cfg, { perceptionText: 'external evidence', calls: [] });
+      await t0.gate.flush();
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' }, { ignorable: true });
+      await s.writer.flush();
+
+      const before = await foldOf(home());
+      const surface = before.snapshot().surface;
+      if (surface === null) throw new Error('missing surface');
+      const group = surface.nodes.find((node) => node.group.kind === 'perception')!.group;
+      const shadow = Buffer.from(canonicalBytes(group.messages));
+      const fields = {
+        revision: surface.revision, groupIds: [group.id], sources: group.sources,
+        shadowHash: sha256HexOf(shadow), shadowBytes: shadow.length,
+      };
+      const start: CompactionStart = {
+        id: sha256HexOf(Buffer.from(canonicalBytes(fields))), ...fields,
+      };
+
+      s.lifecycle('turn/start', { turn: 1, trigger: 'boot', world: { from: null, to: null } });
+      const gate = s.gate('turn', 1).gate;
+      gate.append('compaction/start', start);
+      const message = { role: 'user' as const, content: 'Older committed context was removed.' };
+      const summary = gate.append('compaction/summary', {
+        id: start.id, message, sources: start.sources,
+        // Exactly the shadow size: the replacement is not strictly smaller.
+        replacementBytes: shadow.length,
+      });
+      gate.append('compaction/end', { id: start.id, summary: { seq: summary.seq, hash: summary.hash } });
+      await gate.flush();
+
+      const all = await loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES);
+      await expect(before.observe(all)).rejects.toThrow(SurfacePolicyError);
+      expect(before.snapshot().surface).toEqual(surface);
     } finally {
       await s.close();
     }
