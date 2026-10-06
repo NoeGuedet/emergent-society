@@ -1,8 +1,8 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { access, chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { commitAs, gitIn, useWorld } from '../../node/__tests__/helpers.js';
+import { commitAs, gitIn, useWorld, writeWorldFile } from '../../node/__tests__/helpers.js';
 import { presentWorld } from '../diff.js';
 
 /**
@@ -215,3 +215,97 @@ describe('presentWorld negative and bounded fixtures', () => {
     }
   });
 });
+
+describe('presentWorld hermetic rendering policy', () => {
+  it('ignores a working-tree .gitattributes marking the file -diff (GIT_ATTR_SOURCE pins to `to`)', async () => {
+    const { world } = fixture();
+    const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
+    // Uncommitted working-tree attribute: the to-tree has no attributes, so the
+    // render must show text rather than "Binary files ... differ".
+    await writeWorldFile(world, '.gitattributes', '*.txt -diff\n');
+    const p = await presentWorld(world, 'n1', { from: null, to: c1 }, 8192, 4096);
+    expect(p.text).toContain('+one');
+    expect(p.text).not.toContain('Binary files');
+    expect(p.text).not.toContain('differ');
+  });
+
+  it('ignores .git/info/attributes and a repo-local diff driver config', async () => {
+    const { world } = fixture();
+    const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
+    // Repo metadata that outranks tree attributes and a driver that would break
+    // rendering: both live outside the isolated bare view.
+    await writeFile(join(world.path, '.git', 'info', 'attributes'), '*.txt -diff\n');
+    await gitIn(world.path, ['config', 'diff.evil.xfuncname', '^evil-func']);
+    await gitIn(world.path, ['config', 'diff.evil.command', 'false']);
+    const p = await presentWorld(world, 'n1', { from: null, to: c1 }, 8192, 4096);
+    expect(p.text).toContain('+one');
+    expect(p.text).not.toContain('Binary files');
+  });
+
+  it('cancels a host diff.orderFile so the default order is kept (-O/dev/null)', async () => {
+    const { world } = fixture();
+    const c1 = await commitAs(world, 'n2', { 'a.txt': 'aaa\n', 'z.txt': 'zzz\n' });
+    const orderFile = join(world.path, 'order.txt');
+    // Request z before a; the default git order is alphabetical, so a must stay first.
+    await writeFile(orderFile, 'z.txt\na.txt\n');
+    await gitIn(world.path, ['config', 'diff.orderFile', orderFile]);
+    const p = await presentWorld(world, 'n1', { from: null, to: c1 }, 8192, 4096);
+    const ai = p.text.indexOf('a/a.txt');
+    const zi = p.text.indexOf('b/z.txt');
+    expect(ai).toBeGreaterThanOrEqual(0);
+    expect(zi).toBeGreaterThan(ai);
+  });
+
+  it('fails closed when the world object database the view points at is absent', async () => {
+    const { world } = fixture();
+    const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
+    await rm(join(world.path, '.git', 'objects'), { recursive: true, force: true });
+    await expect(world.diff({ from: null, to: c1 }, 4096)).rejects.toThrow();
+  });
+});
+
+describe('presentWorld list truncation', () => {
+  it('reports list truncation for a 4097-commit history at maxCommits 4096', { timeout: 120_000 }, async () => {
+    const { world } = fixture();
+    await fastImportCommits(world.path, 4097);
+    const head = (await gitIn(world.path, ['rev-parse', 'HEAD'])).trim();
+
+    const range = await world.commitsIn({ from: null, to: head }, 4096);
+    expect(range.listTruncated).toBe(true);
+    expect(range.commits).toHaveLength(4096);
+    // The dropped commit is the oldest; the newest is retained.
+    expect(range.commits.at(-1)?.hash).toBe(head);
+
+    const p = await presentWorld(world, 'n1', { from: null, to: head }, 512, 4096);
+    expect(p.listTruncated).toBe(true);
+    expect(p.commits).toHaveLength(4096);
+    expect(p.text).toContain('commit-list truncated; oldest history omitted');
+  });
+});
+
+/** Builds `count` commits through one `git fast-import` stream, cheaply. */
+async function fastImportCommits(worldPath: string, count: number): Promise<void> {
+  const chunks: string[] = [];
+  for (let i = 1; i <= count; i += 1) {
+    const content = `line ${i}`;
+    const message = `c${i}`;
+    chunks.push(
+      'commit refs/heads/main\n' +
+      'author n2 <n2@world.local> 1700000000 +0000\n' +
+      'committer n2 <n2@world.local> 1700000000 +0000\n' +
+      `data ${Buffer.byteLength(message)}\n${message}\n` +
+      `M 100644 inline f${i}.txt\n` +
+      `data ${Buffer.byteLength(content)}\n${content}\n`,
+    );
+  }
+  chunks.push('done\n');
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn('git', ['fast-import', '--quiet'], { cwd: worldPath });
+    child.on('error', reject);
+    child.stderr.setEncoding('utf8');
+    let stderr = '';
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+    child.on('close', (code) => { if (code === 0) resolve(); else reject(new Error(stderr)); });
+    child.stdin.end(chunks.join(''));
+  });
+}
