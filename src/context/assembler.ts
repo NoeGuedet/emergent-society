@@ -1,7 +1,16 @@
+import { canonicalizeJson } from '../journal/index.js';
 import { sha256HexOf } from '../journal/canon.js';
-import { canonicalBytes, toJson } from './artifacts.js';
+import { canonicalBytes, resolveStored, toJson } from './artifacts.js';
+import { RENDER_POLICY, presentWorld } from './diff.js';
+import { createBoundaryRegistry, validateRequestPlan } from './events.js';
+import { ContextFold } from './fold.js';
+import { sourceOf } from './loader.js';
+import type { GateScope } from '../node/gate.js';
+import type { WorldRepo, WorldRange } from '../node/world.js';
+import type { VerifiedEvent, VerifiedEvents } from './loader.js';
 import type {
-  ChatMessage, PlanSection, ProjectionState, RequestId, RequestPlan, Source, ToolSchema,
+  ChatMessage, PlanSection, ProjectionState, RequestId, RequestPlan, Source, Stored, ToolSchema,
+  WorldPerception,
 } from './contracts.js';
 
 /**
@@ -124,4 +133,121 @@ export function assemble(input: AssembleInput): RequestPlan {
     heading: surface.heading.text,
   };
   return toJson(plan) as unknown as RequestPlan;
+}
+
+// --- offline reconstruction (T9) -------------------------------------------------
+
+/**
+ * One recorded plan and the plan rederived from the recorded facts that preceded
+ * it. Equality is canonical JSON (`canonicalizeJson`, the bytes `canonicalBytes`
+ * hashes), never `JSON.stringify` insertion order.
+ */
+export type ReplayComparison = {
+  readonly source: Source; readonly recorded: RequestPlan; readonly rederived: RequestPlan;
+};
+
+/** The resolved wrapper of a recorded `world/perception` fact. */
+type PerceptionPayload = {
+  readonly turn: number; readonly range: WorldRange; readonly value: Stored<WorldPerception>;
+};
+
+const REPLAY_REGISTRY = createBoundaryRegistry();
+const REPLAY_SIGNAL = new AbortController().signal;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** The canonical JSON text of a value — the comparison `canonicalBytes` hashes. */
+function canonicalText(value: unknown): string {
+  return canonicalizeJson(toJson(value));
+}
+
+/**
+ * Resolves a recorded `world/perception` through the same T1 registry the gate
+ * and fold use (so the wrapper/value range equality is enforced), refusing an
+ * incompatible renderer policy with an explicit message before shape validation.
+ */
+function recordedPerception(events: VerifiedEvents, data: PerceptionPayload): WorldPerception {
+  const scope: GateScope = {
+    phase: 'turn', turn: data.turn, signal: REPLAY_SIGNAL, lookup: () => null,
+  };
+  const validate = (raw: unknown): WorldPerception => {
+    if (isRecord(raw)) {
+      const renderer = raw['renderer'];
+      if (isRecord(renderer) && renderer['policy'] !== RENDER_POLICY) {
+        throw new Error(
+          `replay: recorded perception renderer policy ${JSON.stringify(renderer['policy'])}`
+          + ` is incompatible with ${RENDER_POLICY}`);
+      }
+    }
+    const wrapped = REPLAY_REGISTRY['world/perception'](
+      { turn: data.turn, range: data.range, value: { kind: 'inline', value: raw } }, scope,
+    ) as unknown as { value: { value: WorldPerception } };
+    return wrapped.value.value;
+  };
+  return resolveStored(events, data.value, validate);
+}
+
+/**
+ * Recomputes a recorded perception from the world and compares it canonically.
+ * The recorded `uid` is fed to the renderer and compared, never re-derived; a
+ * differing exact Git version and a differing rendered value both fail
+ * reconstruction explicitly. Missing Git objects propagate as explicit errors.
+ */
+async function verifyPerception(
+  events: VerifiedEvents, world: WorldRepo, event: VerifiedEvent,
+): Promise<void> {
+  const data = event.data as unknown as PerceptionPayload;
+  const recorded = recordedPerception(events, data);
+  const rederived = await presentWorld(
+    world, recorded.uid, recorded.range, recorded.maxBytes, recorded.maxCommits,
+  );
+  if (recorded.renderer.gitVersion !== rederived.renderer.gitVersion) {
+    throw new Error(
+      `replay: recorded Git version ${JSON.stringify(recorded.renderer.gitVersion)}`
+      + ` differs from the host's ${JSON.stringify(rederived.renderer.gitVersion)}`);
+  }
+  if (canonicalText(recorded) !== canonicalText(rederived)) {
+    const at = sourceOf(event);
+    throw new Error(
+      `replay: the world perception recorded at ${at.seq}:${at.hash}`
+      + ' does not match the perception rederived from the world');
+  }
+}
+
+/**
+ * Reconstructs a node's recorded plans and perceptions offline (kernel.md §4).
+ *
+ * It walks every recorded fact with a real `ContextFold`, assembles the plan
+ * immediately before each recorded `request/plan` and compares it canonically,
+ * and recomputes each `world/perception` from the recorded Git range, uid and
+ * render budgets through `presentWorld`. A divergence — a changed renderer
+ * policy, a differing exact Git version or any other canonical difference —
+ * throws rather than promising equality. No external effect is executed: the
+ * fold, the assembler and the renderer are read-only.
+ */
+export async function rederivePlans(
+  events: VerifiedEvents, world: WorldRepo,
+): Promise<readonly ReplayComparison[]> {
+  const fold = new ContextFold();
+  const comparisons: ReplayComparison[] = [];
+  for (const event of events) {
+    if (event.type === 'world/perception') {
+      await verifyPerception(events, world, event);
+    } else if (event.type === 'request/plan') {
+      const data = event.data as unknown as { id: RequestId; value: Stored<RequestPlan> };
+      const recorded = resolveStored(events, data.value, validateRequestPlan);
+      const rederived = assemble({ id: data.id, state: fold.snapshot() });
+      const source = sourceOf(event);
+      if (canonicalText(rederived) !== canonicalText(recorded)) {
+        throw new Error(
+          `replay: the plan recorded at ${source.seq}:${source.hash}`
+          + ' does not match the plan rederived from the recorded facts');
+      }
+      comparisons.push({ source, recorded, rederived });
+    }
+    await fold.observe([event]);
+  }
+  return comparisons;
 }
