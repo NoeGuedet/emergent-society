@@ -205,7 +205,9 @@ describe('NodeDriver run loop', () => {
     await vi.waitFor(() => expect(d.state).toBe('waiting'));
     d.stop();
     await running;
-    // The handler cannot journal and cannot commit: the driver owns both.
-    expect(keys).toEqual(['now', 'trigger', 'turn', 'world']);
+    // The handler cannot journal and cannot commit: the driver owns both. It
+    // receives the trusted gate and the turn's cancellation signal, plus the
+    // clock, trigger and turn/world range, and nothing else.
+    expect(keys).toEqual(['gate', 'now', 'signal', 'trigger', 'turn', 'world']);
   });
 });

@@ -1,13 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import {
-  BlobStore, JournalWriter, MAX_BLOB_BYTES, canonicalizeJson, isBlobRef,
+  BlobStore, CLAIM_CHECK_THRESHOLD, JournalWriter, MAX_BLOB_BYTES, canonicalizeJson, isBlobRef,
 } from '../../journal/index.js';
 import type { EventEnvelope } from '../../journal/index.js';
 import { sha256HexOf } from '../../journal/canon.js';
 import { payloadOfCanonicalBytes, useTempHome } from '../../journal/__tests__/helpers.js';
 import { createBoundaryGate } from '../../node/gate.js';
 import type { GateCallbacks, GateScope, BoundaryGate } from '../../node/gate.js';
+import { NodeDriver, type TurnContext } from '../../node/driver.js';
+import { useWorld } from '../../node/__tests__/helpers.js';
 import { createBoundaryRegistry } from '../events.js';
 import { C13_EVENT_TYPES } from '../events.js';
 import { canonicalBytes, resolveArtifact, resolveStored, toJson } from '../artifacts.js';
@@ -309,6 +313,7 @@ describe('size thresholds', () => {
       expect(spy).toHaveBeenCalledTimes(1);
     } finally {
       h.close();
+      await h.writer.close();
     }
   });
 
@@ -337,6 +342,151 @@ describe('size thresholds', () => {
       expect(stored.kind).toBe('artifact-json');
     } finally {
       h.close();
+      await h.writer.close();
     }
   });
+});
+
+// --- Integrated acceptance B: the real driver-owned gate (T2) ---------------------
+
+const artifactFixture = useWorld('c13-artifact-');
+
+function readVerified(home: string): Promise<VerifiedEvents> {
+  return loadVerifiedEvents(home, 'n1', C13_EVENT_TYPES);
+}
+
+function perception(text: string): WorldPerception {
+  return {
+    uid: 'n1', range: { from: null, to: null }, effectiveFrom: null, fallback: 'none',
+    renderer: { policy: 'commit-patches-v1', gitVersion: 'git version 2.43.0', attrSource: 'to' },
+    maxBytes: 32768, maxCommits: 4096, listTruncated: false,
+    commits: [], included: [], omittedOwn: [], text, truncated: false,
+  };
+}
+
+/** A valid `world/perception` payload whose event data canonicalizes to exactly `n` bytes. */
+function perceptionData(n: number): unknown {
+  const fixed = Buffer.byteLength(canonicalizeJson({
+    turn: 0, range: { from: null, to: null },
+    value: { kind: 'inline', value: perception('') },
+  }), 'utf8');
+  return {
+    turn: 0, range: { from: null, to: null },
+    value: { kind: 'inline', value: perception('a'.repeat(n - fixed)) },
+  };
+}
+
+describe('lossless bounded artifacts under the real driver gate', () => {
+  it('survives quote/control escaping at the inclusive v0 truncation threshold', async () => {
+    const { home, world } = artifactFixture();
+    const giant = '"\n\u0000'.repeat(600000);
+    const input = Buffer.from(giant, 'utf8');
+    expect(Buffer.byteLength(canonicalizeJson({ body: giant }), 'utf8')).toBeGreaterThanOrEqual(MAX_BLOB_BYTES);
+    let ref: ArtifactRef | null = null;
+    let driver: NodeDriver | null = null;
+    let second: NodeDriver | null = null;
+    const hooks = {
+      registry: createBoundaryRegistry(),
+      onDurable: async (): Promise<void> => {},
+      onReady: async (): Promise<void> => {},
+      onTurnStart: async (): Promise<void> => {},
+      readHistory: (path: string, uid: string, knownTypes: ReadonlySet<string>) =>
+        loadVerifiedEvents(path, uid, knownTypes),
+      readBlob: (hash: string) => new BlobStore(home).get(hash),
+    };
+    try {
+      driver = await NodeDriver.open(home, 'n1', async (ctx) => {
+        ref = await ctx.gate.capture(input, 'utf8');
+        ctx.gate.append('request/wire', { id: { turn: ctx.turn, ordinal: 0 }, attempt: 0, body: ref });
+        await ctx.gate.flush();
+        driver!.stop();
+        return { outcome: 'waiting', toolCalls: false };
+      }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+      await driver.run();
+      const events = await readVerified(home);
+      const wire = events.find((event) => event.type === 'request/wire');
+      if (!wire) throw new Error('missing wire');
+      const stored = (wire.data as unknown as { body: ArtifactRef }).body;
+      expect(isBlobRef(stored)).toBe(false);
+      expect(Buffer.from(resolveArtifact(events, stored)).equals(input)).toBe(true);
+      for (const event of events) {
+        expect(Buffer.byteLength(canonicalizeJson(toJson(event.data)), 'utf8')).toBeLessThan(MAX_BLOB_BYTES);
+      }
+      second = await NodeDriver.open(home, 'n1', () => ({ outcome: 'waiting', toolCalls: false }), world,
+        { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+      second.stop();
+      await second.run();
+      second = null;
+      const after = await readVerified(home);
+      expect(Buffer.from(resolveArtifact(after, stored)).equals(input)).toBe(true);
+    } finally {
+      driver?.stop();
+      if (second) { second.stop(); await second.run().catch(() => { /* the assertion failure stands */ }); }
+    }
+  });
+
+  it('rejects a blob substituted under the same hash filename', async () => {
+    const { home } = artifactFixture();
+    const writer = await JournalWriter.open(home, 'n1');
+    const giant = { version: 1, value: { kind: 'inline', value: {
+      version: 1, charter: 'x'.repeat(CLAIM_CHECK_THRESHOLD + 64), heading: 'h',
+      tools: [], allowedTools: [], model: 'mock-model', parameters: {}, policy: {},
+    } } };
+    const receipt = writer.append('system/message', giant as never);
+    await writer.flush();
+    await writer.close();
+    const ref = receipt.data as unknown as { blob?: string; size?: number };
+    if (typeof ref.blob !== 'string') throw new Error('expected a claim-check reference');
+    // A different but valid JSON value under the same hash filename must not resolve.
+    await writeFile(join(home, 'blobs', ref.blob.slice(0, 2), ref.blob), JSON.stringify({ substituted: true }));
+    await expect(loadVerifiedEvents(home, 'n1', C13_EVENT_TYPES)).rejects.toThrow(/digest|size|blob/i);
+  });
+
+  it('refuses append at the ceiling before the writer and round-trips store/capture', async () => {
+    const { home, world } = artifactFixture();
+    const thresholds = [MAX_BLOB_BYTES - 1, MAX_BLOB_BYTES, MAX_BLOB_BYTES + 1];
+    const accepted: boolean[] = [];
+    const storedKinds: string[] = [];
+    const captures: ArtifactRef[] = [];
+    let driver: NodeDriver;
+    const hooks = {
+      registry: createBoundaryRegistry(),
+      onDurable: async (): Promise<void> => {},
+      onReady: async (): Promise<void> => {},
+      onTurnStart: async (): Promise<void> => {},
+      readHistory: (path: string, uid: string, knownTypes: ReadonlySet<string>) =>
+        loadVerifiedEvents(path, uid, knownTypes),
+      readBlob: (hash: string) => new BlobStore(home).get(hash),
+    };
+    let d: NodeDriver | null = null;
+    d = await NodeDriver.open(home, 'n1', async (ctx: TurnContext) => {
+      for (const n of thresholds) {
+        try {
+          ctx.gate.append('world/perception', perceptionData(n) as never);
+          accepted.push(true);
+        } catch {
+          accepted.push(false);
+        }
+      }
+      for (const n of thresholds) {
+        const { payload } = payloadOfCanonicalBytes(n);
+        const stored = await ctx.gate.store({ payload });
+        storedKinds.push(stored.kind);
+        captures.push(await ctx.gate.capture(Buffer.alloc(n, 0x7a), 'binary'));
+      }
+      d!.stop();
+      return { outcome: 'waiting', toolCalls: false };
+    }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+    driver = d;
+    const writer = (driver as unknown as { writer: { append: (...a: unknown[]) => unknown } }).writer;
+    const spy = vi.spyOn(writer, 'append');
+    await driver.run();
+
+    expect(accepted).toEqual([true, false, false]);
+    // Rejected appends never reached the writer.
+    expect(spy.mock.calls.filter((c) => c[0] === 'world/perception')).toHaveLength(1);
+    expect(storedKinds).toEqual(['artifact-json', 'artifact-json', 'artifact-json']);
+    const events = await readVerified(home);
+    expect(captures.map((ref) => resolveArtifact(events, ref).length)).toEqual(thresholds);
+  }, 120_000);
 });

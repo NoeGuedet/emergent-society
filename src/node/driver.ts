@@ -1,10 +1,18 @@
 import {
-  JournalReader, JournalWriter, TornTailError, repair,
-  type JournalWriterOptions,
+  BlobStore, JournalReader, JournalWriter, TornTailError, isBlobRef, repair,
+  type EventDataFor, type EventEnvelope, type JsonValue, type JournalWriterOptions,
 } from '../journal/index.js';
+import { sha256HexOf } from '../journal/canon.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
 import { NodeStateError } from './errors.js';
 import { WakeLatch } from './latch.js';
+import {
+  BlobIntegrityError, createBoundaryGate,
+  type BoundaryGate, type BoundaryRegistry, type DurableWatermark, type DriverHooks,
+  type GateCallbacks, type GateScope,
+} from './gate.js';
+import type { SafeFailure, Source } from '../context/contracts.js';
+import type { VerifiedEvent } from '../context/loader.js';
 import { HeadWatcher } from './watcher.js';
 import type { WorldRange, WorldRepo } from './world.js';
 
@@ -23,24 +31,21 @@ const systemClock = (): number => Date.now();
 // ShutdownReason and a closer takes a TurnEndOutcome.
 export type { ShutdownReason, TurnEndOutcome, TurnTrigger } from './events.js';
 
-/** How a turn ended, as the handler chose to end it. */
-export type TurnOutcome = 'chained' | 'waiting';
+/** How a turn ended: chained/waiting are the handler's, error is a recoverable failure. */
+export type TurnOutcome = 'chained' | 'waiting' | 'error';
 
 /**
  * What the handler reports back. The driver decides what the turn *meant*: it
  * is the only one that knows what the world did, and the handler is the only
  * one that knows what it did with its tools.
+ *
+ * A recoverable failure (`outcome: 'error'`) carries a bounded `SafeFailure`:
+ * the driver commits the turn, journals a nonignorable error closer and parks,
+ * rather than shutting the node down as an ordinary thrown exception does.
  */
-export interface TurnResult {
-  readonly outcome: TurnOutcome;
-  /**
-   * Whether the turn invoked at least one tool. It is the half of the
-   * empty-turn rule (kernel.md §5.4) the driver cannot observe by itself; the
-   * other half is whether the turn's commit changed anything. Deferred to C1.4:
-   * the flag must come from the mutation gate's record, not from a declaration.
-   */
-  readonly toolCalls: boolean;
-}
+export type TurnResult =
+  | { readonly outcome: 'chained' | 'waiting'; readonly toolCalls: boolean }
+  | { readonly outcome: 'error'; readonly toolCalls: boolean; readonly error: SafeFailure };
 
 /** The handler's whole world: no writer, no commit — the clock is the injected `now`. */
 export interface TurnContext {
@@ -54,6 +59,10 @@ export interface TurnContext {
    * records it.
    */
   readonly world: WorldRange;
+  /** The trusted boundary gate for this turn; revoked once the turn closes. */
+  readonly gate: BoundaryGate;
+  /** The turn's cancellation signal; `stop()` aborts it immediately. */
+  readonly signal: AbortSignal;
   now(): number;
 }
 
@@ -73,6 +82,14 @@ export interface NodeDriverOptions extends JournalWriterOptions {
    * repo, since HEAD is one value.
    */
   worldPollMs?: number;
+  /**
+   * The C1.3 trusted hooks: registry, durable/ready/turn-start callbacks and the
+   * required verified-history and blob sources. Absent for legacy handlers, whose
+   * gate is closed and whose resume keeps the resolved reader.
+   */
+  hooks?: DriverHooks;
+  /** Best-effort checkpoint at each durable completed turn boundary. */
+  onCheckpoint?: (mark: DurableWatermark) => Promise<void> | void;
 }
 
 /**
@@ -107,6 +124,29 @@ export class NodeDriver {
   private readonly watcher: HeadWatcher;
   /** Resolved once in the constructor, like the writer's `systemClock`. */
   private readonly now: () => number;
+  private readonly home: string;
+  private readonly hooks: DriverHooks | undefined;
+
+  /**
+   * The ordered durable observation list (T2 seam). Every gate or driver append
+   * pushes its receipt (raw, claim-check ref intact) paired with the original
+   * validated payload; resume pushes the loader-verified events. Delivery to
+   * `onDurable` advances `delivered` only after the callback succeeds.
+   */
+  private readonly observations: VerifiedEvent[] = [];
+  private delivered = 0;
+  /** Receipt inventory for validators, including pending receipts. */
+  private readonly receipts = new Map<string, EventEnvelope>();
+  /** The one logical lookup, shared by reference with every gate scope. */
+  private readonly lookup: (source: Source) => EventEnvelope | null;
+  /** Accepted `tool/call` appends in the active turn (C1.3 accounting). */
+  private turnToolCalls = 0;
+  /** The active turn's cancellation controller, or null between turns. */
+  private activeController: AbortController | null = null;
+  /** Revokes the active turn's gate once the turn closes. */
+  private closeTurnGate: (() => void) | null = null;
+  /** A durability/flush/observation fault ended (or poisoned) the run. */
+  private durabilityFault = false;
 
   private constructor(
     private readonly writer: JournalWriter,
@@ -114,15 +154,24 @@ export class NodeDriver {
     private readonly handler: TurnHandler,
     private readonly world: WorldRepo,
     private readonly opts: NodeDriverOptions,
+    home: string,
   ) {
     this.now = opts.now ?? systemClock;
     this.watcher = HeadWatcher.for(world, opts.worldPollMs);
+    this.home = home;
+    this.hooks = opts.hooks;
+    this.lookup = (source: Source): EventEnvelope | null =>
+      this.receipts.get(`${source.seq}:${source.hash}`) ?? null;
   }
 
   static async open(
     home: string, uid: string, handler: TurnHandler, world: WorldRepo,
     opts: NodeDriverOptions = {},
   ): Promise<NodeDriver> {
+    if (opts.hooks !== undefined
+      && (typeof opts.hooks.readHistory !== 'function' || typeof opts.hooks.readBlob !== 'function')) {
+      throw new Error('C1.3 hooks require readHistory and readBlob');
+    }
     let writer: JournalWriter;
     try {
       writer = await JournalWriter.open(home, uid, opts);
@@ -131,7 +180,7 @@ export class NodeDriver {
       await repair(home, uid);
       writer = await JournalWriter.open(home, uid, opts);
     }
-    const driver = new NodeDriver(writer, uid, handler, world, opts);
+    const driver = new NodeDriver(writer, uid, handler, world, opts, home);
     try {
       await driver.resume(home);
     } catch (err) {
@@ -155,6 +204,9 @@ export class NodeDriver {
     if (this.nodeState === 'stopping' || this.nodeState === 'stopped') return;
     this.stopReason = reason;
     this.stopRequested = true;
+    // Cancel the active turn immediately; the gate stays valid while the
+    // handler's awaited cleanup settles (see `endTurnGate`).
+    this.activeController?.abort();
     if (this.nodeState === 'waiting') this.latch.request();
   }
 
@@ -175,15 +227,28 @@ export class NodeDriver {
       while (!this.stopRequested) {
         const world = await this.worldRange();
         this.watermark = world.to;
-        this.writer.append('turn/start', { turn: this.turn, trigger, world });
-        // Barrier: the turn's opening is durable before the handler can produce
-        // any effect (kernel.md §3).
-        await this.writer.flush();
+        this.writeEvent('turn/start', {
+          turn: this.turn, trigger, world: { from: world.from, to: world.to },
+        });
+        const controller = new AbortController();
+        this.activeController = controller;
+        this.turnToolCalls = 0;
+        const created = this.makeGate('turn', this.turn, controller.signal);
+        this.closeTurnGate = created.close;
+        const ctx: TurnContext = {
+          turn: this.turn, trigger, world, now: () => this.now(),
+          gate: created.gate, signal: controller.signal,
+        };
+        // Barrier: the turn's opening is durable and observed before the handler
+        // can produce any effect (kernel.md §3).
+        await this.flushObservations();
         let result: TurnResult;
         try {
-          result = await this.handler({
-            turn: this.turn, trigger, world, now: () => this.now(),
-          });
+          if (this.hooks !== undefined) await this.hooks.onTurnStart(ctx);
+          result = await this.handler(ctx);
+          if (this.hooks !== undefined && (this.turnToolCalls > 0) !== result.toolCalls) {
+            throw new Error('handler toolCalls report disagrees with accepted tool/call events');
+          }
         } catch (err) {
           await this.endFailedTurn(this.turn, err);
           this.stopReason = 'handler-error';
@@ -193,26 +258,42 @@ export class NodeDriver {
         // can carry the hash that joins the journal to the world's history
         // (kernel.md §3, §5.2).
         const commit = await this.commitWorld(this.turn);
-        const end = {
-          turn: this.turn, outcome: result.outcome,
-          ...(commit !== null ? { commit } : {}),
-        };
-        // Empty (kernel.md §5.4): no tool call and nothing committed. It is
-        // still a turn — the fact of a node that woke and changed nothing — and
-        // the closer is the skip unit: emptiness is knowable only once the turn
-        // has ended, so `turn/end` is the only event that can carry the marker.
-        if (!result.toolCalls && commit === null) this.writer.append('turn/end', end, { ignorable: true });
-        else this.writer.append('turn/end', end);
-        // The closer is durable per event, never left to the write-behind window
-        // (kernel.md §3): a crash right after it would otherwise orphan the
-        // world commit — a hash in the world's history that the journal, the
-        // only record of which turn produced it, does not reference.
-        await this.writer.flush();
+        const toolCalls = this.hooks !== undefined ? this.turnToolCalls > 0 : result.toolCalls;
+        if (result.outcome === 'error') {
+          const status = result.error.status;
+          const end: EventDataFor<'turn/end'> = {
+            turn: this.turn, outcome: 'error',
+            error: status === null ? `${result.error.code} null` : `${result.error.code} ${status}`,
+            ...(commit !== null ? { commit } : {}),
+          };
+          // A normal, nonignorable error closer: failed-turn evidence survives.
+          this.writeEvent('turn/end', end);
+        } else {
+          const end: EventDataFor<'turn/end'> = {
+            turn: this.turn, outcome: result.outcome,
+            ...(commit !== null ? { commit } : {}),
+          };
+          // Empty (kernel.md §5.4): no tool call and nothing committed. It is
+          // still a turn — the fact of a node that woke and changed nothing — and
+          // the closer is the skip unit: emptiness is knowable only once the turn
+          // has ended, so `turn/end` is the only event that can carry the marker.
+          if (!toolCalls && commit === null) this.writeEvent('turn/end', end, { ignorable: true });
+          else this.writeEvent('turn/end', end);
+        }
+        // The closer is durable and observed per event, never left to the
+        // write-behind window (kernel.md §3): a crash right after it would
+        // otherwise orphan the world commit — a hash in the world's history that
+        // the journal, the only record of which turn produced it, does not
+        // reference.
+        await this.flushObservations();
+        await this.checkpoint();
+        this.endTurnGate();
         if (result.outcome === 'chained') {
           trigger = 'chain';
           this.turn += 1;
           continue;
         }
+        // Both 'waiting' and a recoverable 'error' park: the node stays alive.
         this.nodeState = 'waiting';
         try {
           await this.opts.onMaintenance?.();
@@ -242,6 +323,142 @@ export class NodeDriver {
     const shutdownFailure = await this.shutdown(failure);
     failure ??= shutdownFailure;
     if (failure !== null) throw failure;
+  }
+
+  // --- gate construction and the durable observation seam -------------------------
+
+  /** The one lookup, shared by reference with every gate scope (factory requires it). */
+  private makeGate(
+    phase: 'ready' | 'turn', turn: number | null, signal: AbortSignal,
+  ): { readonly gate: BoundaryGate; readonly close: () => void } {
+    const scope: GateScope = { phase, turn, signal, lookup: this.lookup };
+    const callbacks: GateCallbacks = {
+      append: (type, data) => {
+        if (type === 'tool/call') this.turnToolCalls += 1;
+        const receipt = this.writer.append(type, data);
+        this.record(receipt, data);
+        return receipt;
+      },
+      // `callbacks.flush` is the driver's durable barrier: it flushes the writer
+      // and delivers the captured observation prefix to `onDurable`. It never
+      // re-enters `gate.flush`, so a chunked capture cannot deadlock.
+      flush: () => this.flushObservations(),
+      lookup: this.lookup,
+      readBlob: (hash) => this.readBlob(hash),
+      now: () => this.now(),
+    };
+    // A hookless driver keeps the expanded context type but its gate is closed
+    // to every boundary type: an empty registry rejects every append.
+    const registry: BoundaryRegistry = this.hooks !== undefined
+      ? this.hooks.registry
+      : ({} as BoundaryRegistry);
+    return createBoundaryGate(registry, scope, callbacks);
+  }
+
+  private readBlob(hash: string): Promise<Uint8Array> {
+    if (this.hooks !== undefined) return this.hooks.readBlob(hash);
+    return new BlobStore(this.home).get(hash);
+  }
+
+  /** Records a receipt in the inventory and appends an in-memory observation. */
+  private record(receipt: EventEnvelope, data: JsonValue): void {
+    this.receipts.set(`${receipt.seq}:${receipt.hash}`, receipt);
+    this.observations.push({ ...receipt, data, raw: receipt });
+  }
+
+  /** A typed lifecycle append, observed like any other. */
+  private writeEvent<T extends string>(
+    type: T, data: EventDataFor<T>, opts: { ignorable?: boolean } = {},
+  ): EventEnvelope {
+    const receipt = this.writer.append(type, data, opts);
+    this.record(receipt, data as unknown as JsonValue);
+    return receipt;
+  }
+
+  /**
+   * Captures the current pending suffix, flushes the writer, verifies every
+   * captured claim-check, delivers that immutable prefix to `onDurable`, then
+   * advances the delivered watermark. Repeats while appends remain (a callback
+   * may append), and refuses an appending callback after 1024 batches.
+   */
+  private async flushObservations(): Promise<void> {
+    let batches = 0;
+    while (this.delivered < this.observations.length) {
+      batches += 1;
+      if (batches > 1024) throw new Error('observation seam exceeded 1024 batches');
+      const batch: readonly VerifiedEvent[] = this.observations.slice(this.delivered);
+      try {
+        await this.writer.flush();
+        await this.verifyObservations(batch);
+      } catch (err) {
+        this.durabilityFault = true;
+        throw err;
+      }
+      if (this.hooks !== undefined) await this.hooks.onDurable(batch);
+      this.delivered += batch.length;
+    }
+  }
+
+  /**
+   * The driver-flush guarantee: every observation whose raw journaled data is a
+   * claim-check reference is read back and its digest and byte length checked
+   * before it is delivered or any effect is allowed. A resumed event's payload
+   * was already verified by the loader; this re-reads the blob on disk.
+   */
+  private async verifyObservations(batch: readonly VerifiedEvent[]): Promise<void> {
+    for (const obs of batch) {
+      if (!isBlobRef(obs.raw.data)) continue;
+      const ref = obs.raw.data;
+      let bytes: Uint8Array;
+      try {
+        bytes = await this.readBlob(ref.blob);
+      } catch {
+        throw new BlobIntegrityError(ref.blob, ref.size, 0);
+      }
+      const buffer = Buffer.from(bytes);
+      if (buffer.length !== ref.size || sha256HexOf(buffer) !== ref.blob) {
+        throw new BlobIntegrityError(ref.blob, ref.size, buffer.length);
+      }
+    }
+  }
+
+  /** Best-effort checkpoint at a durable turn boundary; never fatal. */
+  private async checkpoint(): Promise<void> {
+    const onCheckpoint = this.opts.onCheckpoint;
+    if (onCheckpoint === undefined || this.delivered === 0) return;
+    const last = this.observations[this.delivered - 1]!;
+    try {
+      await onCheckpoint({ seq: last.raw.seq, hash: last.raw.hash });
+    } catch { /* best-effort: a checkpoint failure must not end the run */ }
+  }
+
+  private endTurnGate(): void {
+    const close = this.closeTurnGate;
+    this.closeTurnGate = null;
+    if (close !== null) close();
+    this.activeController = null;
+  }
+
+  private durableError(err: unknown): string {
+    if (this.hooks === undefined) return String(err);
+    // Only a bounded fixed label ever reaches the journal under C1.3 hooks; the
+    // original exception is retained and rethrown to its trusted caller.
+    return this.durabilityFault ? 'durability failure' : 'kernel invariant failure';
+  }
+
+  private knownTypes(): ReadonlySet<string> {
+    if (this.hooks === undefined) return this.opts.knownTypes ?? NODE_EVENT_TYPES;
+    const registryTypes = Object.keys(this.hooks.registry);
+    const provided = this.opts.knownTypes;
+    if (provided !== undefined) {
+      for (const type of registryTypes) {
+        if (!provided.has(type)) {
+          throw new Error(`knownTypes is missing boundary event type ${JSON.stringify(type)}`);
+        }
+      }
+      return provided;
+    }
+    return new Set([...NODE_EVENT_TYPES, ...registryTypes]);
   }
 
   /**
@@ -351,14 +568,16 @@ export class NodeDriver {
     } catch {
       commit = null;
     }
-    this.writer.append('turn/end', {
-      turn, outcome: 'error', error: String(err),
+    const end: EventDataFor<'turn/end'> = {
+      turn, outcome: 'error', error: this.durableError(err),
       ...(commit !== null ? { commit } : {}),
-    });
+    };
+    this.writeEvent('turn/end', end);
     // The same per-event barrier as the success path: this closer carries the
     // hash of the commit the failed turn did land, and a crash before the
     // write-behind window elapsed would orphan it (kernel.md §3).
-    await this.writer.flush();
+    await this.flushObservations();
+    this.endTurnGate();
   }
 
   /**
@@ -377,9 +596,9 @@ export class NodeDriver {
     let failure: unknown = null;
     this.nodeState = 'stopping';
     try {
-      this.writer.append('node/shutdown', {
+      this.writeEvent('node/shutdown', {
         reason: this.stopReason,
-        ...(prior !== null && prior !== undefined ? { error: String(prior) } : {}),
+        ...(prior !== null && prior !== undefined ? { error: this.durableError(prior) } : {}),
       });
     } catch (err) {
       failure ??= err;
@@ -400,20 +619,17 @@ export class NodeDriver {
    * The resume protocol (kernel.md §3): rebuild the durable state by replay,
    * close an interrupted turn synthetically — committing the world state its
    * writes left in the working tree, with this node's authorship — then journal
-   * the boot, durable before any turn effect can exist.
+   * the boot, durable before any turn effect can exist. With hooks, every
+   * durable event is delivered to `onDurable` through the ordered seam first,
+   * then the synthetic closer and boot, then `onReady`.
    */
   private async resume(home: string): Promise<void> {
-    const reader = await JournalReader.open(home, this.uid, {
-      knownTypes: this.opts.knownTypes ?? NODE_EVENT_TYPES,
-      // Projections replay the original payloads, not claim-check references.
-      resolveBlobs: true,
-    });
+    const knownTypes = this.knownTypes();
     let sawAny = false;
     let openTurn: number | null = null;
-    for await (const e of reader.events()) {
-      sawAny = true;
-      if (e.type === 'turn/start') {
-        const d = e.data as unknown as { turn: number; world: WorldRange };
+    const applyLifecycle = (type: string, data: unknown): void => {
+      if (type === 'turn/start') {
+        const d = data as { turn: number; world: WorldRange };
         openTurn = d.turn;
         this.turn = d.turn + 1;
         // The watermark is the HEAD the last turn opened on: what the node has
@@ -421,8 +637,28 @@ export class NodeDriver {
         // from the current HEAD, is what makes a node that was down while the
         // world moved wake on the commits it missed.
         this.watermark = d.world.to;
-      } else if (e.type === 'turn/end') {
+      } else if (type === 'turn/end') {
         openTurn = null;
+      }
+    };
+    if (this.hooks !== undefined) {
+      const events = await this.hooks.readHistory(home, this.uid, knownTypes);
+      for (const event of events) {
+        sawAny = true;
+        this.receipts.set(`${event.raw.seq}:${event.raw.hash}`, event.raw);
+        this.observations.push(event);
+        applyLifecycle(event.type, event.data);
+      }
+      await this.flushObservations();
+    } else {
+      const reader = await JournalReader.open(home, this.uid, {
+        knownTypes,
+        // Projections replay the original payloads, not claim-check references.
+        resolveBlobs: true,
+      });
+      for await (const e of reader.events()) {
+        sawAny = true;
+        applyLifecycle(e.type, e.data);
       }
     }
     if (openTurn !== null) {
@@ -430,16 +666,34 @@ export class NodeDriver {
       // world's working tree: they are committed here with the node's
       // authorship, and the closer carries the hash (§5.3).
       const commit = await this.commitWorld(openTurn);
-      this.writer.append('turn/end', {
+      this.writeEvent('turn/end', {
         turn: openTurn, outcome: 'interrupted', synthetic: true,
         ...(commit !== null ? { commit } : {}),
       });
       // A closer is a closer, synthetic or not: durable before the boot is
       // journaled on top of it, so a crash between the two still leaves the
       // commit it names attributable (kernel.md §3).
-      await this.writer.flush();
+      await this.flushObservations();
     }
-    this.writer.append('node/boot', { reason: sawAny ? 'resume' : 'start' });
-    await this.writer.flush();
+    this.writeEvent('node/boot', { reason: sawAny ? 'resume' : 'start' });
+    await this.flushObservations();
+    await this.readyPhase();
+  }
+
+  /**
+   * `onReady` during `open`, after synthetic closer and boot durability. It gets
+   * a short-lived ready gate — config, artifacts, synthetic recovery results and
+   * compaction-abort only, no model request or effect — revoked once it returns
+   * and its final flush succeeds.
+   */
+  private async readyPhase(): Promise<void> {
+    if (this.hooks === undefined) return;
+    const created = this.makeGate('ready', null, new AbortController().signal);
+    try {
+      await this.hooks.onReady(created.gate);
+      await this.flushObservations();
+    } finally {
+      created.close();
+    }
   }
 }

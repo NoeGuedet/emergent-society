@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { JournalWriter } from '../../journal/index.js';
+import { BlobStore, JournalWriter } from '../../journal/index.js';
+import { C13_EVENT_TYPES, createBoundaryRegistry } from '../../context/events.js';
+import { loadVerifiedEvents } from '../../context/loader.js';
+import type { DriverHooks } from '../gate.js';
 import { NodeDriver, type TurnResult, type TurnTrigger } from '../driver.js';
 import type { EventEnvelope } from '../../journal/index.js';
 import { HeadWatcher } from '../watcher.js';
@@ -67,6 +70,73 @@ describe('the world as the only channel', () => {
     expect(ends.map((e) => e.commit))
       .toEqual((await worldLog(world)).map((line) => line.split(' ')[0]));
     expect(await worldLog(world)).toHaveLength(2);
+  });
+
+  it('commits and records the hash per turn with C1.3 hooks installed', async () => {
+    // The gate seam must not change world physics: with hooks, the driver still
+    // commits the turn's writes as the node and records the commit hash, and it
+    // observes the lifecycle through the real loader (never resolveBlobs: true).
+    const { home, world } = fixture();
+    const hooks: DriverHooks = {
+      registry: createBoundaryRegistry(),
+      onDurable: async () => {},
+      onReady: async () => {},
+      onTurnStart: async () => {},
+      readHistory: (path, uid, knownTypes) => loadVerifiedEvents(path, uid, knownTypes),
+      readBlob: (hash) => new BlobStore(home).get(hash),
+    };
+    const d = await NodeDriver.open(home, 'n1', async (ctx) => {
+      // Under hooks a reported tool call must be backed by an accepted one.
+      ctx.gate.append('tool/call', {
+        turn: ctx.turn, request: { turn: ctx.turn, ordinal: 0 },
+        call: { id: 'c1', type: 'function', function: { name: 'execute', arguments: '{}' } },
+      });
+      await writeWorldFile(world, 'n1/hooks.md', 'hooked');
+      return acted();
+    }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+    const running = d.run();
+    await parked(d, world);
+    d.stop();
+    await running;
+    const events = await loadVerifiedEvents(home, 'n1', C13_EVENT_TYPES);
+    const commit = (events.find((e) => e.type === 'turn/end')?.data as { commit?: string }).commit;
+    expect(commit).toBe(await world.headHash());
+    expect(await committedContent(world, 'n1/hooks.md')).toBe('hooked');
+  });
+
+  it('parks a recoverable error turn and wakes on a foreign commit', async () => {
+    const { home, world } = fixture();
+    const hooks: DriverHooks = {
+      registry: createBoundaryRegistry(),
+      onDurable: async () => {},
+      onReady: async () => {},
+      onTurnStart: async () => {},
+      readHistory: (path, uid, knownTypes) => loadVerifiedEvents(path, uid, knownTypes),
+      readBlob: (hash) => new BlobStore(home).get(hash),
+    };
+    const seen: TurnTrigger[] = [];
+    const d = await NodeDriver.open(home, 'n1', async (ctx) => {
+      seen.push(ctx.trigger);
+      if (ctx.turn === 0) {
+        await writeWorldFile(world, 'n1/failed.md', 'x');
+        return { outcome: 'error', toolCalls: false, error: { code: 'network', status: null } };
+      }
+      return wait();
+    }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+    const running = d.run();
+    await parked(d, world);
+    const events = await loadVerifiedEvents(home, 'n1', C13_EVENT_TYPES);
+    const end = events.find((e) => e.type === 'turn/end');
+    expect(end?.data).toMatchObject({ outcome: 'error' });
+    expect(end?.ignorable).toBeUndefined();
+    expect(await committedContent(world, 'n1/failed.md')).toBe('x');
+    const foreign = await commitAs(world, 'n2', { 'n2/hello.md': 'hi' });
+    await HeadWatcher.for(world).check();
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
+    expect(seen[1]).toBe('wakeup');
+    expect(foreign).toBe(await world.headHash());
+    d.stop();
+    await running;
   });
 
   it('journals an empty turn as ignorable, and commits nothing', async () => {

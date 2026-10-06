@@ -20,3 +20,5 @@ export {
 export {
   NODE_EVENT_TYPES, type ShutdownReason, type TurnEndOutcome, type TurnTrigger,
 } from './events.js';
+// The hook seam's types are public; the gate factory and the writer are not.
+export type { BoundaryGate, DurableWatermark, DriverHooks } from './gate.js';
