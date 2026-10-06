@@ -13,7 +13,10 @@ export {
   type TurnOutcome,
   type TurnResult,
 } from './driver.js';
-export { WorldRepo, type WorldCommitInfo, type WorldRange } from './world.js';
+export {
+  WorldRepo, type CommitRange, type DiffCapture, type RecordedCommit, type WorldCommitInfo,
+  type WorldRange,
+} from './world.js';
 export {
   GitCommandError, NodeError, NodeStateError, UnsafeWorldPathError, WorldNotARepoError,
 } from './errors.js';
