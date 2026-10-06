@@ -69,6 +69,38 @@ export type WorldRange = {
 };
 
 /**
+ * A bounded rendering of a world range (T4). `bytesRetained` counts the emitted
+ * UTF-8 bytes of `text` after decoding/replacement, including headers and
+ * notices — not an input byte count; `truncated` is true when emission stopped
+ * before the whole bounded range was rendered. Type aliases, not interfaces:
+ * these are journaled in `world/perception` and the envelope's `JsonValue`
+ * constraint only admits alias-shaped object types.
+ */
+export type DiffCapture = {
+  readonly text: string;
+  readonly truncated: boolean;
+  readonly bytesRetained: number;
+};
+
+/** One recorded commit of a bounded range, as the perception records it. */
+export type RecordedCommit = {
+  readonly hash: string;
+  readonly author: string;
+};
+
+/**
+ * A bounded, verified traversal of the world's history (T4). `effectiveFrom` is
+ * the requested `from` when reachable, else `null`; `listTruncated` records that
+ * older commits were omitted rather than claiming a complete history.
+ */
+export type CommitRange = {
+  readonly commits: RecordedCommit[];
+  readonly effectiveFrom: string | null;
+  readonly fallback: 'none' | 'unreachable-from';
+  readonly listTruncated: boolean;
+};
+
+/**
  * Runs one git command in the world and returns its stdout.
  *
  * @throws GitCommandError on any non-zero exit or spawn failure, carrying the
