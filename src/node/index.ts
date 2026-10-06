@@ -25,3 +25,9 @@ export {
 } from './events.js';
 // The hook seam's types are public; the gate factory and the writer are not.
 export type { BoundaryGate, DurableWatermark, DriverHooks } from './gate.js';
+// The C1.3 runtime's public surface: the factory plus its instance and option
+// types. Provider components stay direct imports (no re-export here), and the
+// boundary gate factory and the writer stay unexported.
+export {
+  createAgentRuntime, type AgentRuntime, type RuntimeOptions,
+} from './loop.js';

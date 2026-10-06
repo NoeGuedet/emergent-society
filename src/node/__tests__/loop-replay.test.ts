@@ -25,9 +25,9 @@ import { commitAs, useWorld, type WorldFixture } from './helpers.js';
  *    diffs their perceptions rendered;
  *  - a heading/config update (scheduled strictly newer configuration);
  *  - a closed EMPTY turn whose nonempty external perception is still retained;
- *  - canonical artifacts above 4 MiB (version 1's charter is a giant captured
- *    artifact, so the first turn's plan and wire are giants too; version 2
- *    shrinks the charter so the remaining turns stay cheap);
+ *  - canonical artifacts above 4 MiB (version 2's charter is a giant captured
+ *    artifact, so the final turn's plan and wire are giants too; version 1's
+ *    default charter keeps the earlier turns cheap);
  *  - successive committed compactions;
  *  - an interrupted turn: the shell is armed to throw mid-dispatch, so the turn
  *    closes with a durable error closer that moves its incomplete call group
@@ -64,7 +64,7 @@ vi.mock('../tools/shell.js', async (importOriginal) => {
 const fixture = useWorld('c13-loop-replay-');
 
 const MiB = 1024 * 1024;
-/** A charter above the 4 MiB artifact threshold, so the first turn's plan/wire are giants. */
+/** A charter above the 4 MiB artifact threshold, so the final turn's plan/wire are giants. */
 const GIANT_CHARTER = 'c'.repeat(4.5 * MiB);
 
 beforeEach(() => {
