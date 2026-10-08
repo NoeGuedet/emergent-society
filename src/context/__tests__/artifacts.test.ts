@@ -442,6 +442,38 @@ describe('resolveStored', () => {
       h.close();
     }
   });
+
+  it('refuses a digest-verified artifact whose body is not JSON as a typed mismatch', () => {
+    // Valid UTF-8 that is not JSON, with a manifest whose digest and length match:
+    // the reference is honest, only the payload cannot be decoded.
+    const body = Buffer.from('not json{');
+    const artifact = sha256HexOf(body);
+    const manifestEvent = envelope({
+      type: 'artifact/end', seq: 2, hash: 'c'.repeat(64),
+      data: {
+        artifact, sha256: artifact, bytes: body.length, encoding: 'utf8', complete: true,
+        parts: [{ seq: 1, hash: 'd'.repeat(64) }],
+      },
+    });
+    const chunkEvent = envelope({
+      type: 'artifact/chunk', seq: 1, hash: 'd'.repeat(64),
+      data: { artifact, index: 0, base64: body.toString('base64') },
+    });
+    const events: VerifiedEvents = [verified(chunkEvent), verified(manifestEvent)];
+    const ref: ArtifactRef = {
+      kind: 'c13-artifact', manifest: { seq: 2, hash: 'c'.repeat(64) },
+      sha256: artifact, bytes: body.length, encoding: 'utf8', complete: true,
+    };
+    let err: unknown;
+    try {
+      resolveStored(events, { kind: 'artifact-json', ref }, (v) => v);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ArtifactMismatchError);
+    expect((err as ArtifactMismatchError).field).toBe('json');
+    expect(err).not.toBeInstanceOf(SyntaxError);
+  });
 });
 
 describe('size thresholds', () => {

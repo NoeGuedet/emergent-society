@@ -23,12 +23,18 @@ export type VerifiedEvents = readonly VerifiedEvent[];
 
 export { BlobIntegrityError };
 
-/** An `ArtifactRef` disagreed with its `artifact/end` manifest. */
+/**
+ * An `ArtifactRef` disagreed with its `artifact/end` manifest, or a manifest-
+ * verified body could not be decoded as the JSON its `Stored` consumer expects
+ * (`field: 'json'`). A typed refusal, distinct from a read or programming error.
+ */
 export class ArtifactMismatchError extends Error {
   constructor(
-    public readonly field: 'manifest' | 'sha256' | 'bytes' | 'encoding' | 'complete',
+    public readonly field: 'manifest' | 'sha256' | 'bytes' | 'encoding' | 'complete' | 'json',
   ) {
-    super('artifact reference does not match its manifest');
+    super(field === 'json'
+      ? 'artifact body is not JSON'
+      : 'artifact reference does not match its manifest');
     this.name = 'ArtifactMismatchError';
   }
 }

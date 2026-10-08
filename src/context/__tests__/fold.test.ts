@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
-import { BlobStore, JournalWriter } from '../../journal/index.js';
+import { BlobStore, CLAIM_CHECK_THRESHOLD, isBlobRef, JournalWriter } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
 import { sha256HexOf } from '../../journal/canon.js';
+import { canonicalMessagesBytes } from '../../provider/wire.js';
 import { useTempHome, withFailingWrite } from '../../journal/__tests__/helpers.js';
 import type { BoundaryGate, DriverHooks, GateCallbacks } from '../../node/gate.js';
 import { createBoundaryGate } from '../../node/gate.js';
@@ -407,6 +408,67 @@ describe('fold: compaction applies only after a verified end', () => {
       const all = await loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES);
       await expect(before.observe(all)).rejects.toThrow(SurfacePolicyError);
       expect(before.snapshot().surface).toEqual(surface);
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe('fold: compaction summary above the claim-check threshold', () => {
+  it('resolves and applies a summary stored as a claim-check reference, durably on replay', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      // A real shadow well above the ~20 KiB summary and far below the 4 MiB gate
+      // ceiling, so the strict-smaller rule holds on a genuine span.
+      const shadowText = 'external evidence '.repeat(1400);
+      const t0 = await pipeline(s, 0, cfg, { perceptionText: shadowText, calls: [] });
+      await t0.gate.flush();
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' }, { ignorable: true });
+      await s.writer.flush();
+
+      const before = await foldOf(home());
+      const surface = before.snapshot().surface;
+      if (surface === null) throw new Error('missing surface');
+      const group = surface.nodes.find((node) => node.group.kind === 'perception')!.group;
+      const shadow = Buffer.from(canonicalMessagesBytes(group.messages));
+      const fields = {
+        revision: surface.revision, groupIds: [group.id], sources: group.sources,
+        shadowHash: sha256HexOf(shadow), shadowBytes: shadow.length,
+      };
+      const start: CompactionStart = {
+        id: sha256HexOf(Buffer.from(canonicalBytes(fields))), ...fields,
+      };
+
+      s.lifecycle('turn/start', { turn: 1, trigger: 'boot', world: { from: null, to: null } });
+      const gate = s.gate('turn', 1).gate;
+      gate.append('compaction/start', start);
+      const content = 'compacted summary '.repeat(1200);
+      const message = { role: 'user' as const, content };
+      const replacementBytes = canonicalMessagesBytes([message]).length;
+      expect(replacementBytes).toBeGreaterThan(CLAIM_CHECK_THRESHOLD);
+      expect(replacementBytes).toBeLessThan(shadow.length);
+      const summary = gate.append('compaction/summary', {
+        id: start.id, message, sources: start.sources, replacementBytes,
+      });
+      gate.append('compaction/end', { id: start.id, summary: { seq: summary.seq, hash: summary.hash } });
+      await gate.flush();
+
+      const after = await foldOf(home());
+      const nodes = after.snapshot().surface?.nodes ?? [];
+      expect(nodes.map((node) => node.group.kind)).toEqual(['heading', 'summary']);
+      expect(nodes[1]?.group.messages[0]).toEqual(message);
+
+      // Offline replay through a fresh fold re-derives the same applied summary.
+      expect((await foldOf(home())).snapshot().surface).toEqual(after.snapshot().surface);
+
+      // The raw receipt stays a claim-check reference while the resolved value is
+      // the durable summary payload the surface applied.
+      const verified = await loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES);
+      const receipt = verified.find((event) => event.seq === summary.seq);
+      expect(receipt?.type).toBe('compaction/summary');
+      expect(isBlobRef(receipt?.raw.data)).toBe(true);
+      expect((receipt?.data as { message: { content: string } }).message.content).toBe(content);
     } finally {
       await s.close();
     }

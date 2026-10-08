@@ -72,6 +72,20 @@ function mismatch(field: ArtifactMismatchError['field']): never {
   throw new ArtifactMismatchError(field);
 }
 
+/**
+ * Parses the JSON body of a manifest-verified artifact. The bytes already match
+ * their digest and length; a body that is not JSON is a typed mismatch rather
+ * than a raw `SyntaxError`, so a forged payload is distinguished from a read
+ * error and classified as corruption, not a programming fault.
+ */
+export function parseArtifactJson(bytes: Uint8Array): unknown {
+  try {
+    return JSON.parse(Buffer.from(bytes).toString('utf8'));
+  } catch {
+    mismatch('json');
+  }
+}
+
 function decodeBase64(text: unknown): Buffer {
   if (typeof text !== 'string' || text.length % 4 !== 0
     || !/^[A-Za-z0-9+/]*={0,2}$/.test(text)) {
@@ -154,9 +168,7 @@ export function resolveStored<T>(
   if (value['kind'] === 'inline') return validate(value['value']);
   if (value['kind'] === 'artifact-json') {
     const ref = value['ref'] as ArtifactRef;
-    const bytes = resolveArtifact(events, ref);
-    const parsed: unknown = JSON.parse(Buffer.from(bytes).toString('utf8'));
-    return validate(parsed);
+    return validate(parseArtifactJson(resolveArtifact(events, ref)));
   }
   throw new Error('stored value has an unknown kind');
 }

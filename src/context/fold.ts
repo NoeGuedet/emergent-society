@@ -1,7 +1,7 @@
 import type { EventEnvelope } from '../journal/index.js';
 import type { GateScope, WorldAcknowledgement } from '../node/gate.js';
 import type { WorldRange } from '../node/world.js';
-import { eventKey, resolveArtifact, resolveStored, toJson } from './artifacts.js';
+import { eventKey, parseArtifactJson, resolveArtifact, resolveStored, toJson } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
 import { createBoundaryRegistry, validateRequestPlan } from './events.js';
 import { SAME, sortUnique } from './groups.js';
@@ -287,8 +287,7 @@ export class ContextFold {
       const out = validator(data, scope) as unknown as { value: { value: WorldPerception } };
       return out.value.value;
     }
-    const bytes = resolveArtifact(this.verifiedIndex, data.value.ref);
-    const parsed: unknown = JSON.parse(Buffer.from(bytes).toString('utf8'));
+    const parsed = parseArtifactJson(resolveArtifact(this.verifiedIndex, data.value.ref));
     const out = validator(
       { turn: data.turn, range: data.range, value: { kind: 'inline', value: parsed } }, scope,
     ) as unknown as { value: { value: WorldPerception } };
@@ -401,8 +400,7 @@ export class ContextFold {
       const out = validator({ id, value }, scope) as unknown as { value: { value: AssistantProjection } };
       return out.value.value;
     }
-    const bytes = resolveArtifact(this.verifiedIndex, value.ref);
-    const parsed: unknown = JSON.parse(Buffer.from(bytes).toString('utf8'));
+    const parsed = parseArtifactJson(resolveArtifact(this.verifiedIndex, value.ref));
     const out = validator(
       { id, value: { kind: 'inline', value: parsed } }, scope,
     ) as unknown as { value: { value: AssistantProjection } };
