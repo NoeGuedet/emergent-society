@@ -1,6 +1,6 @@
 import { canonicalizeJson } from '../journal/index.js';
 import type { JsonValue } from '../journal/index.js';
-import { sha256HexOf } from '../journal/canon.js';
+import { copyJsonValue, sha256HexOf } from '../journal/canon.js';
 import type { ArtifactRef, ArtifactChunk, ArtifactManifest, Stored } from './contracts.js';
 import { ArtifactMismatchError } from './loader.js';
 import type { VerifiedEvent, VerifiedEvents } from './loader.js';
@@ -8,67 +8,25 @@ import type { VerifiedEvent, VerifiedEvents } from './loader.js';
 /**
  * The one serialization and artifact-resolution path of the context assembler.
  *
- * `toJson` is the runtime validator behind every journaled payload: a payload
- * with no canonical JSON form (undefined, non-finite numbers, cycles, non-plain
- * objects, lone surrogates) is refused rather than coerced, and the returned
- * value is a deep copy so an exported snapshot never aliases internal state.
+ * `toJson` is the runtime validator behind every journaled payload: it delegates
+ * to the journal's shared stable copy (which refuses undefined, non-finite
+ * numbers, cycles, non-plain objects, accessors, `toJSON` hooks and lone
+ * surrogates) and then freezes the result at every level, so an exported
+ * snapshot never aliases internal state and cannot be mutated after export.
  */
 
-function hasLoneSurrogate(text: string): boolean {
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = text.charCodeAt(i + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
-      i += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return true;
-    }
+function deepFreeze(value: JsonValue): JsonValue {
+  if (value === null || typeof value !== 'object') return value;
+  for (const key of Object.keys(value)) {
+    deepFreeze((value as Record<string, JsonValue>)[key]!);
   }
-  return false;
-}
-
-function copy(value: unknown, path: string, seen: Set<object>): JsonValue {
-  switch (typeof value) {
-    case 'boolean':
-    case 'string':
-      if (typeof value === 'string' && hasLoneSurrogate(value)) {
-        throw new Error(`lone surrogate at ${path}`);
-      }
-      return value;
-    case 'number':
-      if (!Number.isFinite(value)) throw new Error(`non-finite number at ${path}`);
-      return value;
-    case 'object':
-      break;
-    default:
-      throw new Error(`${typeof value} at ${path}`);
-  }
-  if (value === null) return null;
-  if (seen.has(value)) throw new Error(`circular reference at ${path}`);
-  seen.add(value);
-  try {
-    if (Array.isArray(value)) {
-      const out = value.map((item, i) => copy(item, `${path}[${i}]`, seen));
-      return Object.freeze(out) as unknown as JsonValue;
-    }
-    const proto: unknown = Object.getPrototypeOf(value);
-    if (proto !== Object.prototype && proto !== null) {
-      throw new Error(`non-plain object at ${path}`);
-    }
-    const out: Record<string, JsonValue> = {};
-    for (const [key, item] of Object.entries(value)) {
-      out[key] = copy(item, `${path}.${key}`, seen);
-    }
-    return Object.freeze(out);
-  } finally {
-    seen.delete(value);
-  }
+  Object.freeze(value);
+  return value;
 }
 
 /** Returns a validated deep JSON copy, recursively frozen at every ordinary object/array. */
 export function toJson(value: unknown): JsonValue {
-  return copy(value, '$', new Set());
+  return deepFreeze(copyJsonValue(value));
 }
 
 /** The RFC-8785 canonical UTF-8 bytes of a value — the exact measure the journal hashes. */

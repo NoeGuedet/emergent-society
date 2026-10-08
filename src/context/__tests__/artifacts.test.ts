@@ -3,7 +3,8 @@ import { Buffer } from 'node:buffer';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  BlobStore, CLAIM_CHECK_THRESHOLD, JournalWriter, MAX_BLOB_BYTES, canonicalizeJson, isBlobRef,
+  BlobStore, CLAIM_CHECK_THRESHOLD, JournalWriter, MAX_BLOB_BYTES, NonCanonicalizableError,
+  canonicalizeJson, isBlobRef,
 } from '../../journal/index.js';
 import type { EventEnvelope } from '../../journal/index.js';
 import { sha256HexOf } from '../../journal/canon.js';
@@ -88,6 +89,7 @@ describe('toJson', () => {
     expect(() => toJson({ a: Infinity })).toThrow();
     expect(() => toJson('\uD800')).toThrow();
     expect(() => toJson({ a: 'ok\uDC00' })).toThrow();
+    expect(() => toJson(JSON.parse('{"\\uD800":1}'))).toThrow();
   });
 
   it('rejects cycles and non-plain objects', () => {
@@ -99,6 +101,79 @@ describe('toJson', () => {
     expect(() => toJson(Buffer.from('x'))).toThrow();
     class Thing { public x = 1; }
     expect(() => toJson(new Thing())).toThrow();
+  });
+
+  it('preserves an own __proto__ key from JSON.parse without polluting prototypes', () => {
+    const parsed = JSON.parse('{"__proto__":{"x":1},"a":2}') as Record<string, unknown>;
+    const json = toJson(parsed) as Record<string, unknown>;
+    expect(Object.getPrototypeOf(json)).toBe(Object.prototype);
+    expect(Object.getOwnPropertyDescriptor(json, '__proto__')?.value).toEqual({ x: 1 });
+    expect(({} as Record<string, unknown>)['x']).toBeUndefined();
+  });
+
+  it('refuses an own enumerable accessor without evaluating it', () => {
+    let calls = 0;
+    const input: Record<string, unknown> = {};
+    Object.defineProperty(input, 'a', {
+      enumerable: true, configurable: true,
+      get() { calls += 1; return 1; },
+    });
+    expect(() => toJson(input)).toThrow(NonCanonicalizableError);
+    expect(calls).toBe(0);
+  });
+
+  it('refuses a callable toJSON hook without invoking it', () => {
+    let calls = 0;
+    const input: Record<string, unknown> = { a: 1 };
+    Object.defineProperty(input, 'toJSON', {
+      enumerable: false, configurable: true,
+      value: () => { calls += 1; return 'x'; },
+    });
+    expect(() => toJson(input)).toThrow(NonCanonicalizableError);
+    expect(calls).toBe(0);
+  });
+
+  it('rejects sparse arrays, extra own array properties and symbol members', () => {
+    const sparse: unknown[] = new Array(3);
+    sparse[0] = 1;
+    sparse[2] = 3;
+    expect(() => toJson(sparse)).toThrow(NonCanonicalizableError);
+    const extra: unknown[] = [1];
+    (extra as unknown as Record<string, unknown>)['foo'] = 2;
+    expect(() => toJson(extra)).toThrow(NonCanonicalizableError);
+    const sym = Symbol('s');
+    const withSymbol: Record<string, unknown> = { a: 1 };
+    (withSymbol as unknown as Record<symbol, unknown>)[sym] = 2;
+    expect(() => toJson(withSymbol)).toThrow(NonCanonicalizableError);
+  });
+
+  it('keeps a frozen snapshot unchanged when the caller mutates the input afterwards', () => {
+    const input = { a: { b: 1 }, list: [1, 2] };
+    const json = toJson(input) as { a: { b: number }; list: number[] };
+    input.a.b = 99;
+    input.list.push(3);
+    expect(json.a.b).toBe(1);
+    expect(json.list).toEqual([1, 2]);
+    expect(Object.isFrozen(json)).toBe(true);
+    expect(Object.isFrozen(json.a)).toBe(true);
+    expect(Object.isFrozen(json.list)).toBe(true);
+  });
+
+  it('refuses a null-prototype input when its copy would inherit a polluted Object.prototype.toJSON', () => {
+    let calls = 0;
+    Object.defineProperty(Object.prototype, 'toJSON', {
+      configurable: true, writable: true,
+      value() { calls += 1; return 1; },
+    });
+    try {
+      const bare = Object.create(null) as Record<string, unknown>;
+      bare['a'] = 1;
+      expect(() => toJson(bare)).toThrow(NonCanonicalizableError);
+      expect(() => canonicalBytes(bare)).toThrow(NonCanonicalizableError);
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)['toJSON'];
+    }
+    expect(calls).toBe(0);
   });
 });
 
@@ -112,6 +187,11 @@ describe('canonicalBytes', () => {
   it('rejects values with no canonical JSON form', () => {
     expect(() => canonicalBytes({ a: undefined })).toThrow();
     expect(() => canonicalBytes({ a: Number.POSITIVE_INFINITY })).toThrow();
+  });
+
+  it('keeps an own __proto__ key byte-for-byte through toJson and canonicalization', () => {
+    const parsed = JSON.parse('{"__proto__":{"x":1},"a":2}');
+    expect(Buffer.from(canonicalBytes(parsed)).toString('utf8')).toBe('{"__proto__":{"x":1},"a":2}');
   });
 });
 
