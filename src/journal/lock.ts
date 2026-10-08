@@ -75,8 +75,10 @@ export const guardLauncher = {
     return spawn(FLOCK_PATH, args, {
       stdio: ['ignore', 'ignore', 'pipe'],
       timeout: timeoutMs,
-      // The bounded wait must actually end the critical section; SIGKILL cannot
-      // be ignored by a wedged helper.
+      // The bounded wait ends the critical section: SIGKILL is delivered without
+      // unwinding handlers. A helper wedged in uninterruptible kernel I/O (D
+      // state) cannot be reaped until the call returns, so the timeout bounds
+      // the lock, not the process's death.
       killSignal: 'SIGKILL',
     });
   },
@@ -228,9 +230,13 @@ class Ownership implements JournalOwnership {
  *
  * Returns null when `/proc` is unavailable (or the field is missing). At the
  * ownership layer that is not a pid-only fallback: the helper's `ownerIsAlive`
- * cannot prove the requester is alive, so it fails closed (`EXIT_OWNER_GONE`)
- * and every acquire is refused. Ownership therefore requires Linux `/proc` and
- * the hardcoded `flock`.
+ * treats a live pid with an unknown start time as alive (it cannot prove a
+ * *different* process holds the pid, so it refuses rather than reclaims), and a
+ * recorded null-start owner is likewise conservatively live in `recordIsLive`.
+ * The fail-closed `EXIT_OWNER_GONE` outcome occurs when the helper cannot read
+ * `/proc/<pid>/stat` at all — the pid is gone, or the read fails (EPERM), which
+ * `procInfo` reports as unknown — not for every null start time. Ownership
+ * therefore requires Linux `/proc` and the hardcoded `flock`.
  */
 export async function processStartTime(pid: number): Promise<number | null> {
   let stat: string;

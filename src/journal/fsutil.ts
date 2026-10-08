@@ -14,11 +14,25 @@ import { JournalError } from './errors.js';
 /** Makes a path's directory entry durable. Works for a directory or a file. */
 export async function syncPath(path: string): Promise<void> {
   const handle = await open(path, 'r');
+  let failed = false;
+  let failure: unknown;
   try {
     await handle.sync();
-  } finally {
-    await handle.close();
+  } catch (err) {
+    failed = true;
+    failure = err;
   }
+  // The handle is always closed, but a sync failure outranks a close failure:
+  // in a plain `finally` a rejected close would replace the EIO the caller needs.
+  try {
+    await handle.close();
+  } catch (err) {
+    if (!failed) {
+      failed = true;
+      failure = err;
+    }
+  }
+  if (failed) throw failure;
 }
 
 /**
@@ -34,8 +48,10 @@ export async function atomicWriteFile(path: string, data: string | Uint8Array): 
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   const handle = await open(tmp, 'wx');
   try {
-    if (typeof data === 'string') await handle.write(data);
-    else await handle.write(data, 0, data.length, null);
+    // `writeAll` loops until every byte is written, so a short `pwrite` cannot
+    // leave a torn temp that the rename would then make durable under the
+    // canonical name.
+    await writeAll(handle, typeof data === 'string' ? Buffer.from(data, 'utf8') : data);
     await handle.sync();
     await handle.close();
     await rename(tmp, path);
@@ -172,7 +188,7 @@ export class JournalWriteStalledError extends JournalError {
 }
 
 /** Writes the whole buffer, retrying short writes until it is all durable. */
-export async function writeAll(handle: FileHandle, buf: Buffer): Promise<void> {
+export async function writeAll(handle: FileHandle, buf: Uint8Array): Promise<void> {
   let written = 0;
   while (written < buf.length) {
     const { bytesWritten } = await handle.write(buf, written, buf.length - written, null);

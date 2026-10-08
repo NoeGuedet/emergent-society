@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { fork, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { chmod, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   acquireLock, guardLauncher, LockGuard, JournalLockBusyError, JournalLockUnavailableError,
@@ -266,6 +267,35 @@ describe('ownership guard failure', () => {
     }
   });
 
+  it('maps real flock contention on the sidecar to busy, never unavailable', async () => {
+    const dir = await prepareDir();
+    const marker = join(home(), 'sidecar-held');
+    // A real flock holds the sidecar (the marker is touched only after the lock
+    // is acquired), so the guard's flock meets genuine contention.
+    const holder = spawn(FLOCK, [
+      '-F', '--exclusive', lockPath(dir), '/bin/sh', '-c', `touch '${marker}'; sleep 30`,
+    ], { stdio: ['ignore', 'ignore', 'ignore'] });
+    try {
+      await vi.waitFor(async () => { await stat(marker); }, { timeout: 5_000 });
+      const realSpawn = guardLauncher.spawn.bind(guardLauncher);
+      const spy = vi.spyOn(guardLauncher, 'spawn').mockImplementation((args: string[], timeoutMs: number) => {
+        // Keep the production flock flags and helper; only shorten the wait so
+        // the contended guard is observed at once rather than after 5 seconds.
+        return realSpawn(args.map((a) => (a.startsWith('--wait=') ? '--wait=0' : a)), timeoutMs);
+      });
+      try {
+        const err = await acquireLock(dir, 'n1').catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(JournalLockBusyError);
+        expect(err).not.toBeInstanceOf(JournalLockUnavailableError);
+      } finally {
+        spy.mockRestore();
+      }
+    } finally {
+      holder.kill('SIGKILL');
+      await new Promise<void>((resolvePromise) => holder.once('exit', () => resolvePromise()));
+    }
+  }, 15_000);
+
   it('treats any other guard exit code as unavailable, not busy', async () => {
     const dir = await prepareDir();
     const spy = vi.spyOn(guardLauncher, 'spawn').mockImplementation(() =>
@@ -278,6 +308,39 @@ describe('ownership guard failure', () => {
     } finally {
       spy.mockRestore();
     }
+  });
+
+  it('persists the whole owner record through short writeSync calls', async () => {
+    const dir = await prepareDir();
+    const preload = join(home(), 'shortwrite-preload.cjs');
+    // A test-owned preload that forces every `writeSync` to advance at most three
+    // bytes, then re-syncs the builtin ESM bindings so the helper's named import
+    // sees the patched function. No production testing flag is involved.
+    await writeFile(preload, [
+      "const fs = require('node:fs');",
+      'const real = fs.writeSync;',
+      'function short(fd, buf, offset, length, position) {',
+      '  const off = offset ?? 0;',
+      '  const len = length ?? buf.length - off;',
+      '  return real.call(fs, fd, buf, off, Math.min(len, 3), position ?? null);',
+      '}',
+      'fs.writeSync = function (fd, buffer, offset, length, position) {',
+      "  if (typeof buffer === 'string') return short(fd, Buffer.from(buffer, 'utf8'), 0, undefined, position);",
+      '  if (Buffer.isBuffer(buffer)) return short(fd, buffer, offset, length, position);',
+      '  return real.apply(fs, arguments);',
+      '};',
+      "require('node:module').syncBuiltinESMExports();",
+      '',
+    ].join('\n'));
+    const helper = fileURLToPath(new URL('../lock-guard.mjs', import.meta.url));
+    const token = 'b'.repeat(32);
+    const res = spawnSync(process.execPath, [
+      helper, 'acquire', dir, String(process.pid), 'null', token,
+    ], { env: { ...process.env, NODE_OPTIONS: `--require ${preload}` } });
+    expect(res.status).toBe(0);
+    // The record is the complete JSON object, not a truncated prefix.
+    expect(JSON.parse(await readFile(ownerPath(dir), 'utf8')))
+      .toEqual({ pid: process.pid, startedAt: null, token });
   });
 
   it('rejects unknown commands and malformed tokens without writing a record', async () => {

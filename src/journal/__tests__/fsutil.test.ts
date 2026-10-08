@@ -6,10 +6,39 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { ensureDurableDirectory } from '../fsutil.js';
+import {
+  atomicWriteFile, ensureDurableDirectory, JournalWriteStalledError, syncPath,
+} from '../fsutil.js';
 
 const run = promisify(execFile);
 const REPO = fileURLToPath(new URL('../../..', import.meta.url));
+
+// A file-scoped, pass-through mock of `node:fs/promises`: it delegates to the
+// real module unless `armed`, in which case `open` returns a fake handle whose
+// `sync` throws EIO and `close` throws EBADF. This is the only way to reach
+// `syncPath`'s handle: `FileHandle#close` is an own instance property, not on
+// the prototype, so the existing prototype spies cannot intercept it.
+const fsMock = vi.hoisted(() => ({ armed: false, opened: false, synced: false, closed: false }));
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  const open: typeof actual.open = async (...args) => {
+    if (!fsMock.armed) return actual.open(...args);
+    fsMock.opened = true;
+    return {
+      fd: 1,
+      sync: async () => {
+        fsMock.synced = true;
+        throw Object.assign(new Error('injected sync EIO'), { code: 'EIO' });
+      },
+      close: async () => {
+        fsMock.closed = true;
+        throw Object.assign(new Error('injected close EBADF'), { code: 'EBADF' });
+      },
+    } as unknown as Awaited<ReturnType<typeof actual.open>>;
+  };
+  return { ...actual, open };
+});
 
 /**
  * Runs the real public API in a child process whose cwd is a scratch directory,
@@ -69,6 +98,84 @@ async function recordSyncs<T>(fn: () => Promise<T>): Promise<{ result: T; synced
     spy.mockRestore();
   }
 }
+
+/** The shared `FileHandle` prototype, for spying on the write/sync/close primitives. */
+async function fileHandleProto(): Promise<Record<string, (...args: never[]) => unknown>> {
+  const probe = await openFile(join(home, 'proto-probe'), 'w');
+  const proto = Object.getPrototypeOf(probe) as Record<string, (...args: never[]) => unknown>;
+  await probe.close();
+  return proto;
+}
+
+describe('atomicWriteFile short writes', () => {
+  /** Makes every `FileHandle#write` advance at most `chunk` bytes per call. */
+  async function withShortWrites<T>(fn: () => Promise<T>, chunk = 3): Promise<T> {
+    const proto = await fileHandleProto();
+    const real = proto['write'] as (
+      buf: Buffer, offset: number, length: number, position: number | null,
+    ) => Promise<{ bytesWritten: number }>;
+    const spy = vi.spyOn(proto, 'write').mockImplementation(async function (
+      this: unknown, buf: Buffer, offset: number, length: number, position: number | null,
+    ) {
+      return real.call(this, buf, offset, Math.min(length, chunk), position);
+    } as never);
+    try {
+      return await fn();
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it('persists the whole UTF-8 string across short writes', async () => {
+    const target = join(home, 'head.json');
+    const data = JSON.stringify({ count: 42, note: 'unicode-\u00e9\u4e2d-\u2603' });
+    await withShortWrites(() => atomicWriteFile(target, data));
+    expect(await readFile(target, 'utf8')).toBe(data);
+  });
+
+  it('persists the whole byte buffer across short writes', async () => {
+    const target = join(home, 'blob-body');
+    const data = Buffer.from('abcdefghij'.repeat(200), 'utf8');
+    await withShortWrites(() => atomicWriteFile(target, data));
+    expect(await readFile(target)).toEqual(data);
+  });
+
+  it('reports zero progress as a stalled write and removes the temp', async () => {
+    const target = join(home, 'stalled');
+    const proto = await fileHandleProto();
+    const spy = vi.spyOn(proto, 'write').mockImplementation((async () => ({ bytesWritten: 0 })) as never);
+    try {
+      await expect(atomicWriteFile(target, 'x'.repeat(50)))
+        .rejects.toBeInstanceOf(JournalWriteStalledError);
+    } finally {
+      spy.mockRestore();
+    }
+    await expect(readFile(target)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+describe('syncPath error precedence', () => {
+  it('surfaces the sync failure and still services the handle when close also fails', async () => {
+    const target = join(home, 'sync-target');
+    await writeFile(target, 'x');
+    fsMock.armed = true;
+    fsMock.opened = false;
+    fsMock.synced = false;
+    fsMock.closed = false;
+    try {
+      const err = await syncPath(target).catch((e: unknown) => e) as NodeJS.ErrnoException;
+      // The injected close failure must not replace the injected sync failure.
+      expect(err.code).toBe('EIO');
+      expect(err.message).toContain('injected sync EIO');
+      // The handle was fully serviced: sync ran and close was still attempted.
+      expect(fsMock.opened).toBe(true);
+      expect(fsMock.synced).toBe(true);
+      expect(fsMock.closed).toBe(true);
+    } finally {
+      fsMock.armed = false;
+    }
+  });
+});
 
 describe('ensureDurableDirectory', () => {
   it('creates a two-level chain and fsyncs each parent entry top-down', async () => {

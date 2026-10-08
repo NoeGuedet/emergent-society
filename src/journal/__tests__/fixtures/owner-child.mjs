@@ -23,8 +23,10 @@ function selfStart() {
 }
 
 function acquire() {
+  // The production argv: `-F` execs the helper in place (the spawned pid is the
+  // critical section) and `-E 3` reports contention with the reserved exit code.
   return spawnSync('/usr/bin/flock', [
-    '--wait=5', '--exclusive', sidecar,
+    '-F', '-E', '3', '--wait=5', '--exclusive', sidecar,
     process.execPath, helper, 'acquire', dir, String(process.pid), String(selfStart()), token,
   ]).status;
 }

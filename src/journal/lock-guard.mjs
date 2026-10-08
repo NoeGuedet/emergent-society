@@ -138,6 +138,19 @@ function readCandidate(sidecar, owner) {
 // a distinct helper process always has a distinct pid.
 let tempCounter = 0;
 
+// `writeSync` may write fewer bytes than asked, so the loop keeps writing until
+// the whole record is durable. Zero progress is a stall, not a success: it is
+// raised as a guard error so the parent fails closed instead of trusting a
+// partial record.
+function writeAllSync(fd, buf) {
+  let written = 0;
+  while (written < buf.length) {
+    const n = writeSync(fd, buf, written, buf.length - written);
+    if (n === 0) throw new Error('owner record write made no progress');
+    written += n;
+  }
+}
+
 // The record's own temp file is fsynced before the rename, so the rename can
 // never expose a partial record. The rename's directory entry is deliberately
 // not fsynced: losing it in a crash only reverts to the previous (dead-owner)
@@ -146,11 +159,14 @@ function writeOwnerAtomic(owner, record) {
   const tmp = `${owner}.${process.pid}.${Date.now()}.${tempCounter++}.tmp`;
   const fd = openSync(tmp, 'wx');
   try {
-    writeSync(fd, JSON.stringify(record));
+    writeAllSync(fd, Buffer.from(JSON.stringify(record)));
     fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+  } catch (err) {
+    try { closeSync(fd); } catch { /* already closed or unclosable */ }
+    rmSync(tmp, { force: true });
+    throw err;
   }
+  closeSync(fd);
   try {
     renameSync(tmp, owner);
   } catch (err) {
