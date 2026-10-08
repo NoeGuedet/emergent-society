@@ -56,9 +56,10 @@ async function readPid(path: string, timeoutMs = 2000): Promise<number> {
   for (;;) {
     try {
       const value = Number((await readFile(path, 'utf8')).trim());
-      // The shell truncates the file before writing, so an empty read is "not yet
-      // written", never pid 0: process.kill(0, 0) would signal this runner's own
-      // process group and report a survivor that does not exist.
+      // A truncated, partially written or not-yet-published marker must never be
+      // read as a pid: only a complete positive safe integer is accepted, so a
+      // partial read is retried rather than reported. `Number('')` is 0, and
+      // process.kill(0, 0) would signal this runner's own process group.
       if (Number.isSafeInteger(value) && value > 0) return value;
     } catch {
       // not created yet
@@ -139,9 +140,9 @@ describe('runShell: real shell fixtures', () => {
   it('never reads a truncated, not-yet-written pid file as pid 0', async () => {
     const dir = await tempDir('c13-shell-');
     const pidFile = join(dir, 'child.pid');
-    // The shell creates the file with O_TRUNC before writing the leader pid, so a
-    // reader can observe it empty; Number('') is 0, and process.kill(0, 0) signals
-    // this runner's own process group, which alive() would report as a survivor.
+    // The fixture opens the marker with O_TRUNC before writing a pid, so a reader
+    // can observe it empty: `Number('')` is 0 and process.kill(0, 0) signals this
+    // runner's own process group, which alive() would report as a survivor.
     const handle = await open(pidFile, 'w');
     const pending = readPid(pidFile);
     await new Promise((resolve) => setTimeout(resolve, 25));

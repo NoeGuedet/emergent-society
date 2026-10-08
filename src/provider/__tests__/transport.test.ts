@@ -1,8 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { Buffer } from 'node:buffer';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { OpenAITransport } from '../transport.js';
+
+// A file-level restore for the one global `fetch` patch below, so an aborted
+// test cannot leave a wrapper installed in the shared worker.
+const REAL_FETCH = globalThis.fetch;
+afterEach(() => { globalThis.fetch = REAL_FETCH; });
 
 /**
  * Transport tests over a real local HTTP server on 127.0.0.1: the exact bytes

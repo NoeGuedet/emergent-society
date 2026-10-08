@@ -195,9 +195,10 @@ describe('checkpoint wiring', () => {
     ]);
     const runtime = runtimeFor(fx, config, transport);
     const marks: DurableWatermark[] = [];
-    // The signal is the third hook returning, so it means the on-disk write for
-    // the last turn finished, not merely started. Polling the mark count let the
-    // test proceed mid-write and race the fixture teardown under load.
+    // The signal fires once the third checkpoint call has returned. `runToSignal`
+    // then stops the driver and awaits the run, so the `access` below confirms the
+    // row persists after stop — it is not a proof at signal time. Polling the mark
+    // count let the test proceed mid-write and race fixture teardown under load.
     const thirdWritten = deferred();
     const driver = await openRuntime(fx, runtime, async (mark) => {
       marks.push(mark);
@@ -206,7 +207,7 @@ describe('checkpoint wiring', () => {
     });
     await runToSignal(driver, thirdWritten.promise);
 
-    // The signal means the write completed: the newest retained row is on disk.
+    // After the run has stopped, the newest retained row is readable from disk.
     await expect(access(join(snapshotsDir(fx), `${marks[2]!.seq}.json`))).resolves.toBeUndefined();
 
     expect(marks).toHaveLength(3);

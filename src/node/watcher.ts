@@ -152,7 +152,7 @@ export class HeadWatcher {
     // Unref'd on purpose: a library must not decide a process's lifetime, and a
     // driver that parks has no other pending handle — so a process that runs a
     // parked driver and nothing else exits, silently. Holding the loop is the
-    // host's job (the kernel's main, C1.3+); this comment is the whole of the
+    // host's job (the kernel's main, C1.6); this comment is the whole of the
     // watcher's opinion about it.
     this.timer.unref();
   }

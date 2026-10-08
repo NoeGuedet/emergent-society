@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { canonicalizeJson } from '../../journal/index.js';
 import { loadVerifiedEvents, type VerifiedEvents } from '../../context/loader.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
+import { ContextFold } from '../../context/fold.js';
 import { resolveArtifact, resolveStored, toJson } from '../../context/artifacts.js';
 import { validateRequestPlan } from '../../context/events.js';
 import { rederivePlans } from '../../context/assembler.js';
@@ -254,6 +255,143 @@ describe('C1.3 real boundaries', () => {
         } else if (current.state === 'booting' || current.state === 'active') {
           // open() succeeded but run() was never started (an assertion failed first):
           // drive it to shutdown so the writer lock is released.
+          await current.run().catch(() => { /* the assertion failure stands */ });
+        }
+      }
+      await closeServer(server);
+    }
+  }, 20000);
+
+  it('folds a post-headers partial retry into one assistant message from the complete 200', async () => {
+    const { home, world } = fixture();
+    await commitAs(world, 'human', { 'direction.txt': 'start\n' });
+    const prefix = '{"choices":';
+    const requestBodies: Buffer[] = [];
+    let index = 0;
+    const server = createServer((req, res) => {
+      const i = index;
+      index += 1;
+      req.on('error', () => { /* the client abort resets the socket */ });
+      res.on('error', () => { /* the client abort resets the socket */ });
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        requestBodies.push(Buffer.concat(chunks));
+        if (i === 0) {
+          // 200 headers plus a partial body, then a stall: the adapter's own timer
+          // aborts the read and retries.
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.write(prefix);
+        } else {
+          res.setHeader('content-type', 'application/json');
+          res.end(Buffer.from(JSON.stringify({
+            choices: [{ message: { role: 'assistant', content: 'partial-retry-done' } }],
+          })));
+        }
+      });
+    });
+    await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve); });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('missing TCP address');
+    const endpoint = `http://127.0.0.1:${address.port}/v1/chat/completions`;
+    const defaults = defaultAgentConfig();
+    const config = { ...defaults, policy: { ...defaults.policy,
+      maxAttempts: 2, retryDelayMs: 0, requestTimeoutMs: 250,
+    } };
+    const shellPolicy = {
+      timeoutMs: config.policy.shellTimeoutMs, killGraceMs: config.policy.killGraceMs,
+      maxCaptureBytes: config.policy.maxShellCaptureBytes,
+      drainDeadlineMs: config.policy.shellDrainMs,
+      env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', TERM: 'dumb' },
+    };
+    const runtime = createAgentRuntime({
+      home, uid: 'n1', world, initialConfig: config, shellPolicy,
+      adapter: new ProviderAdapter(new OpenAITransport({ endpoint, key: 'test-key-never-log' }), {
+        delay,
+        schedule: (ms, callback) => {
+          const timer = setTimeout(callback, ms);
+          return () => { clearTimeout(timer); };
+        },
+      }),
+    });
+    let driver: NodeDriver | null = null;
+    let running: Promise<void> | null = null;
+    try {
+      driver = await NodeDriver.open(home, 'n1', runtime.handler, world, {
+        knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
+        onCheckpoint: (mark) => runtime.checkpoint(mark),
+      });
+      running = driver.run();
+      await parked(driver, world);
+      expect(requestBodies).toHaveLength(2);
+      expect(requestBodies[1]!.equals(requestBodies[0]!)).toBe(true);
+
+      driver.stop();
+      await running;
+      running = null;
+
+      // An offline rebuild of the exact durable history folds the incomplete then
+      // complete attempts: `onAssistant` binds the projection's raw to *the*
+      // complete 200 response for the same request, so a mismatched or missing
+      // raw would fail the fold. (This turn produces no world effect, so the
+      // driver marks its waiting closer ignorable and the dialogue is not
+      // promoted into the surface — the binding still runs.)
+      const events = await resolved(home);
+      const offline = new ContextFold();
+      await offline.observe(events);
+      expect(offline.orphanCompactions()).toEqual([]);
+      const raws = events.filter((event) => event.type === 'response/raw');
+      expect(raws).toHaveLength(2);
+      const first = raws[0]!.data as unknown as { status: number; complete: boolean; body: ArtifactRef };
+      const second = raws[1]!.data as unknown as { status: number; complete: boolean; body: ArtifactRef };
+      expect(first).toMatchObject({ status: 200, complete: false });
+      expect(second).toMatchObject({ status: 200, complete: true });
+      // The two attempts carry distinct response refs: the binding must be unique.
+      expect(second.body).not.toEqual(first.body);
+      expect(Buffer.from(resolveArtifact(events, first.body)).toString('utf8')).toBe(prefix);
+
+      const attempts = events.filter((event) => event.type === 'assistant/attempt');
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]!.data).toMatchObject({ terminal: false, failure: { code: 'timeout', status: 200 } });
+
+      const wires = events.filter((event) => event.type === 'request/wire');
+      expect(wires).toHaveLength(2);
+      const wire0 = wires[0]!.data as unknown as { attempt: number; body: ArtifactRef };
+      const wire1 = wires[1]!.data as unknown as { attempt: number; body: ArtifactRef };
+      expect([wire0.attempt, wire1.attempt]).toEqual([0, 1]);
+      expect(wire1.body).toEqual(wire0.body);
+      const assistantEvents = events.filter((event) => event.type === 'assistant/message');
+      expect(assistantEvents).toHaveLength(1);
+      // The bound projection's raw is the complete second attempt's ref, never the
+      // incomplete first attempt's.
+      const stored = (assistantEvents[0]!.data as unknown as {
+        value: Stored<{ raw: ArtifactRef }>;
+      }).value;
+      const bind = resolveStored(events, stored, (value) => value as { raw: ArtifactRef });
+      expect(bind.raw).toEqual(second.body);
+      expect(bind.raw).not.toEqual(first.body);
+
+      // A second offline fold is identical: replay writes nothing.
+      const again = new ContextFold();
+      await again.observe(events);
+      expect(again.snapshot()).toEqual(offline.snapshot());
+
+      // Offline re-derivation reproduces the recorded plans; nothing new is written.
+      const comparisons = await rederivePlans(events, world);
+      expect(comparisons.length).toBeGreaterThan(0);
+      for (const comparison of comparisons) {
+        expect(canonicalizeJson(toJson(comparison.rederived)))
+          .toBe(canonicalizeJson(toJson(comparison.recorded)));
+      }
+      expect((await resolved(home)).length).toBe(events.length);
+    } finally {
+      const current = driver;
+      driver = null;
+      if (current) {
+        current.stop();
+        if (running) {
+          await running.catch(() => { /* the assertion failure stands */ });
+        } else if (current.state === 'booting' || current.state === 'active') {
           await current.run().catch(() => { /* the assertion failure stands */ });
         }
       }
