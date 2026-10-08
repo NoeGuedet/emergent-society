@@ -98,7 +98,6 @@ class ScriptedTransport implements SerializedTransport {
 }
 
 const providerPolicy = {
-  now: () => 100,
   delay: (ms: number, signal: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
     if (signal.aborted) { reject(new Error('cancelled')); return; }
     const onAbort = (): void => { clearTimeout(timer); reject(new Error('cancelled')); };

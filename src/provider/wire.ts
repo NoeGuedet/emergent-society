@@ -1,6 +1,7 @@
 import { canonicalizeJson } from '../journal/index.js';
 import type { JsonValue } from '../journal/index.js';
 import { toJson } from '../context/artifacts.js';
+import { validateProviderParameters } from '../context/parameters.js';
 import type { ChatMessage, RequestPlan, ToolSchema } from '../context/contracts.js';
 
 /**
@@ -11,10 +12,12 @@ import type { ChatMessage, RequestPlan, ToolSchema } from '../context/contracts.
  * and `n: 1`. It emits only valid OpenAI message keys — an assistant's
  * `tool_calls` is omitted entirely when empty and emitted in full otherwise,
  * while `content: null` and `tool_call_id` are preserved. It never mutates the
- * plan. Permitted parameters are `temperature` (finite 0..2), `top_p` (finite
- * 0..1), `max_tokens` (positive safe integer) and `stop` (a string or one to
- * four strings); every other key, in particular any `model`/`messages`/`tools`/
- * `stream`/`n`/HTTP/auth/header/endpoint override, is refused.
+ * plan. Permitted parameters are the shared `validateProviderParameters`
+ * contract (`temperature`, `top_p`, `max_tokens`, `stop` and their exact
+ * bounds); every other key, in particular any
+ * `model`/`messages`/`tools`/`stream`/`n`/HTTP/auth/header/endpoint override, is
+ * refused by that same validator, so a configuration that was accepted can
+ * always be sent.
  *
  * `canonicalMessagesBytes` is the shared message encoder: it produces the
  * canonical bytes of a message array *exactly* as `serializeWire` encodes the
@@ -22,53 +25,18 @@ import type { ChatMessage, RequestPlan, ToolSchema } from '../context/contracts.
  * re-implementing the encoder.
  */
 
-const PERMITTED_PARAMETERS: ReadonlySet<string> =
-  new Set(['temperature', 'top_p', 'max_tokens', 'stop']);
-
 function refuse(message: string): never {
   throw new Error(`serializeWire: refusing ${message}`);
-}
-
-function finiteRange(value: JsonValue, key: string, min: number, max: number): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) {
-    refuse(`${key}: expected a finite number in [${min}, ${max}]`);
-  }
-  return value;
-}
-
-function positiveSafeInt(value: JsonValue, key: string): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
-    refuse(`${key}: expected a positive safe integer`);
-  }
-  return value;
-}
-
-function stopValue(value: JsonValue, key: string): JsonValue {
-  if (typeof value === 'string') return value;
-  if (Array.isArray(value) && value.length >= 1 && value.length <= 4
-    && value.every((item): item is string => typeof item === 'string')) {
-    return value;
-  }
-  refuse(`${key}: expected a string or one to four strings`);
 }
 
 function encodeParameters(
   parameters: { readonly [key: string]: JsonValue },
 ): Record<string, JsonValue> {
-  const out: Record<string, JsonValue> = {};
-  for (const [key, value] of Object.entries(parameters)) {
-    if (!PERMITTED_PARAMETERS.has(key)) {
-      refuse(`unsupported parameter ${JSON.stringify(key)}`);
-    }
-    switch (key) {
-      case 'temperature': out[key] = finiteRange(value, key, 0, 2); break;
-      case 'top_p': out[key] = finiteRange(value, key, 0, 1); break;
-      case 'max_tokens': out[key] = positiveSafeInt(value, key); break;
-      case 'stop': out[key] = stopValue(value, key); break;
-      default: refuse(`unsupported parameter ${JSON.stringify(key)}`);
-    }
+  try {
+    return { ...validateProviderParameters(parameters) };
+  } catch (err) {
+    return refuse(err instanceof Error ? err.message : 'invalid parameters');
   }
-  return out;
 }
 
 /** The one message encoder: valid OpenAI keys only, `tool_calls` omitted when empty. */

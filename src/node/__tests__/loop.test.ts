@@ -46,7 +46,6 @@ vi.mock('../../context/diff.js', async (importOriginal) => {
 const fixture = useWorld('c13-loop-');
 
 const providerPolicy: ProviderPolicy = {
-  now: () => 0,
   delay: (ms: number, signal: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
     if (signal.aborted) { reject(new Error('cancelled')); return; }
     let timer: NodeJS.Timeout | undefined;
@@ -405,6 +404,57 @@ describe('configuration and shell policy', () => {
       messages: Array<{ role: string; content: string }>;
     };
     expect(wire.messages[1]?.content).toBe(base.heading);
+  });
+});
+
+describe('configuration parameters', () => {
+  it('refuses an unsendable parameter set at construction, before any effect', async () => {
+    const fx = fixture();
+    const bad = { ...configWith({}), parameters: { n: 2 } };
+    const transport = new ScriptedTransport([]);
+    expect(() => runtimeFor(fx, bad, transport)).toThrow(/parameter|n/);
+    expect(transport.sends).toHaveLength(0);
+  });
+
+  it('refuses an unsendable scheduled configuration before it can be journaled', async () => {
+    const fx = fixture();
+    const base = configWith({ policy: { retryDelayMs: 1 } });
+    const transport = new ScriptedTransport([noCalls('one')]);
+    const runtime = runtimeFor(fx, base, transport);
+    const driver = await openRuntime(fx, runtime);
+    expect(() => runtime.scheduleConfig({ ...base, version: 2, parameters: { stream: true } }))
+      .toThrow(/parameter|stream/);
+    const running = driver.run();
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    driver.stop();
+    await running;
+
+    const versions = (await eventsOf(fx)).filter((event) => event.type === 'system/message')
+      .map((event) => (event.data as { version: number }).version);
+    expect(versions).toEqual([1]);
+  });
+
+  it('applies a strictly newer configuration whose parameters are sendable', async () => {
+    const fx = fixture();
+    const base = configWith({ policy: { retryDelayMs: 1 } });
+    const transport = new ScriptedTransport([noCalls('one')]);
+    const runtime = runtimeFor(fx, base, transport);
+    const driver = await openRuntime(fx, runtime);
+    runtime.scheduleConfig({
+      ...base, version: base.version + 1, parameters: { temperature: 0.5 },
+    });
+    const running = driver.run();
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    driver.stop();
+    await running;
+
+    const wire = JSON.parse(Buffer.from(transport.sends[0]!).toString('utf8')) as {
+      temperature?: number;
+    };
+    expect(wire.temperature).toBe(0.5);
+    const versions = (await eventsOf(fx)).filter((event) => event.type === 'system/message')
+      .map((event) => (event.data as { version: number }).version);
+    expect(versions).toEqual([1, 2]);
   });
 });
 

@@ -24,6 +24,40 @@ async function close(server: Server): Promise<void> {
   });
 }
 
+/**
+ * Installs a narrow wrapper around the global `fetch` that acknowledges when the
+ * client has actually read the first body chunk. The real loopback network and
+ * the real `OpenAITransport` are used — only the one global fetch call is
+ * intercepted, so a test can wait on a client-observable event instead of
+ * guessing with a sleep. `highWaterMark: 0` keeps the stream from prefetching,
+ * so the acknowledgement fires only for a pending client read. Returns the
+ * restore function; always call it in a `finally`.
+ */
+function observeFirstBodyChunk(onFirstChunk: () => void): () => void {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (
+    input: string | URL | Request, init?: RequestInit,
+  ): Promise<Response> => {
+    const response = await realFetch(input, init);
+    if (response.body === null) return response;
+    const reader = response.body.getReader();
+    let first = true;
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller): Promise<void> {
+        const { done, value } = await reader.read();
+        if (done) { controller.close(); return; }
+        controller.enqueue(value);
+        if (first) { first = false; onFirstChunk(); }
+      },
+      cancel(reason): Promise<void> { return reader.cancel(reason); },
+    }, { highWaterMark: 0 });
+    return new Response(stream, {
+      status: response.status, statusText: response.statusText, headers: response.headers,
+    });
+  }) as typeof fetch;
+  return () => { globalThis.fetch = realFetch; };
+}
+
 describe('OpenAITransport: exact bytes and headers', () => {
   it('sends the input bytes verbatim and returns a complete 200 body', async () => {
     const bodies: Buffer[] = [];
@@ -132,6 +166,41 @@ describe('OpenAITransport: bounded body and failures', () => {
       expect(result.complete).toBe(false);
       expect(result.failure).toEqual({ code: 'cancelled', status: null });
     } finally {
+      await close(server);
+    }
+  });
+
+  it('preserves the known status and partial bytes when aborted after headers', async () => {
+    const prefix = '{"partial":';
+    let ack!: () => void;
+    const prefixRead = new Promise<void>((resolve) => { ack = resolve; });
+    const server = createServer((req, res) => {
+      req.on('error', () => { /* the abort resets the socket */ });
+      res.on('error', () => { /* the abort resets the socket */ });
+      req.on('data', () => { /* drain */ });
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write(prefix); // headers + a prefix, then the response stalls
+      });
+    });
+    const endpoint = await listen(server);
+    const restoreFetch = observeFirstBodyChunk(() => ack());
+    try {
+      const transport = new OpenAITransport({ endpoint, key: 'k' });
+      const controller = new AbortController();
+      const sending = transport.post(new Uint8Array(), controller.signal, 1024);
+      // The client has read the first prefix chunk, so `status` is already
+      // assigned and the transport is stalled on the next read: aborting now is
+      // exact, with no timing guess.
+      await prefixRead;
+      controller.abort();
+      const result = await sending;
+      expect(result.status).toBe(200);
+      expect(result.complete).toBe(false);
+      expect(result.failure).toEqual({ code: 'cancelled', status: 200 });
+      expect(Buffer.from(result.body).toString('utf8')).toBe(prefix);
+    } finally {
+      restoreFetch();
       await close(server);
     }
   });

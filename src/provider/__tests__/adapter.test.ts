@@ -93,7 +93,6 @@ const delay = (ms: number, signal: AbortSignal): Promise<void> => new Promise<vo
 
 function policies(over: Partial<ProviderPolicy> = {}): ProviderPolicy {
   return {
-    now: () => Date.now(),
     delay,
     schedule: (ms: number, callback: () => void) => {
       const timer = setTimeout(callback, ms);
@@ -380,6 +379,246 @@ describe('ProviderAdapter: bounded retries', () => {
       expect(attempts[0]!.data).toMatchObject({ terminal: false, failure: { code: 'http', status: 429 } });
       expect(ofType(durable, 'assistant/message')).toHaveLength(1);
       expect(ofType(durable, 'request/usage')).toHaveLength(1);
+    } finally {
+      await session.shutdown();
+      await close(server);
+    }
+  });
+});
+
+// --- status-known body classification --------------------------------------------
+
+describe('ProviderAdapter: status-known incomplete bodies', () => {
+  it('retries a post-headers body stall as a timeout with the same wire bytes', async () => {
+    const session = await openSession();
+    const request = plan({
+      policy: seedPolicy({ maxAttempts: 2, requestTimeoutMs: 150, retryDelayMs: 0 }),
+    });
+    const prefix = '{"choices":';
+    const requestBodies: Buffer[] = [];
+    let index = 0;
+    const server = createServer((req, res) => {
+      const i = index;
+      index += 1;
+      req.on('error', () => { /* the client abort resets the socket */ });
+      res.on('error', () => { /* the client abort resets the socket */ });
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        requestBodies.push(Buffer.concat(chunks));
+        if (i === 0) {
+          // Headers and a partial body are flushed, then the response stalls: the
+          // adapter's own request timeout must fire and abort the read.
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.write(prefix);
+        } else {
+          res.setHeader('content-type', 'application/json');
+          res.end(validBody());
+        }
+      });
+    });
+    const endpoint = await listen(server);
+    try {
+      const adapter = new ProviderAdapter(new OpenAITransport({ endpoint, key: 'k' }), policies());
+      const result = await adapter.send(request, session.gate('turn', 0));
+      expect(result.kind).toBe('response');
+      expect(requestBodies).toHaveLength(2);
+
+      const durable = await events();
+      const raw = ofType(durable, 'response/raw');
+      expect(raw).toHaveLength(2);
+      const first = raw[0]!.data as unknown as { status: number; complete: boolean; body: ArtifactRef };
+      const second = raw[1]!.data as unknown as { status: number; complete: boolean };
+      expect(first.status).toBe(200);
+      expect(first.complete).toBe(false);
+      expect(Buffer.from(resolveArtifact(durable, first.body)).toString('utf8')).toBe(prefix);
+      expect(second.status).toBe(200);
+      expect(second.complete).toBe(true);
+
+      const attempts = ofType(durable, 'assistant/attempt');
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]!.data).toMatchObject({
+        terminal: false, failure: { code: 'timeout', status: 200 },
+      });
+
+      // The retry reuses the one retained wire artifact byte-for-byte.
+      const wires = ofType(durable, 'request/wire');
+      expect(wires).toHaveLength(2);
+      const firstWire = wires[0]!.data as unknown as { attempt: number; body: ArtifactRef };
+      const secondWire = wires[1]!.data as unknown as { attempt: number; body: ArtifactRef };
+      expect(firstWire.attempt).toBe(0);
+      expect(secondWire.attempt).toBe(1);
+      expect(secondWire.body).toEqual(firstWire.body);
+      expect(requestBodies[1]!.equals(requestBodies[0]!)).toBe(true);
+    } finally {
+      await session.shutdown();
+      await close(server);
+    }
+  });
+
+  it('cancels a gate stop after headers non-retryably with status 200 and a partial raw', async () => {
+    const session = await openSession();
+    const request = plan({
+      policy: seedPolicy({ maxAttempts: 4, requestTimeoutMs: 60_000, retryDelayMs: 0 }),
+    });
+    const prefix = '{"choices":';
+    /** A stalled send that only resolves once the gate signal has aborted it. */
+    class StallingTransport implements SerializedTransport {
+      sends = 0;
+      private mark!: () => void;
+      readonly reached = new Promise<void>((resolve) => { this.mark = resolve; });
+      async post(_body: Uint8Array, signal: AbortSignal): Promise<TransportResult> {
+        this.sends += 1;
+        this.mark();
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) { resolve(); return; }
+          signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return {
+          status: 200, body: Buffer.from(prefix), complete: false,
+          failure: { code: 'cancelled', status: 200 },
+        };
+      }
+    }
+    const transport = new StallingTransport();
+    try {
+      const adapter = new ProviderAdapter(transport, policies());
+      const sending = adapter.send(request, session.gate('turn', 0));
+      await transport.reached;
+      session.controller.abort();
+      const result = await sending;
+      expect(result).toEqual({
+        kind: 'failure', failure: { code: 'cancelled', status: 200 },
+      });
+      expect(transport.sends).toBe(1);
+
+      const durable = await events();
+      const raw = ofType(durable, 'response/raw');
+      expect(raw).toHaveLength(1);
+      const data = raw[0]!.data as unknown as { status: number; complete: boolean; body: ArtifactRef };
+      expect(data.status).toBe(200);
+      expect(data.complete).toBe(false);
+      expect(Buffer.from(resolveArtifact(durable, data.body)).toString('utf8')).toBe(prefix);
+      const attempts = ofType(durable, 'assistant/attempt');
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]!.data).toMatchObject({
+        terminal: true, failure: { code: 'cancelled', status: 200 },
+      });
+      expect(ofType(durable, 'request/wire')).toHaveLength(1);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('classifies a gate stop as cancelled even when the capped body reports body-limit', async () => {
+    const session = await openSession();
+    const request = plan({
+      policy: seedPolicy({ maxAttempts: 3, requestTimeoutMs: 60_000, retryDelayMs: 0 }),
+    });
+    const prefix = '{"choices":';
+    /** A capped stalled send that reports `body-limit` only once its signal aborts. */
+    class CappedStallTransport implements SerializedTransport {
+      sends = 0;
+      private mark!: () => void;
+      readonly reached = new Promise<void>((resolve) => { this.mark = resolve; });
+      async post(_body: Uint8Array, signal: AbortSignal): Promise<TransportResult> {
+        this.sends += 1;
+        this.mark();
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) { resolve(); return; }
+          signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return {
+          status: 200, body: Buffer.from(prefix), complete: false,
+          failure: { code: 'body-limit', status: 200 },
+        };
+      }
+    }
+    const transport = new CappedStallTransport();
+    try {
+      const adapter = new ProviderAdapter(transport, policies());
+      const sending = adapter.send(request, session.gate('turn', 0));
+      await transport.reached;
+      session.controller.abort();
+      const result = await sending;
+      // A stop outranks a capped body: the ordering is explicit, and both are
+      // terminal and non-retryable with the status preserved.
+      expect(result).toEqual({
+        kind: 'failure', failure: { code: 'cancelled', status: 200 },
+      });
+      expect(transport.sends).toBe(1);
+
+      const durable = await events();
+      const raw = ofType(durable, 'response/raw');
+      expect(raw).toHaveLength(1);
+      const data = raw[0]!.data as unknown as { status: number; complete: boolean; body: ArtifactRef };
+      expect(data.status).toBe(200);
+      expect(data.complete).toBe(false);
+      expect(Buffer.from(resolveArtifact(durable, data.body)).toString('utf8')).toBe(prefix);
+      expect(ofType(durable, 'assistant/attempt')[0]!.data).toMatchObject({
+        terminal: true, failure: { code: 'cancelled', status: 200 },
+      });
+      expect(ofType(durable, 'request/wire')).toHaveLength(1);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('classifies a truncated response body as a retryable network failure with surviving bytes', async () => {
+    const session = await openSession();
+    const request = plan({
+      policy: seedPolicy({ maxAttempts: 2, requestTimeoutMs: 5000, retryDelayMs: 0 }),
+    });
+    const prefix = '{"choices":';
+    const seen: Array<{ status: number; complete: boolean; bytes: number }> = [];
+    let index = 0;
+    const server = createServer((req, res) => {
+      const i = index;
+      index += 1;
+      req.on('error', () => { /* the peer may reset the socket */ });
+      res.on('error', () => { /* the peer may reset the socket */ });
+      req.on('data', () => { /* drain */ });
+      req.on('end', () => {
+        if (i === 0) {
+          // A short body against a larger content-length, then the socket is
+          // ended mid-body: the read fails after the prefix has arrived.
+          res.writeHead(200, { 'content-type': 'application/json', 'content-length': '4096' });
+          res.write(prefix, () => { res.socket?.end(); });
+        } else {
+          res.setHeader('content-type', 'application/json');
+          res.end(validBody());
+        }
+      });
+    });
+    const endpoint = await listen(server);
+    try {
+      const adapter = new ProviderAdapter(new OpenAITransport({ endpoint, key: 'k' }), policies());
+      const result = await adapter.send(request, session.gate('turn', 0));
+      expect(result.kind).toBe('response');
+
+      const durable = await events();
+      const raw = ofType(durable, 'response/raw');
+      expect(raw).toHaveLength(2);
+      for (const event of raw) {
+        const data = event.data as unknown as {
+          status: number; complete: boolean; body: ArtifactRef;
+        };
+        seen.push({ status: data.status, complete: data.complete, bytes: data.body.bytes });
+      }
+      const first = raw[0]!.data as unknown as { body: ArtifactRef };
+      const second = raw[1]!.data as unknown as { body: ArtifactRef };
+      expect(seen[0]!.status).toBe(200);
+      expect(seen[0]!.complete).toBe(false);
+      expect(seen[0]!.bytes).toBeGreaterThan(0);
+      expect(Buffer.from(resolveArtifact(durable, first.body)).toString('utf8')).toBe(prefix);
+      expect(seen[1]!.complete).toBe(true);
+
+      const attempts = ofType(durable, 'assistant/attempt');
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]!.data).toMatchObject({
+        terminal: false, failure: { code: 'network', status: 200 },
+      });
+      expect(second).toBeDefined();
     } finally {
       await session.shutdown();
       await close(server);

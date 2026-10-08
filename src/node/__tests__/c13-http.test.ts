@@ -162,7 +162,7 @@ describe('C1.3 real boundaries', () => {
     const makeRuntime = () => createAgentRuntime({
       home, uid: 'n1', world, initialConfig: config, shellPolicy,
       adapter: new ProviderAdapter(new OpenAITransport({ endpoint, key: 'test-key-never-log' }), {
-        now: () => 100, delay,
+        delay,
         schedule: (ms, callback) => {
           const timer = setTimeout(callback, ms);
           return () => { clearTimeout(timer); };

@@ -4,6 +4,7 @@ import type { GateScope, BoundaryRegistry } from '../node/gate.js';
 import type { WorldRange } from '../node/world.js';
 import { toJson } from './artifacts.js';
 import { validateAgentConfig, validateSeedPolicy, validateToolSchema } from './config.js';
+import { validateProviderParameters } from './parameters.js';
 import type {
   AgentConfig, ArtifactChunk, ArtifactManifest, ArtifactRef, AssistantProjection, CanonicalUsage,
   ChatMessage, CompactionAbort, CompactionEnd, CompactionStart, CompactionSummary, ErrorCode,
@@ -275,13 +276,13 @@ function policy(value: unknown, where: string): SeedPolicy {
   return validateSeedPolicy(value, where);
 }
 
-/** Rejects extras and validates the seed policy through the single config validator. */
+/** Validates model parameters through the one shared provider-parameter contract. */
 function parameters(value: unknown, where: string): { readonly [key: string]: JsonValue } {
-  const json = toJson(value);
-  if (typeof json !== 'object' || json === null || Array.isArray(json)) {
-    fail(where, 'expected a JSON object');
+  try {
+    return validateProviderParameters(value);
+  } catch (err) {
+    return fail(where, err instanceof Error ? err.message : 'invalid parameters');
   }
-  return json as { readonly [key: string]: JsonValue };
 }
 
 function worldPerception(value: unknown, where: string): WorldPerception {

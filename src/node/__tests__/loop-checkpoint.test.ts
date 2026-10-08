@@ -28,7 +28,6 @@ import { useWorld, type WorldFixture } from './helpers.js';
 const fixture = useWorld('c13-loop-checkpoint-');
 
 const providerPolicy: ProviderPolicy = {
-  now: () => 0,
   delay: () => Promise.resolve(),
   schedule: () => () => {},
 };

@@ -1,5 +1,6 @@
 import type { JsonValue } from '../journal/index.js';
 import { canonicalBytes, toJson } from './artifacts.js';
+import { validateProviderParameters } from './parameters.js';
 import type { AgentConfig, SeedPolicy, ToolSchema } from './contracts.js';
 
 /**
@@ -85,6 +86,15 @@ function json(value: unknown, where: string): JsonValue {
   }
 }
 
+/** The parameters block: the one shared provider-parameter contract, refused before acceptance. */
+function providerParameters(value: unknown): { readonly [key: string]: JsonValue } {
+  try {
+    return validateProviderParameters(value);
+  } catch (err) {
+    return fail(`parameters: ${err instanceof Error ? err.message : 'invalid'}`);
+  }
+}
+
 const POLICY_KEYS = [
   'stepsPerTurn', 'compactAfterBytes', 'keepRecentGroups', 'maxAttempts', 'retryDelayMs',
   'requestTimeoutMs', 'shellTimeoutMs', 'killGraceMs', 'maxCaptureBytes', 'maxRequestBytes',
@@ -133,9 +143,11 @@ export function validateToolSchema(value: unknown, where: string): ToolSchema {
 
 /**
  * Validates an untrusted configuration value and returns a frozen JSON copy.
- * Every numeric field is checked against its recorded bound; the whole value is
- * bounded by the 32 MiB capture ceiling so an oversize config is refused before
- * it is accepted (the prior durable config stays in force).
+ * Every numeric field is checked against its recorded bound; the `parameters`
+ * block is checked against the shared provider-parameter contract, so a config
+ * whose parameters could not be sent is refused here rather than at wire time;
+ * the whole value is bounded by the 32 MiB capture ceiling so an oversize config
+ * is refused before it is accepted (the prior durable config stays in force).
  */
 export function validateAgentConfig(value: unknown): AgentConfig {
   if (!isRecord(value)) fail('expected an object');
@@ -168,8 +180,7 @@ export function validateAgentConfig(value: unknown): AgentConfig {
     if (!names.has(name)) fail(`allowedTools: ${JSON.stringify(name)} is not offered`);
   }
 
-  const parameters = json(value['parameters'], 'parameters');
-  if (!isRecord(parameters)) fail('parameters: expected an object');
+  const parameters = providerParameters(value['parameters']);
   const policy = validateSeedPolicy(value['policy']);
 
   const config = { version, charter, heading, tools, allowedTools, model, parameters, policy };

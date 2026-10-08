@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { defaultAgentConfig, validateAgentConfig } from '../config.js';
+import { validateProviderParameters } from '../parameters.js';
 import type { SeedPolicy } from '../contracts.js';
 
 const base = (): ReturnType<typeof defaultAgentConfig> => defaultAgentConfig();
@@ -139,5 +140,44 @@ describe('validateAgentConfig', () => {
     const d = base();
     const oversize = { ...d, charter: 'c'.repeat(32 * 1024 * 1024 + 1) };
     expect(() => validateAgentConfig(oversize)).toThrow();
+  });
+});
+
+describe('provider parameters: the config boundary', () => {
+  /** A valid config with its parameters replaced, as an untrusted value. */
+  const withParameters = (parameters: unknown): unknown => ({ ...base(), parameters });
+
+  const INVALID: ReadonlyArray<readonly [string, unknown]> = [
+    ['reserved n', { n: 2 }],
+    ['reserved stream', { stream: true }],
+    ['unknown foo', { foo: 1 }],
+    ['temperature above 2', { temperature: 3 }],
+    ['temperature below 0', { temperature: -0.1 }],
+    ['top_p above 1', { top_p: 2 }],
+    ['max_tokens zero', { max_tokens: 0 }],
+    ['max_tokens fractional', { max_tokens: 1.5 }],
+    ['stop as a number', { stop: 7 }],
+    ['stop with too many strings', { stop: ['a', 'b', 'c', 'd', 'e'] }],
+    ['stop as an empty array', { stop: [] }],
+  ];
+
+  it.each(INVALID)('rejects %s before the config is accepted', (_name, parameters) => {
+    expect(() => validateAgentConfig(withParameters(parameters))).toThrow();
+  });
+
+  it('accepts the exact boundary values as a frozen canonical copy', () => {
+    const value = { temperature: 2, top_p: 1, max_tokens: 1, stop: ['a', 'b', 'c', 'd'] };
+    const config = validateAgentConfig(withParameters(value));
+    expect(config.parameters).toEqual(value);
+    expect(Object.isFrozen(config.parameters)).toBe(true);
+  });
+
+  it('shares one decision with direct parameter validation', () => {
+    for (const [, parameters] of INVALID) {
+      expect(() => validateProviderParameters(parameters)).toThrow();
+    }
+    expect(validateProviderParameters({ temperature: 0 })).toEqual({ temperature: 0 });
+    expect(() => validateProviderParameters([])).toThrow();
+    expect(() => validateProviderParameters(null)).toThrow();
   });
 });

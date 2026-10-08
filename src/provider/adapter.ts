@@ -26,11 +26,13 @@ import type { SerializedTransport, TransportResult } from './transport.js';
  * and bytes with an incremented attempt — it never reserializes. The timeout is
  * armed with the injected `schedule` and cleared in `finally`; an already-aborted
  * signal prevents any send, and a stop during the body or the delay yields a
- * terminal cancellation with no later send.
+ * terminal cancellation with no later send. A status-known but incomplete body
+ * keeps the transport's own `body-limit` (non-retryable), lets a gate abort win
+ * as a non-retryable `cancelled` with the status preserved, and turns the
+ * adapter's own timer into a retryable `timeout` rather than a cancellation.
  */
 
 export type ProviderPolicy = {
-  readonly now: () => number;
   readonly delay: (ms: number, signal: AbortSignal) => Promise<void>;
   readonly schedule: (ms: number, callback: () => void) => () => void;
 };
@@ -233,8 +235,7 @@ export class ProviderAdapter {
       let failure: SafeFailure;
       let retryable: boolean;
       if (!result.complete) {
-        failure = result.failure ?? { code: 'network', status: result.status };
-        retryable = failure.code === 'network' || failure.code === 'timeout';
+        ({ failure, retryable } = this.classifyIncomplete(result, posted.timedOut, gate));
       } else if (result.status !== 200) {
         failure = { code: 'http', status: result.status };
         retryable = RETRYABLE_STATUS.has(result.status);
@@ -259,9 +260,47 @@ export class ProviderAdapter {
 
       const next = await this.maybeRetry(gate, id, attempt, failure, retryable, policy, bodyRef);
       if (next === 'continue') { attempt += 1; continue; }
-      if (gate.signal.aborted) return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
+      // A stop observed before headers or during the retry delay is a boundary
+      // cancellation; a stop already classified from a status-known body keeps
+      // its own status.
+      if (gate.signal.aborted && failure.code !== 'cancelled') {
+        return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
+      }
       return this.fail(gate, id, attempt, failure);
     }
+  }
+
+  /**
+   * Classifies a status-known but incomplete body. A gate abort is checked
+   * first: a stop is the terminal boundary decision, non-retryable, with the
+   * known status preserved — the explicit priority the brief pins. The
+   * transport's own `body-limit` is next and non-retryable (a body cut off at
+   * the capture cap is never reclassified as a timeout), then the adapter's own
+   * timer yields a retryable `timeout` with the status preserved, and anything
+   * else is the transport's own failure (`network` when it reports none).
+   *
+   * This compares against the live gate signal, not a snapshot taken when the
+   * POST returned, so an abort raised while the partial prefix is being captured
+   * and flushed also wins. Both `cancelled` and `body-limit` are terminal and
+   * non-retryable, so the ordering is fixed by contract and pinned by test
+   * rather than left to chance.
+   */
+  private classifyIncomplete(
+    result: TransportResult, timedOut: boolean, gate: BoundaryGate,
+  ): { readonly failure: SafeFailure; readonly retryable: boolean } {
+    const status = result.status;
+    const base = result.failure;
+    if (gate.signal.aborted) {
+      return { failure: { code: 'cancelled', status }, retryable: false };
+    }
+    if (base !== null && base.code === 'body-limit') {
+      return { failure: base, retryable: false };
+    }
+    if (timedOut) {
+      return { failure: { code: 'timeout', status }, retryable: true };
+    }
+    const failure = base ?? { code: 'network', status };
+    return { failure, retryable: failure.code === 'network' || failure.code === 'timeout' };
   }
 
   /**

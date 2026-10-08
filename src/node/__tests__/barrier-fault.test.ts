@@ -40,7 +40,7 @@ function runtimeFor(fx: WorldFixture, transport: CountingTransport, config: Agen
       maxCaptureBytes: config.policy.maxShellCaptureBytes, drainDeadlineMs: config.policy.shellDrainMs,
       env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', TERM: 'dumb' } },
     adapter: new ProviderAdapter(transport, {
-      now: () => 100, delay,
+      delay,
       schedule: (ms, callback) => { const timer = setTimeout(callback, ms); return () => { clearTimeout(timer); }; },
     }),
   });
