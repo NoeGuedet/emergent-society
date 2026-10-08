@@ -8,7 +8,7 @@ This document specifies the bootstrap of the system: the minimal foundation — 
 
 > How do we provide a minimalist foundation (system prompt, tools, first heading) that allows emergence without forcing it? Two traps: early production (an intern thrown into the codebase) vs disguised pre-wiring (drawing the tree).
 
-**"Zero structure" is not an option.** Full autonomy is the worst measured protocol in the corpus: minimal scaffolding (fixed order, self-chosen roles) beats it by +44% (Cohen's d=1.86, 25,000 tasks, 8 models; Dochkina, arXiv:2603.28990 — single-author preprint, and the emergent-vs-designed-roles effect is smaller and capability-dependent: +3.5% for a strong model, −9.6% reversal for a weak one). The question is therefore not "seed or tree" but "**which minimal structure**". The answer: a structure that is **physical** (the kernel) and **dispositional** (the instincts), never **organizational**.
+**"Zero structure" is not an option.** Full autonomy is reported as the worst measured protocol in the corpus: minimal scaffolding (fixed order, self-chosen roles) is reported to beat it, but the finding (Dochkina, arXiv:2603.28990 — a single-author, non-peer-reviewed preprint) is treated as an uncertain external reference pending audit, and the effect is capability-dependent; its specific figures are held in the research corpus rather than restated here as a settled quantitative claim. The question is therefore not "seed or tree" but "**which minimal structure**". The answer: a structure that is **physical** (the kernel) and **dispositional** (the instincts), never **organizational**.
 
 **The criterion that settles pre-wiring empirically: antecedence.** An organizational artifact that appears *before* the friction that justifies it is pre-wiring (or corpus replaying); an artifact that appears *after* a friction dated in the journal is a genesis. Measurable, falsifiable, free (§8).
 
@@ -109,7 +109,7 @@ we are trying to hold up over time while drawing closer to it.
 Revision: v1 is negotiated in chat. Any proposal is welcome.
 ```
 
-Pinned outside compaction, versioned, re-injected verbatim on every request (Constraint Pinning: Governance Decay 0% → 30-59% after compaction, pinning → 0%; arXiv:2606.22528). The kernel injects the heading into the context of every child node — never the parent's report (structural anti-inherited-drift). The first negotiation that retires v0 takes place between the human and agent zero.
+Pinned outside compaction, versioned, re-injected verbatim on every request (the reported Constraint Pinning result: compaction is said to erode constraints while pinning restores them — an uncertain external reference pending reconciliation, arXiv:2606.22528, whose specific figures live in the research corpus). The kernel injects the heading into the context of every child node — never the parent's report (structural anti-inherited-drift). The first negotiation that retires v0 takes place between the human and agent zero.
 
 ## 7. Falsification instruments (invisible to the agents, computed from the journal)
 
@@ -135,6 +135,6 @@ Falsification experiments for the experimental protocol: free arm vs complete se
 ## References
 
 - **Cordis / "A Programming Paradigm for Spatiotemporal Composability"**, arXiv:2608.25512 — reversible effects and reactive co-effects; the recursive-graph primitive and the mutation gate (`research/sota-autonomous-agents.md`).
-- **Dochkina, V., "Drop the Hierarchy and Roles: How Self-Organizing LLM Agents Outperform Designed Structures"**, arXiv:2603.28990 — the +44% / d=1.86 result behind the "minimal structure, not zero structure" requirement, with its reading caveat (`research/sota-autonomous-agents.md`, `research/source-verification.md`).
+- **Dochkina, V., "Drop the Hierarchy and Roles: How Self-Organizing LLM Agents Outperform Designed Structures"**, arXiv:2603.28990 — the reported result behind the "minimal structure, not zero structure" requirement; treat it as an uncertain single-author preprint pending audit, with its reading caveat (`research/sota-autonomous-agents.md`, `research/source-verification.md`).
 - **Chen, S., "Governance Decay: How Context Compaction Silently Erases Safety Constraints in Long-Horizon LLM Agents"**, arXiv:2606.22528 — the justification for pinning the heading outside compaction (`research/value-measurement-long-horizon.md`).
 - **DeepSeek Harness** (MIT), `research/harness-deep-dive.md` — minimal single-tool preset (commit `63795eaa`), Plugin → immutable Packages → Runs (`cordis_define/run/stop/undefine`, `cordis_inspect_*`), FS sandbox with no silent passthrough, monotonic guards, "model-visible means logged" as a runtime invariant.

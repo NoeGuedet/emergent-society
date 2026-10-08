@@ -6,17 +6,18 @@ import { atomicWriteFile, ensureDurableDirectory, isErrno, syncPath } from './fs
 
 /**
  * Format constant — a payload whose canonical UTF-8 byte length is at or beyond
- * this is stored as a blob (kernel.md §3: "~8-16 KB"). Changing it changes the
- * format, i.e. it requires `v: 1`.
+ * this is stored as a blob (kernel.md §3: the format constant 16 KiB,
+ * inclusive). Changing it changes the format, i.e. it requires `v: 1`.
  */
 export const CLAIM_CHECK_THRESHOLD = 16 * 1024;
 
 /**
- * Format constant — a claim-checked payload is never *stored* whole past this
- * size. Beyond it the blob holds a prefix and the reference is marked
- * `truncated: true` with the original byte size, so the loss is explicit
- * (kernel.md §3: "truncation of giant payloads marked `truncated: true` +
- * original size — never silent"). Changing it changes the format (`v: 1`).
+ * Format constant — a claim-checked payload is never *stored* whole at or
+ * beyond this size. At or beyond it the blob holds a prefix and the reference
+ * is marked `truncated: true` with the original byte size, so the loss is
+ * explicit (kernel.md §3: "truncation of giant payloads marked `truncated:
+ * true` + original size — never silent"). Changing it changes the format
+ * (`v: 1`).
  */
 export const MAX_BLOB_BYTES = 4 * 1024 * 1024;
 
@@ -32,7 +33,7 @@ export class InvalidBlobHashError extends JournalError {
 /**
  * The reference `JournalWriter.claimCheck` substitutes for a payload whose
  * canonical size is at or past CLAIM_CHECK_THRESHOLD: `data` becomes
- * `{ blob, size }` (plus `truncated: true` past MAX_BLOB_BYTES) and the
+ * `{ blob, size }` (plus `truncated: true` at or above MAX_BLOB_BYTES) and the
  * canonical bytes of the original payload go to the blob store.
  */
 export interface BlobRef {
@@ -42,9 +43,9 @@ export interface BlobRef {
 }
 
 /**
- * A claim-checked payload past MAX_BLOB_BYTES is stored as a prefix only. The
- * reference is honest about the loss, so resolving it is refused outright
- * rather than served as if whole (kernel.md §3: never silent).
+ * A claim-checked payload at or above MAX_BLOB_BYTES is stored as a prefix
+ * only. The reference is honest about the loss, so resolving it is refused
+ * outright rather than served as if whole (kernel.md §3: never silent).
  */
 export class TruncatedBlobError extends JournalError {
   constructor(public readonly hash: string, public readonly size: number) {

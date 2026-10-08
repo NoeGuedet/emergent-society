@@ -22,7 +22,7 @@ This separation also settles the observation surface: everything a node writes t
 
 ## 2. The direction object — a double artifact
 
-A constraint from the research: Constraint Pinning protects *literal* constraints (Governance Decay: 0% → 30-59% violation after compaction, pinning → 0%); a *rich and implicit* direction is not pinnable as is. Hence two linked forms, versioned together:
+A constraint from the research: Constraint Pinning is reported to protect *literal* constraints (Governance Decay, arXiv:2606.22528: compaction is said to erode constraints and pinning to restore them — an uncertain external reference pending audit, not a quantitative claim here); a *rich and implicit* direction is not pinnable as is. Hence two linked forms, versioned together:
 
 - **The heading** — a few verbatim lines, plus the **cycle's value proxy** ("how we will know it works"). Pinned outside compaction, reinjected at every turn, injected by the kernel into the context of every node. The proxy is **visible to the agents**: it is their work target — hiding it from them would divert them. The associated Goodhart risk is accepted: the measurement remains invisible, the proxy ↔ intention gap is read by the human.
 - **The letter** — the rich text of the negotiation: the why, the intentions, the context. Versioned with the heading, stored in the world. Readable on demand by any node via its shell; never injected systematically (cost, cache, dilution).

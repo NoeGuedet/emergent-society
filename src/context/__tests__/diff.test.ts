@@ -149,7 +149,7 @@ describe('presentWorld negative and bounded fixtures', () => {
     await expect(presentWorld(world, 'n1', { from: null, to: MISSING }, 4096, 4096)).rejects.toThrow();
   });
 
-  it('rejects rather than falling back when the repository is unreadable', async () => {
+  it.skipIf(process.getuid?.() === 0)('rejects rather than falling back when the repository is unreadable', async () => {
     const { world } = fixture();
     const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
     const objects = join(world.path, '.git', 'objects');
