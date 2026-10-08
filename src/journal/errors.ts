@@ -30,3 +30,18 @@ export function isCorruption(e: unknown): boolean {
 export function isRetryable(e: unknown): boolean {
   return !(e instanceof JournalError);
 }
+
+/**
+ * A node uid that cannot be used as a path segment and a git identity at once.
+ *
+ * A uid is a technical identifier, not the free name an agent goes by (kernel.md
+ * §3): it is joined under `home/nodes/`, so a separator, a `..` or a control
+ * character in it is a path traversal or a corrupt directory name, and it is a
+ * git author at every turn-end. It is refused before any filesystem effect, so a
+ * hostile uid can never read or create a path outside the cell home.
+ */
+export class InvalidNodeUidError extends JournalError {
+  constructor(public readonly uid: string, reason: string) {
+    super(`invalid node uid ${JSON.stringify(uid)}: ${reason}`);
+  }
+}

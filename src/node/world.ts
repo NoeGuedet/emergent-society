@@ -1,8 +1,12 @@
 import { execFile, spawn } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import type { Stats } from 'node:fs';
+import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
-import { GitCommandError, UnsafeWorldPathError, WorldNotARepoError } from './errors.js';
+import { assertNodeUid } from '../journal/layout.js';
+import {
+  GitCommandError, UnsafeWorldPathError, WorldHeadError, WorldNotARepoError,
+} from './errors.js';
 
 /**
  * The world is one git repository (kernel.md §7): the only communication
@@ -34,9 +38,10 @@ const LOG_FORMAT = `--format=%H${FIELD}%an`;
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 /**
- * Commit attempts before a lock that will not free is reported as a failure.
- * One commit per turn (§5.2) takes tens of milliseconds, so a short bounded
- * wait covers a peer's turn-end; longer means something is wedged.
+ * Commit attempts before a lock that will not free — or a branch that will not
+ * stop moving — is reported as a failure. One commit per turn (§5.2) takes tens
+ * of milliseconds, so a short bounded wait covers a peer's turn-end; longer means
+ * something is wedged.
  */
 const COMMIT_ATTEMPTS = 4;
 
@@ -45,6 +50,62 @@ const COMMIT_RETRY_MS = 25;
 
 /** stderr kept from a failed bounded render: a diagnostic, never the payload (§T4). */
 const MAX_GIT_STDERR_BYTES = 8 * 1024;
+
+/**
+ * The git context variables the kernel strips from every call. Each one lets an
+ * inherited environment point git at a different repository, index, object store
+ * or namespace — the difference between committing the world and committing
+ * somewhere the kernel was never asked to touch. Two of them are config-injection
+ * channels that need no file at all: `GIT_CONFIG_COUNT` with its
+ * `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` entries, and `GIT_CONFIG_PARAMETERS`
+ * (a shell-quoted `-c` list). Either can set `core.*` — a clean filter, an
+ * fsmonitor, hooks — which git would then run unlogged.
+ */
+const GIT_ENV_STRIP: readonly string[] = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
+  'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM',
+  'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
+];
+
+/**
+ * The controlled environment for every kernel git invocation. The redirecting
+ * and config-injecting variables above are removed, system and global config are
+ * neutralized, and the rest of the environment (PATH, locale — git needs both)
+ * is inherited. A caller with an explicit policy (the hermetic diff renderer)
+ * passes overrides, which win. This is the single place that decides a kernel
+ * git environment: the process environment is read, never mutated.
+ */
+function gitEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of GIT_ENV_STRIP) delete env[key];
+  for (const key of Object.keys(env)) {
+    // `GIT_CONFIG_COUNT` names a list; its entries are `GIT_CONFIG_KEY_<n>` and
+    // `GIT_CONFIG_VALUE_<n>`, so they are removed by prefix, whatever the count.
+    if (key.startsWith('GIT_CONFIG_KEY_') || key.startsWith('GIT_CONFIG_VALUE_')) delete env[key];
+  }
+  return {
+    ...env,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    ...overrides,
+  };
+}
+
+/**
+ * `realpath`, or the input unchanged when the path does not exist. Only `ENOENT`
+ * is a fallback — "the path is not there" is a fact this guard can work with. Any
+ * other failure (EACCES, EIO) is an environment fact and propagates: silently
+ * comparing raw strings would weaken a safeguard rather than report it.
+ */
+async function realpathOrSelf(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return path;
+    throw err;
+  }
+}
 
 /**
  * The hermetic diff flag set (T4 step 5). `-c` are git global options and must
@@ -105,7 +166,7 @@ function isFullHex(value: string, length: number): boolean {
   return value.length === length && /^[0-9a-f]+$/.test(value);
 }
 
-/** What git says when another process holds the index or the ref. */
+/** What git says when another process holds the index or the ref, or when a branch compare-and-swap loses its race. */
 const LOCK_CONTENTION = /index\.lock|cannot lock ref|Another git process seems to be running/i;
 
 /** One commit of the world's history, as the wake predicate and the journal need it. */
@@ -175,7 +236,7 @@ async function git(dir: string, args: readonly string[], env?: Record<string, st
       'git', [...args],
       {
         cwd: dir,
-        ...(env !== undefined ? { env: { ...process.env, ...env } } : {}),
+        env: gitEnv(env),
         maxBuffer: MAX_GIT_OUTPUT_BYTES,
         windowsHide: true,
       },
@@ -194,7 +255,7 @@ async function git(dir: string, args: readonly string[], env?: Record<string, st
 /** Runs one git command feeding `input` on stdin and returns stdout (T4 empty-tree hash). */
 async function gitWithStdin(dir: string, args: readonly string[], input: Buffer): Promise<string> {
   return new Promise<string>((resolvePromise, reject) => {
-    const child = spawn('git', [...args], { cwd: dir, windowsHide: true });
+    const child = spawn('git', [...args], { cwd: dir, env: gitEnv(), windowsHide: true });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -239,11 +300,17 @@ function identity(author: string): Record<string, string> {
  * safeguard): `$HOME` and broad roots are what turns a commit-per-turn kernel
  * into the documented 200 GB incident.
  *
+ * `$HOME` is resolved before the comparison: if the home is itself behind a
+ * symlink, comparing a real world path against the unresolved `homedir()` string
+ * would let a symlink to the real home through — the safeguard is about the
+ * directory the kernel would really commit, on both sides of the comparison.
+ *
  * @throws UnsafeWorldPathError.
  */
-function assertDedicated(path: string): string {
+async function assertDedicated(path: string): Promise<string> {
   const depth = path.split(sep).filter((part) => part !== '').length;
-  if (path === resolve(homedir()) || depth < 2) throw new UnsafeWorldPathError(path);
+  const home = await realpathOrSelf(resolve(homedir()));
+  if (path === home || depth < 2) throw new UnsafeWorldPathError(path);
   return path;
 }
 
@@ -279,12 +346,16 @@ const NOOP = (): void => {};
 export class WorldRepo {
   /**
    * Commit serialization, keyed by the repo's canonical root. Two drivers
-   * sharing one world must not interleave `add`/`commit`: git's index lock
-   * turns the loser of that race into a failed commit, which is a turn whose
-   * effects were never attributed. The discipline is the journal's single-writer
-   * rule applied one level up — the resource is shared, so the queue is per
-   * resource, not per driver. Writers *outside* this process (another kernel,
-   * the human's git) are handled by the bounded retry in `commitRetrying`.
+   * sharing one world must not interleave the staging and publishing of a
+   * commit: without the queue both stage the same index and one loses git's
+   * index lock or its compare-and-swap, which is a turn whose effects were never
+   * attributed. The discipline is the journal's single-writer rule applied one
+   * level up — the resource is shared, so the queue is per resource, not per
+   * driver. Writers *outside* this process (another kernel, the human's git) are
+   * handled by the bounded retry in `commitRetrying`.
+   *
+   * An entry lives only while a commit is queued or running (`serialize` prunes
+   * it), so the map does not grow with every world a long-lived process opens.
    */
   private static readonly commitQueues = new Map<string, Promise<unknown>>();
 
@@ -299,10 +370,29 @@ export class WorldRepo {
    * @throws UnsafeWorldPathError when `dir` resolves to `$HOME` or a broad root.
    * @throws WorldNotARepoError when `dir` does not exist, or is not the root of
    * a git repository — including the case where it is a *subdirectory* of one,
-   * which would make every turn-end commit the surrounding repository's tree.
+   * which would make every turn-end commit the surrounding repository's tree,
+   * and the cases where its git dir is not a real, owned directory: a linked
+   * worktree (a gitfile), a separated git dir (a gitfile), and a `.git` that is
+   * a *symlink* to another repository (which shares and writes that repository's
+   * objects and refs — a realpath comparison cannot see it, `lstat` can).
    */
   static async open(dir: string): Promise<WorldRepo> {
     const root = await canonicalWorldPath(dir);
+    // The dedicated-repo contract is about the entry itself, not only what it
+    // resolves to: `.git` must be a real directory of this world. `lstat` sees
+    // the entry, so a symlink, a gitfile or a plain file is refused before any
+    // git call runs against it.
+    let gitEntry: Stats | null = null;
+    try {
+      gitEntry = await lstat(join(root, '.git'));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // ENOENT/ENOTDIR: there is no `.git` entry here. Anything else (EACCES,
+      // EIO) is an environment failure and propagates rather than being reported
+      // as "not a repository".
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw err;
+    }
+    if (gitEntry === null || !gitEntry.isDirectory()) throw new WorldNotARepoError(root);
     let toplevel: string;
     try {
       toplevel = (await git(root, ['rev-parse', '--show-toplevel'])).trim();
@@ -310,6 +400,15 @@ export class WorldRepo {
       throw new WorldNotARepoError(root);
     }
     if (resolve(toplevel) !== root) throw new WorldNotARepoError(root);
+    let gitDir: string;
+    try {
+      gitDir = (await git(root, ['rev-parse', '--absolute-git-dir'])).trim();
+    } catch {
+      throw new WorldNotARepoError(root);
+    }
+    if (await realpathOrSelf(gitDir) !== await realpathOrSelf(join(root, '.git'))) {
+      throw new WorldNotARepoError(root);
+    }
     return new WorldRepo(root);
   }
 
@@ -317,8 +416,12 @@ export class WorldRepo {
    * Creates the world repository. The kernel owns this, not a node: the world
    * exists before the first node boots.
    *
-   * The untracked cache is enabled because it is the one index extension that
-   * is a pure win here; the FSMonitor is not (unavailable on Linux, §7).
+   * The initial branch is pinned rather than left to `init.defaultBranch`: the
+   * kernel runs git under a controlled environment (see `gitEnv`), so a host
+   * gitconfig must not decide the world's branch any more than it decides the
+   * kernel's identity. The untracked cache is enabled because it is the one
+   * index extension that is a pure win here; the FSMonitor is not (unavailable
+   * on Linux, §7).
    */
   static async init(dir: string): Promise<WorldRepo> {
     // The directory is created first, then resolved and checked: `mkdir` on a
@@ -326,7 +429,7 @@ export class WorldRepo {
     const given = resolve(dir);
     await mkdir(given, { recursive: true });
     const path = await canonicalWorldPath(given);
-    await git(path, ['init', '--quiet']);
+    await git(path, ['init', '--quiet', '--initial-branch=main']);
     await git(path, ['config', 'core.untrackedCache', 'true']);
     return WorldRepo.open(path);
   }
@@ -576,7 +679,7 @@ export class WorldRepo {
   ): Promise<BoundedText> {
     return new Promise<BoundedText>((resolvePromise, rejectPromise) => {
       const child = spawn('git', [...args], {
-        cwd: this.path, env: { ...process.env, ...env }, windowsHide: true,
+        cwd: this.path, env: gitEnv(env), windowsHide: true,
       });
       const decoder = new TextDecoder('utf-8');
       let text = '';
@@ -637,21 +740,39 @@ export class WorldRepo {
    * records, and the git layer is meant to show what the society shares.
    *
    * @returns a commit this node authored, or null when this call produced none
-   * of its own — never a peer's, see `ownCommit`.
+   * of its own — the hash is the one git created for this call, so it can never
+   * be a peer's.
+   * @throws InvalidNodeUidError when `author` is not a safe node uid; the
+   * validation precedes the queue and every git effect.
+   * @throws WorldHeadError when HEAD is detached or not a local branch, or when
+   * it switches branch during the commit; the kernel publishes to one named
+   * branch and refuses to guess.
    * @throws GitCommandError when git fails, including a lock another process
    * holds past the bounded retries; the caller decides whether that ends the
    * run (an unattributed effect is not a fact to shrug off).
    */
   async commitAll(author: string, message: string): Promise<WorldCommitInfo | null> {
+    // The author becomes the commit's git identity, so it must be a uid the
+    // kernel can vouch for: a separator or a control character here is a
+    // malformed identity, and this is where it is refused — before the queue,
+    // before `add`, before anything exists to undo. History already written by
+    // someone else is never re-validated: foreign author names stay facts.
+    assertNodeUid(author);
     return this.serialize(() => this.commitRetrying(author, message));
   }
 
   /**
-   * One commit, retried while another process holds git's lock — another
-   * kernel's turn-end, or the human's commit (§5.1). The in-process queue
-   * serializes this kernel's drivers; the lock is what serializes everyone
-   * else, and a lock held past the bounded wait is reported rather than
-   * retried forever.
+   * One commit, retried while another process holds git's lock or moves the
+   * branch — another kernel's turn-end, or the human's commit (§5.1). The
+   * in-process queue serializes this kernel's drivers; the lock and the
+   * compare-and-swap serialize everyone else, and contention held past the
+   * bounded wait is reported rather than retried forever.
+   *
+   * The whole attempt is retried, never a fragment: the parent commit is
+   * re-read, the tree re-snapshotted and the commit re-created against the new
+   * parent, so a peer commit that landed in between is kept, not overwritten.
+   * Only lock/compare-and-swap contention is retryable; any other git or read
+   * failure surfaces unchanged.
    */
   private async commitRetrying(author: string, message: string): Promise<WorldCommitInfo | null> {
     for (let attempt = 1; ; attempt += 1) {
@@ -665,44 +786,95 @@ export class WorldRepo {
     }
   }
 
+  /**
+   * One commit attempt, built from git plumbing rather than `git commit`.
+   *
+   * `git commit` writes the message to the repository-wide `.git/COMMIT_EDITMSG`
+   * and reads it back, so two concurrent commits race on that one shared file —
+   * the observed "empty commit message" abort and a commit whose message is
+   * another writer's. `write-tree` + `commit-tree` + `update-ref` never touch
+   * that file: the tree is a snapshot of the index, the message goes through
+   * `-m`, and the branch moves with a compare-and-swap. The commit hash is known
+   * directly from `commit-tree`, so no read-back of HEAD is needed — that read
+   * could name a peer's commit. Index and working tree are only ever added to:
+   * nothing is reset, and no object is pruned.
+   */
   private async commitOnce(author: string, message: string): Promise<WorldCommitInfo | null> {
+    const headRef = await this.headRef();
     const before = await this.headHash();
     await git(this.path, ['add', '--all']);
     if (await this.nothingStaged()) return null;
-    try {
-      // `-c commit.gpgsign=false --no-verify`: the kernel's commit must depend
-      // neither on the host's git configuration nor on a hook an agent could
-      // have written into the world.
-      await git(
-        this.path,
-        ['-c', 'commit.gpgsign=false', 'commit', '--no-verify', '--quiet', '--message', message],
-        identity(author),
-      );
-    } catch (err) {
-      // Exit 1 with nothing on stderr is git's "nothing to commit": another
-      // process took the tree between our `add` and our `commit`, so this turn
-      // has nothing left of its own to record.
-      if (err instanceof GitCommandError && err.exitCode === 1 && err.stderr.trim() === '') return null;
-      throw err;
-    }
-    return this.ownCommit(before, author);
+    const tree = (await git(this.path, ['write-tree'])).trim();
+    // The net-change guard: a tree identical to the parent's would be an empty
+    // commit — a wake for every other node with no fact behind it (§5.4). The
+    // empty tree stands in for an unborn branch's parent.
+    const parentTree = before === null ? await this.emptyTree() : await this.treeOf(before);
+    if (tree === parentTree) return null;
+    // The commit object is created whether or not the branch can move; a
+    // compare-and-swap loss leaves it unreferenced, and the retry makes a fresh
+    // one. `-c commit.gpgsign=false -c core.hooksPath=/dev/null` keep the commit
+    // independent of host configuration and of any hook — `commit-tree` runs no
+    // hooks, and the explicit empty path also protects a future regression.
+    const commit = (await git(
+      this.path,
+      [
+        '-c', 'commit.gpgsign=false',
+        '-c', 'core.hooksPath=/dev/null',
+        'commit-tree', tree,
+        ...(before === null ? [] : ['-p', before]),
+        '-m', message,
+      ],
+      identity(author),
+    )).trim();
+    await this.publish(headRef, before, commit);
+    return { hash: commit, author };
   }
 
   /**
-   * The commit this call produced, or null when it produced none of its own.
+   * The local branch HEAD names, or a refusal when HEAD is not one.
    *
-   * Reading HEAD is not enough: another process can commit between ours and the
-   * read, and the hash a `turn/end` journals must be a commit *this* node
-   * authored — a peer's hash there would join the journal to the wrong turn. So
-   * the range from the HEAD observed before the commit is searched for the
-   * newest commit of ours. When a peer's commit swept our writes instead, there
-   * is none of ours to name, and the turn records no commit: attribution is
-   * commit-granular (§5.2), and naming a peer's commit would be worse than
-   * naming none.
+   * The kernel publishes to a named branch and verifies it again immediately
+   * before publishing; a detached HEAD, or one pointing outside
+   * `refs/heads/`, fails closed rather than guessing which ref to move.
+   * `symbolic-ref` is the only supported mechanism — git 2.43 has no
+   * `update-ref --symref-verify` — so the check and the update are two commands.
+   * Branch switching is outside the single-branch world contract: the window
+   * between the two is documented, not promised closed against a concurrent
+   * checkout.
    */
-  private async ownCommit(before: string | null, author: string): Promise<WorldCommitInfo | null> {
-    const range = await this.commitsSince(before);
-    return range.filter((commit) => commit.author === author).at(-1) ?? null;
+  private async headRef(): Promise<string> {
+    let ref: string;
+    try {
+      ref = (await git(this.path, ['symbolic-ref', '--quiet', 'HEAD'])).trim();
+    } catch (err) {
+      if (err instanceof GitCommandError && err.exitCode === 1) {
+        throw new WorldHeadError('HEAD is detached, not a branch');
+      }
+      throw err;
+    }
+    if (!ref.startsWith('refs/heads/')) {
+      throw new WorldHeadError(`HEAD names ${JSON.stringify(ref)}, not a local branch`);
+    }
+    return ref;
+  }
+
+  /**
+   * Moves `headRef` from `before` to `commit` with a compare-and-swap.
+   *
+   * The expected old value is the parent this attempt was built on — or the
+   * all-zero object id, sized by the repository's object format, when the branch
+   * is unborn. A peer commit that landed in between makes the update fail
+   * (`cannot lock ref … is at … but expected …`, which the retry loop reads as
+   * contention) instead of being overwritten. HEAD is re-checked immediately
+   * before the update so a branch switch during the attempt fails closed.
+   */
+  private async publish(headRef: string, before: string | null, commit: string): Promise<void> {
+    const current = await this.headRef();
+    if (current !== headRef) {
+      throw new WorldHeadError(`HEAD switched from ${headRef} to ${current} during a commit`);
+    }
+    const expected = before ?? '0'.repeat(hashLength(await this.format()));
+    await git(this.path, ['update-ref', headRef, commit, expected]);
   }
 
   /** Whether the index matches HEAD, so a commit would have nothing to record. */
@@ -721,11 +893,21 @@ export class WorldRepo {
    * Runs `task` after every commit already queued on this repo has finished.
    * The queue is kept alive across failures: a commit that failed must not wedge
    * the next turn's.
+   *
+   * A finished entry is pruned only while it is still the map's tail: if a later
+   * commit queued behind it in the meantime, the map already names that later
+   * promise and this one must not be removed out from under the chain.
    */
   private serialize<T>(task: () => Promise<T>): Promise<T> {
     const previous = WorldRepo.commitQueues.get(this.path) ?? Promise.resolve();
     const next = previous.then(task, task);
-    WorldRepo.commitQueues.set(this.path, next.then(NOOP, NOOP));
+    const settled = next.then(NOOP, NOOP);
+    WorldRepo.commitQueues.set(this.path, settled);
+    void settled.then(() => {
+      if (WorldRepo.commitQueues.get(this.path) === settled) {
+        WorldRepo.commitQueues.delete(this.path);
+      }
+    });
     return next;
   }
 }

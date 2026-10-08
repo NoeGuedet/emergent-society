@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { dirname, join } from 'node:path';
 import { GitCommandError } from '../errors.js';
+import { WorldRepo } from '../world.js';
 import { commitAs, useWorld } from './helpers.js';
 
 /**
@@ -159,5 +161,21 @@ describe('WorldRepo.diff', () => {
     expect(capture.truncated).toBe(true);
     expect(capture.bytesRetained).toBeLessThanOrEqual(4096);
     expect(capture.bytesRetained).toBe(Buffer.byteLength(capture.text, 'utf8'));
+  });
+
+  it('renders the world range even when the environment points GIT_DIR elsewhere', async () => {
+    const { world } = fixture();
+    const other = await WorldRepo.init(join(dirname(world.path), 'world-b'));
+    const c1 = await commitAs(world, 'n1', { 'a.txt': 'one\n' });
+    vi.stubEnv('GIT_DIR', join(other.path, '.git'));
+    try {
+      // The renderer addresses the world explicitly and runs under the controlled
+      // environment, so an inherited GIT_DIR is not an input to the bytes.
+      const capture = await world.diff({ from: null, to: c1 }, 4096);
+      expect(capture.text).toContain('diff --git a/a.txt b/a.txt');
+      expect(capture.text).toContain('+one');
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

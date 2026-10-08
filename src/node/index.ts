@@ -18,7 +18,7 @@ export {
   type WorldRange,
 } from './world.js';
 export {
-  GitCommandError, NodeError, NodeStateError, UnsafeWorldPathError, WorldNotARepoError,
+  GitCommandError, NodeError, NodeStateError, UnsafeWorldPathError, WorldHeadError, WorldNotARepoError,
 } from './errors.js';
 export {
   NODE_EVENT_TYPES, type ShutdownReason, type TurnEndOutcome, type TurnTrigger,

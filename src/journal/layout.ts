@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import { HASH_RE } from './canon.js';
+import { InvalidNodeUidError } from './errors.js';
 
 /**
  * Where a node's journal lives, in one place. The on-disk layout is an interface
@@ -12,15 +13,46 @@ import { HASH_RE } from './canon.js';
  * has been resolved. The module also owns `Head` and `parseHead` — the shape of
  * the one disposable checkpoint that sits beside the log — so that the reader
  * and the writer share it without importing each other.
+ *
+ * The uid is a technical identifier (kernel.md §3), and this module is where it
+ * is validated: every path builder funnels through `nodeDir`, so a rejected uid
+ * can never reach the filesystem from any caller, direct writer included.
  */
+
+/**
+ * What a uid may be: one safe path segment that is also a valid git author and
+ * a stable round-trip through git's identity fields. It must start with an
+ * alphanumeric so `.` and `..` are impossible, and it may continue with
+ * `A-Za-z0-9._-` up to 128 characters — no separator, no control character,
+ * no whitespace, no leading dash or dot.
+ */
+export const NODE_UID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/**
+ * Validates a node uid, returning it unchanged.
+ *
+ * @throws InvalidNodeUidError when it is empty, too long, or carries a
+ * character that is not safe in a path segment and a git identity.
+ */
+export function assertNodeUid(uid: string): string {
+  if (typeof uid !== 'string' || !NODE_UID_RE.test(uid)) {
+    throw new InvalidNodeUidError(String(uid), 'must match /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/');
+  }
+  return uid;
+}
+
 export const LOG_FILE = 'journal.v0.jsonl.zstd';
 export const LOCK_FILE = 'journal.v0.lock';
 export const OWNER_FILE = 'journal.v0.owner';
 export const HEAD_FILE = 'journal.v0.head';
 
-/** `nodes/<uid>/` — the node's journal directory, inside the cell home. */
+/**
+ * `nodes/<uid>/` — the node's journal directory, inside the cell home. The uid
+ * is validated here, before the join, so no caller can address a path outside
+ * `home/nodes/`.
+ */
 export function nodeDir(home: string, nodeUid: string): string {
-  return join(home, 'nodes', nodeUid);
+  return join(home, 'nodes', assertNodeUid(nodeUid));
 }
 
 /** The canonical log of a node. */

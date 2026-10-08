@@ -61,8 +61,8 @@ export {
 } from './blobs.js';
 
 // Layout, for callers that need to address a journal directly.
-export { LOG_FILE, LOCK_FILE, journalPath, headPath, nodeDir } from './layout.js';
+export { LOG_FILE, LOCK_FILE, NODE_UID_RE, assertNodeUid, journalPath, headPath, nodeDir } from './layout.js';
 
 // The typed error family.
-export { JournalError, isCorruption, isRetryable } from './errors.js';
+export { InvalidNodeUidError, JournalError, isCorruption, isRetryable } from './errors.js';
 export { JournalWriteStalledError } from './fsutil.js';

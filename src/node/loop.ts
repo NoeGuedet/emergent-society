@@ -1,4 +1,4 @@
-import { BlobStore } from '../journal/index.js';
+import { BlobStore, assertNodeUid } from '../journal/index.js';
 import { canonicalBytes } from '../context/artifacts.js';
 import { assemble } from '../context/assembler.js';
 import { defaultAgentConfig, validateAgentConfig } from '../context/config.js';
@@ -65,6 +65,11 @@ class Runtime implements AgentRuntime {
   readonly hooks: DriverHooks;
 
   constructor(private readonly options: RuntimeOptions) {
+    // The runtime's uid is the node's technical identity: the journal directory
+    // name, the commit author and the perception uid all derive from it, so it is
+    // validated at construction — an invalid one can never reach the filesystem
+    // or a git identity through this runtime.
+    assertNodeUid(options.uid);
     this.initialConfig = validateAgentConfig(options.initialConfig);
     this.handler = (ctx: TurnContext): Promise<TurnResult> => this.run(ctx);
     this.hooks = {

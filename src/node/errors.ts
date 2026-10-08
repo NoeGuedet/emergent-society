@@ -23,6 +23,18 @@ export class WorldNotARepoError extends NodeError {
   }
 }
 
+/**
+ * The world's HEAD is not a single local branch the kernel can publish to: it is
+ * detached, names something outside `refs/heads/`, or switched branch during a
+ * commit. The kernel publishes with a compare-and-swap against one named branch
+ * and has no safe contract for guessing another, so it fails closed.
+ */
+export class WorldHeadError extends NodeError {
+  constructor(public readonly reason: string) {
+    super(`world HEAD is not a publishable branch: ${reason}`);
+  }
+}
+
 /** A git invocation against the world failed. */
 export class GitCommandError extends NodeError {
   constructor(

@@ -30,6 +30,16 @@ export class HeadWatcher {
    * One watcher per world repo, keyed by its canonical root, kept for the life
    * of the process: the instance a driver subscribes to must be the instance
    * the committing driver pokes, or the in-process signal would be lost.
+   *
+   * The retention is deliberate, not a leak left unexamined. A driver resolves
+   * its watcher once, at construction, and pokes *that* instance at every
+   * turn-end; deleting on the last unsubscribe would fork the identity, so a
+   * poke from one driver would land on an instance no other driver is listening
+   * to and the in-process wake would silently stop. A reference-count lease is
+   * therefore only safe with a lifecycle change (drivers resolving the watcher
+   * per park, plus a dispose protocol) — a C1.4+ decision, not a fixture
+   * accommodation. A process that opens many distinct worlds pays one small
+   * entry per world; the entry holds no timer and no children when idle.
    */
   private static readonly instances = new Map<string, HeadWatcher>();
 
