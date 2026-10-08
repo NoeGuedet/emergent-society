@@ -44,14 +44,19 @@ export { NonCanonicalizableError, canonicalizeJson, type JsonValue } from './can
 export { ChainBreakError } from './verify.js';
 export { CorruptFrameError } from './framing.js';
 
-// Claim-check blobs.
+// Claim-check blobs and the one verified read of their bytes.
 export {
   BlobStore,
   CLAIM_CHECK_THRESHOLD,
   MAX_BLOB_BYTES,
+  BlobIntegrityError,
   InvalidBlobHashError,
   TruncatedBlobError,
+  assertBlobRefReadable,
+  assertBlobBytes,
   isBlobRef,
+  parseBlobJson,
+  throwBlobReadError,
   type BlobRef,
 } from './blobs.js';
 

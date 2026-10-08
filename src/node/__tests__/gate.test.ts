@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
-import { BlobStore, JournalWriter, isBlobRef } from '../../journal/index.js';
+import {
+  BlobIntegrityError, BlobStore, JournalWriter, MAX_BLOB_BYTES, TruncatedBlobError,
+  isBlobRef, isCorruption, isRetryable,
+} from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
 import { useTempHome } from '../../journal/__tests__/helpers.js';
 import { createBoundaryRegistry } from '../../context/events.js';
@@ -26,7 +29,11 @@ interface Harness {
 async function harness(
   phase: 'ready' | 'turn',
   turn: number | null,
-  overrides: { readBlob?: GateCallbacks['readBlob']; registry?: BoundaryRegistry } = {},
+  overrides: {
+    readBlob?: GateCallbacks['readBlob'];
+    registry?: BoundaryRegistry;
+    append?: GateCallbacks['append'];
+  } = {},
 ): Promise<Harness> {
   const writer = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60000 });
   const controller = new AbortController();
@@ -37,7 +44,7 @@ async function harness(
   };
   const lookup = (s: Source): EventEnvelope | null => receipts.get(`${s.seq}:${s.hash}`) ?? null;
   const callbacks: GateCallbacks = {
-    append: (type, data) => record(writer.append(type, data as never)),
+    append: overrides.append ?? ((type, data) => record(writer.append(type, data as never))),
     flush: () => writer.flush(),
     lookup,
     readBlob: overrides.readBlob ?? ((hash: string) => new BlobStore(home()).get(hash)),
@@ -186,7 +193,7 @@ describe('BoundaryGate.flush durable barrier', () => {
 
   it('throws BlobIntegrityError when a claim-check blob is missing', async () => {
     const h = await harness('ready', null, {
-      readBlob: () => Promise.reject(new Error('ENOENT: no such file')),
+      readBlob: () => Promise.reject(Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' })),
     });
     try {
       const config = { ...defaultAgentConfig(), charter: 'c'.repeat(100 * 1024) };
@@ -195,6 +202,54 @@ describe('BoundaryGate.flush durable barrier', () => {
       });
       await expect(h.created.gate.flush()).rejects.toThrow();
       await expect(h.created.gate.flush()).rejects.toMatchObject({ name: 'BlobIntegrityError' });
+    } finally {
+      h.created.close();
+      await h.writer.close();
+    }
+  });
+
+  it('rethrows a non-ENOENT blob read failure as a retryable environment error', async () => {
+    // EACCES and EIO are environment failures: they must keep their own type and
+    // must not be reclassified as corruption just because they cross the barrier.
+    for (const code of ['EACCES', 'EIO']) {
+      const h = await harness('ready', null, {
+        readBlob: () => Promise.reject(Object.assign(new Error(`injected ${code}`), { code })),
+      });
+      try {
+        const config = { ...defaultAgentConfig(), charter: 'c'.repeat(100 * 1024) };
+        h.created.gate.append('system/message', {
+          version: 1, value: { kind: 'inline', value: config },
+        });
+        const err = await h.created.gate.flush().catch((e: unknown) => e);
+        expect(err).not.toBeInstanceOf(BlobIntegrityError);
+        expect(isCorruption(err)).toBe(false);
+        expect(isRetryable(err)).toBe(true);
+        expect((err as { code?: string }).code).toBe(code);
+      } finally {
+        h.created.close();
+        await h.writer.close();
+      }
+    }
+  });
+
+  it('rejects a flagged truncated reference before any effect, even if digest and size match', async () => {
+    // The gate's preflight refuses a BlobRef root and the writer never flags at
+    // or below the ceiling, so the staged append stands in for the one path that
+    // can: a direct writer's receipt. The blob is written for real, so its digest
+    // and byte length match the reference exactly and only the flag can reject.
+    const body = Buffer.alloc(MAX_BLOB_BYTES, 0x61);
+    const blob = await new BlobStore(home()).put(body);
+    const forged: EventEnvelope = {
+      v: 0, type: 'system/message', seq: 0, time: 1, prev_hash: '0'.repeat(64),
+      hash: 'a'.repeat(64),
+      data: { blob, size: body.length, truncated: true },
+    };
+    const h = await harness('ready', null, { append: () => forged });
+    try {
+      h.created.gate.append('system/message', {
+        version: 1, value: { kind: 'inline', value: defaultAgentConfig() },
+      } as never);
+      await expect(h.created.gate.flush()).rejects.toThrow(TruncatedBlobError);
     } finally {
       h.created.close();
       await h.writer.close();

@@ -1,4 +1,4 @@
-import { HASH_RE } from './canon.js';
+import { HASH_RE, NonCanonicalizableError } from './canon.js';
 import { FORMAT_VERSION, GENESIS_HASH, assertKnownType, verifyEvent, type EventEnvelope } from './envelope.js';
 import type { ScannedBatch } from './framing.js';
 import { CorruptionError } from './errors.js';
@@ -21,11 +21,18 @@ export class ChainBreakError extends CorruptionError {
 const ENVELOPE_KEYS = new Set(['v', 'type', 'seq', 'time', 'prev_hash', 'hash', 'ignorable', 'data']);
 
 /**
- * Parses one canonical log line into an envelope. A line that is not a JSON
- * object, that carries a key outside the frozen v0 set, or whose `prev_hash` /
- * `hash` is not 64 lowercase hex characters is refused here, so the caller sees
- * a typed `ChainBreakError` rather than a raw `TypeError` — and an injected
- * top-level field can never ride along unnoticed.
+ * Parses one canonical log line into an envelope, refusing anything that is not
+ * exactly the frozen v0 shape: a non-object, a key outside the v0 set, a missing
+ * or mistyped required field, a non-boolean `ignorable`, or a `prev_hash`/`hash`
+ * that is not 64 lowercase hex characters. Every refusal is a typed
+ * `ChainBreakError`, so a caller never sees a raw `TypeError`, an injected
+ * top-level field can never ride along unnoticed, and a damaged line is
+ * classified as corruption rather than crashing on an unvalidated field.
+ *
+ * `seq` is the expected position in the chain (the reader's next seq), used for
+ * every message: the event's own `seq` is not trusted until it is validated, so
+ * a malformed line still reports a meaningful position instead of `undefined`.
+ * A parsed line is plain JSON data — no accessor can have survived `JSON.parse`.
  */
 function parseEnvelope(line: string, seq: number): EventEnvelope {
   let parsed: unknown;
@@ -41,11 +48,26 @@ function parseEnvelope(line: string, seq: number): EventEnvelope {
   for (const key of Object.keys(e)) {
     if (!ENVELOPE_KEYS.has(key)) throw new ChainBreakError(seq, `unknown envelope field "${key}"`);
   }
+  if (typeof e['v'] !== 'number') throw new ChainBreakError(seq, 'v is not a number');
+  if (typeof e['type'] !== 'string') throw new ChainBreakError(seq, 'type is not a string');
+  const eventSeq = e['seq'];
+  if (typeof eventSeq !== 'number' || !Number.isSafeInteger(eventSeq) || eventSeq < 0) {
+    throw new ChainBreakError(seq, 'seq is not a nonnegative safe integer');
+  }
+  // The documented format is epoch-millisecond wall clock, which may be
+  // fractional, so only finiteness is required — never an invented integer time.
+  if (typeof e['time'] !== 'number' || !Number.isFinite(e['time'])) {
+    throw new ChainBreakError(seq, 'time is not a finite number');
+  }
   if (typeof e['prev_hash'] !== 'string' || !HASH_RE.test(e['prev_hash'])) {
     throw new ChainBreakError(seq, 'prev_hash is not 64 lowercase hex characters');
   }
   if (typeof e['hash'] !== 'string' || !HASH_RE.test(e['hash'])) {
     throw new ChainBreakError(seq, 'hash is not 64 lowercase hex characters');
+  }
+  if (!Object.hasOwn(e, 'data')) throw new ChainBreakError(seq, 'data is missing');
+  if (Object.hasOwn(e, 'ignorable') && typeof e['ignorable'] !== 'boolean') {
+    throw new ChainBreakError(seq, 'ignorable is not a boolean');
   }
   return e as unknown as EventEnvelope;
 }
@@ -83,7 +105,20 @@ export function* verifyChain(
       }
       if (e.seq !== state.seq) throw new ChainBreakError(e.seq, `expected seq ${state.seq}`);
       if (e.prev_hash !== state.prevHash) throw new ChainBreakError(e.seq, 'prev_hash mismatch');
-      if (!verifyEvent(e)) throw new ChainBreakError(e.seq, 'hash recomputation failed');
+      // A payload read from disk that has no RFC 8785 form (a lone surrogate, a
+      // non-finite number) is damaged bytes, not a caller handing us an
+      // uncanonicalizable value: classify it as a chain break, not as the
+      // `NonCanonicalizableError` the writer's validation path uses.
+      let verified: boolean;
+      try {
+        verified = verifyEvent(e);
+      } catch (err) {
+        if (err instanceof NonCanonicalizableError) {
+          throw new ChainBreakError(e.seq, 'data is not canonicalizable JSON');
+        }
+        throw err;
+      }
+      if (!verified) throw new ChainBreakError(e.seq, 'hash recomputation failed');
       if (known !== null) assertKnownType(e.type, e.ignorable ?? false, known);
       state.firstHash ??= e.hash;
       state.prevHash = e.hash;

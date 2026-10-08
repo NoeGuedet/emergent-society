@@ -1,13 +1,13 @@
 import {
-  BlobStore, JournalReader, JournalWriter, TornTailError, isBlobRef, repair,
+  BlobStore, JournalReader, JournalWriter, TornTailError,
+  assertBlobBytes, assertBlobRefReadable, isBlobRef, repair, throwBlobReadError,
   type EventDataFor, type EventEnvelope, type JsonValue, type JournalWriterOptions,
 } from '../journal/index.js';
-import { sha256HexOf } from '../journal/canon.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
 import { NodeStateError } from './errors.js';
 import { WakeLatch } from './latch.js';
 import {
-  BlobIntegrityError, createBoundaryGate,
+  createBoundaryGate,
   type BoundaryGate, type BoundaryRegistry, type DurableWatermark, type DriverHooks,
   type GateCallbacks, type GateScope,
 } from './gate.js';
@@ -403,22 +403,25 @@ export class NodeDriver {
    * The driver-flush guarantee: every observation whose raw journaled data is a
    * claim-check reference is read back and its digest and byte length checked
    * before it is delivered or any effect is allowed. A resumed event's payload
-   * was already verified by the loader; this re-reads the blob on disk.
+   * was already verified by the loader; this re-reads the blob on disk. A missing
+   * blob is a typed integrity error; any other read failure keeps its own type.
    */
   private async verifyObservations(batch: readonly VerifiedEvent[]): Promise<void> {
     for (const obs of batch) {
       if (!isBlobRef(obs.raw.data)) continue;
       const ref = obs.raw.data;
+      // A flagged prefix is refused before any read, so it can never reach
+      // `onDurable` or an effect even when its blob digest and size would match.
+      assertBlobRefReadable(ref);
       let bytes: Uint8Array;
       try {
         bytes = await this.readBlob(ref.blob);
-      } catch {
-        throw new BlobIntegrityError(ref.blob, ref.size, 0);
+      } catch (err) {
+        // Only a missing blob (ENOENT) becomes an integrity error; EACCES/EIO
+        // keep their own type so an environment failure is not called corruption.
+        throwBlobReadError(ref, err);
       }
-      const buffer = Buffer.from(bytes);
-      if (buffer.length !== ref.size || sha256HexOf(buffer) !== ref.blob) {
-        throw new BlobIntegrityError(ref.blob, ref.size, buffer.length);
-      }
+      assertBlobBytes(ref, Buffer.from(bytes));
     }
   }
 

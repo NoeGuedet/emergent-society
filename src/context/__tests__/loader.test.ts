@@ -1,8 +1,13 @@
-import { describe, expect, it } from 'vitest';
-import { readFile, rm, writeFile } from 'node:fs/promises';
+import { describe, expect, it, vi } from 'vitest';
+import { chmod, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { JournalWriter, isBlobRef } from '../../journal/index.js';
-import { useTempHome, collectEvents } from '../../journal/__tests__/helpers.js';
+import {
+  BlobStore, JournalWriter, MAX_BLOB_BYTES, TruncatedBlobError,
+  isBlobRef, isCorruption, isRetryable,
+} from '../../journal/index.js';
+import {
+  appendForgedBlobRef, useTempHome, collectEvents, payloadOfCanonicalBytes,
+} from '../../journal/__tests__/helpers.js';
 import {
   BlobIntegrityError, loadVerifiedEvents, rawEnvelopes, sourceOf,
 } from '../loader.js';
@@ -75,14 +80,79 @@ describe('loadVerifiedEvents', () => {
     await expect(loadVerifiedEvents(home(), 'n1', KNOWN)).rejects.toThrow(BlobIntegrityError);
   });
 
+  it('rethrows a blob read EIO as a retryable environment error, not corruption', async () => {
+    await writeBig('eio-x'); // long enough that writeBig's payload is claim-checked
+    const spy = vi.spyOn(BlobStore.prototype, 'get').mockRejectedValue(
+      Object.assign(new Error('injected EIO'), { code: 'EIO' }),
+    );
+    try {
+      const err = await loadVerifiedEvents(home(), 'n1', KNOWN).catch((e: unknown) => e);
+      expect(err).not.toBeInstanceOf(BlobIntegrityError);
+      expect(isCorruption(err)).toBe(false);
+      expect(isRetryable(err)).toBe(true);
+      expect((err as { code?: string }).code).toBe('EIO');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it.skipIf(process.getuid?.() === 0)('rethrows a real EACCES blob read, not corruption', async () => {
+    const { hash } = await writeBig('eacces');
+    await chmod(blobPath(hash), 0o000);
+    const err = await loadVerifiedEvents(home(), 'n1', KNOWN).catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(BlobIntegrityError);
+    expect(isCorruption(err)).toBe(false);
+    expect(isRetryable(err)).toBe(true);
+  });
+
   it('rejects a truncated reference outright', async () => {
     const writer = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60000 });
-    // Canonical data at or past MAX_BLOB_BYTES is stored as a truncated prefix.
+    // Canonical data past MAX_BLOB_BYTES is stored as a truncated prefix.
     writer.append('test/big', { payload: 'x'.repeat(4 * 1024 * 1024 + 16) });
     await writer.close();
     const raw = await collectEvents(home(), KNOWN);
     expect(isBlobRef(raw[0]?.data)).toBe(true);
     expect((raw[0]?.data as { truncated?: boolean }).truncated).toBe(true);
-    await expect(loadVerifiedEvents(home(), 'n1', KNOWN)).rejects.toThrow(BlobIntegrityError);
+    await expect(loadVerifiedEvents(home(), 'n1', KNOWN)).rejects.toThrow(TruncatedBlobError);
+  });
+
+  it('rejects a reference the writer flagged truncated even when digest and size match', async () => {
+    // Exactly MAX_BLOB_BYTES canonical bytes: the whole payload is stored, so
+    // digest and byte length agree with the reference and only the flag rejects.
+    const writer = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60000 });
+    writer.append('test/big', payloadOfCanonicalBytes(MAX_BLOB_BYTES));
+    await writer.close();
+    const raw = await collectEvents(home(), KNOWN);
+    const ref = raw[0]?.data;
+    if (!isBlobRef(ref)) throw new Error('expected a claim-check reference');
+    expect(ref.truncated).toBe(true);
+    expect(ref.size).toBe(MAX_BLOB_BYTES);
+    await expect(loadVerifiedEvents(home(), 'n1', KNOWN)).rejects.toThrow(TruncatedBlobError);
+  });
+
+  it('accepts a payload one byte under MAX_BLOB_BYTES losslessly', async () => {
+    const input = payloadOfCanonicalBytes(MAX_BLOB_BYTES - 1);
+    const writer = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60000 });
+    writer.append('test/big', input);
+    await writer.close();
+    const events = await loadVerifiedEvents(home(), 'n1', KNOWN);
+    expect(events[0]?.data).toEqual(input);
+  });
+
+  it('rejects a payload one byte over MAX_BLOB_BYTES', async () => {
+    const writer = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60000 });
+    writer.append('test/big', payloadOfCanonicalBytes(MAX_BLOB_BYTES + 1));
+    await writer.close();
+    await expect(loadVerifiedEvents(home(), 'n1', KNOWN)).rejects.toThrow(TruncatedBlobError);
+  });
+
+  it('wraps a verified non-JSON blob body in a typed error, not a raw SyntaxError', async () => {
+    const writer = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60000 });
+    writer.append('test/big', { n: 0 });
+    await writer.close();
+    await appendForgedBlobRef(home(), Buffer.from('{ not json'));
+    const err = await loadVerifiedEvents(home(), 'n1', KNOWN).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(BlobIntegrityError);
+    expect(err).not.toBeInstanceOf(SyntaxError);
   });
 });

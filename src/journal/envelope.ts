@@ -92,8 +92,11 @@ export function verifyEvent(e: EventEnvelope): boolean {
 }
 
 /**
- * The canonical line for an event — exactly the bytes the log stores and the
- * hash was computed over. Capturing it once at append is what stops a later
+ * The canonical line for an event — exactly the bytes the log stores. It is the
+ * canonical form of the *whole* envelope, `prev_hash` and `hash` included, which
+ * is a different string from the payload the chain hashes: `hash` is
+ * `SHA-256(prev_hash || canon(v, type, seq, time, [ignorable], data))`, never a
+ * digest of this line. Capturing the line once at append is what stops a later
  * mutation of the payload from desynchronizing the persisted bytes from the
  * chained hash.
  *

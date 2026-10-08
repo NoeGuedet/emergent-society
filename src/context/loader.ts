@@ -1,20 +1,20 @@
-import { BlobStore, JournalReader, isBlobRef } from '../journal/index.js';
-import type { EventEnvelope, JsonValue } from '../journal/index.js';
-import { sha256HexOf } from '../journal/canon.js';
-import { BlobIntegrityError } from '../node/gate.js';
+import {
+  BlobIntegrityError, BlobStore, JournalReader, assertBlobRefReadable, isBlobRef,
+  parseBlobJson, throwBlobReadError,
+} from '../journal/index.js';
+import type { EventEnvelope } from '../journal/index.js';
 import type { Source } from './contracts.js';
 
 /**
- * The one C1.3 claim-check resolution path. Never call `resolveBlobs: true`:
- * that reader substitutes a payload for its reference *without* re-hashing or
- * size-checking the blob, and discards the raw reference the journal chained.
- * This loader opens a raw reader (the chain verifies the exact journaled bytes),
- * then verifies digest and byte length before parsing, retaining the raw
+ * The one C1.3 claim-check resolution path. This loader opens a raw reader (the
+ * chain verifies the exact journaled bytes), then resolves each reference
+ * through the journal's verified read — refusing a truncated reference, proving
+ * digest and byte length, and parsing the JSON body — while retaining the raw
  * envelope so provenance identity stays `(raw.seq, raw.hash)`.
  *
- * `BlobIntegrityError` is defined in `src/node/gate.ts` (which must not take a
- * node→context value dependency) and re-exported here, where every loader
- * consumer names it.
+ * `BlobIntegrityError` is the journal's own corruption kind (blobs.ts),
+ * re-exported here where every loader consumer names it; the reader with
+ * `resolveBlobs: true` now applies the same verified read.
  */
 
 /** A chain-verified envelope with its payload resolved and its raw journaled form retained. */
@@ -35,8 +35,11 @@ export class ArtifactMismatchError extends Error {
 
 /**
  * Reads a node's journal raw, verifies the whole chain, and resolves every
- * claim-check reference after digest and size verification. A missing blob file
- * is wrapped in `BlobIntegrityError` rather than surfacing a raw ENOENT.
+ * claim-check reference through the journal's verified read: a flagged
+ * truncated reference, a digest or length mismatch, or a non-JSON body is a
+ * typed corruption error. A missing blob file is wrapped in
+ * `BlobIntegrityError` rather than surfacing a raw ENOENT; any other read
+ * failure (EACCES, EIO, invalid hash) propagates with its own type.
  */
 export async function loadVerifiedEvents(
   home: string, uid: string, knownTypes: ReadonlySet<string>, fromSeq = 0,
@@ -50,17 +53,18 @@ export async function loadVerifiedEvents(
       continue;
     }
     const ref = event.data;
+    // Refuse a flagged prefix before the read, so a truncated reference is
+    // never resolved as whole regardless of what its blob file contains.
+    assertBlobRefReadable(ref);
     let bytes: Buffer;
     try {
       bytes = await blobs.get(ref.blob);
-    } catch {
-      throw new BlobIntegrityError(ref.blob, ref.size, 0);
+    } catch (err) {
+      // Only a missing blob is an integrity failure; EACCES/EIO/InvalidBlobHash
+      // keep their own type and cause.
+      throwBlobReadError(ref, err);
     }
-    if (sha256HexOf(bytes) !== ref.blob || bytes.length !== ref.size) {
-      throw new BlobIntegrityError(ref.blob, ref.size, bytes.length);
-    }
-    const data = JSON.parse(bytes.toString('utf8')) as JsonValue;
-    out.push({ ...event, data, raw: event });
+    out.push({ ...event, data: parseBlobJson(ref, bytes), raw: event });
   }
   return out;
 }

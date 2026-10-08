@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, vi } from 'vitest';
-import { appendFile, mkdtemp, rm, open as openFile, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, rm, open as openFile, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BlobStore } from '../blobs.js';
-import { canonicalizeJson } from '../canon.js';
+import { canonicalizeJson, sha256HexOf } from '../canon.js';
 import { encodeBatch, scanBatches } from '../framing.js';
 import { journalPath, nodeDir } from '../layout.js';
 import { JournalReader } from '../reader.js';
-import type { EventEnvelope } from '../envelope.js';
+import { computeHash, type EventEnvelope } from '../envelope.js';
 
 /**
  * Shared scaffolding for the journal suite: temp-home lifecycle, log fixtures,
@@ -88,6 +88,33 @@ export async function rewriteLog(
   const { batches } = scanBatches(await readFile(path));
   const lines = batches.flatMap((b) => b.lines);
   await writeFile(path, encodeBatch(mutate(lines)));
+}
+
+/**
+ * Appends one chain-consistent event whose `data` is a claim-check reference to
+ * `body`. The writer never references a non-JSON body, so this stands in for a
+ * direct writer: the chain verifies exactly (correct `prev_hash` and `hash`),
+ * leaving only the blob read able to catch a forged or non-JSON body.
+ */
+export async function appendForgedBlobRef(
+  home: string, body: Buffer, node = 'n1',
+): Promise<{ blob: string; size: number; seq: number }> {
+  const path = logPath(home, node);
+  const { batches } = scanBatches(await readFile(path));
+  const lines = batches.flatMap((b) => b.lines);
+  const last = JSON.parse(lines[lines.length - 1]!) as EventEnvelope;
+  const blob = sha256HexOf(body);
+  const dir = join(home, 'blobs', blob.slice(0, 2));
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, blob), body);
+  const seq = last.seq + 1;
+  const unsigned = {
+    v: 0, type: 'test/big', seq, time: EPOCH, prev_hash: last.hash,
+    data: { blob, size: body.length },
+  };
+  const line = canonicalizeJson({ ...unsigned, hash: computeHash(unsigned as never) });
+  await writeFile(path, encodeBatch([...lines, line]));
+  return { blob, size: body.length, seq };
 }
 
 /** A payload whose canonical form is exactly `bytes` UTF-8 bytes. */

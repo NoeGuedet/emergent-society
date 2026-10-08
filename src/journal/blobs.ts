@@ -1,7 +1,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { sha256HexOf } from './canon.js';
-import { JournalError } from './errors.js';
+import { sha256HexOf, type JsonValue } from './canon.js';
+import { CorruptionError, JournalError } from './errors.js';
 import { atomicWriteFile, ensureDurableDirectory, isErrno, syncPath } from './fsutil.js';
 
 /**
@@ -53,6 +53,72 @@ export class TruncatedBlobError extends JournalError {
 }
 
 /**
+ * A claim-check blob whose bytes do not match the reference that names it, or
+ * whose body is not the JSON the reference stands for. The bytes are corrupt
+ * source data, so this is classified as corruption — inspect before retrying —
+ * not a retryable environment failure.
+ */
+export class BlobIntegrityError extends CorruptionError {
+  constructor(
+    public readonly hash: string,
+    public readonly expectedBytes: number,
+    public readonly actualBytes: number,
+  ) {
+    super('claim-check blob failed integrity verification');
+  }
+}
+
+/**
+ * Refuses a reference flagged `truncated` before its blob is read: the blob is a
+ * prefix of a payload whose original is unrecoverable, so every verified read
+ * must reject it rather than serve the prefix as whole (kernel.md §3).
+ */
+export function assertBlobRefReadable(ref: BlobRef): void {
+  if (ref.truncated === true) throw new TruncatedBlobError(ref.blob, ref.size);
+}
+
+/**
+ * Verifies the bytes a reference names before they are trusted or parsed: the
+ * exact byte length and the SHA-256 digest must match. Content addressing is not
+ * re-checked by the store's raw `get`, so every verified read routes through
+ * here; a mismatch is source corruption, not a retryable environment failure.
+ */
+export function assertBlobBytes(ref: BlobRef, bytes: Buffer): void {
+  if (bytes.length !== ref.size || sha256HexOf(bytes) !== ref.blob) {
+    throw new BlobIntegrityError(ref.blob, ref.size, bytes.length);
+  }
+}
+
+/**
+ * The one verified read of a claim-checked payload: it refuses a truncated
+ * reference, proves the digest and exact byte length, then parses the JSON body.
+ * A body that is not JSON is reported as `BlobIntegrityError`, never a raw
+ * `SyntaxError`, so a caller classifies exactly one corruption kind.
+ */
+export function parseBlobJson(ref: BlobRef, bytes: Buffer): JsonValue {
+  assertBlobRefReadable(ref);
+  assertBlobBytes(ref, bytes);
+  try {
+    return JSON.parse(bytes.toString('utf8')) as JsonValue;
+  } catch {
+    throw new BlobIntegrityError(ref.blob, ref.size, bytes.length);
+  }
+}
+
+/**
+ * The boundary's mapping of a failed blob read. Only a *missing* blob (ENOENT)
+ * is an integrity failure — the payload is unrecoverable — so it becomes
+ * `BlobIntegrityError`. Every other failure (EACCES, EIO, or an
+ * `InvalidBlobHashError` for a path-shaped hash) is an environment or input
+ * problem, and is rethrown unchanged so it keeps its truthful type and cause and
+ * is never reclassified as corruption by the verified-read path.
+ */
+export function throwBlobReadError(ref: BlobRef, err: unknown): never {
+  if (isErrno(err, 'ENOENT')) throw new BlobIntegrityError(ref.blob, ref.size, 0);
+  throw err;
+}
+
+/**
  * Recognizes the exact shape claimCheck writes. The key set must match exactly:
  * a caller's own `{ blob, size, … }` payload must never be mistaken for a
  * reference and rewritten under it.
@@ -100,6 +166,11 @@ export class BlobStore {
     return hash;
   }
 
+  /**
+   * The raw stored bytes, without verification: content addressing is not
+   * re-checked here, so a caller holding a reference must prove the digest and
+   * byte length (`assertBlobBytes`/`parseBlobJson`) before trusting them.
+   */
   async get(hash: string): Promise<Buffer> {
     return readFile(this.pathFor(hash));
   }

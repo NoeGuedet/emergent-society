@@ -1,5 +1,8 @@
 import type { EventEnvelope, JsonValue } from '../journal/index.js';
-import { MAX_BLOB_BYTES, canonicalizeJson, isBlobRef } from '../journal/index.js';
+import {
+  MAX_BLOB_BYTES, assertBlobBytes, assertBlobRefReadable, canonicalizeJson, isBlobRef,
+  throwBlobReadError,
+} from '../journal/index.js';
 import { sha256HexOf } from '../journal/canon.js';
 import type {
   ArtifactChunk, ArtifactManifest, ArtifactRef, Source, Stored,
@@ -17,22 +20,10 @@ import type { TurnContext } from './driver.js';
  * claim-check reference is read back and digest/size-verified before any effect.
  *
  * The node→context edge is type-only (`VerifiedEvent(s)` above), erased at
- * runtime, so this module's runtime graph pulls in only the journal. To keep
- * that seam, `BlobIntegrityError` lives here and `src/context/loader.ts`
- * re-exports it rather than the reverse.
+ * runtime, so this module's runtime graph pulls in only the journal.
+ * `BlobIntegrityError` is the journal's own corruption kind, so this gate and
+ * `src/context/loader.ts` name one error without a node→context value edge.
  */
-
-/** A claim-check blob failed digest or byte-length verification against its reference. */
-export class BlobIntegrityError extends Error {
-  constructor(
-    public readonly hash: string,
-    public readonly expectedBytes: number,
-    public readonly actualBytes: number,
-  ) {
-    super('claim-check blob failed integrity verification');
-    this.name = 'BlobIntegrityError';
-  }
-}
 
 /** Extended by declaration merging from `src/context/events.ts` with the C1.3 vocabulary. */
 export interface BoundaryDataMap {}
@@ -77,8 +68,10 @@ export type GateCallbacks = {
   /** Receipt lookup over the journal inventory, including pending receipts. */
   readonly lookup: (source: Source) => EventEnvelope | null;
   /**
-   * Reads a claim-check blob's bytes as a fresh copy or throws the raw fs error;
-   * the gate wraps a missing/short/mismatched blob into `BlobIntegrityError`.
+   * Reads a claim-check blob's bytes as a fresh copy or throws the raw fs error.
+   * The gate maps a missing blob (ENOENT) and a short/mismatched blob to
+   * `BlobIntegrityError`; any other read failure (EACCES, EIO, invalid hash)
+   * propagates unchanged as the environment problem it is.
    */
   readonly readBlob: (hash: string) => Promise<Uint8Array>;
   readonly now: () => number;
@@ -209,25 +202,26 @@ class Gate implements BoundaryGate {
 
   /**
    * The durable barrier's verification step: for every pending event whose raw
-   * journaled data is a claim-check `BlobRef`, read the blob back and require the
-   * digest and byte length to match. A raw fs error from `readBlob` is wrapped
-   * into `BlobIntegrityError`, never surfaced as its own type.
+   * journaled data is a claim-check `BlobRef`, refuse a flagged truncated prefix
+   * before any read, then read the blob back and require the digest and byte
+   * length to match. A missing blob (ENOENT) becomes `BlobIntegrityError`; any
+   * other read failure keeps its own type rather than being called corruption.
    */
   private async verifyPending(): Promise<void> {
     const batch = this.pending;
     for (const envelope of batch) {
       if (!isBlobRef(envelope.data)) continue;
       const ref = envelope.data;
+      assertBlobRefReadable(ref);
       let bytes: Uint8Array;
       try {
         bytes = await this.callbacks.readBlob(ref.blob);
-      } catch {
-        throw new BlobIntegrityError(ref.blob, ref.size, 0);
+      } catch (err) {
+        // Only a missing blob (ENOENT) becomes an integrity error; EACCES/EIO
+        // keep their own type so an environment failure is not called corruption.
+        throwBlobReadError(ref, err);
       }
-      const buffer = Buffer.from(bytes);
-      if (buffer.length !== ref.size || sha256HexOf(buffer) !== ref.blob) {
-        throw new BlobIntegrityError(ref.blob, ref.size, buffer.length);
-      }
+      assertBlobBytes(ref, Buffer.from(bytes));
     }
     this.pending = this.pending.slice(batch.length);
   }

@@ -6,7 +6,7 @@ import { TornTailError, JournalClosedError, JournalPoisonedError } from '../writ
 import { SessionAlreadyOwnedError } from '../lock.js';
 import { UnknownEventTypeError } from '../envelope.js';
 import { NonCanonicalizableError } from '../canon.js';
-import { InvalidBlobHashError } from '../blobs.js';
+import { BlobIntegrityError, InvalidBlobHashError } from '../blobs.js';
 import { JournalWriteStalledError } from '../fsutil.js';
 
 describe('the error family', () => {
@@ -20,6 +20,7 @@ describe('the error family', () => {
     expect(new UnknownEventTypeError('t').name).toBe('UnknownEventTypeError');
     expect(new NonCanonicalizableError('x').name).toBe('NonCanonicalizableError');
     expect(new InvalidBlobHashError('h').name).toBe('InvalidBlobHashError');
+    expect(new BlobIntegrityError('h', 3, 2).name).toBe('BlobIntegrityError');
     expect(new JournalWriteStalledError().name).toBe('JournalWriteStalledError');
   });
 
@@ -34,6 +35,7 @@ describe('the error family', () => {
     expect(isCorruption(new CorruptFrameError(0, 'x'))).toBe(true);
     expect(isCorruption(new ChainBreakError(0, 'x'))).toBe(true);
     expect(isCorruption(new TornTailError('/d', 1))).toBe(true);
+    expect(isCorruption(new BlobIntegrityError('h', 3, 2))).toBe(true);
     expect(isCorruption(new JournalClosedError())).toBe(false);
     expect(isCorruption(new Error('EIO'))).toBe(false);
     expect(isCorruption('not an error')).toBe(false);
@@ -44,6 +46,7 @@ describe('the error family', () => {
     expect(isRetryable(eio)).toBe(true);
     expect(isRetryable(new JournalPoisonedError('/d', 'x'))).toBe(false);
     expect(isRetryable(new SessionAlreadyOwnedError('n'))).toBe(false);
+    expect(isRetryable(new BlobIntegrityError('h', 3, 2))).toBe(false);
     expect(isRetryable(undefined)).toBe(true);
   });
 

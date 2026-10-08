@@ -1,18 +1,19 @@
 import { describe, it, expect } from 'vitest';
-import { appendFile, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { JournalWriter } from '../writer.js';
 import { JournalReader, repair } from '../reader.js';
 import { ChainBreakError } from '../verify.js';
 import { UnknownEventTypeError, computeHash } from '../envelope.js';
-import { canonicalizeJson } from '../canon.js';
+import { canonicalizeJson, NonCanonicalizableError, sha256HexOf } from '../canon.js';
+import { isCorruption } from '../errors.js';
 import { encodeBatch, scanBatches, CorruptFrameError } from '../framing.js';
-import { headPath, nodeDir } from '../layout.js';
+import { headPath, journalPath, nodeDir } from '../layout.js';
 import {
-  CLAIM_CHECK_THRESHOLD, isBlobRef, MAX_BLOB_BYTES, TruncatedBlobError,
+  BlobIntegrityError, CLAIM_CHECK_THRESHOLD, isBlobRef, MAX_BLOB_BYTES, TruncatedBlobError,
 } from '../blobs.js';
 import {
-  appendTear, collectFailure, EPOCH, forgedEnvelope, KNOWN_TYPES,
+  appendForgedBlobRef, appendTear, collectFailure, EPOCH, forgedEnvelope, KNOWN_TYPES,
   logPath, payloadOfCanonicalBytes, rewriteLog, useTempHome, WRONG_HASH,
 } from './helpers.js';
 
@@ -23,6 +24,14 @@ async function collect(r: JournalReader, fromSeq = 0) {
   const out = [];
   for await (const e of r.events(fromSeq)) out.push(e);
   return out;
+}
+
+/** A fresh reader over a log whose only line is the given hand-encoded raw line. */
+async function readerOverRawLine(line: string): Promise<JournalReader> {
+  const dir = nodeDir(home(), 'n1');
+  await mkdir(dir, { recursive: true });
+  await writeFile(journalPath(dir), encodeBatch([line]));
+  return JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES });
 }
 
 describe('JournalReader', () => {
@@ -431,5 +440,146 @@ describe('JournalReader integrity', () => {
     await appendTear(home());
     await repair(home(), 'n1');
     expect(await (await JournalReader.open(home(), 'n1', { knownTypes: KNOWN })).head()).toBeNull();
+  });
+});
+
+describe('JournalReader strict envelope validation', () => {
+  const ZERO = '0'.repeat(64);
+  // A v0-shaped line whose hash fields are well-formed hex, so validation must
+  // decide on structure before any hash recomputation can run.
+  const line = (over: Record<string, unknown> = {}): string =>
+    JSON.stringify({
+      v: 0, type: 'test/ping', seq: 0, time: EPOCH, prev_hash: ZERO, hash: ZERO, data: {}, ...over,
+    });
+
+  // Each case pins the specific validation message, so these cannot pass on an
+  // incidental hash/linkage failure instead of the missing or malformed field.
+  async function expectChainBreak(raw: string, reason: string): Promise<Error> {
+    const err = await collectFailure(await readerOverRawLine(raw));
+    expect(err).toBeInstanceOf(ChainBreakError);
+    expect(isCorruption(err)).toBe(true);
+    expect(err.message).toContain(reason);
+    return err;
+  }
+
+  it('refuses a missing data as corruption', async () => {
+    // JSON.stringify drops an `undefined` member, so `data` is truly absent.
+    await expectChainBreak(line({ data: undefined }), 'data is missing');
+  });
+  it('refuses a missing type as corruption', async () => {
+    await expectChainBreak(line({ type: undefined }), 'type is not a string');
+  });
+  it('refuses a missing or non-numeric time as corruption', async () => {
+    await expectChainBreak(line({ time: undefined }), 'time is not a finite number');
+    await expectChainBreak(line({ time: 'soon' }), 'time is not a finite number');
+    await expectChainBreak(line({ time: null }), 'time is not a finite number');
+  });
+  it('refuses a JSON 1e999 time that parses as Infinity', async () => {
+    // JSON.parse('1e999') is Infinity, so `typeof === 'number'` alone is not
+    // enough; the finiteness branch must reject it before hashing.
+    const raw = '{"v":0,"type":"test/ping","seq":0,"time":1e999,'
+      + `"prev_hash":"${ZERO}","hash":"${ZERO}","data":{}}`;
+    await expectChainBreak(raw, 'time is not a finite number');
+  });
+  it('refuses a truthy non-boolean ignorable as corruption', async () => {
+    await expectChainBreak(line({ ignorable: {} }), 'ignorable is not a boolean');
+    await expectChainBreak(line({ ignorable: 'false' }), 'ignorable is not a boolean');
+    await expectChainBreak(line({ ignorable: 1 }), 'ignorable is not a boolean');
+  });
+  it('refuses an invalid seq as corruption', async () => {
+    await expectChainBreak(line({ seq: -1 }), 'seq is not a nonnegative safe integer');
+    await expectChainBreak(line({ seq: 1.5 }), 'seq is not a nonnegative safe integer');
+    await expectChainBreak(line({ seq: '0' }), 'seq is not a nonnegative safe integer');
+  });
+  it('refuses a non-numeric format version as corruption', async () => {
+    await expectChainBreak(line({ v: '0' }), 'v is not a number');
+  });
+  it('classifies non-canonicalizable data as a chain break, not a canonicalization error', async () => {
+    // A lone surrogate survives JSON.parse but has no RFC 8785 form.
+    const err = await collectFailure(await readerOverRawLine(line({ data: { text: '\ud800' } })));
+    expect(err).toBeInstanceOf(ChainBreakError);
+    expect(isCorruption(err)).toBe(true);
+    expect(err).not.toBeInstanceOf(NonCanonicalizableError);
+  });
+  it('reports the expected seq for a malformed line after a valid prefix', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    const e0 = w.append('test/ping', { n: 0 });
+    await w.close();
+    await appendFile(logPath(home()), encodeBatch([
+      line({ seq: 1, prev_hash: e0.hash, data: undefined }),
+    ]));
+    const err = await collectFailure(await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES }));
+    expect(err).toBeInstanceOf(ChainBreakError);
+    expect((err as ChainBreakError).seq).toBe(1);
+    expect(err.message).toContain('data is missing');
+  });
+});
+
+describe('JournalReader verified blob resolution', () => {
+  const openResolving = (): Promise<JournalReader> =>
+    JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES, resolveBlobs: true });
+
+  function blobPath(hash: string): string {
+    return join(home(), 'blobs', hash.slice(0, 2), hash);
+  }
+
+  async function writeClaimChecked(payload: { payload: string }): Promise<{ blob: string; size: number }> {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/big', payload);
+    await w.close();
+    const raw = await collect(await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES }));
+    const data = raw[0]!.data;
+    if (!isBlobRef(data)) throw new Error('expected a claim-check reference');
+    return { blob: data.blob, size: data.size };
+  }
+
+  it('rejects a substituted blob holding different valid JSON under the same hash', async () => {
+    const { blob } = await writeClaimChecked(payloadOfCanonicalBytes(CLAIM_CHECK_THRESHOLD));
+    await writeFile(blobPath(blob), JSON.stringify({ substituted: true }));
+    const err = await collectFailure(await openResolving());
+    expect(err).toBeInstanceOf(BlobIntegrityError);
+    expect(isCorruption(err)).toBe(true);
+  });
+
+  it('rejects a blob whose byte length no longer matches the reference', async () => {
+    const { blob } = await writeClaimChecked(payloadOfCanonicalBytes(CLAIM_CHECK_THRESHOLD));
+    const bytes = await readFile(blobPath(blob));
+    await writeFile(blobPath(blob), bytes.subarray(0, bytes.length - 1));
+    await expect(collect(await openResolving())).rejects.toThrow(BlobIntegrityError);
+  });
+
+  it('rejects digest-verified bytes that are not JSON as a typed corruption error', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/ping', { n: 0 });
+    await w.close();
+    await appendForgedBlobRef(home(), Buffer.from('{ not json'));
+    const err = await collectFailure(await openResolving());
+    expect(err).toBeInstanceOf(BlobIntegrityError);
+    expect(isCorruption(err)).toBe(true);
+    expect(err).not.toBeInstanceOf(SyntaxError);
+  });
+
+  it('refuses a flagged truncated reference even when its blob digest and size match', async () => {
+    // Exactly MAX_BLOB_BYTES canonical bytes: the writer stores the whole payload
+    // but still flags it (inclusive ceiling), so digest and byte length match the
+    // reference and only the flag can stop it from being served as whole.
+    const input = payloadOfCanonicalBytes(MAX_BLOB_BYTES);
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/big', input);
+    await w.close();
+    const raw = await collect(await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES }));
+    const data = raw[0]!.data;
+    if (!isBlobRef(data)) throw new Error('expected a claim-check reference');
+    expect(data.truncated).toBe(true);
+    const bytes = await readFile(blobPath(data.blob));
+    expect(bytes.length).toBe(data.size);
+    expect(sha256HexOf(bytes)).toBe(data.blob);
+    await expect(collect(await openResolving())).rejects.toThrow(TruncatedBlobError);
+  });
+
+  it('keeps the raw reference when resolveBlobs is not set', async () => {
+    const { blob, size } = await writeClaimChecked(payloadOfCanonicalBytes(CLAIM_CHECK_THRESHOLD));
+    const raw = await collect(await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES }));
+    expect(raw[0]!.data).toEqual({ blob, size });
   });
 });

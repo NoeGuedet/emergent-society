@@ -1,10 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { BlobStore, JournalWriter } from '../../journal/index.js';
+import {
+  BlobIntegrityError, BlobStore, JournalWriter, MAX_BLOB_BYTES, TruncatedBlobError,
+  isCorruption, isRetryable,
+} from '../../journal/index.js';
 import { withFailingWrite } from '../../journal/__tests__/helpers.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../../context/events.js';
-import { loadVerifiedEvents, type VerifiedEvents } from '../../context/loader.js';
+import {
+  loadVerifiedEvents, type VerifiedEvent, type VerifiedEvents,
+} from '../../context/loader.js';
 import { defaultAgentConfig } from '../../context/config.js';
 import type { Source } from '../../context/contracts.js';
 import type { BoundaryGate, DriverHooks } from '../gate.js';
@@ -288,6 +293,57 @@ describe('reused-blob validation on resume', () => {
     await expect(NodeDriver.open(home, 'n1', wait, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 }))
       .rejects.toThrow(/digest|size|blob/i);
+  });
+
+  it('refuses a flagged truncated observation at the barrier before any delivery', async () => {
+    const { home, world } = fixture();
+    const w = await JournalWriter.open(home, 'n1');
+    const receipt = w.append('node/boot', { reason: 'start' });
+    await w.flush();
+    await w.close();
+    // A resumed receipt whose raw journaled data is a flagged reference. The
+    // blob is written for real, so its digest and byte length match exactly and
+    // only the flag can stop delivery.
+    const body = Buffer.alloc(MAX_BLOB_BYTES, 0x62);
+    const blob = await new BlobStore(home).put(body);
+    const forged: VerifiedEvent = {
+      ...receipt,
+      raw: {
+        ...receipt,
+        data: { blob, size: body.length, truncated: true },
+      },
+    };
+    const delivered: string[] = [];
+    const hooks = hooksFor(home, {
+      onDurable: async (events) => { for (const e of events) delivered.push(e.type); },
+      readHistory: async () => [forged],
+    });
+    await expect(NodeDriver.open(home, 'n1', wait, world,
+      { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 }))
+      .rejects.toThrow(TruncatedBlobError);
+    expect(delivered).toEqual([]);
+  });
+
+  it('rethrows a blob read EIO at the barrier as a retryable error, not corruption', async () => {
+    const { home, world } = fixture();
+    const w = await JournalWriter.open(home, 'n1');
+    const big = { ...defaultAgentConfig(), charter: 'c'.repeat(100 * 1024) };
+    w.append('system/message', { version: 1, value: { kind: 'inline', value: big } });
+    await w.flush();
+    await w.close();
+    const eio = Object.assign(new Error('injected EIO'), { code: 'EIO' });
+    let delivered = 0;
+    const hooks = hooksFor(home, {
+      readBlob: () => Promise.reject(eio),
+      onDurable: async () => { delivered += 1; },
+    });
+    const err = await NodeDriver.open(home, 'n1', wait, world,
+      { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 }).catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(BlobIntegrityError);
+    expect(isCorruption(err)).toBe(false);
+    expect(isRetryable(err)).toBe(true);
+    expect((err as { code?: string }).code).toBe('EIO');
+    expect(delivered).toBe(0);
   });
 });
 

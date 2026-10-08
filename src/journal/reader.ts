@@ -1,6 +1,5 @@
 import { readFile, rm, truncate } from 'node:fs/promises';
-import { BlobStore, isBlobRef, TruncatedBlobError } from './blobs.js';
-import type { JsonValue } from './canon.js';
+import { BlobStore, assertBlobRefReadable, isBlobRef, parseBlobJson } from './blobs.js';
 import { scanBatches } from './framing.js';
 import { readFileOrNull, syncPath } from './fsutil.js';
 import { headPath, journalPath, nodeDir, parseHead, type Head } from './layout.js';
@@ -13,8 +12,10 @@ export interface JournalReaderOptions {
   knownTypes: ReadonlySet<string>;
   /**
    * Resolve claim-checked `data` references through the blob store, so a caller
-   * replaying into projections sees the original payloads. Defaults to false:
-   * events are served raw, exactly as journaled.
+   * replaying into projections sees the original payloads. Each resolved blob is
+   * verified against the reference that names it — exact byte length, SHA-256
+   * digest and JSON body — and a flagged truncated reference is refused. Defaults
+   * to false: events are served raw, exactly as journaled.
    */
   resolveBlobs?: boolean;
 }
@@ -79,8 +80,10 @@ export class JournalReader {
    * @throws ChainBreakError on a broken link, a seq gap, a hash mismatch, a
    * non-v0 envelope or a malformed line; CorruptFrameError on interior damage;
    * UnknownEventTypeError on an unknown non-ignorable type; with
-   * `resolveBlobs`, TruncatedBlobError on a truncated reference and the blob
-   * store's own errors on a missing or unreadable blob.
+   * `resolveBlobs`, TruncatedBlobError on a truncated reference,
+   * BlobIntegrityError when the blob does not match its reference (digest,
+   * length or a non-JSON body), and the blob store's own errors on a missing or
+   * unreadable blob.
    */
   async *events(fromSeq = 0): AsyncGenerator<EventEnvelope> {
     // A missing log is an empty journal. Anything else (EACCES, EIO) must not
@@ -96,15 +99,19 @@ export class JournalReader {
   /**
    * Substitutes the original payload for a claim-check reference. Resolution
    * happens after verification: the chain always verifies the bytes exactly as
-   * journaled, reference and all.
+   * journaled, reference and all. The blob is read through the journal's one
+   * verified path, so a flagged prefix, a digest or length mismatch, or a
+   * non-JSON body is refused rather than served as the payload.
    */
   private async resolveData(e: EventEnvelope): Promise<EventEnvelope> {
     if (this.blobs === null || !isBlobRef(e.data)) return e;
     const ref = e.data;
-    if (ref.truncated === true) throw new TruncatedBlobError(ref.blob, ref.size);
-    // The blob holds the canonical UTF-8 bytes of the payload as appended.
-    const data = JSON.parse((await this.blobs.get(ref.blob)).toString('utf8')) as JsonValue;
-    return { ...e, data };
+    // Refuse a flagged prefix *before* the read: resolution of a truncated
+    // reference must stay TruncatedBlobError even if its blob file is gone.
+    assertBlobRefReadable(ref);
+    // A missing or unreadable blob keeps the store's own error (ENOENT, EACCES).
+    const bytes = await this.blobs.get(ref.blob);
+    return { ...e, data: parseBlobJson(ref, bytes) };
   }
 }
 
