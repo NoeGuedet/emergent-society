@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { Buffer } from 'node:buffer';
 import { access, chmod, mkdir, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -13,7 +13,7 @@ import { DEFAULT_SHELL_ENV, type ShellPolicy } from '../tools/shell.js';
 import { ProviderAdapter, type ProviderPolicy } from '../../provider/adapter.js';
 import type { SerializedTransport, TransportResult } from '../../provider/transport.js';
 import type { AgentConfig } from '../../context/contracts.js';
-import { useWorld, type WorldFixture } from './helpers.js';
+import { readNode, useWorld, type WorldFixture } from './helpers.js';
 
 /**
  * T10 checkpoint-hook acceptance. The real `createAgentRuntime` is wired to the
@@ -112,11 +112,37 @@ function runtimeFor(fx: WorldFixture, config: AgentConfig, transport: ScriptedTr
 function openRuntime(
   fx: WorldFixture, runtime: AgentRuntime,
   onCheckpoint: (mark: DurableWatermark) => Promise<void> | void,
+  onMaintenance?: () => Promise<void> | void,
 ): Promise<NodeDriver> {
   return NodeDriver.open(fx.home, 'n1', runtime.handler, fx.world, {
     knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
     onCheckpoint,
+    ...(onMaintenance === undefined ? {} : { onMaintenance }),
   });
+}
+
+/** A one-shot signal driven by real work, never by a poll interval. */
+function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((fire) => { resolve = () => fire(); });
+  return { promise, resolve };
+}
+
+/**
+ * Runs to the signal that stands for the work the test needs, then tears the
+ * driver down in a `finally`: a failing assertion can never leave the driver
+ * writing while `useWorld` removes the fixture root. Racing the run's own
+ * promise means a driver that dies before the signal surfaces that error and
+ * still tears down, instead of awaiting a signal no live run can fire.
+ */
+async function runToSignal(driver: NodeDriver, signal: Promise<void>): Promise<void> {
+  const running = driver.run();
+  try {
+    await Promise.race([signal, running]);
+  } finally {
+    driver.stop();
+    await running;
+  }
 }
 
 function snapshotsDir(fx: WorldFixture): string {
@@ -129,14 +155,12 @@ describe('checkpoint wiring', () => {
     const transport = new ScriptedTransport([noCalls('idle')]);
     const runtime = runtimeFor(fx, defaultAgentConfig(), transport);
     const marks: DurableWatermark[] = [];
+    const parked = deferred();
     const driver = await openRuntime(fx, runtime, (mark) => {
       marks.push(mark);
       return runtime.checkpoint(mark);
-    });
-    const running = driver.run();
-    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
-    driver.stop();
-    await running;
+    }, () => parked.resolve());
+    await runToSignal(driver, parked.promise);
 
     const events = await loadVerifiedEvents(fx.home, 'n1', C13_EVENT_TYPES);
     const closer = events.filter((event) => event.type === 'turn/end').at(-1)!;
@@ -171,14 +195,19 @@ describe('checkpoint wiring', () => {
     ]);
     const runtime = runtimeFor(fx, config, transport);
     const marks: DurableWatermark[] = [];
-    const driver = await openRuntime(fx, runtime, (mark) => {
+    // The signal is the third hook returning, so it means the on-disk write for
+    // the last turn finished, not merely started. Polling the mark count let the
+    // test proceed mid-write and race the fixture teardown under load.
+    const thirdWritten = deferred();
+    const driver = await openRuntime(fx, runtime, async (mark) => {
       marks.push(mark);
-      return runtime.checkpoint(mark);
+      await runtime.checkpoint(mark);
+      if (marks.length === 3) thirdWritten.resolve();
     });
-    const running = driver.run();
-    await vi.waitFor(() => expect(marks.length).toBeGreaterThanOrEqual(3));
-    driver.stop();
-    await running;
+    await runToSignal(driver, thirdWritten.promise);
+
+    // The signal means the write completed: the newest retained row is on disk.
+    await expect(access(join(snapshotsDir(fx), `${marks[2]!.seq}.json`))).resolves.toBeUndefined();
 
     expect(marks).toHaveLength(3);
     expect(marks[0]!.seq).toBeLessThan(marks[1]!.seq);
@@ -200,7 +229,7 @@ describe('checkpoint wiring', () => {
     expect(snap!.val.watermark).toEqual(marks[2]);
   });
 
-  it('parks with no maintenance error when the snapshot write fails with EACCES', async () => {
+  it.skipIf(process.getuid?.() === 0)('parks with no maintenance error when the snapshot write fails with EACCES', async () => {
     const fx = fixture();
     const dir = snapshotsDir(fx);
     await mkdir(dir, { recursive: true });
@@ -213,14 +242,13 @@ describe('checkpoint wiring', () => {
       const transport = new ScriptedTransport([noCalls('idle')]);
       const runtime = runtimeFor(fx, defaultAgentConfig(), transport);
       const marks: DurableWatermark[] = [];
+      const parked = deferred();
       const driver = await openRuntime(fx, runtime, (mark) => {
         marks.push(mark);
         return runtime.checkpoint(mark);
-      });
-      const running = driver.run();
-      await vi.waitFor(() => expect(driver.state).toBe('waiting'));
-      driver.stop();
-      await running; // resolves: the checkpoint failure never ended the run
+      }, () => parked.resolve());
+      // Resolves after the parked closer, so the refused write never ended the run.
+      await runToSignal(driver, parked.promise);
 
       expect(marks).toHaveLength(1);
       // The hook ran, but nothing durable landed: the write was refused, not thrown.
@@ -242,14 +270,13 @@ describe('checkpoint wiring', () => {
     const transport = new ScriptedTransport([noCalls('idle')]);
     const runtime = runtimeFor(fx, defaultAgentConfig(), transport);
     let calls = 0;
+    const parked = deferred();
     const driver = await openRuntime(fx, runtime, () => {
       calls += 1;
       throw new Error('injected checkpoint hook crash');
-    });
-    const running = driver.run();
-    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
-    driver.stop();
-    await running; // resolves: the hook's throw was caught, not fatal
+    }, () => parked.resolve());
+    // Resolves after the parked closer, so the hook's throw was caught, not fatal.
+    await runToSignal(driver, parked.promise);
 
     expect(calls).toBe(1);
     expect(transport.sends).toHaveLength(1);
@@ -258,5 +285,23 @@ describe('checkpoint wiring', () => {
       .toMatchObject({ outcome: 'waiting' });
     expect((events.at(-1)!.data as { reason: string }).reason).toBe('stop-requested');
     await expect(readSnapshot(fx.home, 'n1', events)).resolves.toBeNull();
+  });
+
+  it('propagates a driver failure before the signal, instead of awaiting one that never fires', async () => {
+    const fx = fixture();
+    const boom = new Error('handler exploded');
+    const driver = await NodeDriver.open(fx.home, 'n1', () => {
+      throw boom;
+    }, fx.world, { worldPollMs: 0 });
+    // Explicit deferred that is never resolved: only the run's own rejection can
+    // end the wait, so the helper must race it. The old `await signal` form hung
+    // here until Vitest's own per-test bound, with the driver torn down too late.
+    const never = deferred();
+    await expect(runToSignal(driver, never.promise)).rejects.toBe(boom);
+
+    // The failure still ran the driver's shutdown path to completion.
+    const events = await readNode(fx.home);
+    expect(events.at(-1)?.data).toEqual({ reason: 'handler-error', error: 'Error: handler exploded' });
+    expect(driver.state).toBe('stopped');
   });
 });
