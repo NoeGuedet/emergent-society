@@ -1,8 +1,15 @@
 import type { EventEnvelope } from '../journal/index.js';
 import { sha256HexOf } from '../journal/canon.js';
+import { canonicalMessagesBytes } from '../provider/wire.js';
+import type { GateScope } from '../node/gate.js';
 import { canonicalBytes, toJson } from './artifacts.js';
+import { createBoundaryRegistry } from './events.js';
+import {
+  MAX_COMPACTION_SOURCES, SAME, candidateIdentity, groupCitations, isBalancedGroup, sameSourceSet,
+  sortUnique,
+} from './groups.js';
 import type {
-  CompactionStart, CompactionSummary, Source, SurfaceGroup, SurfaceNode, SurfaceSnapshot,
+  ChatMessage, CompactionStart, CompactionSummary, Source, SurfaceGroup, SurfaceNode, SurfaceSnapshot,
 } from './contracts.js';
 
 /**
@@ -20,7 +27,14 @@ export class SurfacePolicyError extends Error {
   }
 }
 
-const SAME = (a: Source, b: Source): boolean => a.seq === b.seq && a.hash === b.hash;
+/** The shared boundary registry: the one `compaction/summary` shape validator. */
+const REGISTRY = createBoundaryRegistry();
+const SIGNAL = new AbortController().signal;
+
+/** Byte-for-byte canonical equality of two payloads. */
+function sameCanonical(a: unknown, b: unknown): boolean {
+  return Buffer.from(canonicalBytes(a)).equals(Buffer.from(canonicalBytes(b)));
+}
 
 function groupType(kind: SurfaceGroup['kind']): string | null {
   switch (kind) {
@@ -30,38 +44,6 @@ function groupType(kind: SurfaceGroup['kind']): string | null {
     case 'heading': return 'system/message';
     default: return null;
   }
-}
-
-function sortUnique(sources: readonly Source[]): Source[] {
-  const seen = new Set<string>();
-  const out: Source[] = [];
-  for (const source of sources) {
-    const key = `${source.seq}:${source.hash}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(source);
-  }
-  out.sort((a, b) => (a.seq - b.seq) || (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
-  return out;
-}
-
-/** Order-insensitive set equality of two receipt lists, compared canonically. */
-function sameSourceSet(a: readonly Source[], b: readonly Source[]): boolean {
-  const left = sortUnique(a);
-  const right = sortUnique(b);
-  if (left.length !== right.length) return false;
-  for (let i = 0; i < left.length; i++) {
-    if (!SAME(left[i]!, right[i]!)) return false;
-  }
-  return true;
-}
-
-/** The transaction identity: the hash of the durable start's own five fields. */
-function candidateIdentity(candidate: CompactionStart): string {
-  return sha256HexOf(Buffer.from(canonicalBytes({
-    revision: candidate.revision, groupIds: candidate.groupIds, sources: candidate.sources,
-    shadowHash: candidate.shadowHash, shadowBytes: candidate.shadowBytes,
-  })));
 }
 
 function headingText(group: SurfaceGroup): string {
@@ -114,6 +96,22 @@ export class Surface {
   }
 
   /**
+   * Resolves a durable `compaction/summary` receipt's own payload through the one
+   * shared registry shape, so the applied summary is the recorded value — never a
+   * caller-supplied object of the same shape.
+   */
+  private durableSummary(data: unknown, turn: number): CompactionSummary {
+    const scope: GateScope = { phase: 'turn', turn, signal: SIGNAL, lookup: this.lookup };
+    try {
+      return REGISTRY['compaction/summary'](data, scope) as unknown as CompactionSummary;
+    } catch (err) {
+      throw new SurfacePolicyError(
+        'replaceCommitted: durable summary is not a valid compaction/summary: '
+        + (err instanceof Error ? err.message : String(err)));
+    }
+  }
+
+  /**
    * Appends a committed group. The group's id and every claimed source must
    * resolve to a real receipt of the declared type; an empty or unresolvable
    * source list, a duplicate id and a direct heading append all reject.
@@ -155,13 +153,18 @@ export class Surface {
   }
 
   /**
-   * Applies a completed compaction: the contiguous run of committed groups named
-   * by `candidate.groupIds` (never node 0, the pin) is replaced by one summary
-   * group and positions are reindexed. The candidate's revision must still equal
-   * the surface revision at apply time, its id must be the hash of its own
-   * fields, the summary must name the same id and cite exactly the candidate's
-   * sources, and the replacement must be strictly smaller than the shadow — a
-   * durable end that fails any of these is refused and nothing is replaced.
+   * Applies a completed compaction, verifying the whole transaction at apply time
+   * and *before* any mutation: the candidate's revision must still equal the
+   * surface revision, its id must be the hash of its own five fields, the summary
+   * must name the same id and cite exactly the candidate's sources, the named
+   * groups must be a real, contiguous, balanced span outside the heading pin, the
+   * candidate's sources must be exactly the sorted unique citations of that span
+   * (a prior summary cited by its own receipt, never flattened), the recorded
+   * shadowBytes/shadowHash must equal the real canonical encoding of the span,
+   * `replacementBytes` must equal the encoded summary message and be strictly
+   * smaller than that real shadow, and every claimed receipt must resolve. A false
+   * field is refused even when the id, revision and journal chain are otherwise
+   * coherent; nothing is replaced.
    */
   replaceCommitted(
     candidate: CompactionStart, summary: CompactionSummary, summarySource: Source,
@@ -178,34 +181,28 @@ export class Surface {
     if (!sameSourceSet(summary.sources, candidate.sources)) {
       throw new SurfacePolicyError('replaceCommitted: summary sources do not match the candidate');
     }
-    if (summary.replacementBytes >= candidate.shadowBytes) {
-      throw new SurfacePolicyError(
-        'replaceCommitted: replacement is not strictly smaller than the shadow',
-      );
-    }
-    const summaryReceipt = this.receipt(summarySource, 'replaceCommitted.summary');
-    if (summaryReceipt.type !== 'compaction/summary') {
-      throw new SurfacePolicyError('replaceCommitted: summary source is not compaction/summary');
-    }
     if (candidate.groupIds.length === 0) {
       throw new SurfacePolicyError('replaceCommitted: no group ids');
     }
     if (candidate.sources.length === 0) {
       throw new SurfacePolicyError('replaceCommitted: no source receipts');
     }
-    for (const source of candidate.sources) this.receipt(source, 'replaceCommitted.source');
+    if (candidate.sources.length > MAX_COMPACTION_SOURCES) {
+      throw new SurfacePolicyError(
+        `replaceCommitted: candidate cites more than ${MAX_COMPACTION_SOURCES} receipts`);
+    }
 
     const positions: number[] = [];
-    const seen = new Set<number>();
+    const seenPositions = new Set<number>();
     for (const id of candidate.groupIds) {
       const position = this.groups.findIndex((group) => SAME(group.id, id));
       if (position < 0) {
         throw new SurfacePolicyError(`replaceCommitted: group ${id.seq}:${id.hash} is not on the surface`);
       }
-      if (seen.has(position)) {
+      if (seenPositions.has(position)) {
         throw new SurfacePolicyError('replaceCommitted: duplicate group id in candidate');
       }
-      seen.add(position);
+      seenPositions.add(position);
       positions.push(position);
     }
     const first = Math.min(...positions);
@@ -219,10 +216,63 @@ export class Surface {
       }
     }
 
+    // The real span, in surface order: its balance, its citations and its encoded
+    // shadow are re-derived from the durable groups, never trusted from the record.
+    const messages: ChatMessage[] = [];
+    const citations: Source[] = [];
+    for (const position of sorted) {
+      const group = this.groups[position]!;
+      if (!isBalancedGroup(group)) {
+        throw new SurfacePolicyError('replaceCommitted: a selected group is not a balanced unit');
+      }
+      for (const message of group.messages) messages.push(message);
+      for (const source of groupCitations(group)) citations.push(source);
+    }
+    const derived = sortUnique(citations);
+    if (derived.length !== candidate.sources.length) {
+      throw new SurfacePolicyError('replaceCommitted: candidate sources are not the group citations');
+    }
+    for (let i = 0; i < derived.length; i++) {
+      if (!SAME(derived[i]!, candidate.sources[i]!)) {
+        throw new SurfacePolicyError('replaceCommitted: candidate sources are not the group citations');
+      }
+    }
+    const shadow = canonicalMessagesBytes(messages);
+    if (shadow.length !== candidate.shadowBytes) {
+      throw new SurfacePolicyError(
+        'replaceCommitted: candidate shadowBytes do not match the real span');
+    }
+    if (sha256HexOf(Buffer.from(shadow)) !== candidate.shadowHash) {
+      throw new SurfacePolicyError('replaceCommitted: candidate shadowHash does not match the real span');
+    }
+    if (summary.replacementBytes !== canonicalMessagesBytes([summary.message]).length) {
+      throw new SurfacePolicyError(
+        'replaceCommitted: summary replacementBytes does not match the encoded summary');
+    }
+    if (summary.replacementBytes >= shadow.length) {
+      throw new SurfacePolicyError(
+        'replaceCommitted: replacement is not strictly smaller than the shadow',
+      );
+    }
+
+    const summaryReceipt = this.receipt(summarySource, 'replaceCommitted.summary');
+    if (summaryReceipt.type !== 'compaction/summary') {
+      throw new SurfacePolicyError('replaceCommitted: summary source is not compaction/summary');
+    }
+    // Bind the applied summary to the durable receipt's own data: the caller's
+    // payload is accepted only when it is byte-identical to the recorded
+    // `compaction/summary`, and the spliced group is built from that recorded value.
+    const durable = this.durableSummary(summaryReceipt.data, this.groups[first]!.turn);
+    if (!sameCanonical(durable, summary)) {
+      throw new SurfacePolicyError(
+        'replaceCommitted: summary does not match its durable compaction/summary receipt');
+    }
+    for (const source of candidate.sources) this.receipt(source, 'replaceCommitted.source');
+
     const summaryGroup: SurfaceGroup = toJson({
       id: summarySource, kind: 'summary', turn: this.groups[first]!.turn,
-      messages: [summary.message],
-      sources: sortUnique([summarySource, ...summary.sources]),
+      messages: [durable.message],
+      sources: sortUnique([summarySource, ...durable.sources]),
     }) as unknown as SurfaceGroup;
     this.groups.splice(first, sorted.length, summaryGroup);
   }

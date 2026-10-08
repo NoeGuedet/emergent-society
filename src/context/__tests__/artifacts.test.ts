@@ -15,7 +15,9 @@ import { NodeDriver, type TurnContext } from '../../node/driver.js';
 import { useWorld } from '../../node/__tests__/helpers.js';
 import { createBoundaryRegistry } from '../events.js';
 import { C13_EVENT_TYPES } from '../events.js';
-import { canonicalBytes, resolveArtifact, resolveStored, toJson } from '../artifacts.js';
+import {
+  buildEventIndex, canonicalBytes, eventKey, resolveArtifact, resolveStored, toJson,
+} from '../artifacts.js';
 import { loadVerifiedEvents, ArtifactMismatchError } from '../loader.js';
 import type { VerifiedEvent, VerifiedEvents } from '../loader.js';
 import type { ArtifactChunk, ArtifactRef, ArtifactManifest, Source, WorldPerception } from '../contracts.js';
@@ -331,6 +333,81 @@ describe('capture, resolveArtifact and manifest verification', () => {
       sha256: 'a'.repeat(64), bytes: 0, encoding: 'utf8', complete: true,
     };
     expect(() => resolveArtifact([], ref)).toThrow(ArtifactMismatchError);
+  });
+});
+
+describe('verified event index', () => {
+  /** A two-chunk artifact whose manifest is the last receipt (seq 2). */
+  function abFixture(): { base: VerifiedEvents; ref: ArtifactRef } {
+    const sha = sha256HexOf(Buffer.from('ab'));
+    const manifestEvent = envelope({
+      type: 'artifact/end', seq: 2, hash: 'c'.repeat(64),
+      data: {
+        artifact: sha, sha256: sha, bytes: 2, encoding: 'utf8', complete: true,
+        parts: [{ seq: 0, hash: 'd'.repeat(64) }, { seq: 1, hash: 'e'.repeat(64) }],
+      },
+    });
+    const good0 = envelope({
+      type: 'artifact/chunk', seq: 0, hash: 'd'.repeat(64),
+      data: { artifact: sha, index: 0, base64: Buffer.from('a').toString('base64') },
+    });
+    const good1 = envelope({
+      type: 'artifact/chunk', seq: 1, hash: 'e'.repeat(64),
+      data: { artifact: sha, index: 1, base64: Buffer.from('b').toString('base64') },
+    });
+    return {
+      base: [verified(manifestEvent), verified(good0), verified(good1)],
+      ref: {
+        kind: 'c13-artifact', manifest: { seq: 2, hash: 'c'.repeat(64) },
+        sha256: sha, bytes: 2, encoding: 'utf8', complete: true,
+      },
+    };
+  }
+
+  it('resolves byte-identically from a prebuilt index and from the array', () => {
+    const { base, ref } = abFixture();
+    const index = buildEventIndex(base);
+    expect(index.size).toBe(3);
+    expect(index.get(eventKey(ref.manifest))).toBe(base[0]);
+    const fromArray = Buffer.from(resolveArtifact(base, ref));
+    const fromIndex = Buffer.from(resolveArtifact(index, ref));
+    expect(fromIndex.equals(fromArray)).toBe(true);
+    expect(fromIndex.toString('utf8')).toBe('ab');
+  });
+
+  it('refuses a prefix index that does not yet contain the manifest', () => {
+    const { base, ref } = abFixture();
+    // Only the chunks are observed: the manifest is still in the future, so the
+    // prefix cannot resolve it even though the full history does.
+    const prefix = buildEventIndex(base.slice(1));
+    expect(prefix.has(eventKey(ref.manifest))).toBe(false);
+    expect(() => resolveArtifact(prefix, ref)).toThrow(ArtifactMismatchError);
+    expect(Buffer.from(resolveArtifact(base, ref)).toString('utf8')).toBe('ab');
+  });
+
+  it('treats the supplied index as authoritative for resolveStored', () => {
+    const bytes = Buffer.from(JSON.stringify({ payload: 'ok' }), 'utf8');
+    const sha = sha256HexOf(bytes);
+    const chunk = envelope({
+      type: 'artifact/chunk', seq: 0, hash: 'd'.repeat(64),
+      data: { artifact: sha, index: 0, base64: bytes.toString('base64') },
+    });
+    const manifest = envelope({
+      type: 'artifact/end', seq: 1, hash: 'c'.repeat(64),
+      data: {
+        artifact: sha, sha256: sha, bytes: bytes.length, encoding: 'utf8', complete: true,
+        parts: [{ seq: 0, hash: 'd'.repeat(64) }],
+      },
+    });
+    const ref: ArtifactRef = {
+      kind: 'c13-artifact', manifest: { seq: 1, hash: 'c'.repeat(64) },
+      sha256: sha, bytes: bytes.length, encoding: 'utf8', complete: true,
+    };
+    const stored = { kind: 'artifact-json' as const, ref };
+    expect(resolveStored(buildEventIndex([verified(manifest), verified(chunk)]), stored,
+      (raw) => raw)).toEqual({ payload: 'ok' });
+    expect(() => resolveStored(buildEventIndex([verified(chunk)]), stored, (raw) => raw))
+      .toThrow(ArtifactMismatchError);
   });
 });
 

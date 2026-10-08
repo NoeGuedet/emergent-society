@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { Buffer } from 'node:buffer';
-import type { JsonValue } from '../../journal/index.js';
+import type { EventEnvelope, JsonValue } from '../../journal/index.js';
+import { sha256HexOf } from '../../journal/canon.js';
 import { defaultAgentConfig } from '../config.js';
-import { canonicalBytes } from '../artifacts.js';
-import { assemble } from '../assembler.js';
+import { ArtifactMismatchError, type VerifiedEvent, type VerifiedEvents } from '../loader.js';
+import { canonicalBytes, resolveArtifact } from '../artifacts.js';
+import { assemble, rederivePlans } from '../assembler.js';
 import { serializeWire } from '../../provider/wire.js';
+import type { WorldRepo } from '../../node/world.js';
 import type {
-  AgentConfig, CanonicalUsage, ChatMessage, FunctionCall, OpenTurn, ProjectionState, RequestId,
-  Source, SurfaceGroup, SurfaceNode, SurfaceSnapshot, ToolSchema,
+  AgentConfig, ArtifactRef, CanonicalUsage, ChatMessage, FunctionCall, OpenTurn, ProjectionState,
+  RequestId, RequestPlan, Source, SurfaceGroup, SurfaceNode, SurfaceSnapshot, ToolSchema,
 } from '../contracts.js';
 
 /**
@@ -258,5 +261,82 @@ describe('assemble: freezing and null preservation', () => {
       inputTotal: null, inputUncached: null, output: null, cacheRead: null, cacheWrite: null,
     });
     expect(Object.values(parsed).every((v) => v === null)).toBe(true);
+  });
+});
+
+describe('rederivePlans: the observed prefix is authoritative', () => {
+  const GENESIS = '0'.repeat(64);
+
+  function envelope(over: Partial<EventEnvelope> & { type: string; data: JsonValue }): EventEnvelope {
+    return { v: 0, seq: 0, time: 1, prev_hash: GENESIS, hash: GENESIS, ...over };
+  }
+
+  const verified = (event: EventEnvelope): VerifiedEvent => ({ ...event, raw: event });
+
+  it('cannot resolve a request/plan from an artifact that only appears later', async () => {
+    const H0 = 'a'.repeat(64);
+    const H1 = 'b'.repeat(64);
+    const H2 = 'c'.repeat(64);
+    const C0 = '1'.repeat(64);
+    const C1 = '2'.repeat(64);
+    const HM = 'e'.repeat(64);
+
+    const plan: RequestPlan = {
+      id: { turn: 0, ordinal: 0 }, config: { seq: 0, hash: H0 }, stateHash: 'x'.repeat(64),
+      model: 'mock-model', parameters: {}, policy: defaultAgentConfig().policy,
+      tools: [], toolsHash: 'd'.repeat(64),
+      sections: [
+        { name: 'tools', cache: 'stable', sources: [] },
+        { name: 'charter', cache: 'stable', sources: [] },
+        { name: 'heading', cache: 'stable', sources: [] },
+        { name: 'history', cache: 'advance', sources: [] },
+        { name: 'queue', cache: 'volatile', sources: [] },
+      ],
+      history: [], queue: [], charter: '', heading: '',
+    };
+    const bytes = Buffer.from(JSON.stringify(plan), 'utf8');
+    const sha = sha256HexOf(bytes);
+    const half = Math.floor(bytes.length / 2);
+    const ref: ArtifactRef = {
+      kind: 'c13-artifact', manifest: { seq: 5, hash: HM },
+      sha256: sha, bytes: bytes.length, encoding: 'utf8', complete: true,
+    };
+
+    const events: VerifiedEvents = [
+      verified(envelope({
+        type: 'system/message', seq: 0, hash: H0,
+        data: { version: 1, value: { kind: 'inline', value: defaultAgentConfig() } },
+      })),
+      verified(envelope({
+        type: 'turn/start', seq: 1, hash: H1, prev_hash: H0,
+        data: { turn: 0, trigger: 'boot', world: { from: null, to: null } },
+      })),
+      verified(envelope({
+        type: 'request/plan', seq: 2, hash: H2, prev_hash: H1,
+        data: { id: { turn: 0, ordinal: 0 }, value: { kind: 'artifact-json', ref } },
+      })),
+      verified(envelope({
+        type: 'artifact/chunk', seq: 3, hash: C0, prev_hash: H2,
+        data: { artifact: sha, index: 0, base64: bytes.subarray(0, half).toString('base64') },
+      })),
+      verified(envelope({
+        type: 'artifact/chunk', seq: 4, hash: C1, prev_hash: C0,
+        data: { artifact: sha, index: 1, base64: bytes.subarray(half).toString('base64') },
+      })),
+      verified(envelope({
+        type: 'artifact/end', seq: 5, hash: HM, prev_hash: C1,
+        data: {
+          artifact: sha, sha256: sha, bytes: bytes.length, encoding: 'utf8', complete: true,
+          parts: [{ seq: 3, hash: C0 }, { seq: 4, hash: C1 }],
+        },
+      })),
+    ];
+
+    // The artifact itself is genuinely resolvable from the whole history...
+    expect(Buffer.from(resolveArtifact(events, ref)).equals(bytes)).toBe(true);
+    // ...but the plan cites a manifest that is still in the future when it is
+    // read, so reconstruction refuses rather than trusting a later receipt.
+    const world = {} as unknown as WorldRepo;
+    await expect(rederivePlans(events, world)).rejects.toThrow(ArtifactMismatchError);
   });
 });

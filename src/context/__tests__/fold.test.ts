@@ -12,11 +12,11 @@ import { C13_EVENT_TYPES, createBoundaryRegistry } from '../events.js';
 import { defaultAgentConfig } from '../config.js';
 import { ContextFold } from '../fold.js';
 import { SurfacePolicyError } from '../surface.js';
-import { loadVerifiedEvents } from '../loader.js';
+import { ArtifactMismatchError, loadVerifiedEvents } from '../loader.js';
 import { canonicalBytes } from '../artifacts.js';
 import type {
-  ArtifactRef, AssistantProjection, CompactionStart, FunctionCall, RequestId, RequestPlan, Source,
-  WorldPerception,
+  ArtifactRef, AssistantProjection, CompactionStart, CompactionSummary, FunctionCall, RequestId,
+  RequestPlan, Source, WorldPerception,
 } from '../contracts.js';
 import type { WorldRange } from '../../node/world.js';
 
@@ -599,5 +599,335 @@ describe('fold recovery: interrupted dialogue through the real T2 driver', () =>
       && (e.data as unknown as { callId: string }).callId === 'c1');
     expect(c1).toHaveLength(1);
     expect((c1[0]!.data as unknown as { synthetic: boolean }).synthetic).toBe(false);
+  });
+});
+
+// --- strict assistant provenance and sequencing invariants (T7) ------------------
+
+describe('fold: assistant provenance binds to a recorded complete 200 response', () => {
+  /**
+   * Opens one turn and drives it up to (and excluding) the closer. The assistant
+   * projection's raw ref defaults to the recorded response body; `assistantRawBytes`
+   * substitutes a different valid artifact and `assistantRawForge` mutates the ref.
+   */
+  async function turnWithAssistant(
+    s: Session, cfg: Source, opts: {
+      calls?: FunctionCall[]; response?: boolean; status?: number; complete?: boolean;
+      assistantRawBytes?: Uint8Array; assistantRawForge?: (ref: ArtifactRef) => ArtifactRef;
+      resultCount?: number;
+    } = {},
+  ): Promise<{ id: RequestId; gate: BoundaryGate }> {
+    s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+    const gate = s.gate('turn', 0).gate;
+    gate.append('world/perception', {
+      turn: 0, range: { from: null, to: null },
+      value: { kind: 'inline', value: perception('evidence') },
+    });
+    const id: RequestId = { turn: 0, ordinal: 0 };
+    gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
+    const body = await gate.capture(Buffer.from('{}'), 'utf8');
+    gate.append('request/wire', { id, attempt: 0, body });
+    const responseBody = await gate.capture(Buffer.from('{"ok":true}'), 'utf8');
+    if (opts.response !== false) {
+      gate.append('response/raw', {
+        id, attempt: 0, status: opts.status ?? 200, body: responseBody,
+        complete: opts.complete ?? true,
+      });
+    }
+    const chosen = opts.assistantRawBytes === undefined
+      ? responseBody
+      : await gate.capture(Buffer.from(opts.assistantRawBytes), 'utf8');
+    const raw = (opts.assistantRawForge ?? ((ref: ArtifactRef): ArtifactRef => ref))(chosen);
+    gate.append('assistant/message', { id, value: await gate.store(projection(opts.calls ?? [], raw)) });
+    const calls = opts.calls ?? [];
+    for (const advertised of calls) gate.append('tool/call', { turn: 0, request: id, call: advertised });
+    const count = opts.resultCount ?? calls.length;
+    for (let i = 0; i < count; i++) {
+      gate.append('tool/result', result(id, 0, calls[i]!.id) as never);
+    }
+    return { id, gate };
+  }
+
+  it('rejects an assistant message when no response was recorded for the request', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const t = await turnWithAssistant(s, cfg, { response: false });
+      await t.gate.flush();
+      await expect(foldOf(home())).rejects.toThrow(/response/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects an assistant whose raw is a different valid artifact than the response', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const t = await turnWithAssistant(s, cfg, {
+        assistantRawBytes: Buffer.from('{"other":true}'),
+      });
+      await t.gate.flush();
+      await expect(foldOf(home())).rejects.toThrow(/response/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects an assistant whose raw ref digest does not match its artifact', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const t = await turnWithAssistant(s, cfg, {
+        assistantRawForge: (ref) => ({ ...ref, sha256: 'f'.repeat(64) }),
+      });
+      await t.gate.flush();
+      await expect(foldOf(home())).rejects.toThrow(ArtifactMismatchError);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('does not bind an assistant to an HTTP 429 response', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const t = await turnWithAssistant(s, cfg, { status: 429 });
+      await t.gate.flush();
+      await expect(foldOf(home())).rejects.toThrow(/response/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('does not bind an assistant to an incomplete response', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const t = await turnWithAssistant(s, cfg, { complete: false });
+      await t.gate.flush();
+      await expect(foldOf(home())).rejects.toThrow(/response/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('accepts a 200 complete response whose raw covers the recorded body', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const t = await turnWithAssistant(s, cfg, { calls: [call('c1')] });
+      await t.gate.flush();
+      const folded = await foldOf(home());
+      expect(folded.snapshot().open?.messages).toHaveLength(2);
+    } finally {
+      await s.close();
+    }
+  });
+
+  /**
+   * Opens one turn with the assistant projection captured as an `artifact-json`
+   * value (the same inner-projection shape a giant assistant message uses). The
+   * caller supplies the inner raw ref so the same binding path is exercised.
+   */
+  async function turnWithStoredAssistant(
+    s: Session, cfg: Source, innerRaw: (responseBody: ArtifactRef) => Promise<ArtifactRef>,
+  ): Promise<void> {
+    s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+    const gate = s.gate('turn', 0).gate;
+    gate.append('world/perception', {
+      turn: 0, range: { from: null, to: null },
+      value: { kind: 'inline', value: perception('') },
+    });
+    const id: RequestId = { turn: 0, ordinal: 0 };
+    gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
+    const body = await gate.capture(Buffer.from('{}'), 'utf8');
+    gate.append('request/wire', { id, attempt: 0, body });
+    const responseBody = await gate.capture(Buffer.from('{"ok":true}'), 'utf8');
+    gate.append('response/raw', {
+      id, attempt: 0, status: 200, body: responseBody, complete: true,
+    });
+    const raw = await innerRaw(responseBody);
+    const projectionBytes = Buffer.from(JSON.stringify(projection([], raw)), 'utf8');
+    const ref = await gate.capture(projectionBytes, 'utf8');
+    gate.append('assistant/message', { id, value: { kind: 'artifact-json', ref } });
+    await gate.flush();
+  }
+
+  it('applies the same binding to an artifact-json assistant projection', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      await turnWithStoredAssistant(s, cfg, async (responseBody) => responseBody);
+      const folded = await foldOf(home());
+      expect(folded.snapshot().open?.messages).toHaveLength(1);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects an artifact-json assistant whose inner raw is a different artifact', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      await turnWithStoredAssistant(s, cfg, async () => {
+        const gate = s.gate('turn', 0).gate;
+        return gate.capture(Buffer.from('{"other":true}'), 'utf8');
+      });
+      await expect(foldOf(home())).rejects.toThrow(/response/);
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe('fold: compaction and refusal sequencing invariants', () => {
+  it('rejects a compaction summary that does not follow a start', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      const gate = s.gate('turn', 0).gate;
+      gate.append('compaction/summary', {
+        id: 'ghost', message: { role: 'user', content: 'x' }, sources: [cfg], replacementBytes: 1,
+      });
+      await gate.flush();
+      await expect(foldOf(home())).rejects.toThrow(/start|matching/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects a duplicate compaction summary for one start', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      const gate = s.gate('turn', 0).gate;
+      const start: CompactionStart = {
+        id: 's1', revision: 'a'.repeat(64), groupIds: [cfg], sources: [cfg],
+        shadowHash: 'b'.repeat(64), shadowBytes: 10,
+      };
+      const summary: CompactionSummary = {
+        id: 's1', message: { role: 'user', content: 'x' }, sources: [cfg], replacementBytes: 1,
+      };
+      gate.append('compaction/start', start);
+      gate.append('compaction/summary', summary);
+      gate.append('compaction/summary', summary);
+      await gate.flush();
+      await expect(foldOf(home())).rejects.toThrow(/duplicate/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects a compaction abort for an id with no matching start', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      const gate = s.gate('turn', 0).gate;
+      gate.append('compaction/abort', { id: 'ghost', reason: 'orphan' });
+      await gate.flush();
+      await expect(foldOf(home())).rejects.toThrow(/abort|matching/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects a duplicate request/refused for one request', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      const gate = s.gate('turn', 0).gate;
+      const id: RequestId = { turn: 0, ordinal: 0 };
+      gate.append('request/refused', { id, bytes: 5, limit: 10, phase: 'plan' });
+      gate.append('request/refused', { id, bytes: 5, limit: 10, phase: 'plan' });
+      await gate.flush();
+      await expect(foldOf(home())).rejects.toThrow(/refused/);
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe('fold: an invariant never leaves the cached surface half-changed', () => {
+  /**
+   * Opens turn 0 with a nonempty perception and a two-call assistant whose second
+   * call has no result, leaving a durable state an ordinary closer would promote
+   * from an unbalanced dialogue.
+   */
+  async function unbalancedTurn(s: Session, cfg: Source): Promise<ContextFold> {
+    const fold = new ContextFold();
+    const syncTo = async (): Promise<void> => {
+      await fold.observe(await loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES));
+    };
+    await syncTo();
+    s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+    const gate = s.gate('turn', 0).gate;
+    gate.append('world/perception', {
+      turn: 0, range: { from: null, to: null },
+      value: { kind: 'inline', value: perception('evidence') },
+    });
+    const id: RequestId = { turn: 0, ordinal: 0 };
+    gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
+    const body = await gate.capture(Buffer.from('{}'), 'utf8');
+    gate.append('request/wire', { id, attempt: 0, body });
+    const raw = await gate.capture(Buffer.from('{"ok":true}'), 'utf8');
+    gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
+    gate.append('assistant/message', {
+      id, value: await gate.store(projection([call('c1'), call('c2')], raw)),
+    });
+    gate.append('tool/call', { turn: 0, request: id, call: call('c1') });
+    gate.append('tool/result', result(id, 0, 'c1') as never);
+    gate.append('tool/call', { turn: 0, request: id, call: call('c2') });
+    await gate.flush();
+    await syncTo();
+    return fold;
+  }
+
+  it('refuses an unbalanced dialogue under a successful closer before appending', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const fold = await unbalancedTurn(s, cfg);
+      const before = fold.snapshot().surface;
+      expect(before?.nodes).toHaveLength(1);
+
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
+      await s.writer.flush();
+      await expect(fold.observe(await loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES)))
+        .rejects.toThrow(/unbalanced/);
+      expect(fold.snapshot().surface).toEqual(before);
+      expect(fold.snapshot().surface?.nodes).toHaveLength(1);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('fail-stops after a fatal invariant and refuses re-delivery onto partial state', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const fold = await unbalancedTurn(s, cfg);
+      const before = fold.snapshot().surface;
+
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
+      await s.writer.flush();
+      await expect(fold.observe(await loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES)))
+        .rejects.toThrow(/unbalanced/);
+      // The same fold now refuses any further observation rather than re-delivering
+      // the batch onto the partially-mutated cache...
+      await expect(fold.observe(await loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES)))
+        .rejects.toThrow(/poisoned/);
+      // ...its cached snapshot is unchanged, and a fresh fold is unaffected.
+      expect(fold.snapshot().surface).toEqual(before);
+      const fresh = new ContextFold();
+      await expect(fresh.observe(await loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES)))
+        .rejects.toThrow(/unbalanced/);
+    } finally {
+      await s.close();
+    }
   });
 });

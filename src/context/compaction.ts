@@ -1,6 +1,9 @@
 import { sha256HexOf } from '../journal/canon.js';
 import { canonicalMessagesBytes } from '../provider/wire.js';
 import { canonicalBytes, toJson } from './artifacts.js';
+import {
+  MAX_COMPACTION_SOURCES, SAME, candidateIdentity, groupCitations, isBalancedGroup, sortUnique,
+} from './groups.js';
 import type { BoundaryGate } from '../node/gate.js';
 import type { ContextFold } from './fold.js';
 import type {
@@ -34,71 +37,8 @@ import type {
 /** The one replacement notice (kernel.md §4); the removed span is replaced by this user message. */
 export const COMPACTION_NOTICE = 'Older committed context was removed; externalize what must survive.';
 
-/**
- * The per-transaction citation bound: at most this many source receipts are named,
- * so a marker's canonical payload can never grow toward `MAX_BLOB_BYTES`. The span
- * stops growing (keeping that group in the recent tail) rather than truncating.
- */
-const MAX_COMPACTION_SOURCES = 4096;
-
-const SAME = (a: Source, b: Source): boolean => a.seq === b.seq && a.hash === b.hash;
-
-function sortUnique(sources: readonly Source[]): Source[] {
-  const seen = new Set<string>();
-  const out: Source[] = [];
-  for (const source of sources) {
-    const key = `${source.seq}:${source.hash}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ seq: source.seq, hash: source.hash });
-  }
-  out.sort((a, b) => (a.seq - b.seq) || (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
-  return out;
-}
-
 function noticeMessage(): Extract<ChatMessage, { role: 'user' }> {
   return { role: 'user', content: COMPACTION_NOTICE };
-}
-
-/**
- * A group is balanced when its messages are a complete unit: a dialogue is an
- * assistant followed by exactly its advertised results, in call order; a
- * perception or summary group is a single user message. An unbalanced group is
- * never selected for removal (assistant + all results is indivisible).
- */
-function isBalanced(group: SurfaceGroup): boolean {
-  switch (group.kind) {
-    case 'heading':
-      return false;
-    case 'perception':
-    case 'summary': {
-      const only = group.messages[0];
-      return group.messages.length === 1 && only !== undefined && only.role === 'user';
-    }
-    default: {
-      const assistant = group.messages[0];
-      if (assistant === undefined || assistant.role !== 'assistant') return false;
-      if (group.messages.length !== 1 + assistant.tool_calls.length) return false;
-      for (let i = 0; i < assistant.tool_calls.length; i++) {
-        const message = group.messages[i + 1];
-        const call = assistant.tool_calls[i];
-        if (message === undefined || call === undefined) return false;
-        if (message.role !== 'tool' || message.tool_call_id !== call.id) return false;
-      }
-      return true;
-    }
-  }
-}
-
-/** The canonical identity of a candidate: the five fields the transaction ID hashes. */
-function candidateIdentity(candidate: CompactionStart): string {
-  return sha256HexOf(Buffer.from(canonicalBytes({
-    revision: candidate.revision,
-    groupIds: candidate.groupIds,
-    sources: candidate.sources,
-    shadowHash: candidate.shadowHash,
-    shadowBytes: candidate.shadowBytes,
-  })));
 }
 
 /** The sorted, deduplicated union of the accumulated receipts and one group's receipts. */
@@ -107,17 +47,6 @@ function mergeSources(existing: readonly Source[], incoming: readonly Source[]):
   for (const source of existing) merged.push({ seq: source.seq, hash: source.hash });
   for (const source of incoming) merged.push({ seq: source.seq, hash: source.hash });
   return sortUnique(merged);
-}
-
-/**
- * The receipts one selected group contributes to a transaction. A non-summary
- * group cites its stored sources. A summary group is cited by its own summary
- * receipt only: its transitive ancestry is resolved through that durable receipt
- * at verification time, never recursively flattened into every later marker.
- */
-function groupCitations(group: SurfaceGroup): Source[] {
-  if (group.kind === 'summary') return [{ seq: group.id.seq, hash: group.id.hash }];
-  return group.sources;
 }
 
 /**
@@ -151,7 +80,7 @@ export function selectCompaction(state: ProjectionState): CompactionStart | null
   const chosen: SurfaceGroup[] = [];
   const sources: Source[] = [];
   for (const group of eligible) {
-    if (!isBalanced(group)) return null;
+    if (!isBalancedGroup(group)) return null;
     const merged = mergeSources(sources, groupCitations(group));
     if (merged.length > MAX_COMPACTION_SOURCES) break;
     chosen.push(group);
@@ -209,7 +138,7 @@ function transactionValid(state: ProjectionState, candidate: CompactionStart): b
   const messages: ChatMessage[] = [];
   const sources: Source[] = [];
   for (const group of groups) {
-    if (!isBalanced(group)) return false;
+    if (!isBalancedGroup(group)) return false;
     for (const message of group.messages) messages.push(message);
     for (const source of groupCitations(group)) sources.push(source);
   }

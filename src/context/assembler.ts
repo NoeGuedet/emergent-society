@@ -1,6 +1,7 @@
 import { canonicalizeJson } from '../journal/index.js';
 import { sha256HexOf } from '../journal/canon.js';
-import { canonicalBytes, resolveStored, toJson } from './artifacts.js';
+import { canonicalBytes, eventKey, resolveStored, toJson } from './artifacts.js';
+import type { VerifiedEventIndex } from './artifacts.js';
 import { RENDER_POLICY, presentWorld } from './diff.js';
 import { createBoundaryRegistry, validateRequestPlan } from './events.js';
 import { ContextFold } from './fold.js';
@@ -168,7 +169,9 @@ function canonicalText(value: unknown): string {
  * and fold use (so the wrapper/value range equality is enforced), refusing an
  * incompatible renderer policy with an explicit message before shape validation.
  */
-function recordedPerception(events: VerifiedEvents, data: PerceptionPayload): WorldPerception {
+function recordedPerception(
+  events: VerifiedEvents | VerifiedEventIndex, data: PerceptionPayload,
+): WorldPerception {
   const scope: GateScope = {
     phase: 'turn', turn: data.turn, signal: REPLAY_SIGNAL, lookup: () => null,
   };
@@ -196,7 +199,7 @@ function recordedPerception(events: VerifiedEvents, data: PerceptionPayload): Wo
  * reconstruction explicitly. Missing Git objects propagate as explicit errors.
  */
 async function verifyPerception(
-  events: VerifiedEvents, world: WorldRepo, event: VerifiedEvent,
+  events: VerifiedEvents | VerifiedEventIndex, world: WorldRepo, event: VerifiedEvent,
 ): Promise<void> {
   const data = event.data as unknown as PerceptionPayload;
   const recorded = recordedPerception(events, data);
@@ -232,12 +235,16 @@ export async function rederivePlans(
 ): Promise<readonly ReplayComparison[]> {
   const fold = new ContextFold();
   const comparisons: ReplayComparison[] = [];
+  // The observed prefix only: an event that has not yet been reached cannot
+  // resolve a receipt, so a plan can never be verified against a future fact.
+  const prefix = new Map<string, VerifiedEvent>();
   for (const event of events) {
+    prefix.set(eventKey(event.raw), event);
     if (event.type === 'world/perception') {
-      await verifyPerception(events, world, event);
+      await verifyPerception(prefix, world, event);
     } else if (event.type === 'request/plan') {
       const data = event.data as unknown as { id: RequestId; value: Stored<RequestPlan> };
-      const recorded = resolveStored(events, data.value, validateRequestPlan);
+      const recorded = resolveStored(prefix, data.value, validateRequestPlan);
       const rederived = assemble({ id: data.id, state: fold.snapshot() });
       const source = sourceOf(event);
       if (canonicalText(rederived) !== canonicalText(recorded)) {

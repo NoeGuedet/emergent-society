@@ -568,6 +568,17 @@ describe('runCompaction transaction discipline', () => {
     } finally {
       await restarted.shutdown();
     }
+
+    // A second restart sees the durable abort: nothing left to abort, the surface
+    // still unchanged (the orphan recovery is repeatable, never double-applied).
+    const again = await openSession();
+    try {
+      expect(again.fold.orphanCompactions()).toEqual([]);
+      expect(again.fold.snapshot().surface?.nodes).toEqual(prepared.before.surface?.nodes);
+      expect(again.fold.snapshot().pendingCompactions).toEqual([]);
+    } finally {
+      await again.shutdown();
+    }
   });
 
   for (const position of [1, 2, 3] as const) {

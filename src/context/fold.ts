@@ -1,9 +1,10 @@
 import type { EventEnvelope } from '../journal/index.js';
 import type { GateScope, WorldAcknowledgement } from '../node/gate.js';
 import type { WorldRange } from '../node/world.js';
-import { resolveArtifact, resolveStored, toJson } from './artifacts.js';
+import { eventKey, resolveArtifact, resolveStored, toJson } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
 import { createBoundaryRegistry, validateRequestPlan } from './events.js';
+import { SAME, sortUnique } from './groups.js';
 import type {
   AgentConfig, ArtifactRef, AssistantProjection, ChatMessage, CompactionStart, CompactionSummary,
   FunctionCall, OpenTurn, ProjectionState, RecoveryGroup, RequestId, RequestPlan, Source, Stored,
@@ -33,23 +34,13 @@ type ToolMessage = Extract<ChatMessage, { role: 'tool' }>;
 const REGISTRY = createBoundaryRegistry();
 const SIGNAL = new AbortController().signal;
 
-const SAME = (a: Source, b: Source): boolean => a.seq === b.seq && a.hash === b.hash;
 const SAME_ID = (a: RequestId, b: RequestId): boolean =>
   a.turn === b.turn && a.ordinal === b.ordinal;
+/** The exact artifact tuple: two refs are the same artifact only if every field agrees. */
+const sameRef = (a: ArtifactRef, b: ArtifactRef): boolean =>
+  SAME(a.manifest, b.manifest) && a.sha256 === b.sha256 && a.bytes === b.bytes
+  && a.encoding === b.encoding && a.complete === b.complete;
 const rangeEquals = (a: WorldRange, b: WorldRange): boolean => a.from === b.from && a.to === b.to;
-
-function sortUnique(sources: Iterable<Source>): Source[] {
-  const seen = new Set<string>();
-  const out: Source[] = [];
-  for (const source of sources) {
-    const key = `${source.seq}:${source.hash}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(source);
-  }
-  out.sort((a, b) => (a.seq - b.seq) || (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
-  return out;
-}
 
 function invariant(message: string): never {
   throw new Error(`context fold invariant failure: ${message}`);
@@ -61,6 +52,12 @@ interface ResultEntry {
   readonly synthetic: boolean;
 }
 
+interface RecordedResponse {
+  readonly body: ArtifactRef;
+  readonly status: number;
+  readonly complete: boolean;
+}
+
 interface DialogueBuffer {
   readonly request: RequestId;
   planSource: Source | null;
@@ -68,7 +65,8 @@ interface DialogueBuffer {
   wireSeen: boolean;
   firstBodySha: string | null;
   readonly attempts: Set<number>;
-  readonly responses: Set<number>;
+  /** The recorded `response/raw` per attempt: its body tuple, status and completeness. */
+  readonly responses: Map<number, RecordedResponse>;
   assistantSource: Source | null;
   assistant: AssistantMessage | null;
   rawSource: Source | null;
@@ -101,7 +99,7 @@ interface RecoveryEntry {
 function emptyBuffer(request: RequestId): DialogueBuffer {
   return {
     request, planSource: null, refused: false, wireSeen: false, firstBodySha: null,
-    attempts: new Set(), responses: new Set(), assistantSource: null, assistant: null,
+    attempts: new Set(), responses: new Map(), assistantSource: null, assistant: null,
     rawSource: null, advertised: [], callReceipts: new Map(), results: new Map(),
   };
 }
@@ -131,33 +129,62 @@ export class ContextFold {
   private readonly pendingCompactions: CompactionStart[] = [];
   private readonly pendingSummaries = new Map<string, { summary: CompactionSummary; source: Source }>();
   private readonly seen: VerifiedEvent[] = [];
-  private readonly receipts = new Map<string, EventEnvelope>();
+  /**
+   * The incremental `(seq, hash)` index of observed verified events, so artifact
+   * resolution is an O(1) lookup instead of a per-call rebuild over the history.
+   * It holds exactly the observed prefix — a receipt that has not been folded yet
+   * cannot resolve through it — and stores the *resolved* envelope, so provenance
+   * lookups (the surface's receipts, the boundary validators' `scope.lookup`) see
+   * the real payload even when a raw v0 envelope carried a claim-check reference.
+   */
+  private readonly verifiedIndex = new Map<string, VerifiedEvent>();
   private readonly lookup = (source: Source): EventEnvelope | null =>
-    this.receipts.get(`${source.seq}:${source.hash}`) ?? null;
+    this.verifiedIndex.get(eventKey(source)) ?? null;
+  /**
+   * A fatal invariant is fail-stop: once `observe` throws, the fold may hold a
+   * partially-mutated cache (index registered before `process`, handlers partway),
+   * so it refuses every later observation. A fresh `ContextFold` re-folds the
+   * durable history from scratch — the crash/restart path — instead of continuing
+   * on suspect state.
+   */
+  private poisoned: string | null = null;
 
   /**
    * Folds verified events in order. A suffix must continue the observed chain;
    * an already-observed `(seq,hash)` is skipped, a changed hash or a gap rejects.
+   * Any failure is fail-stop: the fold is poisoned and refuses later observation
+   * (a fresh fold re-folds the durable history) rather than risking a re-delivery
+   * on top of a partially-mutated cache.
    */
   async observe(events: VerifiedEvents): Promise<void> {
-    for (const event of events) {
-      const seq = event.raw.seq;
-      if (seq < this.seen.length) {
-        const prior = this.seen[seq]!;
-        if (prior.raw.hash !== event.raw.hash) {
-          invariant(`changed hash at seq ${seq}: ${prior.raw.hash} -> ${event.raw.hash}`);
+    if (this.poisoned !== null) {
+      throw new Error(
+        `context fold invariant failure: fold is poisoned after a prior failure: ${this.poisoned}`);
+    }
+    try {
+      for (const event of events) {
+        const seq = event.raw.seq;
+        if (seq < this.seen.length) {
+          const prior = this.seen[seq]!;
+          if (prior.raw.hash !== event.raw.hash) {
+            invariant(`changed hash at seq ${seq}: ${prior.raw.hash} -> ${event.raw.hash}`);
+          }
+          continue;
         }
-        continue;
+        if (seq !== this.seen.length) {
+          invariant(`gap in observation: expected seq ${this.seen.length}, received ${seq}`);
+        }
+        // Register the resolution index before processing so a group appended by
+        // this event can resolve its own source (a synthetic recovery result) and
+        // every resolution is an O(1) lookup of the resolved envelope.
+        this.verifiedIndex.set(eventKey(event.raw), event);
+        this.process(event);
+        this.seen.push(event);
+        this.watermark = sourceOf(event);
       }
-      if (seq !== this.seen.length) {
-        invariant(`gap in observation: expected seq ${this.seen.length}, received ${seq}`);
-      }
-      // Record the receipt before processing so a group appended by this event
-      // can resolve its own source (a synthetic recovery result).
-      this.receipts.set(`${seq}:${event.raw.hash}`, event.raw);
-      this.process(event);
-      this.seen.push(event);
-      this.watermark = sourceOf(event);
+    } catch (err) {
+      this.poisoned = err instanceof Error ? err.message : String(err);
+      throw err;
     }
   }
 
@@ -194,7 +221,7 @@ export class ContextFold {
   private onConfig(event: VerifiedEvent): void {
     const data = event.data as unknown as { version: number; value: Stored<AgentConfig> };
     const source = sourceOf(event);
-    const config = resolveStored(this.seen, data.value, validateAgentConfig);
+    const config = resolveStored(this.verifiedIndex, data.value, validateAgentConfig);
     if (config.version !== data.version) {
       invariant('system/message version does not equal the resolved config version');
     }
@@ -260,7 +287,7 @@ export class ContextFold {
       const out = validator(data, scope) as unknown as { value: { value: WorldPerception } };
       return out.value.value;
     }
-    const bytes = resolveArtifact(this.seen, data.value.ref);
+    const bytes = resolveArtifact(this.verifiedIndex, data.value.ref);
     const parsed: unknown = JSON.parse(Buffer.from(bytes).toString('utf8'));
     const out = validator(
       { turn: data.turn, range: data.range, value: { kind: 'inline', value: parsed } }, scope,
@@ -305,7 +332,7 @@ export class ContextFold {
     const buffer = this.buffer(open, data.id);
     if (buffer.refused) invariant('request/plan after request/refused');
     if (buffer.planSource !== null) invariant('duplicate request/plan');
-    const plan = resolveStored(this.seen, data.value, validateRequestPlan);
+    const plan = resolveStored(this.verifiedIndex, data.value, validateRequestPlan);
     if (!SAME_ID(plan.id, data.id)) invariant('request/plan id does not match its payload');
     if (this.config === null || !SAME(plan.config, this.config.source)) {
       invariant('request/plan config does not equal the active config');
@@ -318,6 +345,7 @@ export class ContextFold {
     const data = event.data as unknown as { id: RequestId };
     if (data.id.turn !== open.turn) invariant('request/refused id.turn mismatch');
     const buffer = this.buffer(open, data.id);
+    if (buffer.refused) invariant('duplicate request/refused for a request');
     if (buffer.planSource !== null || buffer.wireSeen || buffer.assistant !== null) {
       invariant('request/refused after a plan, wire or assistant');
     }
@@ -331,7 +359,7 @@ export class ContextFold {
     const buffer = this.buffer(open, data.id);
     if (buffer.refused) invariant('request/wire after request/refused');
     if (buffer.planSource === null) invariant('request/wire without a recorded plan');
-    resolveArtifact(this.seen, data.body);
+    resolveArtifact(this.verifiedIndex, data.body);
     if (data.attempt === 0) {
       if (buffer.wireSeen) invariant('duplicate first request/wire');
       buffer.wireSeen = true;
@@ -354,14 +382,16 @@ export class ContextFold {
   private onResponse(event: VerifiedEvent): void {
     const open = this.requireOpen('response/raw');
     const data = event.data as unknown as {
-      id: RequestId; attempt: number; body: ArtifactRef;
+      id: RequestId; attempt: number; status: number; body: ArtifactRef; complete: boolean;
     };
     if (data.id.turn !== open.turn) invariant('response/raw id.turn mismatch');
     const buffer = this.buffer(open, data.id);
     if (!buffer.attempts.has(data.attempt)) invariant('response/raw without a preceding wire');
     if (buffer.responses.has(data.attempt)) invariant('duplicate response/raw for an attempt');
-    resolveArtifact(this.seen, data.body);
-    buffer.responses.add(data.attempt);
+    resolveArtifact(this.verifiedIndex, data.body);
+    buffer.responses.set(data.attempt, {
+      body: data.body, status: data.status, complete: data.complete,
+    });
   }
 
   private resolveAssistant(id: RequestId, value: Stored<AssistantProjection>): AssistantProjection {
@@ -371,7 +401,7 @@ export class ContextFold {
       const out = validator({ id, value }, scope) as unknown as { value: { value: AssistantProjection } };
       return out.value.value;
     }
-    const bytes = resolveArtifact(this.seen, value.ref);
+    const bytes = resolveArtifact(this.verifiedIndex, value.ref);
     const parsed: unknown = JSON.parse(Buffer.from(bytes).toString('utf8'));
     const out = validator(
       { id, value: { kind: 'inline', value: parsed } }, scope,
@@ -389,6 +419,22 @@ export class ContextFold {
     if (!buffer.wireSeen) invariant('assistant/message without a preceding wire');
     if (buffer.assistant !== null) invariant('duplicate assistant/message for a request');
     const projection = this.resolveAssistant(data.id, data.value);
+    // The projection's raw must be a real artifact (its manifest, digest, size,
+    // encoding and completeness all verified) and must be *the* body of a
+    // successful complete 200 response recorded for this same request: neither an
+    // arbitrary valid artifact, nor a shared digest, nor a 429/incomplete body can
+    // support an assistant projection.
+    resolveArtifact(this.verifiedIndex, projection.raw);
+    let bound = false;
+    for (const response of buffer.responses.values()) {
+      if (response.status !== 200 || !response.complete) continue;
+      if (!sameRef(response.body, projection.raw)) continue;
+      if (bound) invariant('assistant/message matches more than one complete 200 response');
+      bound = true;
+    }
+    if (!bound) {
+      invariant('assistant/message raw does not match a complete 200 response for the request');
+    }
     const ids = new Set<string>();
     for (const call of projection.message.tool_calls) {
       if (ids.has(call.id)) invariant(`duplicate call id ${call.id} within a response`);
@@ -426,7 +472,7 @@ export class ContextFold {
     if (data.message.tool_call_id !== data.callId) {
       invariant('tool/result message.tool_call_id does not match its callId');
     }
-    if (data.raw !== null) resolveArtifact(this.seen, data.raw);
+    if (data.raw !== null) resolveArtifact(this.verifiedIndex, data.raw);
 
     if (this.open !== null && this.open.turn === data.turn && data.request.turn === this.open.turn) {
       const open = this.open;
@@ -476,24 +522,33 @@ export class ContextFold {
     const ignorable = event.raw.ignorable === true;
     const success = data.outcome === 'chained' || data.outcome === 'waiting';
 
-    // The external perception is promoted first, so it precedes this turn's
-    // dialogues in committed history, even when the turn did nothing else.
-    if (open.perceptionGroup !== null && this.surface !== null) {
-      this.surface.append(open.perceptionGroup);
-    }
-
+    // Validate the whole turn before mutating anything: a fatal invariant must not
+    // leave the cached surface half-applied (perception appended, dialogue not).
+    const promote: DialogueBuffer[] = [];
+    const recover: DialogueBuffer[] = [];
     for (const buffer of open.dialogues.values()) {
       if (buffer.assistant === null) continue;
       const balanced = buffer.advertised.every((call) => buffer.results.has(call.id));
       if (success) {
         if (!balanced) invariant('unbalanced dialogue under a successful closer');
-        if (!ignorable) this.promoteDialogue(buffer, open.turn);
+        if (!ignorable) promote.push(buffer);
       } else if (balanced) {
-        this.promoteDialogue(buffer, open.turn);
+        promote.push(buffer);
       } else {
-        this.moveToRecovery(buffer, open.turn);
+        recover.push(buffer);
       }
     }
+    if (promote.length > 0 && this.surface === null) {
+      invariant('no heading surface to append a dialogue to');
+    }
+
+    // The external perception is promoted first, so it precedes this turn's
+    // dialogues in committed history, even when the turn did nothing else.
+    if (open.perceptionGroup !== null && this.surface !== null) {
+      this.surface.append(open.perceptionGroup);
+    }
+    for (const buffer of promote) this.promoteDialogue(buffer, open.turn);
+    for (const buffer of recover) this.moveToRecovery(buffer, open.turn);
     this.open = null;
   }
 
@@ -559,6 +614,14 @@ export class ContextFold {
   private onCompactionSummary(event: VerifiedEvent): void {
     const data = event.data as unknown as CompactionSummary;
     const source = sourceOf(event);
+    // A summary completes exactly one open start and is recorded once: validate
+    // everything before mutating, so a refusal never leaves a half-set map.
+    if (!this.pendingCompactions.some((pending) => pending.id === data.id)) {
+      invariant(`compaction/summary without a matching start ${data.id}`);
+    }
+    if (this.pendingSummaries.has(data.id)) {
+      invariant(`duplicate compaction/summary ${data.id}`);
+    }
     for (const cited of data.sources) {
       if (this.lookup(cited) === null) invariant('compaction/summary cites an unknown receipt');
     }
@@ -583,8 +646,11 @@ export class ContextFold {
 
   private onCompactionAbort(event: VerifiedEvent): void {
     const data = event.data as unknown as { id: string };
+    // The producer aborts once, and only a recorded transaction can be aborted;
+    // an unknown id is an invalid sequence, not a no-op.
     const index = this.pendingCompactions.findIndex((pending) => pending.id === data.id);
-    if (index >= 0) this.pendingCompactions.splice(index, 1);
+    if (index < 0) invariant(`compaction/abort without a matching start ${data.id}`);
+    this.pendingCompactions.splice(index, 1);
     this.pendingSummaries.delete(data.id);
   }
 

@@ -1,9 +1,39 @@
 import { canonicalizeJson } from '../journal/index.js';
 import type { JsonValue } from '../journal/index.js';
 import { copyJsonValue, sha256HexOf } from '../journal/canon.js';
-import type { ArtifactRef, ArtifactChunk, ArtifactManifest, Stored } from './contracts.js';
+import type { ArtifactRef, ArtifactChunk, ArtifactManifest, Source, Stored } from './contracts.js';
 import { ArtifactMismatchError } from './loader.js';
 import type { VerifiedEvent, VerifiedEvents } from './loader.js';
+
+/**
+ * A resolved `(seq, hash)` index over chain-verified events. The fold keeps one
+ * for its whole observed history and passes it to every resolution, so a lookup
+ * is O(1) and a caller never rebuilds the map once per artifact. Passing an index
+ * is authoritative: a receipt it does not contain is unresolved even when the
+ * caller also holds a full history that does.
+ */
+export type VerifiedEventIndex = ReadonlyMap<string, VerifiedEvent>;
+
+/** The one `(seq, hash)` key: the provenance identity of a verified event. */
+export function eventKey(source: Source): string {
+  return `${source.seq}:${source.hash}`;
+}
+
+/** Builds the `(seq, hash)` index from a verified sequence in one pass. */
+export function buildEventIndex(events: VerifiedEvents): Map<string, VerifiedEvent> {
+  const index = new Map<string, VerifiedEvent>();
+  for (const event of events) index.set(eventKey(event.raw), event);
+  return index;
+}
+
+function isEventIndex(value: VerifiedEvents | VerifiedEventIndex): value is VerifiedEventIndex {
+  return !Array.isArray(value);
+}
+
+/** Uses an already-built index, or builds one from the sequence exactly once. */
+function asIndex(events: VerifiedEvents | VerifiedEventIndex): VerifiedEventIndex {
+  return isEventIndex(events) ? events : buildEventIndex(events);
+}
 
 /**
  * The one serialization and artifact-resolution path of the context assembler.
@@ -81,11 +111,12 @@ function chunkOf(event: VerifiedEvent): ArtifactChunk {
  * length, encoding and completeness; each part receipt must resolve to the
  * matching chunk; and the concatenation must re-hash to the manifest digest.
  */
-export function resolveArtifact(events: VerifiedEvents, ref: ArtifactRef): Uint8Array {
+export function resolveArtifact(
+  events: VerifiedEvents | VerifiedEventIndex, ref: ArtifactRef,
+): Uint8Array {
   if (!isRecord(ref) || ref.kind !== 'c13-artifact') mismatch('manifest');
-  const index = new Map<string, VerifiedEvent>();
-  for (const event of events) index.set(`${event.seq}:${event.hash}`, event);
-  const manifestEvent = index.get(`${ref.manifest.seq}:${ref.manifest.hash}`);
+  const index = asIndex(events);
+  const manifestEvent = index.get(eventKey(ref.manifest));
   if (!manifestEvent) mismatch('manifest');
   const manifest = manifestOf(manifestEvent);
   if (manifest.artifact !== manifest.sha256) mismatch('manifest');
@@ -98,7 +129,7 @@ export function resolveArtifact(events: VerifiedEvents, ref: ArtifactRef): Uint8
   let total = 0;
   for (let i = 0; i < manifest.parts.length; i++) {
     const part = manifest.parts[i]!;
-    const event = index.get(`${part.seq}:${part.hash}`);
+    const event = index.get(eventKey(part));
     if (!event) mismatch('manifest');
     const chunk = chunkOf(event!);
     if (chunk.index !== i || chunk.artifact !== manifest.artifact) mismatch('manifest');
@@ -117,7 +148,7 @@ export function resolveArtifact(events: VerifiedEvents, ref: ArtifactRef): Uint8
  * `artifact-json` value is decoded from its verified artifact bytes first.
  */
 export function resolveStored<T>(
-  events: VerifiedEvents, value: Stored<T>, validate: (value: unknown) => T,
+  events: VerifiedEvents | VerifiedEventIndex, value: Stored<T>, validate: (value: unknown) => T,
 ): T {
   if (!isRecord(value)) throw new Error('stored value is not a JSON object');
   if (value['kind'] === 'inline') return validate(value['value']);
