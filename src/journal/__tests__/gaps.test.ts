@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdir, readFile, readdir, writeFile, appendFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, writeFile, appendFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { JournalWriter, JournalClosedError, JournalPoisonedError } from '../writer.js';
 import { repair } from '../reader.js';
@@ -221,16 +221,29 @@ describe('writer lifecycle guards', () => {
   });
 });
 
-describe('head checkpoint tmp files', () => {
-  it('leaves no tmp file behind when the head rename fails', async () => {
-    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+describe('head checkpoint is disposable', () => {
+  it('leaves no tmp file behind and keeps the durable log when the head write fails', async () => {
+    const failures: Error[] = [];
+    const w = await JournalWriter.open(home(), 'n1', {
+      batchWindowMs: 60_000, onError: (e) => failures.push(e),
+    });
     w.append('test/ping', { n: 0 });
     // A directory occupies the head's path, so the atomic rename must fail.
     await mkdir(headPath(nodeDir(home(), 'n1')), { recursive: true });
-    await expect(w.flush()).rejects.toThrow();
+    // The batch is already fsynced into the log, so the head failure is a
+    // diagnostic: the flush succeeds rather than poisoning the writer.
+    await w.flush();
+    expect(failures.length).toBeGreaterThan(0);
     const leaked = (await readdir(nodeDir(home(), 'n1'))).filter((n) => n.endsWith('.tmp'));
     expect(leaked).toEqual([]);
-    await w.close().catch(() => {});
+    // The committed log is readable and the writer is still usable: with the
+    // path fixed the next flush rebuilds the head over both batches.
+    expect((await collectEvents(home())).map((e) => e.seq)).toEqual([0]);
+    await rm(headPath(nodeDir(home(), 'n1')), { recursive: true });
+    w.append('test/ping', { n: 1 });
+    await w.flush();
+    await w.close();
+    expect((await collectEvents(home())).map((e) => e.seq)).toEqual([0, 1]);
   });
 });
 

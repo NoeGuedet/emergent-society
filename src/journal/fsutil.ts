@@ -1,6 +1,7 @@
-import { open, readFile, rename, rm } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { dirname, resolve } from 'node:path';
 import { JournalError } from './errors.js';
 
 /**
@@ -42,6 +43,109 @@ export async function atomicWriteFile(path: string, data: string | Uint8Array): 
     await handle.close().catch(() => {});
     await rm(tmp, { force: true }).catch(() => {});
     throw err;
+  }
+}
+
+/** True when `path` exists; ENOENT is "missing", EACCES/EIO are failures. */
+async function pathIsPresent(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (err) {
+    if (isErrno(err, 'ENOENT')) return false;
+    throw err;
+  }
+}
+
+function ignoreExisting(err: unknown): void {
+  if (!isErrno(err, 'EEXIST')) throw err;
+}
+
+/**
+ * The levels to create and prove for `dir`, leaf-first, stopping at `root` — the
+ * trusted boundary — or, when `root` is omitted, at `dir`'s first existing
+ * ancestor. A missing `root` is not a stop: it is returned as a level too, along
+ * with its own missing ancestors up to the first that exists, so a caller may
+ * open a journal under a home that does not exist yet.
+ *
+ * @throws when `dir` is not inside a provided `root`.
+ */
+async function levelsToProve(dir: string, root: string | undefined): Promise<string[]> {
+  const levels: string[] = [];
+  if (root === undefined) {
+    // No trusted root: prove `dir` and every missing ancestor against the first
+    // ancestor that already exists, which is the only boundary available.
+    levels.push(dir);
+    let cur = dirname(dir);
+    for (;;) {
+      if (await pathIsPresent(cur)) return levels;
+      levels.push(cur);
+      const up = dirname(cur);
+      if (up === cur) return levels;
+      cur = up;
+    }
+  }
+  let cur = dir;
+  let atRoot = true;
+  for (;;) {
+    if (atRoot && cur === root) {
+      if (await pathIsPresent(cur)) return levels;
+      atRoot = false; // root itself is missing: create and prove it as well
+    } else if (!atRoot && await pathIsPresent(cur)) {
+      return levels;
+    }
+    levels.push(cur);
+    const up = dirname(cur);
+    if (up === cur) {
+      if (cur !== root) throw new Error(`${dir} is not inside ${root}`);
+      return levels;
+    }
+    cur = up;
+  }
+}
+
+/**
+ * Creates `dir` — and every missing ancestor down from the trusted `root` — and
+ * makes each level's *parent directory entry* durable before returning.
+ *
+ * A directory survives a crash only once the parent holding its entry has been
+ * fsynced, so `mkdir -p` is not durable. This proves the chain from `root` down
+ * to `dir`, top-down: the topmost level is synced against `root` itself, so a
+ * directory another process created and did not sync cannot become a false trust
+ * anchor, and the concurrent-creator window is closed.
+ *
+ * `root` is the trusted boundary — the cell home, which the caller owns and which
+ * is durable independently of the journal. Only the chain at or below `root` is
+ * touched. When `root` is missing it is created like any other level and its own
+ * missing ancestors are created and proven up to the first that already exists,
+ * which then becomes the boundary; with no `root` the boundary is `dir`'s first
+ * existing ancestor. Nothing is cached: every call re-proves the chain, so a
+ * deleted or substituted directory is never trusted through a stale pathname.
+ *
+ * `dir` is normally built with `path.join` (which normalizes `.`/`..`/doubled
+ * separators) while `root` is passed verbatim, so both are resolved to absolute,
+ * normalized paths before comparing; `resolve` is lexical, so an existing symlink
+ * in either path is preserved rather than followed.
+ *
+ * @throws ENOENT/EACCES/EIO from `stat`/`mkdir`/`syncPath`, and ENOTDIR when the
+ * leaf (or an ancestor) that must be a directory is a file; also throws before
+ * any I/O when `dir` is not inside a provided `root`.
+ */
+export async function ensureDurableDirectory(dir: string, root?: string): Promise<void> {
+  const target = resolve(dir);
+  const trusted = root === undefined ? undefined : resolve(root);
+  const levels = await levelsToProve(target, trusted);
+  for (let i = levels.length - 1; i >= 0; i--) {
+    const level = levels[i]!;
+    await mkdir(level).catch(ignoreExisting);
+    await syncPath(dirname(level));
+  }
+  // `mkdir` reports EEXIST for a file just as for a directory; only the leaf is
+  // checked here, because a file in an ancestor makes the next `mkdir` fail
+  // ENOTDIR on its own.
+  const info = await stat(target);
+  if (!info.isDirectory()) {
+    throw Object.assign(new Error(`not a directory: ${target}`), { code: 'ENOTDIR' });
   }
 }
 

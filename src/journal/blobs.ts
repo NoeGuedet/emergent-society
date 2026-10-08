@@ -1,8 +1,8 @@
-import { mkdir, readFile, stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { sha256HexOf } from './canon.js';
 import { JournalError } from './errors.js';
-import { atomicWriteFile, isErrno, syncPath } from './fsutil.js';
+import { atomicWriteFile, ensureDurableDirectory, isErrno, syncPath } from './fsutil.js';
 
 /**
  * Format constant — a payload whose canonical UTF-8 byte length is at or beyond
@@ -85,7 +85,11 @@ export class BlobStore {
     const hash = sha256HexOf(content);
     const dir = this.dirFor(hash);
     const path = this.pathFor(hash);
-    await mkdir(dir, { recursive: true });
+    // The shard's entry — and every level newly created to reach it — must be
+    // durable before a log entry can reference this blob, or a crash could keep
+    // the reference and lose the directory that holds the bytes. `home` is the
+    // trusted root; the chain is re-proved on every call, never cached.
+    await ensureDurableDirectory(dir, this.home);
     // Content addressing makes an existing blob byte-identical to what we were
     // asked to store, so there is nothing to write.
     if (await this.has(hash)) return hash;

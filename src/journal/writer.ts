@@ -1,11 +1,11 @@
-import { open as openFile, mkdir, truncate } from 'node:fs/promises';
+import { open as openFile, truncate } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { canonicalizeJson, sha256HexOf, type JsonValue } from './canon.js';
 import { GENESIS_HASH, makeEvent, eventLine, type EventDataFor, type EventEnvelope } from './envelope.js';
 import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from './blobs.js';
 import { encodeBatch, scanBatches } from './framing.js';
 import { CorruptionError, JournalError } from './errors.js';
-import { atomicWriteFile, readFileOrNull, syncPath, writeAll } from './fsutil.js';
+import { atomicWriteFile, ensureDurableDirectory, readFileOrNull, syncPath, writeAll } from './fsutil.js';
 import { headPath, journalPath, nodeDir, type Head } from './layout.js';
 import { acquireLock, SessionAlreadyOwnedError, type JournalOwnership } from './lock.js';
 import { genesisState, verifyAll } from './verify.js';
@@ -107,7 +107,12 @@ export interface JournalWriterOptions {
   now?: () => number;
   /** Write-behind window; defaults to `DEFAULT_BATCH_WINDOW_MS`. */
   batchWindowMs?: number;
-  /** Observes write-behind failures; the failure still surfaces on the next call. */
+  /**
+   * Diagnostic sink for write-behind failures and for a disposable head write
+   * that failed after its batch was already durable. A recorded write-behind
+   * failure still surfaces on the next call; a head failure does not, because
+   * the log it describes is committed. A callback that throws is swallowed.
+   */
   onError?: (err: Error) => void;
 }
 
@@ -159,7 +164,7 @@ export class JournalWriter {
     home: string, nodeUid: string, opts: JournalWriterOptions = {},
   ): Promise<JournalWriter> {
     const dir = nodeDir(home, nodeUid);
-    await mkdir(dir, { recursive: true });
+    await ensureDurableDirectory(dir, home);
     const ownership = await acquireLock(dir, nodeUid);
     let log: FileHandle;
     try {
@@ -329,8 +334,9 @@ export class JournalWriter {
     // can land during the await, so drain until nothing is outstanding.
     await this.drainBlobs();
     if (this.pending.length === 0) {
-      // Nothing to retry, but a failure recorded by a prior timer flush (e.g. a
-      // failed head checkpoint write) must still surface to the caller.
+      // Nothing to retry, but a write-behind failure recorded by a prior timer
+      // flush must still surface to the caller. A disposable head failure is
+      // deliberately not recorded here: its batch is already durable.
       if (this.pendingFailure) throw this.pendingFailure;
       return;
     }
@@ -363,7 +369,7 @@ export class JournalWriter {
     };
     this.writeFailureStreak = 0;
     this.pendingFailure = null;
-    await this.writeHead();
+    await this.writeHeadDisposable();
   }
 
   /** Rolls the log back to the last durable byte; false if the rollback failed. */
@@ -391,6 +397,38 @@ export class JournalWriter {
     // after so the rename itself survives a crash.
     await atomicWriteFile(this.headFilePath, JSON.stringify(head));
     await syncPath(this.dir);
+  }
+
+  /**
+   * Writes the disposable head checkpoint, after the batch it describes is
+   * already durable in the log.
+   *
+   * The log is the single truth and the head is only a cache rebuilt from it, so
+   * a head failure cannot make the committed batch unsafe: it is reported as a
+   * diagnostic and the flush still succeeds. This is deliberately unlike a log
+   * or blob write failure, which stays pending and can poison the writer —
+   * losing the head costs at most a rebuild; refusing a durable batch would cost
+   * data the caller was told was logged.
+   */
+  private async writeHeadDisposable(): Promise<void> {
+    try {
+      await this.writeHead();
+    } catch (err) {
+      this.notifyHost(err);
+    }
+  }
+
+  /**
+   * Delivers a diagnostic to the host without letting the callback change the
+   * outcome it reports. A throw here must not become an unhandled rejection on
+   * the write-behind path or reject the flush that just made the batch durable.
+   */
+  private notifyHost(err: unknown): void {
+    try {
+      this.onError?.(err instanceof Error ? err : new Error(String(err)));
+    } catch {
+      // Deliberately swallowed: the diagnostic is not the failure.
+    }
   }
 
   /**
@@ -442,7 +480,7 @@ export class JournalWriter {
   private recordAsyncFailure(err: unknown): void {
     const error = err instanceof Error ? err : new Error(String(err));
     this.pendingFailure = error;
-    this.onError?.(error);
+    this.notifyHost(error);
   }
 
   private async forceClose(): Promise<void> {

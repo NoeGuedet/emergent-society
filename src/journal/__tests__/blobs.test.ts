@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
-import { writeFile } from 'node:fs/promises';
+import { describe, it, expect, vi } from 'vitest';
+import { readlink, writeFile, open as openFile } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { BlobStore, CLAIM_CHECK_THRESHOLD, InvalidBlobHashError } from '../blobs.js';
@@ -7,7 +8,38 @@ import { useTempHome } from './helpers.js';
 
 const home = useTempHome('cell-blobs-');
 
+/** Records the real path behind every `FileHandle#sync` while `fn` runs. */
+async function recordSyncs<T>(fn: () => Promise<T>): Promise<{ result: T; synced: string[] }> {
+  const probe = await openFile(join(home(), 'probe'), 'w');
+  const proto = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
+  await probe.close();
+  const real = proto.sync;
+  const synced: string[] = [];
+  const spy = vi.spyOn(proto, 'sync').mockImplementation(async function (this: FileHandle) {
+    synced.push(await readlink(`/proc/self/fd/${this.fd}`));
+    return real.call(this);
+  });
+  try {
+    return { result: await fn(), synced };
+  } finally {
+    spy.mockRestore();
+  }
+}
+
 describe('BlobStore', () => {
+  it('makes a new shard chain durable before put resolves', async () => {
+    const store = new BlobStore(home());
+    const content = Buffer.from('shard-durability');
+    const hash = createHash('sha256').update(content).digest('hex');
+    const { synced } = await recordSyncs(() => store.put(content));
+    const shard = join(home(), 'blobs', hash.slice(0, 2));
+    // home's entry for `blobs`, `blobs`'s entry for the shard, and the shard's
+    // entry for the blob itself must all be flushed before the put is durable.
+    expect(synced).toContain(home());
+    expect(synced).toContain(join(home(), 'blobs'));
+    expect(synced).toContain(shard);
+    expect(await store.has(hash)).toBe(true);
+  });
   it('stores content-addressed bytes', async () => {
     const store = new BlobStore(home());
     const content = Buffer.from('hello blob');
