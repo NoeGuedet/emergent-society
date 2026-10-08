@@ -1,8 +1,10 @@
 import { execFile, spawn } from 'node:child_process';
-import { access, chmod, mkdir, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { commitAs, gitIn, useWorld, writeWorldFile } from '../../node/__tests__/helpers.js';
+import { WorldRepo } from '../../node/world.js';
 import { presentWorld } from '../diff.js';
 
 /**
@@ -119,6 +121,70 @@ describe('presentWorld concrete rendering', () => {
     // The marker file must not exist: no external diff/textconv process ran.
     await expect(access(marker)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await gitIn(world.path, ['--version'])).toMatch(/^git version \d+\./);
+  });
+});
+
+describe('world reads ignore a refs/replace projection', () => {
+  /** Creates a commit object with `author` and `message` over an existing tree. */
+  async function commitTreeAs(worldPath: string, tree: string, message: string, author: string): Promise<string> {
+    const email = `${author}@world.local`;
+    return new Promise<string>((resolve, reject) => {
+      execFile('git', ['commit-tree', tree, '-m', message], {
+        cwd: worldPath,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: email,
+          GIT_COMMITTER_NAME: author, GIT_COMMITTER_EMAIL: email,
+        },
+      }, (err, stdout, stderr) => { if (err) reject(new Error(stderr)); else resolve(stdout.trim()); });
+    });
+  }
+
+  it('reads the physical commit author and subject, not the replacement', async () => {
+    const { world } = fixture();
+    const c1 = await commitAs(world, 'n1', { 'a.txt': 'one\n' });
+    const tree = (await gitIn(world.path, ['rev-parse', `${c1}^{tree}`])).trim();
+    const replacement = await commitTreeAs(world.path, tree, 'forged subject', 'attacker');
+    await gitIn(world.path, ['replace', c1, replacement]);
+
+    // Sanity: a plain git read without the kernel's env does project the forgery.
+    expect(await gitIn(world.path, ['log', '--format=%an', '-1', c1])).toBe('attacker\n');
+    expect(await gitIn(world.path, ['log', '--format=%s', '-1', c1])).toBe('forged subject\n');
+
+    // The kernel's git environment neutralizes the projection: the log and the
+    // rev-list traversal report the physical author.
+    expect(await world.commitsSince(null)).toEqual([{ hash: c1, author: 'n1' }]);
+    expect((await world.commitsIn({ from: null, to: c1 }, 4096)).commits)
+      .toEqual([{ hash: c1, author: 'n1' }]);
+
+    // The rendered perception carries the physical facts and no forged text.
+    const p = await presentWorld(world, 'n2', { from: null, to: c1 }, 8192, 4096);
+    expect(p.text).toContain(`commit ${c1}\nauthor n1\nparent none\n`);
+    expect(p.text).not.toContain('attacker');
+    expect(p.text).not.toContain('forged subject');
+  });
+});
+
+describe('presentWorld on a SHA-256 world', () => {
+  it('renders a foreign first commit patch and a subsequent commit', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'context-diff-sha256-'));
+    const dir = join(root, 'world');
+    await mkdir(dir, { recursive: true });
+    await gitIn(dir, ['init', '--quiet', '--object-format=sha256', '--initial-branch=main']);
+    try {
+      const world = await WorldRepo.open(dir);
+      const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
+      const p1 = await presentWorld(world, 'n1', { from: null, to: c1 }, 4096, 4096);
+      expect(p1.included).toEqual([c1]);
+      expect(p1.text).toContain('+one');
+      const c2 = await commitAs(world, 'n2', { 'b.txt': 'two\n' });
+      const p2 = await presentWorld(world, 'n1', { from: c1, to: c2 }, 8192, 4096);
+      expect(p2.included).toEqual([c2]);
+      expect(p2.text).toContain('+two');
+      expect(p2.text).not.toContain('+one');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

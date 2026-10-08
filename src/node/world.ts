@@ -77,6 +77,9 @@ const GIT_ENV_STRIP: readonly string[] = [
   'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
   'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM',
   'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
+  // A replace ref lets `.git/refs/replace/*` project a forged commit in place
+  // of the physical one; this variable would redirect where git looks for them.
+  'GIT_REPLACE_REF_BASE',
 ];
 
 /**
@@ -84,8 +87,11 @@ const GIT_ENV_STRIP: readonly string[] = [
  * and config-injecting variables above are removed, system and global config are
  * neutralized, and the rest of the environment (PATH, locale — git needs both)
  * is inherited. A caller with an explicit policy (the hermetic diff renderer)
- * passes overrides, which win. This is the single place that decides a kernel
- * git environment: the process environment is read, never mutated.
+ * passes overrides, which win. Replace refs are neutralized as well, so the
+ * kernel reads physical committed facts rather than a `refs/replace` projection
+ * — intentionally, since a projection is not a durable fact of the world. This
+ * is the single place that decides a kernel git environment: the process
+ * environment is read, never mutated.
  */
 function gitEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
@@ -99,6 +105,10 @@ function gitEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
     ...env,
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: '/dev/null',
+    // The kernel reads physical committed objects only: a `refs/replace` entry
+    // is a projection, and every read command (log, rev-list, first-parent,
+    // reconciliation, diff) must see the real author and subject.
+    GIT_NO_REPLACE_OBJECTS: '1',
     ...overrides,
   };
 }
@@ -648,6 +658,9 @@ export class WorldRepo {
       : (await this.commitExists(range.from) ? await this.treeOf(range.from) : await this.emptyTree());
 
     const scratch = await this.openScratchView();
+    let result: BoundedText | undefined;
+    let failed = false;
+    let failure: unknown;
     try {
       const env: Record<string, string> = {
         GIT_CONFIG_NOSYSTEM: '1',
@@ -657,10 +670,23 @@ export class WorldRepo {
         GIT_ATTR_SOURCE: range.to,
       };
       const args = [`--git-dir=${scratch}`, ...HERMETIC_CONFIG, ...HERMETIC_DIFF_ARGS, fromTree, toTree, '--'];
-      return await this.streamDiff(args, env, maxBytes);
-    } finally {
-      await rm(scratch, { recursive: true, force: true });
+      result = await this.streamDiff(args, env, maxBytes);
+    } catch (err) {
+      failed = true;
+      failure = err;
     }
+    // The scratch view is always removed, but a render failure outranks a
+    // cleanup failure so the original git error is never masked by `rm`.
+    try {
+      await rm(scratch, { recursive: true, force: true });
+    } catch (err) {
+      if (!failed) {
+        failed = true;
+        failure = err;
+      }
+    }
+    if (failed) throw failure;
+    return result!;
   }
 
   /**
@@ -674,7 +700,14 @@ export class WorldRepo {
     await mkdir(join(scratch, 'objects', 'info'), { recursive: true });
     await mkdir(join(scratch, 'refs'), { recursive: true });
     await writeFile(join(scratch, 'objects', 'info', 'alternates'), `${join(this.gitDir(), 'objects')}\n`);
-    await writeFile(join(scratch, 'config'), '');
+    // The scratch git dir is explicit (`--git-dir=`), so git derives the object
+    // format from *its* config, not the world's. An empty config means "sha1"
+    // and rejects a sha256 world's 64-hex ids, so the scratch view declares the
+    // world's own format (validated by `format()`; no other setting is read).
+    const format = await this.format();
+    await writeFile(join(scratch, 'config'), format === 'sha256'
+      ? '[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n'
+      : '');
     await writeFile(join(scratch, 'HEAD'), 'ref: refs/heads/main\n');
     return scratch;
   }

@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { GitCommandError } from '../errors.js';
 import { WorldRepo } from '../world.js';
-import { commitAs, useWorld } from './helpers.js';
+import { commitAs, gitIn, useWorld } from './helpers.js';
 
 /**
  * The bounded, pinned history primitives (T4): `commitsIn` traversal and the
@@ -161,6 +163,37 @@ describe('WorldRepo.diff', () => {
     expect(capture.truncated).toBe(true);
     expect(capture.bytesRetained).toBeLessThanOrEqual(4096);
     expect(capture.bytesRetained).toBe(Buffer.byteLength(capture.text, 'utf8'));
+  });
+
+  it('renders on a SHA-256 world: empty-tree first commit and a subsequent range', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'node-diff-sha256-'));
+    const dir = join(root, 'world');
+    await mkdir(dir, { recursive: true });
+    await gitIn(dir, ['init', '--quiet', '--object-format=sha256', '--initial-branch=main']);
+    try {
+      const world = await WorldRepo.open(dir);
+      const c1 = await commitAs(world, 'n1', { 'a.txt': 'one\n' });
+      expect(c1).toMatch(/^[0-9a-f]{64}$/);
+      const first = await world.diff({ from: null, to: c1 }, 4096);
+      expect(first.text).toContain('diff --git a/a.txt b/a.txt');
+      expect(first.text).toContain('+one');
+      const c2 = await commitAs(world, 'n2', { 'a.txt': 'two\n', 'b.txt': 'new\n' });
+      const range = await world.diff({ from: c1, to: c2 }, 4096);
+      expect(range.text).toContain('-one');
+      expect(range.text).toContain('+two');
+      expect(range.text).toContain('+new');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('runs on a host Git at or above the documented 2.42 floor for GIT_ATTR_SOURCE', async () => {
+    const out = (await gitIn(process.cwd(), ['--version'])).trim();
+    const match = /^git version (\d+)\.(\d+)/.exec(out);
+    expect(match).not.toBeNull();
+    const major = Number(match![1]);
+    const minor = Number(match![2]);
+    expect(major > 2 || (major === 2 && minor >= 42)).toBe(true);
   });
 
   it('renders the world range even when the environment points GIT_DIR elsewhere', async () => {
