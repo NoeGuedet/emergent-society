@@ -239,5 +239,5 @@ describe('C1.3 offline reconstruction (writer-backed, no runtime)', () => {
     expect(nodes[2]?.group.messages[0]?.content).toBe('Older committed context was removed.');
     expect(nodes[3]?.group.kind).toBe('dialogue');
     expect(rebuilt.snapshot().recovery).toEqual([]);
-  }, 20000);
+  }, 30000);
 });

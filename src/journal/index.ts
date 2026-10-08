@@ -13,7 +13,11 @@ export {
   TornTailError,
   type JournalWriterOptions,
 } from './writer.js';
-export { SessionAlreadyOwnedError } from './lock.js';
+export {
+  SessionAlreadyOwnedError,
+  JournalLockBusyError,
+  JournalLockUnavailableError,
+} from './lock.js';
 
 // Reading and repair.
 export { JournalReader, repair, type JournalReaderOptions } from './reader.js';

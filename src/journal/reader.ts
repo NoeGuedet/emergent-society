@@ -4,6 +4,7 @@ import type { JsonValue } from './canon.js';
 import { scanBatches } from './framing.js';
 import { readFileOrNull, syncPath } from './fsutil.js';
 import { headPath, journalPath, nodeDir, parseHead, type Head } from './layout.js';
+import { acquireLock } from './lock.js';
 import { genesisState, verifyChain } from './verify.js';
 import type { EventEnvelope } from './envelope.js';
 
@@ -114,27 +115,43 @@ export class JournalReader {
  * operator action that runs *before* the writer opens (kernel.md §3), so it
  * needs no reader instance and can never happen as a side effect of reading.
  *
+ * It takes exclusive ownership for the duration, so it can never truncate a log
+ * a live writer is appending to; a live owner is refused. A journal that does
+ * not exist is untouched (no directory or lock is created just to repair it).
+ *
+ * @throws SessionAlreadyOwnedError when a live writer owns the journal.
+ * @throws JournalLockBusyError / JournalLockUnavailableError when the ownership
+ * guard cannot run; the log is left untouched.
  * @throws CorruptFrameError on interior corruption — it refuses to truncate
  * through valid committed events; any other read error propagates.
  */
 export async function repair(home: string, nodeUid: string): Promise<{ tornBytes: number }> {
   const dir = nodeDir(home, nodeUid);
   const path = journalPath(dir);
-  const raw = await readFileOrNull(path);
-  if (raw === null) return { tornBytes: 0 };
-  // scanBatches throws CorruptFrameError on interior corruption: repair must
-  // never truncate through valid committed events, so that error propagates
-  // and nothing is deleted.
-  const { tornBytes } = scanBatches(raw);
-  if (tornBytes > 0) {
-    await truncate(path, raw.length - tornBytes);
-    // The truncation and its directory entry are both metadata changes, so both
-    // are fsynced before the caller trusts the new length.
-    await syncPath(path);
-    await syncPath(dir);
-    // The head checkpoint may now point past the truncation point; it is
-    // disposable, so it is removed and rebuilt from the log on the next flush.
-    await rm(headPath(dir), { force: true });
+  // Probe first: repairing a journal that does not exist must not create one.
+  if ((await readFileOrNull(path)) === null) return { tornBytes: 0 };
+  const ownership = await acquireLock(dir, nodeUid);
+  try {
+    // Read under ownership, so the length cannot change between scan and
+    // truncate.
+    const raw = await readFileOrNull(path);
+    if (raw === null) return { tornBytes: 0 };
+    // scanBatches throws CorruptFrameError on interior corruption: repair must
+    // never truncate through valid committed events, so that error propagates
+    // and nothing is deleted.
+    const { tornBytes } = scanBatches(raw);
+    if (tornBytes > 0) {
+      await truncate(path, raw.length - tornBytes);
+      // The truncation and its directory entry are both metadata changes, so both
+      // are fsynced before the caller trusts the new length.
+      await syncPath(path);
+      await syncPath(dir);
+      // The head checkpoint may now point past the truncation point; it is
+      // disposable, so it is removed and rebuilt from the log on the next flush.
+      await rm(headPath(dir), { force: true });
+    }
+    return { tornBytes };
+  } finally {
+    await ownership.release();
   }
-  return { tornBytes };
 }

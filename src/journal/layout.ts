@@ -15,6 +15,7 @@ import { HASH_RE } from './canon.js';
  */
 export const LOG_FILE = 'journal.v0.jsonl.zstd';
 export const LOCK_FILE = 'journal.v0.lock';
+export const OWNER_FILE = 'journal.v0.owner';
 export const HEAD_FILE = 'journal.v0.head';
 
 /** `nodes/<uid>/` — the node's journal directory, inside the cell home. */
@@ -32,9 +33,23 @@ export function headPath(dir: string): string {
   return join(dir, HEAD_FILE);
 }
 
-/** The single-writer lock of a node. */
+/**
+ * The stable flock sidecar of a node. It is the lock target and is never
+ * unlinked or atomically replaced, so every lifecycle transition contends on
+ * the same inode; its content is only ever a legacy record from an older
+ * writer.
+ */
 export function lockPath(dir: string): string {
   return join(dir, LOCK_FILE);
+}
+
+/**
+ * The owner record: the durable `{pid, startedAt, token}` that grants lifetime
+ * exclusion. It is a separate file from the flock sidecar because it must be
+ * written atomically (temp + rename) while the sidecar inode stays fixed.
+ */
+export function ownerPath(dir: string): string {
+  return join(dir, OWNER_FILE);
 }
 
 /**

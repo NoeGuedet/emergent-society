@@ -7,7 +7,7 @@ import { encodeBatch, scanBatches } from './framing.js';
 import { CorruptionError, JournalError } from './errors.js';
 import { atomicWriteFile, readFileOrNull, syncPath, writeAll } from './fsutil.js';
 import { headPath, journalPath, nodeDir, type Head } from './layout.js';
-import { acquireLock, releaseLock, SessionAlreadyOwnedError } from './lock.js';
+import { acquireLock, SessionAlreadyOwnedError, type JournalOwnership } from './lock.js';
 import { genesisState, verifyAll } from './verify.js';
 
 export { SessionAlreadyOwnedError };
@@ -143,6 +143,7 @@ export class JournalWriter {
     private readonly batchWindowMs: number,
     private readonly onError: ((err: Error) => void) | undefined,
     private readonly log: FileHandle,
+    private readonly ownership: JournalOwnership,
   ) {}
 
   /**
@@ -159,19 +160,20 @@ export class JournalWriter {
   ): Promise<JournalWriter> {
     const dir = nodeDir(home, nodeUid);
     await mkdir(dir, { recursive: true });
-    await acquireLock(dir, nodeUid);
+    const ownership = await acquireLock(dir, nodeUid);
     let log: FileHandle;
     try {
       // 'a' both creates the log and makes every write an append: no code path
       // can seek backwards into journaled history.
       log = await openFile(journalPath(dir), 'a');
     } catch (err) {
-      await releaseLock(dir);
+      // Same-token cleanup; the open failure stays the surfaced cause.
+      await ownership.release().catch(() => {});
       throw err;
     }
     const w = new JournalWriter(
       dir, new BlobStore(home),
-      opts.now ?? systemClock, opts.batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS, opts.onError, log,
+      opts.now ?? systemClock, opts.batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS, opts.onError, log, ownership,
     );
     try {
       // The log file was just created: fsync the directory so its entry is
@@ -179,7 +181,8 @@ export class JournalWriter {
       await syncPath(dir);
       await w.resume();
     } catch (err) {
-      await w.forceClose();
+      // Preserve the open failure as the surfaced cause: cleanup is best-effort.
+      await w.forceClose().catch(() => {});
       throw err;
     }
     return w;
@@ -405,15 +408,24 @@ export class JournalWriter {
     // are released even when the flush rejects.
     if (this.closed) return;
     this.closed = true;
+    let failure: unknown;
     try {
       this.throwIfPoisoned();
       // Attempt a final flush: a burst that failed on the write-behind path is
       // retried here, so close() rejects only when the events really could not
       // be committed.
       await this.enqueueFlush();
-    } finally {
-      await this.forceClose();
+    } catch (err) {
+      failure = err;
     }
+    // The handle and ownership are always released, even when the flush
+    // rejected; the flush failure stays the surfaced cause.
+    try {
+      await this.forceClose();
+    } catch (err) {
+      failure ??= err;
+    }
+    if (failure !== undefined) throw failure;
   }
 
   private throwIfPoisoned(): void {
@@ -436,8 +448,20 @@ export class JournalWriter {
   private async forceClose(): Promise<void> {
     this.closed = true;
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-    await this.log.close();
-    await releaseLock(this.dir);
+    let failure: unknown;
+    try {
+      await this.log.close();
+    } catch (err) {
+      failure = err;
+    }
+    // Ownership is released even when the handle close failed, and the close
+    // failure is preserved as the surfaced cause.
+    try {
+      await this.ownership.release();
+    } catch (err) {
+      failure ??= err;
+    }
+    if (failure !== undefined) throw failure;
   }
 }
 
