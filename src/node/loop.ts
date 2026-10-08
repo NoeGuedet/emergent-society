@@ -79,6 +79,7 @@ class Runtime implements AgentRuntime {
       onTurnStart: async (ctx): Promise<void> => { await this.beginTurn(ctx); },
       readHistory: (home, uid, knownTypes) => loadVerifiedEvents(home, uid, knownTypes),
       readBlob: (hash) => new BlobStore(this.options.home).get(hash),
+      acknowledgedWorld: () => this.fold.acknowledgedWorld(),
     };
   }
 

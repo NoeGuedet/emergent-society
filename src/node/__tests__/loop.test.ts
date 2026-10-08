@@ -4,13 +4,16 @@ import { access } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { NodeDriver } from '../driver.js';
 import { HeadWatcher } from '../watcher.js';
-import { WorldRepo } from '../world.js';
+import { WorldRepo, type WorldRange } from '../world.js';
+import { BlobStore } from '../../journal/index.js';
 import { DEFAULT_SHELL_ENV, type ShellPolicy } from '../tools/shell.js';
 import { createAgentRuntime, defaultAgentConfig, type AgentRuntime } from '../loop.js';
+import { ContextFold } from '../../context/fold.js';
 import { rederivePlans } from '../../context/assembler.js';
 import { canonicalBytes } from '../../context/artifacts.js';
-import { C13_EVENT_TYPES } from '../../context/events.js';
+import { C13_EVENT_TYPES, createBoundaryRegistry } from '../../context/events.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
+import type { DriverHooks } from '../gate.js';
 import { ProviderAdapter, type ProviderPolicy } from '../../provider/adapter.js';
 import type { SerializedTransport, TransportResult } from '../../provider/transport.js';
 import type {
@@ -491,5 +494,175 @@ describe('offline reconstruction', () => {
     const events = await eventsOf(fx);
     const elsewhere = await WorldRepo.init(join(dirname(fx.home), 'elsewhere-world'));
     await expect(rederivePlans(events, elsewhere)).rejects.toThrow();
+  });
+});
+
+const waitTurn = (): { outcome: 'waiting'; toolCalls: boolean } =>
+  ({ outcome: 'waiting', toolCalls: false });
+
+/**
+ * Hooks that acknowledge on resume but claim nothing once a turn starts: the
+ * fixture handler records no perception of its own, so it reports no proof — the
+ * way a trusted handler that only waits owns no acknowledgement.
+ */
+function resumingProofHooks(home: string): DriverHooks {
+  const fold = new ContextFold();
+  let moving = false;
+  return {
+    registry: createBoundaryRegistry(),
+    onDurable: async (events) => { await fold.observe(events); },
+    onReady: async () => {},
+    onTurnStart: async () => { moving = true; },
+    readHistory: (path, uid, knownTypes) => loadVerifiedEvents(path, uid, knownTypes),
+    readBlob: (hash) => new BlobStore(home).get(hash),
+    acknowledgedWorld: () => (moving ? null : fold.acknowledgedWorld()),
+  };
+}
+
+describe('durable world acknowledgement', () => {
+  it('keeps the last durable perception across a renderer failure and two restarts', async () => {
+    const fx = fixture();
+    const h0 = await commitAs(fx.world, 'n2', { 'n2/a.md': 'a' });
+    // Turn 0 perceives null..h0 and acknowledges it, then parks.
+    const transport = new ScriptedTransport([noCalls('seen')]);
+    const runtime = runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
+    const first = await openRuntime(fx, runtime);
+    const run0 = first.run();
+    await vi.waitFor(() => expect(first.state).toBe('waiting'));
+    first.stop();
+    await run0;
+    expect(transport.sends).toHaveLength(1);
+
+    // The world moves while the node is down; the next turn's renderer fails
+    // after its durable turn/start but before it records any perception.
+    const h1 = await commitAs(fx.world, 'n3', { 'n3/b.md': 'b' });
+    presenter.override = () => { throw new Error('render boom'); };
+    const failing = runtimeFor(
+      fx, configWith({ policy: { retryDelayMs: 1 } }), new ScriptedTransport([]),
+    );
+    const d2 = await NodeDriver.open(fx.home, 'n1', failing.handler, fx.world,
+      { knownTypes: C13_EVENT_TYPES, hooks: failing.hooks, worldPollMs: 0 });
+    await expect(d2.run()).rejects.toThrow('render boom');
+    presenter.override = null;
+
+    const events = await eventsOf(fx);
+    expect(events.some((e) => e.type === 'turn/start'
+      && (e.data as unknown as { world: WorldRange }).world.to === h1)).toBe(true);
+    expect(events.some((e) => e.type === 'world/perception'
+      && (e.data as unknown as { range: WorldRange }).range.to === h1)).toBe(false);
+
+    // Two restarts: each opens on the acknowledged HEAD h0, never the failed
+    // range's h1 — the error closer does not roll the acknowledgement back.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const seen: WorldRange[] = [];
+      const ref: { d: NodeDriver | null } = { d: null };
+      ref.d = await NodeDriver.open(fx.home, 'n1', (ctx) => {
+        seen.push(ctx.world);
+        ref.d!.stop();
+        return waitTurn();
+      }, fx.world, {
+        knownTypes: C13_EVENT_TYPES, hooks: resumingProofHooks(fx.home), worldPollMs: 0,
+      });
+      await ref.d.run();
+      expect(seen).toEqual([{ from: h0, to: h1 }]);
+    }
+  });
+
+  it('starts the next turn from the perceived HEAD after a provider failure, not replaying it', async () => {
+    const fx = fixture();
+    const h0 = await commitAs(fx.world, 'n2', { 'n2/a.md': 'a' });
+    // Turn 0 perceives null..h0 and acknowledges it, then the provider fails
+    // recoverably and the node parks.
+    const transport = new ScriptedTransport([statusResponse(429), statusResponse(429)]);
+    const runtime = runtimeFor(
+      fx, configWith({ policy: { maxAttempts: 2, retryDelayMs: 1 } }), transport,
+    );
+    const first = await openRuntime(fx, runtime);
+    const run0 = first.run();
+    await vi.waitFor(() => expect(first.state).toBe('waiting'));
+    first.stop();
+    await run0;
+    expect((await eventsOf(fx)).find((e) => e.type === 'turn/end')?.data)
+      .toMatchObject({ outcome: 'error' });
+
+    // The world moves; a restart resumes from the perceived HEAD, so the next
+    // range begins at h0 — the failed turn is not re-presented.
+    const h1 = await commitAs(fx.world, 'n3', { 'n3/b.md': 'b' });
+    const seen: WorldRange[] = [];
+    const ref: { d: NodeDriver | null } = { d: null };
+    ref.d = await NodeDriver.open(fx.home, 'n1', (ctx) => {
+      seen.push(ctx.world);
+      ref.d!.stop();
+      return waitTurn();
+    }, fx.world, {
+      knownTypes: C13_EVENT_TYPES, hooks: resumingProofHooks(fx.home), worldPollMs: 0,
+    });
+    await ref.d.run();
+    expect(seen).toEqual([{ from: h0, to: h1 }]);
+  });
+
+  it('acknowledges a turn whose perception text is empty', async () => {
+    const fx = fixture();
+    const h0 = await commitAs(fx.world, 'n2', { 'n2/a.md': 'a' });
+    // One step per turn: turn 0 chains, and turn 1 opens on the unmoved HEAD, so
+    // its perception carries no text at all.
+    const base = defaultAgentConfig();
+    const config: AgentConfig = {
+      ...base, policy: { ...base.policy, stepsPerTurn: 1, retryDelayMs: 1 },
+    };
+    const transport = new ScriptedTransport([calling([execute('c1', 'true')]), noCalls('done')]);
+    const runtime = runtimeFor(fx, config, transport);
+    const driver = await openRuntime(fx, runtime);
+    const running = driver.run();
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    driver.stop();
+    await running;
+
+    const events = await eventsOf(fx);
+    expect(events.filter((e) => e.type === 'world/perception')).toHaveLength(2);
+    const ack = runtime.hooks.acknowledgedWorld();
+    // The empty-text perception is still a durable proof of turn 1's range.
+    expect(ack).not.toBeNull();
+    expect(ack!.turn).toBe(1);
+    expect(ack!.range).toEqual({ from: h0, to: h0 });
+    const perception = events.find((e) => e.raw.seq === ack!.source.seq);
+    expect(perception?.type).toBe('world/perception');
+    const stored = (perception?.data as unknown as {
+      value: { kind: string; value?: { text: string } };
+    }).value;
+    expect(stored.kind).toBe('inline');
+    expect(stored.value?.text).toBe('');
+  });
+
+  it('starts the next turn from the perceived HEAD after the handler throws', async () => {
+    const fx = fixture();
+    const h0 = await commitAs(fx.world, 'n2', { 'n2/a.md': 'a' });
+    // The runtime's own onTurnStart records and flushes the perception; the
+    // handler then throws, so the turn closes with a durable error closer.
+    const runtime = runtimeFor(
+      fx, configWith({ policy: { retryDelayMs: 1 } }), new ScriptedTransport([]),
+    );
+    const d0 = await NodeDriver.open(fx.home, 'n1', async () => {
+      throw new Error('assistant throw');
+    }, fx.world, { knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0 });
+    await expect(d0.run()).rejects.toThrow('assistant throw');
+    const events = await eventsOf(fx);
+    expect(events.filter((e) => e.type === 'world/perception')).toHaveLength(1);
+    expect(events.find((e) => e.type === 'turn/end')?.data).toMatchObject({ outcome: 'error' });
+
+    // The durable perception still names h0: after a restart the next range
+    // begins there, and the failed turn is not re-presented.
+    const h1 = await commitAs(fx.world, 'n3', { 'n3/b.md': 'b' });
+    const seen: WorldRange[] = [];
+    const ref: { d: NodeDriver | null } = { d: null };
+    ref.d = await NodeDriver.open(fx.home, 'n1', (ctx) => {
+      seen.push(ctx.world);
+      ref.d!.stop();
+      return waitTurn();
+    }, fx.world, {
+      knownTypes: C13_EVENT_TYPES, hooks: resumingProofHooks(fx.home), worldPollMs: 0,
+    });
+    await ref.d.run();
+    expect(seen).toEqual([{ from: h0, to: h1 }]);
   });
 });

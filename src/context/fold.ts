@@ -1,5 +1,5 @@
 import type { EventEnvelope } from '../journal/index.js';
-import type { GateScope } from '../node/gate.js';
+import type { GateScope, WorldAcknowledgement } from '../node/gate.js';
 import type { WorldRange } from '../node/world.js';
 import { resolveArtifact, resolveStored, toJson } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
@@ -121,6 +121,13 @@ export class ContextFold {
   private open: MutableOpen | null = null;
   private readonly recovery: RecoveryEntry[] = [];
   private watermark: Source | null = null;
+  /**
+   * The latest durable `world/perception` the fold observed, as the proof a
+   * driver verifies before advancing its world watermark. It is set from the
+   * resolved, validated perception itself — even when its text is empty — and
+   * never from `turn/start` or a closer.
+   */
+  private perceptionProof: WorldAcknowledgement | null = null;
   private readonly pendingCompactions: CompactionStart[] = [];
   private readonly pendingSummaries = new Map<string, { summary: CompactionSummary; source: Source }>();
   private readonly seen: VerifiedEvent[] = [];
@@ -276,6 +283,11 @@ export class ContextFold {
       invariant('resolved perception range does not equal the wrapper range');
     }
     open.perceptionSeen = true;
+    this.perceptionProof = {
+      turn: open.turn,
+      range: { from: data.range.from, to: data.range.to },
+      source: sourceOf(event),
+    };
     if (perception.text.length > 0) {
       open.perceptionGroup = toJson({
         id: sourceOf(event), kind: 'perception', turn: open.turn,
@@ -636,6 +648,23 @@ export class ContextFold {
 
   verifiedEvents(): VerifiedEvents {
     return this.seen.slice();
+  }
+
+  /**
+   * The proof a driver verifies before advancing its watermark: the latest
+   * durable world perception this fold folded, derived from the full observed
+   * history and only from events delivered as durable — never from a
+   * `turn/start` or a closer, and never from a cache or snapshot. The returned
+   * object is a fresh copy, so no caller can mutate fold state through it.
+   */
+  acknowledgedWorld(): WorldAcknowledgement | null {
+    const proof = this.perceptionProof;
+    if (proof === null) return null;
+    return {
+      turn: proof.turn,
+      range: { from: proof.range.from, to: proof.range.to },
+      source: { seq: proof.source.seq, hash: proof.source.hash },
+    };
   }
 
   unresolvedCalls(): readonly {

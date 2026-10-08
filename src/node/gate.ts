@@ -9,6 +9,7 @@ import type {
 } from '../context/contracts.js';
 import type { VerifiedEvent, VerifiedEvents } from '../context/loader.js';
 import type { TurnContext } from './driver.js';
+import type { WorldRange } from './world.js';
 
 /**
  * The trusted boundary gate (T1 factory / T2 driver).
@@ -61,6 +62,19 @@ export interface BoundaryGate {
 
 export type DurableWatermark = { readonly seq: number; readonly hash: string };
 
+/**
+ * The proof a hooks bundle gives the driver that a turn's world range was
+ * durably perceived: the turn, the opening range and the receipt of the
+ * `world/perception` it recorded and observed. The driver advances its
+ * watermark only on a proof it can re-verify against its own delivered
+ * observations, so a handler can never move the watermark with a claim alone.
+ */
+export type WorldAcknowledgement = {
+  readonly turn: number;
+  readonly range: WorldRange;
+  readonly source: Source;
+};
+
 export type GateCallbacks = {
   /** Writer-backed append; the gate validates through the registry first. */
   readonly append: (type: string, data: JsonValue) => EventEnvelope;
@@ -77,7 +91,11 @@ export type GateCallbacks = {
   readonly now: () => number;
 };
 
-/** The driver's trusted hooks (T2). `readHistory`/`readBlob` are required when hooks exist. */
+/**
+ * The driver's trusted hooks (T2). `readHistory`, `readBlob` and
+ * `acknowledgedWorld` are required when hooks exist; the driver refuses a bundle
+ * that omits any of them, before it takes the writer.
+ */
 export interface DriverHooks {
   readonly registry: BoundaryRegistry;
   onDurable(events: readonly VerifiedEvent[]): Promise<void>;
@@ -85,6 +103,19 @@ export interface DriverHooks {
   onTurnStart(ctx: TurnContext): Promise<void>;
   readHistory: (home: string, uid: string, knownTypes: ReadonlySet<string>) => Promise<VerifiedEvents>;
   readBlob: (hash: string) => Promise<Uint8Array>;
+  /**
+   * The latest world acknowledgement the handler can prove from its own durable
+   * history — the `world/perception` it has recorded and observed — or null when
+   * it owns no perception (a trusted handler that operates without one).
+   *
+   * The driver calls this after `onTurnStart` and, on resume, after the whole
+   * history has been delivered; it advances the watermark only on a proof whose
+   * turn, opening range and receipt match a delivered `world/perception`
+   * observation. Null alone never advances the watermark, so a handler that
+   * makes no perception claim is never falsely acknowledged — the prior
+   * watermark simply stands.
+   */
+  acknowledgedWorld(): WorldAcknowledgement | null;
 }
 
 /** Fixed artifact ingest ceiling (algorithm 2); lower runtime limits apply before capture. */

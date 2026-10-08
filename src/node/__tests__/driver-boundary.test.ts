@@ -12,15 +12,26 @@ import {
 } from '../../context/loader.js';
 import { defaultAgentConfig } from '../../context/config.js';
 import type { Source } from '../../context/contracts.js';
-import type { BoundaryGate, DriverHooks } from '../gate.js';
+import type { BoundaryGate, DriverHooks, WorldAcknowledgement } from '../gate.js';
 import { GateClosedError } from '../gate.js';
 import { NodeDriver, type TurnContext, type TurnResult } from '../driver.js';
 import { HeadWatcher } from '../watcher.js';
+import { WorldRepo, type WorldRange } from '../world.js';
 import { commitAs, useWorld, writeWorldFile } from './helpers.js';
 
 const fixture = useWorld('node-boundary-');
 
 const wait = (): TurnResult => ({ outcome: 'waiting', toolCalls: false });
+
+/** A structurally valid inline world perception for acknowledgement fixtures. */
+function perceptionValue(range: WorldRange, text = '') {
+  return {
+    uid: 'n1', range, effectiveFrom: null, fallback: 'none',
+    renderer: { policy: 'commit-patches-v1', gitVersion: 'git version 2.43.0', attrSource: 'to' },
+    maxBytes: 32768, maxCommits: 4096, listTruncated: false,
+    commits: [], included: [], omittedOwn: [], text, truncated: false,
+  };
+}
 
 /** A reusable hook bundle over the real T1 loader and blob store. */
 function hooksFor(home: string, over: Partial<DriverHooks> = {}): DriverHooks {
@@ -32,6 +43,7 @@ function hooksFor(home: string, over: Partial<DriverHooks> = {}): DriverHooks {
     readHistory: (path: string, uid: string, knownTypes: ReadonlySet<string>) =>
       loadVerifiedEvents(path, uid, knownTypes),
     readBlob: (hash: string) => new BlobStore(home).get(hash),
+    acknowledgedWorld: () => null,
     ...over,
   };
 }
@@ -475,10 +487,11 @@ describe('error-closer recovery at ready', () => {
     const running = ref.d.run();
     await handlerReached;
     // Two writes fail: the error closer's flush and close()'s retry, so no
-    // closer reaches disk and the group is left open.
+    // closer reaches disk and the group is left open. The handler's own failure
+    // is what reaches the caller: a commit or closer fault must not displace it.
     await withFailingWrite(home, async () => {
       inject();
-      await expect(running).rejects.toThrow('injected EIO');
+      await expect(running).rejects.toThrow('boom after flush');
     }, 2);
     const before = await read(home);
     expect(before.some((e) => e.type === 'turn/end')).toBe(false);
@@ -528,5 +541,244 @@ describe('error-closer recovery at ready', () => {
     // The real result for call-1 is still the only one, and no second result exists.
     expect(after.filter((e) => e.type === 'tool/result'
       && (e.data as unknown as { callId: string }).callId === 'call-1')).toHaveLength(1);
+  });
+});
+
+/** A hook object literal missing one required port, for the early-refusal tests. */
+function withoutPort(hooks: DriverHooks, port: string): DriverHooks {
+  const stripped = { ...hooks } as unknown as Record<string, unknown>;
+  delete stripped[port];
+  return stripped as unknown as DriverHooks;
+}
+
+describe('the world acknowledgement proof', () => {
+  it('accepts a proof whose source is a delivered world/perception and advances nothing else', async () => {
+    const { home, world } = fixture();
+    let ack: WorldAcknowledgement | null = null;
+    const hooks = hooksFor(home, {
+      onTurnStart: async (ctx) => {
+        const source = ctx.gate.append('world/perception', {
+          turn: ctx.turn, range: ctx.world,
+          value: { kind: 'inline', value: perceptionValue(ctx.world) },
+        } as never);
+        await ctx.gate.flush();
+        ack = { turn: ctx.turn, range: { from: ctx.world.from, to: ctx.world.to }, source };
+      },
+      acknowledgedWorld: () => ack,
+    });
+    let handlerCalls = 0;
+    const ref: { d: NodeDriver | null } = { d: null };
+    ref.d = await NodeDriver.open(home, 'n1', () => {
+      handlerCalls += 1;
+      ref.d!.stop();
+      return wait();
+    }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+    await ref.d.run();
+    expect(handlerCalls).toBe(1);
+    expect((await read(home)).some((e) => e.type === 'world/perception')).toBe(true);
+  });
+
+  it('rejects a proof whose source is a pending, undelivered receipt', async () => {
+    const { home, world } = fixture();
+    let cited: Source | null = null;
+    let handlerCalls = 0;
+    const hooks = hooksFor(home, {
+      onTurnStart: async (ctx) => {
+        // Appended but never flushed: the receipt is pending, delivered nowhere.
+        cited = ctx.gate.append('world/perception', {
+          turn: ctx.turn, range: ctx.world,
+          value: { kind: 'inline', value: perceptionValue(ctx.world) },
+        } as never);
+      },
+      acknowledgedWorld: () => (cited === null
+        ? null
+        : { turn: 0, range: { from: null, to: null }, source: cited }),
+    });
+    const ref: { d: NodeDriver | null } = { d: null };
+    ref.d = await NodeDriver.open(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
+      { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0, batchWindowMs: 10_000 });
+    await expect(ref.d.run()).rejects.toThrow(/delivered observation/);
+    expect(handlerCalls).toBe(0);
+  });
+
+  it('rejects a proof whose source is a delivered observation of the wrong type', async () => {
+    const { home, world } = fixture();
+    let startSource: Source | null = null;
+    let handlerCalls = 0;
+    const hooks = hooksFor(home, {
+      onDurable: async (events) => {
+        for (const event of events) {
+          if (event.type === 'turn/start') startSource = { seq: event.raw.seq, hash: event.raw.hash };
+        }
+      },
+      acknowledgedWorld: () => (startSource === null
+        ? null
+        : { turn: 0, range: { from: null, to: null }, source: startSource }),
+    });
+    const ref: { d: NodeDriver | null } = { d: null };
+    ref.d = await NodeDriver.open(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
+      { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+    await expect(ref.d.run()).rejects.toThrow(/not world\/perception/);
+    expect(handlerCalls).toBe(0);
+  });
+
+  it('rejects a proof whose turn is not the current turn, before any effect', async () => {
+    const { home, world } = fixture();
+    let ack: WorldAcknowledgement | null = null;
+    let handlerCalls = 0;
+    const hooks = hooksFor(home, { acknowledgedWorld: () => ack });
+    const ref: { d: NodeDriver | null } = { d: null };
+    ref.d = await NodeDriver.open(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
+      { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+    ack = { turn: 7, range: { from: null, to: null }, source: { seq: 0, hash: 'a'.repeat(64) } };
+    await expect(ref.d.run()).rejects.toThrow(/current turn/);
+    expect(handlerCalls).toBe(0);
+  });
+
+  it('rejects a proof whose range is not the turn opening range, before any effect', async () => {
+    const { home, world } = fixture();
+    let ack: WorldAcknowledgement | null = null;
+    let handlerCalls = 0;
+    const hooks = hooksFor(home, { acknowledgedWorld: () => ack });
+    const ref: { d: NodeDriver | null } = { d: null };
+    ref.d = await NodeDriver.open(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
+      { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+    ack = { turn: 0, range: { from: null, to: 'b'.repeat(40) }, source: { seq: 0, hash: 'a'.repeat(64) } };
+    await expect(ref.d.run()).rejects.toThrow(/range/);
+    expect(handlerCalls).toBe(0);
+  });
+
+  it('treats a null proof as no acknowledgement and lets the handler run', async () => {
+    const { home, world } = fixture();
+    const hooks = hooksFor(home, { acknowledgedWorld: () => null });
+    let handlerCalls = 0;
+    const ref: { d: NodeDriver | null } = { d: null };
+    ref.d = await NodeDriver.open(home, 'n1', () => {
+      handlerCalls += 1;
+      ref.d!.stop();
+      return wait();
+    }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+    await ref.d.run();
+    expect(handlerCalls).toBe(1);
+  });
+});
+
+describe('hook contract refusals', () => {
+  it('refuses a hooks bundle that does not expose acknowledgedWorld', async () => {
+    const { home, world } = fixture();
+    const hooks = withoutPort(hooksFor(home), 'acknowledgedWorld');
+    await expect(NodeDriver.open(home, 'n1', wait, world,
+      { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 })).rejects.toThrow(/acknowledgedWorld/);
+  });
+
+  it('refuses provided knownTypes that omit a node lifecycle type', async () => {
+    const { home, world } = fixture();
+    const hooks = hooksFor(home);
+    const known = new Set([...C13_EVENT_TYPES].filter((type) => type !== 'node/shutdown'));
+    await expect(NodeDriver.open(home, 'n1', wait, world,
+      { knownTypes: known, hooks, worldPollMs: 0 })).rejects.toThrow(/node\/shutdown/);
+  });
+
+  it('journals a fixed maintenance label under hooks, never the raw message', async () => {
+    const { home, world } = fixture();
+    const hooks = hooksFor(home);
+    const d = await NodeDriver.open(home, 'n1', wait, world, {
+      knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0,
+      onMaintenance: () => { throw new Error('secret api key sk-live-123'); },
+    });
+    await expect(d.run()).rejects.toThrow('secret api key sk-live-123');
+    const shutdown = (await read(home)).find((e) => e.type === 'node/shutdown');
+    expect(shutdown?.data).toEqual({ reason: 'maintenance-error', error: 'maintenance failure' });
+  });
+
+  it('fails a turn whose toolCalls report disagrees with the accepted gate', async () => {
+    const { home, world } = fixture();
+    const hooks = hooksFor(home);
+    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+      ctx.gate.append('tool/call', {
+        turn: ctx.turn, request: { turn: ctx.turn, ordinal: 0 },
+        call: { id: 'c1', type: 'function', function: { name: 'execute', arguments: '{}' } },
+      });
+      return { outcome: 'waiting', toolCalls: false };
+    }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+    await expect(d.run()).rejects.toThrow(/toolCalls/);
+    const end = (await read(home)).find((e) => e.type === 'turn/end');
+    expect(end?.data).toMatchObject({ outcome: 'error', error: 'kernel invariant failure' });
+    expect(end?.ignorable).toBeUndefined();
+  });
+});
+
+describe('gate revocation on every failure path', () => {
+  it('revokes the gate when the turn/start barrier flush fails', async () => {
+    const { home, world } = fixture();
+    const hooks = hooksFor(home);
+    const d = await NodeDriver.open(home, 'n1', wait, world,
+      { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0, batchWindowMs: 10_000 });
+    let retained: BoundaryGate | null = null;
+    const loose = d as unknown as {
+      makeGate: (phase: string, turn: number | null, signal: AbortSignal) =>
+        { gate: BoundaryGate; close: () => void };
+    };
+    const original = loose.makeGate.bind(d);
+    loose.makeGate = (phase, turn, signal) => {
+      const created = original(phase, turn, signal);
+      if (phase === 'turn') retained = created.gate;
+      return created;
+    };
+    await withFailingWrite(home, async () => {
+      await expect(d.run()).rejects.toThrow('injected EIO');
+    });
+    expect(retained).not.toBeNull();
+    expect(() => retained!.append('compaction/abort', { id: 'x', reason: 'orphan' }))
+      .toThrow(GateClosedError);
+    await expect(retained!.flush()).rejects.toThrow(GateClosedError);
+  });
+
+  it('revokes the gate when the commit fails', async () => {
+    const { home, world } = fixture();
+    const hooks = hooksFor(home);
+    let retained: BoundaryGate | null = null;
+    const spy = vi.spyOn(WorldRepo.prototype, 'commitAll').mockRejectedValue(new Error('commit dead'));
+    try {
+      const d = await NodeDriver.open(home, 'n1', (ctx) => {
+        retained = ctx.gate;
+        return wait();
+      }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+      await expect(d.run()).rejects.toThrow('commit dead');
+      expect(retained).not.toBeNull();
+      expect(() => retained!.append('compaction/abort', { id: 'x', reason: 'orphan' }))
+        .toThrow(GateClosedError);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('revokes the gate when the error closer cannot flush', async () => {
+    const { home, world } = fixture();
+    const hooks = hooksFor(home);
+    let retained: BoundaryGate | null = null;
+    let release!: () => void;
+    const reached = new Promise<void>((r) => { release = r; });
+    let inject!: () => void;
+    const active = new Promise<void>((r) => { inject = r; });
+    const ref: { d: NodeDriver | null } = { d: null };
+    ref.d = await NodeDriver.open(home, 'n1', async (ctx) => {
+      retained = ctx.gate;
+      await ctx.gate.flush();
+      release();
+      await active;
+      throw new Error('boom');
+    }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0, batchWindowMs: 10_000 });
+    const running = ref.d.run();
+    await reached;
+    await withFailingWrite(home, async () => {
+      inject();
+      await expect(running).rejects.toThrow('boom');
+    }, 2);
+    expect(retained).not.toBeNull();
+    expect(() => retained!.append('compaction/abort', { id: 'x', reason: 'orphan' }))
+      .toThrow(GateClosedError);
+    await expect(retained!.capture(new Uint8Array(), 'utf8')).rejects.toThrow(GateClosedError);
+    await expect(retained!.store({ a: 1 })).rejects.toThrow(GateClosedError);
   });
 });

@@ -4,12 +4,12 @@ import {
   type EventDataFor, type EventEnvelope, type JsonValue, type JournalWriterOptions,
 } from '../journal/index.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
-import { NodeStateError } from './errors.js';
+import { NodeStateError, WorldReconciliationError } from './errors.js';
 import { WakeLatch } from './latch.js';
 import {
   createBoundaryGate,
   type BoundaryGate, type BoundaryRegistry, type DurableWatermark, type DriverHooks,
-  type GateCallbacks, type GateScope,
+  type GateCallbacks, type GateScope, type WorldAcknowledgement,
 } from './gate.js';
 import type { SafeFailure, Source } from '../context/contracts.js';
 import type { VerifiedEvent } from '../context/loader.js';
@@ -24,6 +24,27 @@ export type NodeState = 'booting' | 'active' | 'waiting' | 'stopping' | 'stopped
  * injected (or the wall clock when none was given).
  */
 const systemClock = (): number => Date.now();
+
+/**
+ * The replay vocabulary a hooks bundle must be able to read: the node's own
+ * lifecycle types unioned with every boundary type in its registry. When the
+ * caller supplies `knownTypes`, it must cover both sets — a set missing a node
+ * lifecycle type or a registered boundary type is refused here, explicitly and
+ * early, rather than surfacing later as an unknown-event replay failure.
+ */
+function checkedKnownTypes(
+  registryTypes: readonly string[], provided: ReadonlySet<string> | undefined,
+): ReadonlySet<string> {
+  if (provided === undefined) {
+    return new Set([...NODE_EVENT_TYPES, ...registryTypes]);
+  }
+  for (const type of [...NODE_EVENT_TYPES, ...registryTypes]) {
+    if (!provided.has(type)) {
+      throw new Error(`knownTypes is missing event type ${JSON.stringify(type)}`);
+    }
+  }
+  return provided;
+}
 
 // The turn/shutdown vocabulary lives in events.ts (single home); re-exported
 // here for consumers of the driver's own signatures. The public surface
@@ -73,7 +94,9 @@ export interface NodeDriverOptions extends JournalWriterOptions {
   /**
    * The event types this driver's replay understands, defaulting to its own
    * `NODE_EVENT_TYPES`. Later checkpoints boot a driver with their types unioned
-   * in, so a journal written by a richer node still resumes here.
+   * in, so a journal written by a richer node still resumes here. With hooks, a
+   * supplied set must cover both `NODE_EVENT_TYPES` and every type in the
+   * registry; a set missing either is refused before the writer is opened.
    */
   knownTypes?: ReadonlySet<string>;
   /**
@@ -106,11 +129,16 @@ export class NodeDriver {
   private turn = 0;
   /**
    * The last world commit this node has been shown (§5.2), null before it has
-   * ever perceived the world. It advances when a turn opens, not when a commit
-   * lands: what a turn perceives is fixed at its opening, and a commit made
-   * while the turn ran is part of the *next* turn's range — otherwise a foreign
-   * write landing mid-turn would be absorbed into this node's own commit and
-   * never presented.
+   * ever perceived the world. It never advances when a commit lands — what a
+   * turn perceives is fixed at its opening, and a commit made while the turn ran
+   * is part of the *next* turn's range, or a foreign write landing mid-turn
+   * would be absorbed into this node's own commit and never presented.
+   *
+   * How it advances depends on the physics in play: a hookless node advances it
+   * at the turn/start barrier, which is its own perception; a hooks node advances
+   * it only from a verified durable `world/perception` proof (see
+   * `advanceAcknowledgement`/`resumeAcknowledgement`), so a turn that failed
+   * before recording one is re-presented rather than skipped.
    */
   private watermark: string | null = null;
   /**
@@ -135,6 +163,15 @@ export class NodeDriver {
    */
   private readonly observations: VerifiedEvent[] = [];
   private delivered = 0;
+  /**
+   * The index of every delivered observation, keyed by `seq:hash`, so a world
+   * acknowledgement's source can be verified against the delivered prefix in
+   * O(1) — never by rescanning history, and never against the receipt inventory,
+   * which also holds pending, not-yet-delivered receipts.
+   */
+  private readonly deliveredIndex = new Map<string, number>();
+  /** The highest turn whose verified acknowledgement advanced the watermark. */
+  private acknowledgedTurn = -1;
   /** Receipt inventory for validators, including pending receipts. */
   private readonly receipts = new Map<string, EventEnvelope>();
   /** The one logical lookup, shared by reference with every gate scope. */
@@ -147,6 +184,8 @@ export class NodeDriver {
   private closeTurnGate: (() => void) | null = null;
   /** A durability/flush/observation fault ended (or poisoned) the run. */
   private durabilityFault = false;
+  /** The maintenance hook failed; distinguishes that fixed label from a kernel invariant. */
+  private maintenanceFault = false;
 
   private constructor(
     private readonly writer: JournalWriter,
@@ -168,9 +207,15 @@ export class NodeDriver {
     home: string, uid: string, handler: TurnHandler, world: WorldRepo,
     opts: NodeDriverOptions = {},
   ): Promise<NodeDriver> {
-    if (opts.hooks !== undefined
-      && (typeof opts.hooks.readHistory !== 'function' || typeof opts.hooks.readBlob !== 'function')) {
-      throw new Error('C1.3 hooks require readHistory and readBlob');
+    if (opts.hooks !== undefined) {
+      // The whole hooks contract is checked before the writer exists: a missing
+      // port must not leave a lock taken by a driver that can never run.
+      for (const port of ['readHistory', 'readBlob', 'acknowledgedWorld'] as const) {
+        if (typeof (opts.hooks as unknown as Record<string, unknown>)[port] !== 'function') {
+          throw new Error(`C1.3 hooks require ${port}`);
+        }
+      }
+      checkedKnownTypes(Object.keys(opts.hooks.registry), opts.knownTypes);
     }
     let writer: JournalWriter;
     try {
@@ -226,7 +271,6 @@ export class NodeDriver {
       let trigger: TurnTrigger = (await this.wakeDue()) ? 'wakeup' : 'boot';
       while (!this.stopRequested) {
         const world = await this.worldRange();
-        this.watermark = world.to;
         this.writeEvent('turn/start', {
           turn: this.turn, trigger, world: { from: world.from, to: world.to },
         });
@@ -239,74 +283,92 @@ export class NodeDriver {
           turn: this.turn, trigger, world, now: () => this.now(),
           gate: created.gate, signal: controller.signal,
         };
-        // Barrier: the turn's opening is durable and observed before the handler
-        // can produce any effect (kernel.md §3).
-        await this.flushObservations();
-        let result: TurnResult;
         try {
-          if (this.hooks !== undefined) await this.hooks.onTurnStart(ctx);
-          result = await this.handler(ctx);
-          if (this.hooks !== undefined && (this.turnToolCalls > 0) !== result.toolCalls) {
-            throw new Error('handler toolCalls report disagrees with accepted tool/call events');
+          // Barrier: the turn's opening is durable and observed before the handler
+          // can produce any effect (kernel.md §3).
+          await this.flushObservations();
+          // Hookless legacy physics: the turn/start barrier *is* the node's
+          // perception of this range, so its watermark advances to HEAD here. A
+          // hooks bundle advances the watermark only from a verified durable
+          // `world/perception` (see `advanceAcknowledgement`), so a turn that
+          // fails before recording one re-presents its range after a restart
+          // instead of skipping it.
+          if (this.hooks === undefined) this.watermark = world.to;
+          let result: TurnResult;
+          try {
+            if (this.hooks !== undefined) {
+              await this.hooks.onTurnStart(ctx);
+              this.advanceAcknowledgement(ctx);
+            }
+            result = await this.handler(ctx);
+            if (this.hooks !== undefined && (this.turnToolCalls > 0) !== result.toolCalls) {
+              throw new Error('handler toolCalls report disagrees with accepted tool/call events');
+            }
+          } catch (err) {
+            await this.endFailedTurn(this.turn, err);
+            this.stopReason = 'handler-error';
+            throw err;
           }
-        } catch (err) {
-          await this.endFailedTurn(this.turn, err);
-          this.stopReason = 'handler-error';
-          throw err;
-        }
-        // The world is committed before the closer is journaled, so the closer
-        // can carry the hash that joins the journal to the world's history
-        // (kernel.md §3, §5.2).
-        const commit = await this.commitWorld(this.turn);
-        const toolCalls = this.hooks !== undefined ? this.turnToolCalls > 0 : result.toolCalls;
-        if (result.outcome === 'error') {
-          const status = result.error.status;
-          const end: EventDataFor<'turn/end'> = {
-            turn: this.turn, outcome: 'error',
-            error: status === null ? `${result.error.code} null` : `${result.error.code} ${status}`,
-            ...(commit !== null ? { commit } : {}),
-          };
-          // A normal, nonignorable error closer: failed-turn evidence survives.
-          this.writeEvent('turn/end', end);
-        } else {
-          const end: EventDataFor<'turn/end'> = {
-            turn: this.turn, outcome: result.outcome,
-            ...(commit !== null ? { commit } : {}),
-          };
-          // Empty (kernel.md §5.4): no tool call and nothing committed. It is
-          // still a turn — the fact of a node that woke and changed nothing — and
-          // the closer is the skip unit: emptiness is knowable only once the turn
-          // has ended, so `turn/end` is the only event that can carry the marker.
-          if (!toolCalls && commit === null) this.writeEvent('turn/end', end, { ignorable: true });
-          else this.writeEvent('turn/end', end);
-        }
-        // The closer is durable and observed per event, never left to the
-        // write-behind window (kernel.md §3): a crash right after it would
-        // otherwise orphan the world commit — a hash in the world's history that
-        // the journal, the only record of which turn produced it, does not
-        // reference.
-        await this.flushObservations();
-        await this.checkpoint();
-        this.endTurnGate();
-        if (result.outcome === 'chained') {
-          trigger = 'chain';
+          // The world is committed before the closer is journaled, so the closer
+          // can carry the hash that joins the journal to the world's history
+          // (kernel.md §3, §5.2).
+          const commit = await this.commitWorld(this.turn);
+          const toolCalls = this.hooks !== undefined ? this.turnToolCalls > 0 : result.toolCalls;
+          if (result.outcome === 'error') {
+            const status = result.error.status;
+            const end: EventDataFor<'turn/end'> = {
+              turn: this.turn, outcome: 'error',
+              error: status === null ? `${result.error.code} null` : `${result.error.code} ${status}`,
+              ...(commit !== null ? { commit } : {}),
+            };
+            // A normal, nonignorable error closer: failed-turn evidence survives.
+            this.writeEvent('turn/end', end);
+          } else {
+            const end: EventDataFor<'turn/end'> = {
+              turn: this.turn, outcome: result.outcome,
+              ...(commit !== null ? { commit } : {}),
+            };
+            // Empty (kernel.md §5.4): no tool call and nothing committed. It is
+            // still a turn — the fact of a node that woke and changed nothing — and
+            // the closer is the skip unit: emptiness is knowable only once the turn
+            // has ended, so `turn/end` is the only event that can carry the marker.
+            if (!toolCalls && commit === null) this.writeEvent('turn/end', end, { ignorable: true });
+            else this.writeEvent('turn/end', end);
+          }
+          // The closer is durable and observed per event, never left to the
+          // write-behind window (kernel.md §3): a crash right after it would
+          // otherwise orphan the world commit — a hash in the world's history that
+          // the journal, the only record of which turn produced it, does not
+          // reference.
+          await this.flushObservations();
+          await this.checkpoint();
+          this.endTurnGate();
+          if (result.outcome === 'chained') {
+            trigger = 'chain';
+            this.turn += 1;
+            continue;
+          }
+          // Both 'waiting' and a recoverable 'error' park: the node stays alive.
+          this.nodeState = 'waiting';
+          try {
+            await this.opts.onMaintenance?.();
+          } catch (err) {
+            this.maintenanceFault = true;
+            this.stopReason = 'maintenance-error';
+            throw err;
+          }
+          if (this.stopRequested) break;
+          await this.park();
+          if (this.stopRequested) break;
+          this.nodeState = 'active';
+          trigger = 'wakeup';
           this.turn += 1;
-          continue;
+        } finally {
+          // Every exit from the turn — the barrier, a handler failure, a commit
+          // or closer fault, a maintenance error, a clean park — revokes the
+          // gate, so a retained reference can never append after it closed.
+          this.endTurnGate();
         }
-        // Both 'waiting' and a recoverable 'error' park: the node stays alive.
-        this.nodeState = 'waiting';
-        try {
-          await this.opts.onMaintenance?.();
-        } catch (err) {
-          this.stopReason = 'maintenance-error';
-          throw err;
-        }
-        if (this.stopRequested) break;
-        await this.park();
-        if (this.stopRequested) break;
-        this.nodeState = 'active';
-        trigger = 'wakeup';
-        this.turn += 1;
       }
     } catch (err) {
       failure = err;
@@ -395,6 +457,10 @@ export class NodeDriver {
         throw err;
       }
       if (this.hooks !== undefined) await this.hooks.onDurable(batch);
+      for (let offset = 0; offset < batch.length; offset += 1) {
+        const observation = batch[offset]!;
+        this.deliveredIndex.set(`${observation.raw.seq}:${observation.raw.hash}`, this.delivered + offset);
+      }
       this.delivered += batch.length;
     }
   }
@@ -442,26 +508,87 @@ export class NodeDriver {
     this.activeController = null;
   }
 
+  /**
+   * Advances the watermark from the handler's own acknowledgement, verified
+   * against the current turn. Called after `onTurnStart` returns: by then the
+   * handler has recorded and flushed its `world/perception`, so its proof — if
+   * any — names a delivered observation. A null acknowledgement advances
+   * nothing: a trusted handler that owns no perception is never falsely
+   * acknowledged, and its prior watermark simply stands.
+   */
+  private advanceAcknowledgement(ctx: TurnContext): void {
+    const ack = this.hooks!.acknowledgedWorld();
+    if (ack === null) return;
+    if (ack.turn !== ctx.turn) {
+      throw new Error(
+        `world acknowledgement turn ${ack.turn} is not the current turn ${ctx.turn}`);
+    }
+    if (ack.range.from !== ctx.world.from || ack.range.to !== ctx.world.to) {
+      throw new Error('world acknowledgement range is not the turn opening range');
+    }
+    this.proveAcknowledgement(ack);
+    if (ack.turn < this.acknowledgedTurn) {
+      throw new Error(`world acknowledgement turn ${ack.turn} regresses ${this.acknowledgedTurn}`);
+    }
+    this.watermark = ack.range.to;
+    this.acknowledgedTurn = ack.turn;
+  }
+
+  /**
+   * The watermark rebuild at resume: the last range the node can prove it
+   * durably perceived, derived from the full observed history. Only a verified
+   * proof moves it — never the last `turn/start`, whose range a turn that failed
+   * before recording a perception never actually showed the node.
+   */
+  private resumeAcknowledgement(): void {
+    const ack = this.hooks!.acknowledgedWorld();
+    if (ack === null || ack.turn < this.acknowledgedTurn) return;
+    this.proveAcknowledgement(ack);
+    this.watermark = ack.range.to;
+    this.acknowledgedTurn = ack.turn;
+  }
+
+  /**
+   * Verifies an acknowledgement against the driver's own delivered prefix: its
+   * source must be a delivered observation (not a pending receipt), that
+   * observation must be a `world/perception`, and the wrapper turn and range it
+   * carried must match the acknowledgement exactly. The check reads the resolved
+   * observation, not the raw receipt inventory, so a claim-check raw reference
+   * cannot pass for a resolved perception, and it is O(1) in the delivered index.
+   */
+  private proveAcknowledgement(ack: WorldAcknowledgement): void {
+    const index = this.deliveredIndex.get(`${ack.source.seq}:${ack.source.hash}`);
+    if (index === undefined) {
+      throw new Error('world acknowledgement source is not a delivered observation');
+    }
+    const observation = this.observations[index]!;
+    if (observation.type !== 'world/perception') {
+      throw new Error(
+        `world acknowledgement source is a ${observation.type} observation, not world/perception`);
+    }
+    const data = observation.data as { turn: number; range: WorldRange };
+    if (data.turn !== ack.turn) {
+      throw new Error('world acknowledgement turn does not match its observation');
+    }
+    if (data.range.from !== ack.range.from || data.range.to !== ack.range.to) {
+      throw new Error('world acknowledgement range does not match its observation');
+    }
+  }
+
   private durableError(err: unknown): string {
     if (this.hooks === undefined) return String(err);
     // Only a bounded fixed label ever reaches the journal under C1.3 hooks; the
-    // original exception is retained and rethrown to its trusted caller.
-    return this.durabilityFault ? 'durability failure' : 'kernel invariant failure';
+    // original exception is retained and rethrown to its trusted caller. The
+    // labels are distinct so the journal names the kind of failure without ever
+    // carrying a message that might hold a payload (an API key, a provider body).
+    if (this.durabilityFault) return 'durability failure';
+    if (this.maintenanceFault) return 'maintenance failure';
+    return 'kernel invariant failure';
   }
 
   private knownTypes(): ReadonlySet<string> {
     if (this.hooks === undefined) return this.opts.knownTypes ?? NODE_EVENT_TYPES;
-    const registryTypes = Object.keys(this.hooks.registry);
-    const provided = this.opts.knownTypes;
-    if (provided !== undefined) {
-      for (const type of registryTypes) {
-        if (!provided.has(type)) {
-          throw new Error(`knownTypes is missing boundary event type ${JSON.stringify(type)}`);
-        }
-      }
-      return provided;
-    }
-    return new Set([...NODE_EVENT_TYPES, ...registryTypes]);
+    return checkedKnownTypes(Object.keys(this.hooks.registry), this.opts.knownTypes);
   }
 
   /**
@@ -559,10 +686,11 @@ export class NodeDriver {
    * this node's authorship — rather than left to be swept into the next
    * committer's commit (§5.3: an effect is never left unattributed).
    *
-   * A commit failure must not displace the handler's error, which is the one
-   * that ended the run: it is caught, and the writes then stay in the tree for
-   * the next commit of this world — a later turn's, whoever ends it — to pick
-   * up.
+   * A commit or closer fault must not displace the handler's error, which is the
+   * one that ended the run: both are caught, and the writes then stay in the tree
+   * for the next commit of this world — a later turn's, whoever ends it — to pick
+   * up. A turn left without a durable closer here is closed synthetically, and its
+   * commit reconciled, on the next restart.
    */
   private async endFailedTurn(turn: number, err: unknown): Promise<void> {
     let commit: string | null = null;
@@ -575,12 +703,18 @@ export class NodeDriver {
       turn, outcome: 'error', error: this.durableError(err),
       ...(commit !== null ? { commit } : {}),
     };
-    this.writeEvent('turn/end', end);
-    // The same per-event barrier as the success path: this closer carries the
-    // hash of the commit the failed turn did land, and a crash before the
-    // write-behind window elapsed would orphan it (kernel.md §3).
-    await this.flushObservations();
-    this.endTurnGate();
+    try {
+      this.writeEvent('turn/end', end);
+      // The same per-event barrier as the success path: this closer carries the
+      // hash of the commit the failed turn did land, and a crash before the
+      // write-behind window elapsed would orphan it (kernel.md §3).
+      await this.flushObservations();
+    } catch {
+      // The handler's failure is the one that ended the run; a commit or closer
+      // fault must not displace it. The writes stay in the tree for the next
+      // commit of this world (§5.3), and the next restart reconciles the turn
+      // left open here.
+    }
   }
 
   /**
@@ -620,26 +754,31 @@ export class NodeDriver {
 
   /**
    * The resume protocol (kernel.md §3): rebuild the durable state by replay,
-   * close an interrupted turn synthetically — committing the world state its
-   * writes left in the working tree, with this node's authorship — then journal
-   * the boot, durable before any turn effect can exist. With hooks, every
-   * durable event is delivered to `onDurable` through the ordered seam first,
-   * then the synthetic closer and boot, then `onReady`.
+   * reconcile an interrupted turn — naming the commit its own turn already made
+   * when it exists, else committing the world state its writes left in the
+   * working tree, with this node's authorship — then journal the boot, durable
+   * before any turn effect can exist. With hooks, every durable event is
+   * delivered to `onDurable` through the ordered seam first, then the proof of
+   * the last durably perceived range rebuilds the watermark, then the synthetic
+   * closer and boot, then `onReady`.
    */
   private async resume(home: string): Promise<void> {
     const knownTypes = this.knownTypes();
     let sawAny = false;
     let openTurn: number | null = null;
+    let openRangeTo: string | null = null;
     const applyLifecycle = (type: string, data: unknown): void => {
       if (type === 'turn/start') {
         const d = data as { turn: number; world: WorldRange };
         openTurn = d.turn;
+        openRangeTo = d.world.to;
         this.turn = d.turn + 1;
-        // The watermark is the HEAD the last turn opened on: what the node has
-        // been shown, not what it wrote. Rebuilding it from the journal, never
-        // from the current HEAD, is what makes a node that was down while the
-        // world moved wake on the commits it missed.
-        this.watermark = d.world.to;
+        // Hookless legacy physics: the last `turn/start` is the node's own
+        // perception of that range. A hooks bundle instead rebuilds the
+        // watermark from the verified durable proof below — the last range the
+        // node can *prove* it was shown — so a turn that failed before recording
+        // a perception is re-presented rather than silently skipped.
+        if (this.hooks === undefined) this.watermark = d.world.to;
       } else if (type === 'turn/end') {
         openTurn = null;
       }
@@ -653,6 +792,10 @@ export class NodeDriver {
         applyLifecycle(event.type, event.data);
       }
       await this.flushObservations();
+      // Only after the whole history is delivered can the handler prove the last
+      // range it durably perceived; that proof, not the last turn/start, is the
+      // rebuilt watermark.
+      this.resumeAcknowledgement();
     } else {
       const reader = await JournalReader.open(home, this.uid, {
         knownTypes,
@@ -665,10 +808,11 @@ export class NodeDriver {
       }
     }
     if (openTurn !== null) {
-      // The interrupted turn never closed, so its writes are still in the
-      // world's working tree: they are committed here with the node's
-      // authorship, and the closer carries the hash (§5.3).
-      const commit = await this.commitWorld(openTurn);
+      // The interrupted turn never closed. Its own commit may already have
+      // landed — the driver committed the world, then crashed before the closer
+      // — so the closer first looks for that commit in the turn's own range and
+      // names it rather than making a second one.
+      const commit = await this.reconcileInterrupted(openTurn, openRangeTo);
       this.writeEvent('turn/end', {
         turn: openTurn, outcome: 'interrupted', synthetic: true,
         ...(commit !== null ? { commit } : {}),
@@ -681,6 +825,26 @@ export class NodeDriver {
     this.writeEvent('node/boot', { reason: sawAny ? 'resume' : 'start' });
     await this.flushObservations();
     await this.readyPhase();
+  }
+
+  /**
+   * The commit a surviving open turn already made, or the one its remaining
+   * working-tree writes now make. The search base is the range the turn opened
+   * on (`to`), never the prior acknowledgement: only commits *after* the turn
+   * opened can belong to it, and the node's uid and the exact `turn N` subject
+   * must both match. Zero candidates is the existing dirty-tree recovery; exactly
+   * one is named as-is, without staging anything a peer left in the tree; a
+   * bounded-out search, an unreachable base or more than one match is refused by
+   * `commitsForTurn`.
+   */
+  private async reconcileInterrupted(turn: number, base: string | null): Promise<string | null> {
+    const candidates = await this.world.commitsForTurn(base, this.uid, turn);
+    if (candidates.length > 1) {
+      throw new WorldReconciliationError(
+        `interrupted turn ${turn} names ${candidates.length} matching commits`);
+    }
+    if (candidates.length === 1) return candidates[0]!.hash;
+    return this.commitWorld(turn);
   }
 
   /**

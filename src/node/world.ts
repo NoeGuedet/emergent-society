@@ -6,6 +6,7 @@ import { join, resolve, sep } from 'node:path';
 import { assertNodeUid } from '../journal/layout.js';
 import {
   GitCommandError, UnsafeWorldPathError, WorldHeadError, WorldNotARepoError,
+  WorldReconciliationError,
 } from './errors.js';
 
 /**
@@ -27,8 +28,9 @@ import {
 /** Git's field separator inside a `--format` line: a control character no uid or hash carries. */
 const FIELD = '\x1f';
 
-/** The `git log` format the parser reads: hash, author name. */
+/** The `git log` format the parser reads: hash, author name, subject. */
 const LOG_FORMAT = `--format=%H${FIELD}%an`;
+const RECONCILE_FORMAT = `--format=%H${FIELD}%an${FIELD}%s`;
 
 /**
  * Output bound for every git call. It is a refusal, not a truncation: the child
@@ -47,6 +49,15 @@ const COMMIT_ATTEMPTS = 4;
 
 /** Wait before commit attempt n, linear: 25, 50, 75 ms. */
 const COMMIT_RETRY_MS = 25;
+
+/**
+ * Commits scanned when finding an interrupted turn's own commit. The search
+ * range is the turn's opening base to HEAD, so it holds the turn's own commit
+ * and the few peers that landed while it ran. A range past this bound is
+ * refused, not truncated: a bounded walk that stopped early could miss a second
+ * matching commit and so choose one of several.
+ */
+const MAX_RECONCILE_SCAN = 4096;
 
 /** stderr kept from a failed bounded render: a diagnostic, never the payload (§T4). */
 const MAX_GIT_STDERR_BYTES = 8 * 1024;
@@ -759,6 +770,66 @@ export class WorldRepo {
     // someone else is never re-validated: foreign author names stay facts.
     assertNodeUid(author);
     return this.serialize(() => this.commitRetrying(author, message));
+  }
+
+  /**
+   * The commits a node authored for one turn, reachable from HEAD but not from
+   * the turn's opening `base` — the search that reconciles an interrupted turn
+   * whose own commit landed and whose closer did not (kernel.md §3).
+   *
+   * The candidate must carry the exact uid and the exact subject `turn N`: a
+   * prefixed, suffixed, substring or trimmed label is not a candidate, and a
+   * commit by another node with the same subject is not one either. Author and
+   * subject are a jointure, not a cryptographic identity (C1.4 owns that); this
+   * only refuses to guess.
+   *
+   * `base` null means the turn opened on an unborn branch, so the whole reachable
+   * history is after it. A non-null `base` that is missing, malformed or no
+   * longer an ancestor of HEAD fails closed rather than falling back to all
+   * history; a walk past the bound fails closed rather than truncating. The
+   * compare-and-swap loser of a failed publish is unreachable from HEAD, so it is
+   * never a candidate, and nothing here mutates history or runs gc.
+   *
+   * @throws WorldReconciliationError when the base is unreachable, the walk is
+   * bounded out, or the search cannot name one commit without guessing.
+   */
+  async commitsForTurn(
+    base: string | null, uid: string, turn: number,
+  ): Promise<readonly WorldCommitInfo[]> {
+    const subject = `turn ${turn}`;
+    const head = await this.headHash();
+    if (head === null) {
+      if (base !== null) {
+        throw new WorldReconciliationError(
+          `interrupted turn ${turn}: base ${base} is unreachable on an unborn branch`);
+      }
+      return [];
+    }
+    if (base !== null) {
+      if (!isFullHex(base, hashLength(await this.format()))) {
+        throw new WorldReconciliationError(
+          `interrupted turn ${turn}: base ${JSON.stringify(base)} is not a full commit id`);
+      }
+      if (!(await this.commitExists(base)) || !(await this.isAncestor(base, head))) {
+        throw new WorldReconciliationError(
+          `interrupted turn ${turn}: base ${base} is not an ancestor of HEAD`);
+      }
+    }
+    const spec = base === null ? head : `${base}..${head}`;
+    const out = await git(this.path, [
+      'log', `--max-count=${MAX_RECONCILE_SCAN + 1}`, RECONCILE_FORMAT, spec,
+    ]);
+    const lines = out.split('\n').filter((line) => line !== '');
+    if (lines.length > MAX_RECONCILE_SCAN) {
+      throw new WorldReconciliationError(
+        `interrupted turn ${turn}: more than ${MAX_RECONCILE_SCAN} commits after its opening`);
+    }
+    const matches: WorldCommitInfo[] = [];
+    for (const line of lines) {
+      const [hash = '', author = '', found = ''] = line.split(FIELD);
+      if (author === uid && found === subject) matches.push({ hash, author });
+    }
+    return matches;
   }
 
   /**

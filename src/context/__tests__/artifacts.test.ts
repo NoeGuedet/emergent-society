@@ -473,6 +473,7 @@ describe('lossless bounded artifacts under the real driver gate', () => {
       readHistory: (path: string, uid: string, knownTypes: ReadonlySet<string>) =>
         loadVerifiedEvents(path, uid, knownTypes),
       readBlob: (hash: string) => new BlobStore(home).get(hash),
+      acknowledgedWorld: () => null,
     };
     try {
       driver = await NodeDriver.open(home, 'n1', async (ctx) => {
@@ -537,6 +538,7 @@ describe('lossless bounded artifacts under the real driver gate', () => {
       readHistory: (path: string, uid: string, knownTypes: ReadonlySet<string>) =>
         loadVerifiedEvents(path, uid, knownTypes),
       readBlob: (hash: string) => new BlobStore(home).get(hash),
+      acknowledgedWorld: () => null,
     };
     let d: NodeDriver | null = null;
     d = await NodeDriver.open(home, 'n1', async (ctx: TurnContext) => {

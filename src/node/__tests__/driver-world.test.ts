@@ -6,6 +6,7 @@ import type { DriverHooks } from '../gate.js';
 import { NodeDriver, type TurnResult, type TurnTrigger } from '../driver.js';
 import type { EventEnvelope } from '../../journal/index.js';
 import { HeadWatcher } from '../watcher.js';
+import { WorldReconciliationError } from '../errors.js';
 import { WorldRepo, type WorldRange } from '../world.js';
 import {
   commitAs, committedContent, readNode, useWorld, worldLog, writeWorldFile,
@@ -84,6 +85,7 @@ describe('the world as the only channel', () => {
       onTurnStart: async () => {},
       readHistory: (path, uid, knownTypes) => loadVerifiedEvents(path, uid, knownTypes),
       readBlob: (hash) => new BlobStore(home).get(hash),
+      acknowledgedWorld: () => null,
     };
     const d = await NodeDriver.open(home, 'n1', async (ctx) => {
       // Under hooks a reported tool call must be backed by an accepted one.
@@ -113,6 +115,7 @@ describe('the world as the only channel', () => {
       onTurnStart: async () => {},
       readHistory: (path, uid, knownTypes) => loadVerifiedEvents(path, uid, knownTypes),
       readBlob: (hash) => new BlobStore(home).get(hash),
+      acknowledgedWorld: () => null,
     };
     const seen: TurnTrigger[] = [];
     const d = await NodeDriver.open(home, 'n1', async (ctx) => {
@@ -591,5 +594,135 @@ describe('resume and the world', () => {
     expect(seen[0]).toEqual({ trigger: 'wakeup', world: { from: seenByFirst, to: head } });
     second.stop();
     await secondRun;
+  });
+});
+
+describe('orphan commit reconciliation at resume', () => {
+  /** A node journal whose turn 0 opened on `to` and never closed — the crash shape. */
+  async function openTurnOn(home: string, to: string | null): Promise<void> {
+    const w = await JournalWriter.open(home, 'n1');
+    w.append('node/boot', { reason: 'start' });
+    w.append('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to } });
+    await w.close();
+  }
+
+  /** The one synthetic closer of the node's journal. */
+  async function closerOf(home: string): Promise<{ commit?: string } | undefined> {
+    const events = await readNode(home);
+    const end = events.find((e) => e.type === 'turn/end');
+    return end?.data as { commit?: string } | undefined;
+  }
+
+  it('names the turn’s own landed commit instead of making a second one', async () => {
+    const { home, world } = fixture();
+    const base = await commitAs(world, 'n2', { 'n2/start.md': 'start' });
+    await openTurnOn(home, base);
+    // The turn wrote and committed as n1, then the process died before its closer.
+    await writeWorldFile(world, 'n1/kept.md', 'kept');
+    const landed = await world.commitAll('n1', 'turn 0');
+    expect(landed?.hash).toBe(await world.headHash());
+    // A peer's in-flight write sits in the same tree: naming the existing commit
+    // must not sweep it in.
+    await writeWorldFile(world, 'peer/inflight.md', 'not mine');
+
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const closer = await closerOf(home);
+    expect(closer).toMatchObject({
+      turn: 0, outcome: 'interrupted', synthetic: true, commit: landed?.hash,
+    });
+    expect(await world.headHash()).toBe(landed?.hash);
+    expect(await worldLog(world)).toHaveLength(2);
+    // The peer's dirty write stayed out of the world, waiting for its own author.
+    expect(await committedContent(world, 'peer/inflight.md')).toBeNull();
+    d.stop();
+    await d.run();
+  });
+
+  it('names its own ancestor when a peer advanced HEAD past it', async () => {
+    const { home, world } = fixture();
+    const base = await commitAs(world, 'n2', { 'n2/start.md': 'start' });
+    await openTurnOn(home, base);
+    await writeWorldFile(world, 'n1/kept.md', 'kept');
+    const landed = await world.commitAll('n1', 'turn 0');
+    const peer = await commitAs(world, 'n3', { 'n3/after.md': 'after' });
+    expect(await world.headHash()).toBe(peer);
+
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    expect(await closerOf(home)).toMatchObject({ outcome: 'interrupted', commit: landed?.hash });
+    // The peer's commit stays HEAD; nothing new was committed.
+    expect(await world.headHash()).toBe(peer);
+    expect(await worldLog(world)).toHaveLength(3);
+    d.stop();
+    await d.run();
+  });
+
+  it('refuses an ambiguous turn with two matching commits, without journal damage', async () => {
+    const { home, world } = fixture();
+    const base = await commitAs(world, 'n2', { 'n2/start.md': 'start' });
+    await openTurnOn(home, base);
+    await writeWorldFile(world, 'n1/one.md', '1');
+    await world.commitAll('n1', 'turn 0');
+    await writeWorldFile(world, 'n1/two.md', '2');
+    await world.commitAll('n1', 'turn 0');
+    const head = await world.headHash();
+    const before = (await readNode(home)).map((e) => e.type);
+
+    await expect(NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 }))
+      .rejects.toBeInstanceOf(WorldReconciliationError);
+    // No closer was written and the world was not touched: a safe refusal.
+    expect((await readNode(home)).map((e) => e.type)).toEqual(before);
+    expect(await world.headHash()).toBe(head);
+  });
+
+  it('refuses an interrupted turn whose opening base is unreachable, not guessing history', async () => {
+    const { home, world } = fixture();
+    await commitAs(world, 'n2', { 'n2/start.md': 'start' });
+    // A base that names no object: the kernel cannot bound the search, so it
+    // refuses rather than falling back to all history.
+    await openTurnOn(home, 'a'.repeat(40));
+    const head = await world.headHash();
+    await expect(NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 }))
+      .rejects.toBeInstanceOf(WorldReconciliationError);
+    expect(await world.headHash()).toBe(head);
+  });
+
+  it('ignores a wrong subject and a foreign author, then recovers the dirty tree', async () => {
+    const { home, world } = fixture();
+    const base = await commitAs(world, 'n2', { 'n2/start.md': 'start' });
+    await openTurnOn(home, base);
+    // The right uid with the wrong subject, and the right subject with a foreign
+    // uid: neither is a candidate, so the turn recovers as the dirty-tree case.
+    await writeWorldFile(world, 'n1/wrong-subject.md', 'w');
+    await world.commitAll('n1', 'turn 0 extra');
+    await writeWorldFile(world, 'n2/foreign.md', 'f');
+    await commitAs(world, 'n2', { 'n2/foreign.md': 'f' }, 'turn 0');
+    await writeWorldFile(world, 'n1/recovered.md', 'r');
+
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const commit = (await closerOf(home))?.commit;
+    expect(commit).toBe(await world.headHash());
+    expect(await committedContent(world, 'n1/recovered.md')).toBe('r');
+    d.stop();
+    await d.run();
+  });
+
+  it('is idempotent across restarts: a durable closer leaves nothing to reconcile', async () => {
+    const { home, world } = fixture();
+    const base = await commitAs(world, 'n2', { 'n2/start.md': 'start' });
+    await openTurnOn(home, base);
+    await writeWorldFile(world, 'n1/kept.md', 'kept');
+    await world.commitAll('n1', 'turn 0');
+
+    const first = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    first.stop();
+    await first.run();
+    const head = await world.headHash();
+    expect((await readNode(home)).filter((e) => e.type === 'turn/end')).toHaveLength(1);
+
+    const second = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    second.stop();
+    await second.run();
+    expect(await world.headHash()).toBe(head);
+    expect((await readNode(home)).filter((e) => e.type === 'turn/end')).toHaveLength(1);
   });
 });

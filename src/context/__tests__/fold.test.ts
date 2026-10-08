@@ -439,6 +439,7 @@ function hooksFor(fold: ContextFold, path: string, over: Partial<DriverHooks> = 
     onTurnStart: async () => {},
     readHistory: (path2, uid, knownTypes) => loadVerifiedEvents(path2, uid, knownTypes),
     readBlob: (hash) => new BlobStore(path).get(hash),
+    acknowledgedWorld: () => fold.acknowledgedWorld(),
     ...over,
   };
 }
@@ -493,7 +494,9 @@ async function runFirstBoot(
     await reached;
     await withFailingWrite(path, async () => {
       inject();
-      await expect(running).rejects.toThrow('injected EIO');
+      // The handler's own failure reaches the caller: the error-closer flush
+      // fault that follows it must not displace it.
+      await expect(running).rejects.toThrow('boom after durable calls');
     }, 2);
   } else {
     const running = ref.d.run();

@@ -46,3 +46,17 @@ export class GitCommandError extends NodeError {
     super(`git ${args.join(' ')} failed${exit}: ${stderr.trim()}`);
   }
 }
+
+/**
+ * An interrupted turn's own world commit cannot be identified unambiguously
+ * without guessing: the search's verified base is unreachable, the bounded walk
+ * was exceeded, or more than one commit in the turn's range carries the node's
+ * uid and the exact `turn N` subject. The kernel reconciles by joining the one
+ * commit the turn made, never by picking one of several — so it fails closed
+ * with this typed error, before any replay effect.
+ */
+export class WorldReconciliationError extends NodeError {
+  constructor(public readonly reason: string) {
+    super(`world reconciliation refused: ${reason}`);
+  }
+}
