@@ -61,6 +61,36 @@ function noCalls(content: string): TransportResult {
   };
 }
 
+/** One advertised `execute` call: a turn that cannot park, so the driver chains. */
+function executeCall(id: string, cmd: string): TransportResult {
+  return {
+    status: 200, complete: true, failure: null,
+    body: Buffer.from(JSON.stringify({
+      choices: [{
+        message: {
+          role: 'assistant', content: null,
+          tool_calls: [{
+            id, type: 'function',
+            function: { name: 'execute', arguments: JSON.stringify({ cmd }) },
+          }],
+        },
+      }],
+    })),
+  };
+}
+
+/** The canonical `<seq>.json` rows on disk, as ascending seq numbers. */
+async function canonicalRows(fx: WorldFixture): Promise<number[]> {
+  const names = await readdir(snapshotsDir(fx));
+  const seqs: number[] = [];
+  for (const name of names) {
+    const match = /^(0|[1-9][0-9]*)\.json$/.exec(name);
+    if (match === null) continue;
+    seqs.push(Number(match[1]));
+  }
+  return seqs.sort((a, b) => a - b);
+}
+
 function shellPolicyFor(config: AgentConfig): ShellPolicy {
   return {
     timeoutMs: config.policy.shellTimeoutMs,
@@ -126,6 +156,48 @@ describe('checkpoint wiring', () => {
     expect(snap!.seq).toBe(mark.seq);
     expect(snap!.hash).toBe(mark.hash);
     expect(snap!.val.watermark).toEqual({ seq: mark.seq, hash: mark.hash });
+  });
+
+  it('writes one monotonic checkpoint per turn and keeps only the newest two', async () => {
+    const fx = fixture();
+    const base = defaultAgentConfig();
+    // One step per turn: an `execute` response chains to the next turn, and the
+    // final no-call response parks. Three turns, three durable closers.
+    const config: AgentConfig = { ...base, policy: { ...base.policy, stepsPerTurn: 1 } };
+    const transport = new ScriptedTransport([
+      executeCall('c0', 'true'),
+      executeCall('c1', 'true'),
+      noCalls('idle'),
+    ]);
+    const runtime = runtimeFor(fx, config, transport);
+    const marks: DurableWatermark[] = [];
+    const driver = await openRuntime(fx, runtime, (mark) => {
+      marks.push(mark);
+      return runtime.checkpoint(mark);
+    });
+    const running = driver.run();
+    await vi.waitFor(() => expect(marks.length).toBeGreaterThanOrEqual(3));
+    driver.stop();
+    await running;
+
+    expect(marks).toHaveLength(3);
+    expect(marks[0]!.seq).toBeLessThan(marks[1]!.seq);
+    expect(marks[1]!.seq).toBeLessThan(marks[2]!.seq);
+
+    const events = await loadVerifiedEvents(fx.home, 'n1', C13_EVENT_TYPES);
+    const closers = events.filter((event) => event.type === 'turn/end');
+    expect(closers).toHaveLength(3);
+    expect(marks.at(-1)).toEqual({ seq: closers.at(-1)!.raw.seq, hash: closers.at(-1)!.raw.hash });
+
+    // One response per turn: checkpointing never re-executes a turn.
+    expect(transport.sends).toHaveLength(3);
+
+    // Retention: the newest two verified rows, nothing older.
+    await expect(canonicalRows(fx)).resolves.toEqual([marks[1]!.seq, marks[2]!.seq]);
+    const snap = await readSnapshot(fx.home, 'n1', events);
+    expect(snap!.seq).toBe(marks[2]!.seq);
+    expect(snap!.hash).toBe(marks[2]!.hash);
+    expect(snap!.val.watermark).toEqual(marks[2]);
   });
 
   it('parks with no maintenance error when the snapshot write fails with EACCES', async () => {

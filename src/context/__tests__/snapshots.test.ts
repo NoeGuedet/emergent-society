@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
-import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { access, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, relative } from 'node:path';
 import { BlobStore, ChainBreakError, JournalWriter, nodeDir } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
 import { logPath, rewriteLog, useTempHome } from '../../journal/__tests__/helpers.js';
@@ -17,6 +17,67 @@ import { loadVerifiedEvents } from '../loader.js';
 import type { VerifiedEvents } from '../loader.js';
 import { readSnapshot, writeSnapshot } from '../snapshots.js';
 import type { Snapshot } from '../snapshots.js';
+
+/**
+ * Deterministic barriers for the alias test, threaded through two narrow lower
+ * dependencies and armed only for that one test. `realpath` completion is the
+ * point after which a caller's pre-queue work is over; `atomicWriteFile` entry is
+ * the point at which a queued task has actually started. Neither is a production
+ * seam: the wrappers delegate to the real functions and are inert when disarmed.
+ */
+const hooks = vi.hoisted(() => ({
+  armed: false,
+  realpaths: 0,
+  realpathWaiters: [] as Array<{ count: number; resolve: () => void }>,
+  writeEntries: [] as string[],
+  firstEntered: null as null | (() => void),
+  releaseFirst: null as null | (() => void),
+}));
+
+function waitForRealpaths(count: number): Promise<void> {
+  if (hooks.realpaths >= count) return Promise.resolve();
+  return new Promise((resolve) => { hooks.realpathWaiters.push({ count, resolve }); });
+}
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    realpath: async (path: Parameters<typeof actual.realpath>[0]) => {
+      const resolved = await actual.realpath(path);
+      if (hooks.armed) {
+        hooks.realpaths += 1;
+        for (let i = hooks.realpathWaiters.length - 1; i >= 0; i -= 1) {
+          const waiter = hooks.realpathWaiters[i]!;
+          if (hooks.realpaths >= waiter.count) {
+            hooks.realpathWaiters.splice(i, 1);
+            waiter.resolve();
+          }
+        }
+      }
+      return resolved;
+    },
+  };
+});
+
+vi.mock('../../journal/fsutil.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../journal/fsutil.js')>();
+  return {
+    ...actual,
+    atomicWriteFile: async (path: string, data: string | Uint8Array) => {
+      if (hooks.armed) {
+        hooks.writeEntries.push(path);
+        // Hold only the first queued write, so a second queue's write would be
+        // observably entered while the first is still in flight.
+        if (hooks.writeEntries.length === 1) {
+          hooks.firstEntered?.();
+          await new Promise<void>((resolve) => { hooks.releaseFirst = resolve; });
+        }
+      }
+      return actual.atomicWriteFile(path, data);
+    },
+  };
+});
 
 const home = useTempHome('c13-snapshots-');
 
@@ -142,6 +203,31 @@ function withHeading(state: ProjectionState, text: string): ProjectionState {
 async function putValue(path: string, name: string, value: unknown): Promise<void> {
   await mkdir(snapshotsDir(path), { recursive: true });
   await writeFile(join(snapshotsDir(path), name), JSON.stringify(value));
+}
+
+/**
+ * A checkpoint whose identity is the real verified `(seq, hash)` of one event,
+ * with the state watermark rewritten to name it — the shape a real fold
+ * checkpoint has, but at a chosen event so a multi-write sequence is possible.
+ */
+function checkpointAt(events: VerifiedEvents, index: number, state: ProjectionState): Snapshot {
+  const event = events[index]!;
+  return {
+    ver: 1, seq: event.raw.seq, hash: event.raw.hash,
+    val: withWatermark(state, event.raw.seq, event.raw.hash),
+  };
+}
+
+/** The canonical `<seq>.json` rows on disk, as ascending seq numbers. */
+async function canonicalRows(path: string): Promise<number[]> {
+  const names = await readdir(snapshotsDir(path));
+  const seqs: number[] = [];
+  for (const name of names) {
+    const match = /^(0|[1-9][0-9]*)\.json$/.exec(name);
+    if (match === null) continue;
+    seqs.push(Number(match[1]));
+  }
+  return seqs.sort((a, b) => a - b);
 }
 
 describe('snapshots: round-trip', () => {
@@ -285,6 +371,13 @@ describe('snapshots: read validates and never throws', () => {
     const path = home();
     const events = await seedJournal(path);
     await expect(readSnapshot(path, 'n1', events)).resolves.toBeNull();
+  });
+
+  it('returns null for a uid the path builder rejects, without throwing', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    await expect(readSnapshot(path, 'not/a/uid', events)).resolves.toBeNull();
+    await expect(readSnapshot(path, '..', events)).resolves.toBeNull();
   });
 
   it('ignores filenames that are not canonical nonnegative-safe-integer seqs', async () => {
@@ -481,5 +574,226 @@ describe('snapshots: disposable, never a substitute for verification', () => {
       return lines;
     });
     await expect(loadVerifiedEvents(path, 'n1', C13_EVENT_TYPES)).rejects.toThrow(ChainBreakError);
+  });
+});
+
+describe('snapshots: write validates the whole snapshot before any filesystem work', () => {
+  it('refuses a state whose watermark does not name the envelope identity', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const mark = state.watermark!;
+    const wrong = 'a'.repeat(64);
+
+    await expect(writeSnapshot(path, 'n1', {
+      ver: 1, seq: mark.seq, hash: mark.hash, val: withWatermark(state, mark.seq, wrong),
+    })).resolves.toBe(false);
+    await expect(readdir(snapshotsDir(path))).rejects.toThrow();
+  });
+
+  it('refuses a state that fails the shared schema and writes nothing', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const mark = state.watermark!;
+
+    await expect(writeSnapshot(path, 'n1', {
+      ver: 1, seq: mark.seq, hash: mark.hash, val: { nonsense: true } as unknown as ProjectionState,
+    })).resolves.toBe(false);
+    await expect(readdir(snapshotsDir(path))).rejects.toThrow();
+  });
+
+  it('refuses a uid the path builder rejects without throwing', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+
+    await expect(writeSnapshot(path, 'not/a/uid', checkpoint(state))).resolves.toBe(false);
+    await expect(writeSnapshot(path, '..', checkpoint(state))).resolves.toBe(false);
+  });
+
+  it('writes the same canonical body the reader would accept', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const snap = checkpoint(state);
+
+    await expect(writeSnapshot(path, 'n1', snap)).resolves.toBe(true);
+    const raw = await readFile(join(snapshotsDir(path), `${snap.seq}.json`), 'utf8');
+    // Re-reading the exact written bytes through the shared parser must succeed.
+    await expect(readSnapshot(path, 'n1', events)).resolves.toEqual(JSON.parse(raw));
+  });
+});
+
+describe('snapshots: bounded retention keeps only the newest two rows', () => {
+  it('keeps the new row and the newest valid prior row, pruning older valid rows', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const first = checkpointAt(events, 0, state);
+    const second = checkpointAt(events, 1, state);
+    const third = checkpointAt(events, 2, state);
+
+    for (const snap of [first, second, third]) {
+      await expect(writeSnapshot(path, 'n1', snap)).resolves.toBe(true);
+    }
+
+    await expect(canonicalRows(path)).resolves.toEqual([second.seq, third.seq]);
+    await expect(readSnapshot(path, 'n1', events)).resolves.toEqual(third);
+  });
+
+  it('cannot let a malformed higher name displace the valid older fallback', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const old = checkpointAt(events, 0, state);
+    await expect(writeSnapshot(path, 'n1', old)).resolves.toBe(true);
+
+    // A canonical-named row above the old one that the shared parser rejects.
+    const broken = events[1]!;
+    await putValue(path, `${broken.raw.seq}.json`, {
+      ver: 1, seq: broken.raw.seq, hash: broken.raw.hash, val: { nonsense: true },
+    });
+
+    const fresh = checkpointAt(events, 2, state);
+    await expect(writeSnapshot(path, 'n1', fresh)).resolves.toBe(true);
+
+    await expect(canonicalRows(path)).resolves.toEqual([old.seq, fresh.seq]);
+    const onDisk: unknown = JSON.parse(
+      await readFile(join(snapshotsDir(path), `${old.seq}.json`), 'utf8'),
+    );
+    expect(onDisk).toEqual(old);
+    await expect(readSnapshot(path, 'n1', events)).resolves.toEqual(fresh);
+  });
+
+  it('never deletes a canonical row newer than the write being pruned', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const newer = checkpointAt(events, 3, state);
+    await putValue(path, `${newer.seq}.json`, newer);
+
+    const older = checkpointAt(events, 0, state);
+    await expect(writeSnapshot(path, 'n1', older)).resolves.toBe(true);
+
+    await expect(canonicalRows(path)).resolves.toContain(newer.seq);
+    await expect(readFile(join(snapshotsDir(path), `${newer.seq}.json`), 'utf8'))
+      .resolves.toBe(JSON.stringify(newer));
+  });
+
+  it('leaves unrecognized names and temp files entirely untouched', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    await mkdir(snapshotsDir(path), { recursive: true });
+    await writeFile(join(snapshotsDir(path), 'notes.txt'), 'keep me');
+    await writeFile(join(snapshotsDir(path), '7.json.123.tmp'), 'temp');
+
+    for (const index of [0, 1, 2]) {
+      await expect(writeSnapshot(path, 'n1', checkpointAt(events, index, state))).resolves.toBe(true);
+    }
+
+    await expect(readFile(join(snapshotsDir(path), 'notes.txt'), 'utf8')).resolves.toBe('keep me');
+    await expect(readFile(join(snapshotsDir(path), '7.json.123.tmp'), 'utf8')).resolves.toBe('temp');
+  });
+
+  it('serializes concurrent writes so an older one never drops the newest row', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const fallback = checkpointAt(events, 0, state);
+    const older = checkpointAt(events, 1, state);
+    const newer = checkpointAt(events, 2, state);
+    await expect(writeSnapshot(path, 'n1', fallback)).resolves.toBe(true);
+
+    // Concurrent calls give no guaranteed call order: the durable-directory
+    // proof and `realpath` run before the queue, so the row set is one of the
+    // serialized outcomes — but an older write must never drop the newest row.
+    await Promise.all([
+      writeSnapshot(path, 'n1', older),
+      writeSnapshot(path, 'n1', newer),
+    ]);
+
+    const rows = await canonicalRows(path);
+    expect(rows).toContain(newer.seq);
+    expect(rows.every((seq) => [fallback.seq, older.seq, newer.seq].includes(seq))).toBe(true);
+    await expect(readSnapshot(path, 'n1', events)).resolves.toEqual(newer);
+  });
+});
+
+describe('snapshots: pruning is best-effort and never fails a durable write', () => {
+  it('keeps the written row and the fallback when an unlink fault is injected', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const fallback = checkpointAt(events, 0, state);
+    await expect(writeSnapshot(path, 'n1', fallback)).resolves.toBe(true);
+
+    // A directory named like a canonical row: read and unlink both fail there.
+    await mkdir(join(snapshotsDir(path), `${events[1]!.raw.seq}.json`));
+
+    const fresh = checkpointAt(events, 2, state);
+    await expect(writeSnapshot(path, 'n1', fresh)).resolves.toBe(true);
+
+    await expect(readSnapshot(path, 'n1', events)).resolves.toEqual(fresh);
+    await expect(access(join(snapshotsDir(path), `${fallback.seq}.json`))).resolves.toBeUndefined();
+    await expect(access(join(snapshotsDir(path), `${fresh.seq}.json`))).resolves.toBeUndefined();
+  });
+});
+
+describe('snapshots: one write queue for every spelling of the same directory', () => {
+  it('serializes a symlink alias and a relative alias against the canonical home', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const fallback = checkpointAt(events, 0, state);
+    const older = checkpointAt(events, 1, state);
+    const newer = checkpointAt(events, 2, state);
+    await expect(writeSnapshot(path, 'n1', fallback)).resolves.toBe(true);
+
+    // Two spellings of the very same physical home: a symlink alias and a
+    // lexically relative one. `join` alone cannot unify these.
+    const alias = `${path}-link`;
+    await symlink(path, alias, 'dir');
+    const spelled = relative(process.cwd(), path);
+    expect(isAbsolute(spelled)).toBe(false);
+    expect(spelled).not.toBe(path);
+
+    // Deterministic barriers through two narrow lower dependencies (see the
+    // mocked `realpath`/`atomicWriteFile` above): the first queued write is held
+    // inside `atomicWriteFile`, and we wait on the *second* call's `realpath`
+    // completion. A raw-dir key would then let the second queued task start its
+    // own write; one canonical key cannot, because the queue is still held.
+    hooks.realpaths = 0;
+    hooks.realpathWaiters.length = 0;
+    hooks.writeEntries.length = 0;
+    const firstEntered = new Promise<void>((resolve) => { hooks.firstEntered = resolve; });
+    const bothRealpathed = waitForRealpaths(2);
+    hooks.armed = true;
+
+    let first: Promise<boolean> | null = null;
+    let second: Promise<boolean> | null = null;
+    try {
+      first = writeSnapshot(alias, 'n1', older);
+      await firstEntered;
+      second = writeSnapshot(spelled, 'n1', newer);
+      await bothRealpathed;
+      // Drain the continuation after `await realpath` and any queued task's
+      // microtasks: no wall-clock window, just one event-loop turn.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(hooks.writeEntries).toHaveLength(1);
+
+      hooks.releaseFirst?.();
+      await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
+    } finally {
+      hooks.releaseFirst?.();
+      hooks.armed = false;
+      await Promise.allSettled([first, second].filter((p): p is Promise<boolean> => p !== null));
+      await rm(alias, { force: true });
+    }
+
+    // One queue: the older write and its prune complete before the newer starts,
+    // so the fallback is replaced rather than left beside the new row.
+    await expect(canonicalRows(path)).resolves.toEqual([older.seq, newer.seq]);
   });
 });

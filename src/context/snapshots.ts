@@ -1,7 +1,7 @@
-import { mkdir, readdir } from 'node:fs/promises';
+import { readdir, realpath, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { HASH_RE } from '../journal/canon.js';
-import { atomicWriteFile, readFileOrNull, syncPath } from '../journal/fsutil.js';
+import { atomicWriteFile, ensureDurableDirectory, readFileOrNull, syncPath } from '../journal/fsutil.js';
 import { nodeDir } from '../journal/index.js';
 import { toJson } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
@@ -22,9 +22,15 @@ import type { VerifiedEvents } from './loader.js';
  * fatal error and never a substitute for the journal. Snapshot acceleration with
  * a complete fold inventory is C1.6.
  *
- * Writing is best effort (any exception is `false`); reading fully validates the
- * file and cross-checks it against the verified events, returning the newest row
- * that still agrees with them, or `null`.
+ * Writing is best effort (any exception is `false`). A snapshot is validated
+ * through the *same* full parser the reader uses — envelope, schema and the
+ * state watermark naming its own `(seq, hash)` — before any filesystem work, so
+ * only a row the reader would accept is ever written. After a durable write the
+ * directory is pruned to that row plus the newest structurally valid prior row
+ * as a fallback (retention 2, a fixed kernel-side bound); pruning is itself best
+ * effort and never turns a durable write into a failure. Reading fully validates
+ * the file and cross-checks it against the verified events, returning the newest
+ * row that still agrees with them, or `null`.
  */
 
 /** A projection checkpoint: the state and the verified identity it was folded at. */
@@ -307,24 +313,125 @@ function parseSnapshot(value: unknown): Snapshot | null {
   }
 }
 
+/** The canonical `<seq>.json` seq numbers in `names`, in directory order. */
+function canonicalSeqs(names: readonly string[]): number[] {
+  const seqs: number[] = [];
+  for (const name of names) {
+    const match = NAME_RE.exec(name);
+    if (match === null) continue;
+    const seq = Number(match[1]);
+    if (!Number.isSafeInteger(seq)) continue;
+    seqs.push(seq);
+  }
+  return seqs;
+}
+
 /**
- * Writes a checkpoint to `nodes/<uid>/snapshots/<seq>.json`. The envelope is
- * checked (a canonical filename needs a safe nonnegative seq) and the value is
- * passed through `toJson` so an unserializable snapshot is refused rather than
- * written lossily. Directory creation, the atomic write and the directory sync
- * are one best-effort attempt: any exception is `false`, never a throw.
+ * Reads and fully validates one canonical row, requiring its filename seq to
+ * match its content. This is the one per-row check the reader and the pruner's
+ * fallback search share, so the two can never disagree about what "valid"
+ * means. A missing, unreadable, non-JSON or invalid row is `null`.
+ */
+async function readValidRow(dir: string, seq: number): Promise<Snapshot | null> {
+  const bytes = await readFileOrNull(join(dir, `${seq}.json`)).catch(() => null);
+  if (bytes === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString('utf8'));
+  } catch {
+    return null;
+  }
+  const snap = parseSnapshot(parsed);
+  if (snap === null || snap.seq !== seq) return null;
+  return snap;
+}
+
+/**
+ * Per-directory write serialization. `writeSnapshot` is a public API, not only
+ * the runtime's hook, so two concurrent calls for one node could otherwise race:
+ * one writes a newer row while the other treats it as an older row to prune. The
+ * queue makes each write+prune pair atomic with respect to other calls in this
+ * process. It is keyed by the directory's *canonical physical* path (see
+ * `writeSnapshot`), so every spelling of the same directory — relative,
+ * absolute, or a symlink alias — shares one queue. The map holds at most one
+ * promise per live directory: the tail entry is deleted as soon as it settles,
+ * so an idle directory leaves nothing behind.
+ */
+const writeQueues = new Map<string, Promise<void>>();
+
+function enqueueWrite<T>(dir: string, task: () => Promise<T>): Promise<T> {
+  const prior = writeQueues.get(dir) ?? Promise.resolve();
+  const run = prior.then(task);
+  const tail: Promise<void> = run.then(() => undefined, () => undefined);
+  writeQueues.set(dir, tail);
+  void tail.then(() => {
+    if (writeQueues.get(dir) === tail) writeQueues.delete(dir);
+  });
+  return run;
+}
+
+/**
+ * Bounded retention after a durable write: keep the new row and the newest
+ * *prior* structurally valid canonical row as its fallback, and delete the other
+ * canonical rows strictly older than the new one. A candidate is only a fallback
+ * when the shared parser accepts it *and* its filename seq matches its content,
+ * so a malformed higher name can never chase a valid older row out. Rows newer
+ * than `newSeq` (a checkpoint another call wrote) and every non-canonical name
+ * (`notes.txt`, `.tmp`, …) are left entirely untouched.
+ *
+ * Pruning is best effort throughout: an unlink failure here never turns the
+ * durable write that preceded it into a failure.
+ */
+async function pruneSnapshots(dir: string, newSeq: number): Promise<void> {
+  const names = await readdir(dir);
+  const older = canonicalSeqs(names).filter((seq) => seq < newSeq).sort((a, b) => b - a);
+
+  let keptFallback = false;
+  for (const seq of older) {
+    if (!keptFallback) {
+      const snap = await readValidRow(dir, seq);
+      if (snap !== null) {
+        keptFallback = true;
+        continue;
+      }
+    }
+    await rm(join(dir, `${seq}.json`), { force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Writes a checkpoint to `nodes/<uid>/snapshots/<seq>.json`. The snapshot is
+ * validated through the same `parseSnapshot` the reader uses — envelope shape,
+ * `ver`, a canonical `(seq, hash)` and a frozen state whose watermark names that
+ * same identity — and only the canonical result is written; an invalid snapshot
+ * is `false` with no filesystem effect. The directory is created through the
+ * shared durable-directory helper, then its *physical* path is resolved with
+ * `realpath` before the write and prune are queued, so two spellings of one
+ * directory (relative, absolute, symlink alias) never race in two queues — the
+ * durable-directory proof is idempotent, so it runs per call, before the queue.
+ * The row is written atomically and the directory synced, all best effort: any
+ * exception is `false`, never a throw. A uid the path builder rejects is refused
+ * the same way. After the row is durable the directory is pruned to retention 2;
+ * a pruning failure still returns `true`, because the write itself succeeded.
  */
 export async function writeSnapshot(home: string, uid: string, snap: Snapshot): Promise<boolean> {
   try {
-    if (snap.ver !== 1) fail('ver', 'expected version 1');
-    const seq = safeInt(snap.seq, 'seq', 0);
-    hash(snap.hash, 'hash');
-    const body = JSON.stringify(toJson({ ver: 1, seq, hash: snap.hash, val: snap.val }));
+    const checked = parseSnapshot(snap);
+    if (checked === null) return false;
+    const body = JSON.stringify(checked);
     const dir = snapshotsDir(home, uid);
-    await mkdir(dir, { recursive: true });
-    await atomicWriteFile(join(dir, `${seq}.json`), body);
-    await syncPath(dir);
-    return true;
+    await ensureDurableDirectory(dir, home);
+    const canonicalDir = await realpath(dir);
+    return await enqueueWrite(canonicalDir, async () => {
+      try {
+        await atomicWriteFile(join(canonicalDir, `${checked.seq}.json`), body);
+        await syncPath(canonicalDir);
+      } catch {
+        return false;
+      }
+      await pruneSnapshots(canonicalDir, checked.seq).catch(() => {});
+      return true;
+    });
   } catch {
     return false;
   }
@@ -335,7 +442,8 @@ export async function writeSnapshot(home: string, uid: string, snap: Snapshot): 
  * `null`. Rows are scanned in descending seq; a row that is missing, malformed,
  * the wrong version, path-inconsistent, hash-mismatched or ahead of the chain is
  * skipped in favour of an earlier valid one. Nothing here is fatal: a missing
- * directory, an unreadable file or a `readdir` failure all return `null`.
+ * directory, an unreadable file, a `readdir` failure, or a uid the path builder
+ * rejects all return `null` (symmetric with `writeSnapshot`'s `false`).
  *
  * `events` is the already chain-verified journal; the snapshot is never trusted
  * over it, so this never skips verification or the fold.
@@ -346,7 +454,12 @@ export async function readSnapshot(
   const verified = new Map<number, string>();
   for (const event of events) verified.set(event.raw.seq, event.raw.hash);
 
-  const dir = snapshotsDir(home, uid);
+  let dir: string;
+  try {
+    dir = snapshotsDir(home, uid);
+  } catch {
+    return null;
+  }
   let names: string[];
   try {
     names = await readdir(dir);
@@ -354,27 +467,10 @@ export async function readSnapshot(
     return null;
   }
 
-  const rows: number[] = [];
-  for (const name of names) {
-    const match = NAME_RE.exec(name);
-    if (match === null) continue;
-    const seq = Number(match[1]);
-    if (!Number.isSafeInteger(seq)) continue;
-    rows.push(seq);
-  }
-  rows.sort((a, b) => b - a);
-
+  const rows = canonicalSeqs(names).sort((a, b) => b - a);
   for (const seq of rows) {
-    const bytes = await readFileOrNull(join(dir, `${seq}.json`)).catch(() => null);
-    if (bytes === null) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(bytes.toString('utf8'));
-    } catch {
-      continue;
-    }
-    const snap = parseSnapshot(parsed);
-    if (snap === null || snap.seq !== seq) continue;
+    const snap = await readValidRow(dir, seq);
+    if (snap === null) continue;
     if (verified.get(seq) !== snap.hash) continue;
     return snap;
   }
