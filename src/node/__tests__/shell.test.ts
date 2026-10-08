@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { Buffer } from 'node:buffer';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, open, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { canonicalizeJson } from '../../journal/index.js';
@@ -55,11 +55,16 @@ async function readPid(path: string, timeoutMs = 2000): Promise<number> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      return Number((await readFile(path, 'utf8')).trim());
+      const value = Number((await readFile(path, 'utf8')).trim());
+      // The shell truncates the file before writing, so an empty read is "not yet
+      // written", never pid 0: process.kill(0, 0) would signal this runner's own
+      // process group and report a survivor that does not exist.
+      if (Number.isSafeInteger(value) && value > 0) return value;
     } catch {
-      if (Date.now() > deadline) throw new Error(`pid file never appeared: ${path}`);
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      // not created yet
     }
+    if (Date.now() > deadline) throw new Error(`valid pid never appeared: ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
 
@@ -131,12 +136,32 @@ describe('runShell: real shell fixtures', () => {
     expect(shellFailure(result)).toEqual({ code: 'output-limit', status: null });
   }, 8000);
 
+  it('never reads a truncated, not-yet-written pid file as pid 0', async () => {
+    const dir = await tempDir('c13-shell-');
+    const pidFile = join(dir, 'child.pid');
+    // The shell creates the file with O_TRUNC before writing the leader pid, so a
+    // reader can observe it empty; Number('') is 0, and process.kill(0, 0) signals
+    // this runner's own process group, which alive() would report as a survivor.
+    const handle = await open(pidFile, 'w');
+    const pending = readPid(pidFile);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await handle.writeFile('4242\n');
+    await handle.close();
+    await expect(pending).resolves.toBe(4242);
+  }, 8000);
+
   it('cancels a running command via the abort signal and leaves no survivor', async () => {
     const dir = await tempDir('c13-shell-');
     const pidFile = join(dir, 'child.pid');
     const controller = new AbortController();
-    const running = run('echo $$ > child.pid; sleep 30 & wait', dir,
-      { timeoutMs: 60_000 }, controller.signal);
+    // The leader publishes child.pid by atomic rename only once the background
+    // `sleep` is already running: the marker's appearance then proves both that a
+    // complete pid was written and that the process group is populated, so the
+    // abort always cancels a live group rather than racing the file write.
+    const running = run(
+      'echo $$ > child.pid.tmp; sleep 30 & mv child.pid.tmp child.pid; wait', dir,
+      { timeoutMs: 60_000 }, controller.signal,
+    );
     const pid = await readPid(pidFile);
     controller.abort();
     const result = await running;
