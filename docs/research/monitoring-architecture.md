@@ -8,21 +8,23 @@
 
 ## 1. The sandwich: observation physically outside the world
 
+**Status (honest).** This section states the target architecture, not the current tree. The instrument being *physically* outside the world is a goal: with the raw shell still unconfined (C1.4 is open — `kernel.md` §7), a node can today read host files and reach the network outside the world, so the "outside" boundary is **editorial** until confinement (C1.4) and the kill switch (C1.7) exist. The analysis layers and metrics of §3–§6 are likewise specified, not implemented. Nothing below should be read as a claim about the delivered system.
+
 The instrument is arranged in three layers, and the society sits in the middle of them.
 
 - **Above — the wire.** Every model request and response, every tool effect, every lifecycle transition is journaled by the kernel at boundaries an agent cannot avoid crossing (`kernel.md` §3). This is the truth about *deliberation*: what a node thought, what it was given, what it paid.
-- **Below — the filesystem.** The world is a git repository, and the kernel commits it at the end of every node turn with the node's uid as the git author (`kernel.md` §5.2). This is the truth about *acts*: what changed, who changed it, when.
-- **Between — the society.** Nodes perceive each other through the world's files and its git history; they have no address at which the journal, the analysis or the metrics can be reached. Nothing in their universe reports that they are being measured.
+- **Below — the filesystem.** The world is a git repository, and the kernel commits it at the end of every node turn with the node's uid as the git author (`kernel.md` §5.2). This is the truth about *acts* at **commit granularity**: the author names the node whose turn closed the commit, not every file inside it — one shared working tree means a turn-end commit can carry a peer's in-flight writes. It says who moved the world when, not who wrote each line.
+- **Between — the society.** Nodes perceive each other through the world's files and its git history; in the target they have no address at which the journal, the analysis or the metrics can be reached. Today, while the raw shell is unconfined, an agent can read outside the world — so this separation becomes true only with confinement (C1.4). Nothing in their universe reports that they are being measured.
 
-**The anti-Goodhart property, in its strongest form.** The usual rule is that metrics are invisible to the agents (`vision.md` §3). The sandwich makes the property physical rather than editorial: the instrument is not hidden from the observed world, it is *outside* it. There is no sensor to read, no counter to inflate, no report to make flattering, because no part of the apparatus exists inside the world the agents inhabit. Fidelity is therefore measured on acts — what the world and the wire record — and never on declarations. An agent that wants to influence the measurement has nothing to address.
+**The anti-Goodhart property, in its strongest form.** The usual rule is that metrics are invisible to the agents (`vision.md` §3). Once confinement exists, the sandwich makes the property physical rather than editorial: the instrument is not hidden from the observed world, it is *outside* it. There is no sensor to read, no counter to inflate, no report to make flattering, because no part of the apparatus exists inside the world the agents inhabit. Fidelity is therefore measured on acts — what the world and the wire record — and never on declarations. An agent that wants to influence the measurement has nothing to address. Until confinement lands this is the target, and an unconfined shell can still reach outside the world.
 
 **The precise boundary, stated honestly.** The world's own git history *is* inside the world: an agent can run `git log` and read who wrote what, and that is deliberate — authorship is how the society perceives itself, and the masks of `kernel.md` §7 protect the trace from erasure, not from reading. What is outside is everything above the filesystem (the journal) and everything derived from either record (the graph, the sensors, the readings). The observed may see each other's acts; they cannot see the instrument that reads them.
 
 ## 2. Two raw truths, one disposable projection
 
 - **Raw truth 1 — the kernel event journal.** Append-only, hash-chained, per node (`kernel.md` §3). The wire side of every turn, including the commit hash that closed it.
-- **Raw truth 2 — the world's git history.** Every write, with its author and its position in time (`kernel.md` §5.2, §7).
-- **The cross-reference.** The two records are joined by the commit hash recorded in the `turn/end` journal event: for any journal `seq` the exact world state is known, and for any commit the turn that produced it is known. Neither record alone suffices — one holds the reasoning without the files, the other the files without the reasoning.
+- **Raw truth 2 — the world's git history.** One commit per closed turn, with the git author naming the node whose turn closed it (**commit-granular**, not per-file) and its position in time (`kernel.md` §5.2, §7). It is not a per-write record: a turn-end commit can carry a peer's in-flight writes.
+- **The cross-reference.** The two records are joined by the commit hash recorded in the `turn/end` journal event: **at each recorded turn boundary** the world state that turn closed is known, and for a turn-end commit the turn that produced it is known. An arbitrary journal `seq` is **not** an exact world snapshot — a shell write mid-turn, or a commit made outside any journal turn, has no per-`seq` mapping (`kernel.md` §5.2; `architecture.md` §4). Neither record alone suffices — one holds the reasoning without the files, the other the files without the reasoning.
 - **Everything else is a projection.** The semantic graph, its communities, its inferred roles, the metric series: all of it is *recomputable* from the two raw truths, disposable, and never a source of truth. A projection may be deleted and rebuilt at will; the two records may not. This is what lets the analysis be revised as the research progresses without rewriting the facts (`kernel.md` §3, rule 1).
 - **Provenance is mandatory.** Every node and every edge in the projection carries a path back to the raw truth: a source file and line for the file layer, a commit and an author for the git layer, a `seq` for the journal layer. A reading that cannot be walked back to the raw records is not a reading.
 
@@ -47,9 +49,9 @@ The kernel imposes no communication structure (`kernel.md` §5.1), so the social
 
 The git history is a first-class analysis input, not a timestamp source:
 
-- **Authorship** — per commit, and per line where needed: which node produced a file, a paragraph, a line.
-- **Time** — commit order and timestamps give turns, durations and the ordering of a dialogue.
-- **Tombstones** — a deletion is an event (the file vanished in commit X, authored by Y), never a silent absence. A projection that only knows the current tree cannot distinguish "never existed" from "removed".
+- **Authorship** — per commit only: which node's turn closed a commit. Per-file and per-line attribution is **not** recoverable here — neither Git (one shared tree, commit-granular author) nor the journal (mediated tool invocations and results, recorded perceptions, turn-boundary commit links, **no syscall-level trace**) yields who wrote every line. Per-file truth is a research direction (per-node worktrees), not a current capability (`kernel.md` §5.2, §7).
+- **Time** — commit order and timestamps order acts within the world repo; each node's journal is a per-node `seq` with **no global order across nodes**, so a merged cross-node timeline (and any causal-merge inference over it) is a future instrument, not a current one.
+- **Tombstones** — a deletion is an event (the file vanished in commit X, whose author is the node that closed that commit — commit-granular), never a silent absence. A projection that only knows the current tree cannot distinguish "never existed" from "removed".
 - **Negation via diff** — the absence of an expected act is computable: a convention present in one snapshot and absent from a node's files, a question with no reply, a proposal with no implementation. A graph has no node for a non-edge; a diff against the previous snapshot does, and for a monitoring instrument negative evidence ("no handoff happened") is often the most interesting signal there is.
 
 ### 3.4 Optional layer — a local model for fuzzy prose semantics
@@ -75,6 +77,8 @@ Two disciplines follow. First, the definitions are written into the extractor it
 
 Graphify treats the filesystem as a *codebase* and projects it as a structure graph. The monitoring pipeline treats the filesystem as a *society* and projects it as a social graph with provenance. Those projections disagree on nearly every edge that matters, which is why the architecture is borrowed and the pipeline is built here rather than adopted.
 
+**Provenance of these numbers.** The spike was a one-off local experiment run by the author against a simulated corpus. The corpus, the Graphify v0.9.66 build and the raw outputs are **not artifacts of this repository**, so the table below is a *reported* measurement and the protocol is **not reproducible from this repo alone**. The numbers are kept exactly as reported, together with their stated limitations; they are not re-certified here.
+
 **What the validation spike measured.** A spike ran Graphify (v0.9.66, fully offline, no LLM backend) against a simulated agent-society filesystem — 27 tracked files, three tagged snapshots, with an agent-written message convention, a proposal, a holdout, a disagreement and an abandoned experiment embedded in it. Its deterministic pass over *code* is strong: a tool file was mapped completely, including `indirect_call` edges derived from `set_defaults(func=…)` patterns and `rationale_for` edges carrying docstrings, and prose→code `references` edges correctly merged a README into its tool's community. The keyless graph of the *society*, however, recovered almost none of what a monitor needs:
 
 | Measured on the final snapshot (27 files) | Value |
@@ -96,6 +100,8 @@ The corpus's own convention is the sharpest illustration: a proposal file specif
 **Honest caveat.** The spike ran with no LLM backend, so the comparison is between Graphify keyless and what a society monitor needs — not between Graphify at full power and what a society monitor needs. The expectation, stated as an expectation and not as a finding, is that a semantic pass would add generic prose→prose relations and link the proposal to its implementation, while still producing no authorship, no mention edges, no negation and no temporal ordering. The custom layers would remain necessary.
 
 ## 6. Relation to the instrument (3 sensors + 1 metronome)
+
+**Status: this mapping is design, not code.** The pipeline — its layers, the EXTRACTED/INFERRED honesty model, the sensors — is specified here; none of it is implemented, and **no metric has been computed from any journal**. The C1.3 checkpoint is the context and provider boundary, not the monitoring instrument.
 
 - **Sensor 2 (structure graph)** reads the projection directly: role stability, hierarchical coherence, turnover, the March cascade.
 - **Sensor 1 (semantic trajectory)** consumes the prose the projection attributes and orders: embeddings over attributed text, with authorship and time as filters, so a phase can be read per node and per period rather than over an anonymous corpus.

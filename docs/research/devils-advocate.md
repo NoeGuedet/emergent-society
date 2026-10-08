@@ -95,7 +95,7 @@ Legend for classifying each attack:
 
 ### 1.6 Level 1 synthesis
 
-**No published result demonstrates that behavioral metrics on logs cannot capture exploration/exploitation or plasticity.** There is no impossibility theorem targeting this device. The closest attacks (Goodhart, trilemmas, sycophancy, unfaithful traces) are theorems about *optimization* and about the *fidelity of signals*, not about *observation*. They impose a defensive measurement protocol (continuous metrics, acts rather than statements, exogenous perturbations, holdouts) — which the current design already partly anticipates (step response, anti-Goodhart in commit 9785a8f).
+**No published result demonstrates that behavioral metrics on logs cannot capture exploration/exploitation or plasticity.** There is no impossibility theorem targeting this device. The closest attacks (Goodhart, trilemmas, sycophancy, unfaithful traces) are theorems about *optimization* and about the *fidelity of signals*, not about *observation*. They impose a defensive measurement protocol (continuous metrics, acts rather than statements, exogenous perturbations, holdouts) — which the current design already partly anticipates (step response, and anti-Goodhart as a golden rule in `vision.md` §3, with the journal as the only truth in `kernel.md` §9).
 
 ---
 
@@ -123,9 +123,11 @@ Legend for classifying each attack:
 
 ### 2.3 The "multi-agent tax": error amplification ×17, negative gains
 
-**Reference:** Kim et al., *Towards a Science of Scaling Agent Systems*, Google DeepMind, arXiv:2512.08296 (Dec. 2025). 180 configurations, 3 LLM families. Results: (1) **independent agents amplify errors ×17.2** (95% CI [14.3; 20.1]) via unverified propagation, versus ×4.4 for centralized coordination; (2) **capacity saturation**: beyond ~45% success in single-agent, adding agents has negative returns (β=-0.408, p<0.001); (3) tool/coordination trade-off (β=-0.330); average success: independent 0.370 vs single-agent 0.466. [arXiv](https://arxiv.org/html/2512.08296v1)
+**Reference:** Kim et al., *Towards a Science of Scaling Agent Systems*, Google Research / Google DeepMind / MIT, arXiv:2512.08296 (Dec. 2025, v3 2026-04-08). Results relied on here, all exact in the v3 full text: (1) **independent agents amplify errors ×17.2** (95% CI [14.3; 20.1]) via unverified propagation, versus ×4.4 for centralized coordination; (2) **capacity saturation**: beyond ~45% success in single-agent, adding agents has negative returns; (3) average success: independent 0.370 vs single-agent 0.466. [arXiv](https://arxiv.org/html/2512.08296v1)
 
-*Honesty note: the figure "average gain -3.5%" cited in the command could not be found as such in the sources; the Google paper rather documents a -9.6 point success gap for the independent architecture and a ×17.2 error amplification. To be re-verified against the user's original source.*
+*Verification status: the configuration count and saturation coefficient that circulate with this paper (180 configurations, β=-0.408, p<0.001) were flagged FALSE against the v3 full text by our September 11 verification pass, which read 260 configurations and β=-0.236 (p=0.004) — but neither preprint version was re-checked here, so the disputed figures are dropped from the argument rather than swapped for the alternative, and the count and coefficient are left **pending primary verification**. Only the figures named above are relied on.*
+
+*Honesty note: the figure "average gain -3.5%" cited in the command could not be found as such in the sources. It is not the same claim as the −9.6 point success gap this paper documents between the independent and single-agent architectures (0.370 vs 0.466), nor the +3.5% strong-model effect reported by Dochkina (§2.8) — three distinct claims. The ×17.2 amplification and the 0.370 vs 0.466 success gap are the figures relied on, and the count/coefficient remain pending primary verification.*
 
 **Reading against the project:** the "self-organizing agents without a coded coordinator" architecture is *precisely* the category that amplifies errors the most. The project tests the hypothesis that self-organized emergence does better than ×17.2 — yet the measured literature says that without a validation bottleneck, it does not.
 
@@ -289,4 +291,4 @@ The most likely risk is neither impossibility nor mirage: it is the **variance c
 | 3.2 | Theater of convergence | Sid §7; Clever Hans EACL 2024; 2604.18373; Sha Li 2026 | High, unfalsifiable in absolute terms | ⚠️ refutable in degree, 4 preregistered tests |
 | 3.3 | E/E construct contested in its home discipline | March 1991; Lavie et al. 2010 | Medium | ✅ total observability = contribution to org. metrology |
 
-*Sources consulted on September 11, 2026. The "-3.5%" figure from the command could not be verified in the literature found; the verifiable figures from the Google DeepMind paper are ×17.2 (amplification) and 0.370 vs 0.466 (independent vs single-agent success).*
+*Sources consulted on September 11, 2026. The "-3.5%" figure from the command could not be verified in the literature found; the verifiable figures from the Google DeepMind paper are ×17.2 (amplification) and 0.370 vs 0.466 (independent vs single-agent success). Reconciliation (2026-10-08): the configuration count and saturation coefficient are left pending primary verification and are not relied on; no source was re-fetched.*

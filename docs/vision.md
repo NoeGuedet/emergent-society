@@ -1,4 +1,6 @@
-# Vision — the unoccupied triangle
+# Vision — the conceptual triangle
+
+*Research hypothesis. The triangle below is a working name for a gap identified in the September 2026 literature survey (`research/sota-autonomous-agents.md`): a survey-date-bounded and not independently verified claim, not an established result. The project's name stays "vision"; this is the project goal, not a new one.*
 
 This document specifies what the project sets out to demonstrate, the design discipline it commits to, and the measurement apparatus that backs the claim. It is the entry point to the design corpus: [seed.md](seed.md) (the cold start), [direction.md](direction.md) (chat and direction), [kernel.md](kernel.md) (the runtime), [ROADMAP.md](../ROADMAP.md) (checkpoints and next steps), and [research/](research/) (the evidence base).
 
@@ -20,8 +22,8 @@ A specification that accumulates **product** mechanisms — graduation, promotio
 The state of the art ([research/sota-autonomous-agents.md](research/sota-autonomous-agents.md)) settles the positioning:
 
 - **Perpetual** — solved (Letta, ambient agents, OpenClaw, durable execution engines). Not a contribution in itself.
-- **Emergent structure** — explored ("Drop the Hierarchy and Roles"), with one crucial correction: emergence beats fixed roles by **+3.5%** for a strong model but **loses −9.6% for a weak model**. This is why the design is model-agnostic and targets cheap/smart models rather than assuming one tier of intelligence.
-- **Direction co-negotiated through continuous chat** — nobody does this. Static missions (charters), finite objectives (benchmarks) and self-generated curricula (Voyager) all exist; the *direction* as a persistent, versioned artifact, continuously revised, exists nowhere.
+- **Emergent structure** — explored ("Drop the Hierarchy and Roles"), with one crucial correction: emergence is *reported* to beat fixed roles by **+3.5%** for a strong model and to *lose* **−9.6% for a weak model**. These two figures come from a secondary analysis (indras-net) of a single-author preprint; the source version is uncertain and the primary text was not re-checked in this corpus, so they are held as **reported, pending primary verification** — and they are a different claim from the paper's +44% Sequential-vs-autonomous effect, which is *not* treated as ground truth here. The reason the design is model-agnostic and targets cheap/smart models rather than assuming one tier of intelligence stands regardless.
+- **Direction co-negotiated through continuous chat** — not found as a first-class object in the literature surveyed as of September 2026 (a claim bounded by that survey date). Static missions (charters), finite objectives (benchmarks) and self-generated curricula (Voyager) all exist; the *direction* as a persistent, versioned artifact, continuously revised, is what the survey could not find.
 
 **The triangle perpetual × emergent × direction is the contribution. Everything else must be minimal so as not to dilute it.**
 
@@ -92,17 +94,17 @@ The catalogue of ~20 metrics becomes a diagnostic manual: a posteriori queries o
 
 ### Feasibility and attack handling
 
-The metrics exist individually (~70%); the unified instrument is virgin territory, and that is the contribution. Nobody has demonstrated the impossibility: the theorems constrain optimization, not observation. The self-evolution trilemma (Wang 2026) proves that external human steering is *necessary* — which is the concept of the project.
+The metrics exist individually in the literature (~70%); **none is implemented in this project yet** — C1.3 is the context and provider boundary, not the monitoring instrument. The unified instrument is, as of the surveys read for this project, virgin territory — a survey-date-bounded claim, not a verified result — and that is the intended contribution. Nobody has demonstrated the impossibility: the theorems constrain optimization, not observation. The self-evolution trilemma (Wang 2026) proves that external human steering is *necessary* — which is the concept of the project.
 
 Attacks handled by design: **sycophancy** (→ fidelity to actions), **meltdown loops** (→ measured time-to-meltdown), **emergence theater** (→ anti-imitation tests, out-of-corpus forms), **variance and noise** (→ experimental protocol).
 
 ## 7. Research backing
 
 - **Kernel mechanics** — [research/harness-deep-dive.md](research/harness-deep-dive.md): a single mutation gate (`effect(install) → disposer`, inverses composed in LIFO order; Cordis fits in ~2000 lines); the dsh-session journal (log = the only truth, everything else is a projection; "model-visible means logged"; `{type, contiguous seq, time, data}`; extensibility with a required refusal to read an unknown type); the chat as a second application on top of the same kernel (Chat and Trajectory are two projections of the same stream, and human input enters the same stream as everything else); the identified gap we fill — in DeepSeek Harness self-written plugins live in memory only and are lost on restart, whereas ours must persist (journal + persistent modules); **confluence (Th. 80)** — the final state depends only on the final config, not on the order, a decisive property for a self-modifying system.
-- **Models** — [research/models-overview.md](research/models-overview.md). No hardware constraint: the "local Qwen on a 3090" prerequisite is dropped (local inference remains available for free routing and summaries). Candidates to test (price per M tokens in/out):
-  - **GLM-5.3-Flash** ($0.075/$0.25) — best measured intelligence/price ratio → agents in volume
+- **Models** — [research/models-overview.md](research/models-overview.md). No hardware constraint: the "local Qwen on a 3090" prerequisite is dropped (local inference remains available for free routing and summaries). Candidates to test (price per M tokens in/out, all *reported* as of 11/09/2026 and subject to re-verification):
+  - **GLM-5.3-Flash** — quoted at a **$0.075/$0.25 promo** in that snapshot (*reported*; the promo has since expired, list reported around $0.15/$0.50) → candidate for agents in volume
   - **DeepSeek V4.1 Flash** ($0.15–0.30/$0.60–1.20, cache hit $0.003, MIT) — no independent eval yet
-  - **GLM-5.3** ($1.40/$4.40) — no. 1 open weights on the Intelligence Index → orchestrator
-  - **Kimi K2.7 Code** ($0.95/$4.00) — 12h+ sessions / 4000 tool calls, ~30% fewer reasoning tokens
+  - **GLM-5.3** ($1.40/$4.40) — a *reported* leader among open weights; the Intelligence Index reading itself is disputed across snapshots (45 on v4.3 / 60 on v4.1.1) → candidate orchestrator
+  - **Kimi K2.7 Code** ($0.95/$4.00) — 12h+ sessions / 4000 tool calls, ~30% fewer reasoning tokens (**vendor-reported**)
   
-  Cost lever no. 1 is the **cache hit rate** (a ×30 spread at DeepSeek) → a design consequence for context assembly.
+  These are dated, source-reported figures, not a fresh price check; prices and benchmark scales move weekly, so the routing choice is a design consequence to re-verify, not a settled budget. Cost lever no. 1 is the **cache hit rate** (a ×30 spread at DeepSeek, on that snapshot) → a design consequence for context assembly.

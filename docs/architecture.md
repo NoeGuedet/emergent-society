@@ -307,7 +307,7 @@ Four event types only: `node/boot`, `node/shutdown`, `turn/start`, `turn/end`. A
 
 ### 4.2 Wake-on-change
 
-The watcher monitors the world's git **HEAD**, not the filesystem: no inotify, no partial-write races, nothing to debounce — HEAD moves exactly once per turn, at a kernel-controlled point. It announces *movement*, not *waking*: deciding whether a movement concerns a given node is that node's predicate. Its first read announces the HEAD it finds (including an unborn HEAD) to set a baseline; later reads announce only a change.
+The watcher monitors the world's git **HEAD**, not the filesystem: no inotify, no filesystem-level partial-write races, nothing to debounce. Each wake is pinned to an **opening range** (`{watermark → HEAD}` at the moment the turn opens), so perception is taken at a commit boundary, never mid-write. HEAD is not moved only by a node's turn — a human or external commit can land between turns — so commits may arrive between the pinned bounds and are covered by the next wake's range; this is a commit-boundary guarantee, not a claim that no event is ever missed. It announces *movement*, not *waking*: deciding whether a movement concerns a given node is that node's predicate. Its first read announces the HEAD it finds (including an unborn HEAD) to set a baseline; later reads announce only a change.
 
 ```mermaid
 flowchart LR

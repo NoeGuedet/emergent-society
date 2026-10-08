@@ -5,6 +5,8 @@
 
 > ⚠️ **Method and limits.** All the data below comes from web research on 11/09/2026 (Artificial Analysis, pricing aggregators, dated technical articles). Prices and benchmarks change **every week** in this segment: re-check the official pages before committing any budget. "Vendor" scores are reported by the lab itself, with no independent replication — they are marked **[vendor]**. Scores marked **[AA]** come from Artificial Analysis (independent). Inconsistencies between sources are flagged explicitly. Models released less than ~2 weeks ago (DeepSeek V4.1 Flash: **yesterday**) have **no independent evaluation**.
 
+> 🔁 **Reconciliation status (2026-10-08).** This is a dated snapshot: the figures below are what the 11/09 sources *reported* and were **not** re-fetched. The pass that reconciles it with the corpus (`source-verification.md`) corrected two load-bearing points — the GLM-5.3 Intelligence Index reading and the GLM-5.3-Flash pricing. Both are annotated in place; GLM-5.3-Flash's **cache figure is left explicitly disputed** (0.011 vs 0.015 promo, 0.03 list reported) and is **not** treated as a routing input; the routing table no longer rests on an absolute "no. 1" or on expired promo prices; and where two Artificial Analysis snapshots disagree (v4.3 vs v4.1.1, different model counts) the cells are marked and **no comparison is made across snapshots**.
+
 ---
 
 ## 1. Summary comparison table
@@ -17,8 +19,8 @@ Prices in USD per million tokens. "Cache" = cached input on a cache hit. Ctx = m
 | **DeepSeek V4 Pro** | 24/04/2026 (GA 07/2026) | $0.66 / $1.32 (peak) | $0.022 / $0.044 | $1.98 / $3.96 | 1M | MIT | 80.6% (Pro-Max config, preview era, **[vendor/aggregated]**) | DeepSWE 62.7 · TB 2.1 87.9 **[vendor]** | 36–44 (v4.3/v4.1, max configs) **[AA]** |
 | **DeepSeek V4 Flash** (0731) — *retired on 10/09* | 04/2026 | $0.22 / $0.44 | $0.007 / $0.014 | $0.66 / $1.32 | 1M | MIT | 79.0% (Flash-Max, llm-stats board); 73.7% tech report **[vendor]** | TB 2.1 82.7 **[vendor, not replicated]** | 35 (v4.3) **[AA]** |
 | **DeepSeek V3.2** (older, via OpenRouter) | 2025 | $0.27–0.28 | $0.028 | $0.40–0.42 | 128–164K | MIT | ~65–70%; 73.1% SWE-Verified **[vendor apidog]** | Terminal-Bench 2.0 80.3% **[vendor]** | n/a |
-| **GLM-5.3** (Z.ai) | 14/08/2026 | $1.40 | $0.26 | $4.40 | 1M | GLM-5.3 License ($10B revenue clause) | n/a (not published) | Terminal-Bench 3.0 28.3 · DeepSWE 66.9 · CyberGym 84.5% **[vendor]** | **45 — no. 1 among the 112 open weights (v4.3)** **[AA]**; Agentic Index 59.1 **[AA, 27/08 snapshot]** |
-| **GLM-5.3-Flash** (Z.ai) | 26/08/2026 | **$0.075** | **$0.011** | **$0.250** | 1M | (to be verified) | n/a | Agentic Index 58.2 **[AA]** | 41.9 (98th percentile) **[AA/aggregated]** |
+| **GLM-5.3** (Z.ai) | 14/08/2026 | $1.40 | $0.26 | $4.40 | 1M | GLM-5.3 License ($10B revenue clause) | n/a (not published) | Terminal-Bench 3.0 28.3 · DeepSWE 66.9 · CyberGym 84.5% **[vendor]** | **45 (v4.3, 112 models) — *disputed*: the 11/09 verification read 60 (v4.1.1, 181 models), tied no. 1 open weights with Kimi K3; different versions/scales, not comparable** **[AA]**; Agentic Index 59.1 **[AA, 27/08 snapshot]** |
+| **GLM-5.3-Flash** (Z.ai) | 26/08/2026 | **$0.075**¹ | **cache disputed**¹ | **$0.250**¹ | 1M | (to be verified) | n/a | Agentic Index 58.2 **[AA, reported; not reconfirmed at source]** | 41.9 (98th percentile) **[AA/aggregated]** |
 | **GLM-5.2** | 13/06/2026 | $1.40 | $0.26 | $4.40 | 1M | MIT | ~80.9% (est.) | TB 2.1 81.0 | 39 (v4.3) **[AA]** |
 | **GLM-4.6 / 4.7** | late 2025 | $0.50 | n/a | $2.00 | 200K | MIT | 73.8% (4.7) | τ²-Bench 87.4% (4.7) | n/a |
 | **Kimi K3** (Moonshot) | 16/07/2026 | $3.00 ($2.40 at some providers) | $0.30 | $15.00 | 1M | Kimi K3 License (weights published 27/07) | n/a independent | FrontierSWE 81.2 · TB 2.0 88.3 **[vendor]**; 12 h+ sessions documented | 44 (v4.3) / 57.1 (v4.1) **[AA]** — *different scales, see §7* |
@@ -33,6 +35,8 @@ Prices in USD per million tokens. "Cache" = cached input on a cache hit. Ctx = m
 | **Llama 4 Scout / Maverick** (Meta) | 2025 | variable | — | variable | 10M (Scout) / 1M | Llama Community | weak | TerminalBench 6.8 (Maverick) — **not recommended for agentic use** | 14.3 (Maverick) **[AA]** |
 
 **Frontier reference points (for calibration):** Claude Fable 5: 95% SWE-bench, $10/$50. Claude Opus 4.8: 88.6%, $5/$25. GPT-5.5: 88.7%, $5/$30. METR TH1.1: 50% horizon ≈ 12–14.5 h (Opus 4.6, 02/2026). The models above cost **5× to 60× less** than the frontier for 80–90% of the agentic capability.
+
+¹ GLM-5.3-Flash pricing is **dated and reported, not a fresh fact**, and its cache figure is **disputed in the historical notes**: the 11/09 snapshot read a promo of $0.075 input / $0.250 output / **$0.011 cache**, while the verification pass (which found that promo expired on 2026-09-09) read a promo cache of **$0.015** and a list of ~$0.15 / $0.50 with **cache $0.03 reported**. Both readings are kept here, explicitly conflicting and unresolved — **neither is chosen**. Cache pricing for this model is therefore **disputed in the historical notes and is not a current routing input**, and no cache-economy conclusion is derived from it. See §3 and §9.
 
 ---
 
@@ -64,9 +68,9 @@ Prices in USD per million tokens. "Cache" = cached input on a cache hit. Ctx = m
 
 ## 3. GLM (Zhipu / Z.ai)
 
-### GLM-5.3 — 14 August 2026 (independent open-weights no. 1)
+### GLM-5.3 — 14 August 2026 (a reported open-weights leader)
 - Same 753B MoE base as GLM-5.2; **all the gains come from post-training**: Terminal-Bench 3.0 4.6 → 28.3; DeepSWE v1.1 46.2 → 66.9; CyberGym 77.2 → 84.5% **[vendor]**.
-- **[AA] Intelligence Index v4.3 = 45, no. 1 among the 112 open-weights models**, ahead of Kimi K3 (44), at ~1/5 the price. Agentic Index 59.1 (AA snapshot of 27/08, nearly tied with Opus 5 max at 59.2).
+- **[AA] Intelligence Index v4.3 = 45 (112 models), a reported leader among open weights** on that snapshot, ahead of Kimi K3 (44) there, at ~1/5 the price. **Disputed:** the 11/09 verification read AA **v4.1.1**: score **60**, **tied no. 1 open weights with Kimi K3**, 181 models — a different index version and model count, so neither reading can be compared across snapshots. Agentic Index 59.1 (AA snapshot of 27/08, nearly tied with Opus 5 max at 59.2). Status: *reported; a consistent-snapshot re-check is pending.*
 - Price unchanged vs 5.2: **$1.40 / $4.40**, cache $0.26, 1M ctx, 128K max output. Reasoning always-on (effort low/high/max, default max).
 - Weights public since 25/08/2026 under the **custom GLM-5.3 License** (security review clause above $10B in revenue — not MIT).
 - ⚠️ Verbose: 210M tokens on the index vs a 120M median **[AA]**. No vision. No published SWE-bench Verified score.
@@ -74,8 +78,8 @@ Prices in USD per million tokens. "Cache" = cached input on a cache hit. Ctx = m
 - Sources: [morphllm.com/glm-5-3, 28/08/2026](https://www.morphllm.com/glm-5-3); [morphllm.com/glm-5-3-vs-claude, 21/08/2026](https://www.morphllm.com/glm-5-3-vs-claude).
 
 ### GLM-5.3-Flash — 26 August 2026 (the cheapest of the "smart" models)
-- **$0.075 input / $0.250 output / $0.011 cache**, 1M ctx, 58 tok/s, vision, 20 providers.
-- **[AA] Agentic Index 58.2** — on par with Qwen3.8 Max (58.4) and GPT-5.6 Sol (57.8) — and Intelligence 41.9 (98th percentile) at an order of magnitude lower price.
+- **$0.075 input / $0.250 output** (dated promo, *reported*, expired 2026-09-09) and a **cache figure disputed in the historical notes**: the 11/09 snapshot read **$0.011**, the verification pass read a promo cache of **$0.015** and a list of **$0.15 / $0.50 with cache $0.03 reported**. Both readings are dated, reported and conflicting — **neither is chosen**, and **cache pricing is not a current routing input**. 1M ctx, 58 tok/s, vision, 20 providers. The list figures were **not re-fetched here** and remain *reported, not fresh-verified*.
+- **[AA] Agentic Index 58.2** *[reported; not reconfirmed at the source — closest 57 as of 30/08]* — on par with Qwen3.8 Max (58.4) and GPT-5.6 Sol (57.8) on that snapshot — and Intelligence 41.9 (98th percentile) at an order of magnitude lower price.
 - Source: [pricepertoken.com, 10/09/2026](https://pricepertoken.com/pricing-page/model/z-ai-glm-5.3-flash); [everylocalai.com (AA data, 27/08/2026)](https://everylocalai.com/model/qwen3-6-27b).
 
 ### Older generations
@@ -148,14 +152,14 @@ Prices in USD per million tokens. "Cache" = cached input on a cache hit. Ctx = m
 
 | Role in the org | Model | Why |
 |---|---|---|
-| **Worker agents (volume)** | **GLM-5.3-Flash** ($0.075/$0.25) or **DeepSeek V4.1 Flash** ($0.15/$0.60 off-peak) | Best measured intelligence/price ratio; 1M ctx; near-free cache |
-| **Orchestrator / planning** | **GLM-5.3** ($1.40/$4.40) | independent open-weights no. 1 [AA 45]; Anthropic-format endpoint (drop-in) |
+| **Worker agents (volume)** | **GLM-5.3-Flash** (promo $0.075/$0.25 — see §3) or **DeepSeek V4.1 Flash** ($0.15/$0.60 off-peak) | Best measured intelligence/price ratio *on this dated snapshot*; 1M ctx. The GLM price was a promo that has since expired and its cache pricing is disputed (see §3) — re-check before relying on it. |
+| **Orchestrator / planning** | **GLM-5.3** ($1.40/$4.40) | a reported open-weights leader (AA 45 v4.3 / 60 v4.1.1 — disputed, cross-snapshot, see §3); Anthropic-format endpoint (drop-in) |
 | **Long-horizon coding** | **Kimi K2.7 Code** ($0.95/$4.00) | −30% reasoning tokens, 12 h+ sessions [vendor], reliable MCP |
 | **Multimodal / GUI tasks** | **MiniMax M3** ($0.24–0.60 / $0.96–2.40) | the only one in the set with native vision+video and OSWorld 70% |
 | **Trivial / routing / summaries** | **Qwen3.6-27B local (RTX 3090)** | zero marginal cost, 77% SWE-bench, Apache 2.0 |
 
 ### Cost levers specific to "always on"
-1. **Mandatory cache hits**: a harness that sends the same system prompt + history at every turn should target >90% cache hits (DeepSeek: $0.003–0.022/M; GLM: $0.011–0.26/M; Kimi: $0.19–0.30/M). This is lever no. 1 — a 30× gap between miss and hit at DeepSeek.
+1. **Mandatory cache hits**: a harness that sends the same system prompt + history at every turn should target >90% cache hits (DeepSeek: $0.003–0.022/M; Kimi: $0.19–0.30/M; **GLM cache pricing is disputed in the historical notes — $0.011 vs $0.015 promo, $0.03 list reported — and is not a current routing input**). This is lever no. 1 — a 30× gap between miss and hit at DeepSeek on the dated snapshot; no GLM cache-economy figure is derived from it.
 2. **Schedule large runs during DeepSeek off-peak** (UTC nights and weekends = half price).
 3. **Cap reasoning effort**: V4-Flash and GLM-5.3 are ~2× more verbose than the median [AA] — cost per task can double despite cheap tokens.
 4. **GLM Coding Plan subscription (from $18/month)** to be evaluated as an alternative to pay-per-token for high-volume coding agents.
@@ -169,6 +173,7 @@ Prices in USD per million tokens. "Cache" = cached input on a cache hit. Ctx = m
 - [ ] GLM-5.3 license ($10B clause) and MiniMax Community License (separate commercial agreement) — have them validated if used commercially.
 - [ ] Scale inconsistencies between Artificial Analysis snapshots (v4.1: scores ~44–60; v4.3: ~36–45 for the same families; everylocalai 27/08 snapshot: 57–60) — compare only within a single snapshot.
 - [ ] "Min provider" prices (pricepertoken) ≠ first-party prices; verify SLAs and per-provider rate limits.
+- [ ] **GLM-5.3 index reading and GLM-5.3-Flash pricing** (reconciled 2026-10-08): two passes disagree (AA v4.3 = 45 over 112 models vs v4.1.1 = 60 over 181; promo vs list price; cache 0.011 vs 0.015 promo). Re-check both on a *single* Artificial Analysis snapshot and on Z.ai's own pricing page before relying on them.
 
 ---
 
