@@ -138,27 +138,48 @@ export async function repair(home: string, nodeUid: string): Promise<{ tornBytes
   // Probe first: repairing a journal that does not exist must not create one.
   if ((await readFileOrNull(path)) === null) return { tornBytes: 0 };
   const ownership = await acquireLock(dir, nodeUid);
+  let result: { tornBytes: number } | undefined;
+  let failed = false;
+  let failure: unknown;
   try {
     // Read under ownership, so the length cannot change between scan and
     // truncate.
     const raw = await readFileOrNull(path);
-    if (raw === null) return { tornBytes: 0 };
-    // scanBatches throws CorruptFrameError on interior corruption: repair must
-    // never truncate through valid committed events, so that error propagates
-    // and nothing is deleted.
-    const { tornBytes } = scanBatches(raw);
-    if (tornBytes > 0) {
-      await truncate(path, raw.length - tornBytes);
-      // The truncation and its directory entry are both metadata changes, so both
-      // are fsynced before the caller trusts the new length.
-      await syncPath(path);
-      await syncPath(dir);
-      // The head checkpoint may now point past the truncation point; it is
-      // disposable, so it is removed and rebuilt from the log on the next flush.
-      await rm(headPath(dir), { force: true });
+    if (raw === null) {
+      result = { tornBytes: 0 };
+    } else {
+      // scanBatches throws CorruptFrameError on interior corruption: repair must
+      // never truncate through valid committed events, so that error propagates
+      // and nothing is deleted.
+      const { tornBytes } = scanBatches(raw);
+      if (tornBytes > 0) {
+        await truncate(path, raw.length - tornBytes);
+        // The truncation and its directory entry are both metadata changes, so
+        // both are fsynced before the caller trusts the new length.
+        await syncPath(path);
+        await syncPath(dir);
+        // The head checkpoint may now point past the truncation point; it is
+        // disposable, so it is removed and rebuilt from the log on the next flush.
+        await rm(headPath(dir), { force: true });
+      }
+      result = { tornBytes };
     }
-    return { tornBytes };
-  } finally {
-    await ownership.release();
+  } catch (err) {
+    failed = true;
+    failure = err;
   }
+  // The release always runs, but a body failure outranks a release failure: in a
+  // plain `finally` a rejected release would replace the original error, hiding
+  // the CorruptFrameError that tells the operator to inspect instead of retry.
+  // A release failure on an otherwise successful body still propagates.
+  try {
+    await ownership.release();
+  } catch (err) {
+    if (!failed) {
+      failed = true;
+      failure = err;
+    }
+  }
+  if (failed) throw failure;
+  return result!;
 }

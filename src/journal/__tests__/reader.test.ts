@@ -1,8 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { spawn } from 'node:child_process';
 import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { JournalWriter } from '../writer.js';
 import { JournalReader, repair } from '../reader.js';
+import { acquireLock, guardLauncher, JournalLockUnavailableError } from '../lock.js';
 import { ChainBreakError } from '../verify.js';
 import { UnknownEventTypeError, computeHash } from '../envelope.js';
 import { canonicalizeJson, NonCanonicalizableError, sha256HexOf } from '../canon.js';
@@ -440,6 +442,74 @@ describe('JournalReader integrity', () => {
     await appendTear(home());
     await repair(home(), 'n1');
     expect(await (await JournalReader.open(home(), 'n1', { knownTypes: KNOWN })).head()).toBeNull();
+  });
+});
+
+describe('repair error precedence', () => {
+  // Writes two real batches, then corrupts the interior of the first one, so
+  // `scanBatches` inside `repair` throws CorruptFrameError. Returns the log
+  // length and the head the failing repair must leave untouched.
+  async function interiorCorruptLog(): Promise<{ length: number; headCount: number | undefined }> {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/ping', { n: 0 });
+    await w.close();
+    const w2 = await JournalWriter.open(home(), 'n1');
+    w2.append('test/ping', { n: 1 });
+    await w2.flush();
+    await w2.close();
+    const raw = await readFile(logPath(home()));
+    const { batches } = scanBatches(raw);
+    const first = batches[0]!;
+    const corrupt = Buffer.from(raw);
+    corrupt.fill(0xff, first.offset + 4, first.offset + first.size);
+    await writeFile(logPath(home()), corrupt);
+    const head = await (await JournalReader.open(home(), 'n1', { knownTypes: KNOWN })).head();
+    return { length: (await readFile(logPath(home()))).length, headCount: head?.count };
+  }
+
+  // Runs the real `flock` + helper for an acquire, but fails the release with a
+  // guard startup exit so `ownership.release()` rejects. The command sits after
+  // the helper path in the argv the launcher receives.
+  function withFailingRelease<T>(fn: () => Promise<T>): Promise<T> {
+    const realSpawn = guardLauncher.spawn.bind(guardLauncher);
+    const spy = vi.spyOn(guardLauncher, 'spawn').mockImplementation((args: string[], timeoutMs: number) => {
+      if (args[8] === 'release') {
+        return spawn('/bin/sh', ['-c', 'exit 1'], { stdio: ['ignore', 'ignore', 'pipe'] });
+      }
+      return realSpawn(args, timeoutMs);
+    });
+    return fn().finally(() => spy.mockRestore());
+  }
+
+  it('keeps the CorruptFrameError when the release also fails', async () => {
+    const { length, headCount } = await interiorCorruptLog();
+    const err = await withFailingRelease(() => repair(home(), 'n1')).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CorruptFrameError);
+    expect(isCorruption(err)).toBe(true);
+    // The destructive path ran under exclusive ownership but deleted nothing:
+    // no truncation and the head still points at the intact prefix.
+    expect((await readFile(logPath(home()))).length).toBe(length);
+    expect((await (await JournalReader.open(home(), 'n1', { knownTypes: KNOWN })).head())?.count)
+      .toBe(headCount);
+  });
+
+  it('propagates a typed release failure when the body succeeded', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/ping', { n: 0 });
+    await w.close();
+    const err = await withFailingRelease(() => repair(home(), 'n1')).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(JournalLockUnavailableError);
+  });
+
+  it('still releases ownership on a successful repair', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/ping', { n: 0 });
+    await w.close();
+    await appendTear(home());
+    expect(await repair(home(), 'n1')).toEqual({ tornBytes: 9 });
+    // The release ran, so a fresh acquire succeeds instead of seeing a live owner.
+    const owner = await acquireLock(nodeDir(home(), 'n1'), 'n1');
+    await owner.release();
   });
 });
 
