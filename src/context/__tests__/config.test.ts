@@ -46,7 +46,7 @@ describe('defaultAgentConfig', () => {
         },
         {
           name: 'web_fetch',
-          description: 'Fetch one web page through the kernel-mediated provider and return its extracted text.',
+          description: 'Fetch one web page through the kernel-mediated provider and return its extracted text. The url must be an absolute http(s) URL.',
           parameters: {
             type: 'object',
             properties: { url: { type: 'string', minLength: 1 } },

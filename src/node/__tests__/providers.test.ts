@@ -64,6 +64,7 @@ describe('loadProviders', () => {
       { key: 'k', maxResponseBytes: 100 }, { key: 'k', maxResponseBytes: 8388609 },
       { key: 'k', baseUrl: 'ftp://example.com' }, { key: 'k', baseUrl: 'not a url' },
       { key: 'k', baseUrl: 'https://user:pass@example.com' },
+      { key: 'k', baseUrl: 'https://example.com/?x=1' },
       { key: '' },
     ]) {
       await write({ tavily: bad });

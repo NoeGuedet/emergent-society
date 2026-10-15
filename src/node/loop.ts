@@ -29,8 +29,8 @@ import type { WorldRepo } from './world.js';
  * shape: every fact it writes goes through the boundary gate.
  *
  * The runtime is not a confinement boundary. Raw bash can still escape the
- * world; C1.4 and C1.5 remain deferred, and `mock-model` is a test fixture, not
- * a certified provider.
+ * world; C1.4b, C1.4c and C1.5 remain deferred, and `mock-model` is a test
+ * fixture, not a certified provider.
  */
 
 /** Everything one runtime needs; each field is either a recorded policy or a trusted port. */

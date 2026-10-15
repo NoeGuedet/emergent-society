@@ -10,7 +10,10 @@ import type { ProviderEntry, ProviderRegistry } from './providers.js';
  * and the credential only ever travels in an `Authorization` header this module
  * writes. No streaming, no retry: a failure is an agent-visible classified
  * outcome. `WebOutcome` never carries request URLs, error objects, or the key —
- * only a status, bounded body bytes and a `SafeFailure`. The bounded streamed
+ * only a status, bounded body bytes and a `SafeFailure`. That is one half of the
+ * bound: a provider response body is captured and journaled verbatim, so a
+ * hostile provider could reflect the credential back into the journal —
+ * unfiltered, accepted for the experiment phase. The bounded streamed
  * read deliberately mirrors `src/provider/transport.ts` instead of importing it:
  * importing provider code from node would invert the layering.
  */

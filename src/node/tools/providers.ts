@@ -7,8 +7,10 @@ import { toJson } from '../../context/artifacts.js';
  *
  * `<home>/providers.json` holds named credential bundles outside the world and
  * outside the project checkout; a missing file is an empty registry, never an
- * error, and a malformed file is refused loudly. Validation errors name fields
- * and never quote values, so a credential cannot leak through an exception.
+ * error, and a malformed file is refused loudly. Keeping `<home>` outside the
+ * world and outside the project checkout is a host responsibility — documented,
+ * not enforced by a runtime guard. Validation errors name fields and never quote
+ * values, so a credential cannot leak through an exception.
  * Honesty bound: until Landlock containment (C1.4c) the unconfined raw shell
  * runs as the same OS user with `cwd = <home>/world`, so this file IS readable
  * by an agent (`cat ../providers.json`) — the guarantee bought here is that the
@@ -77,6 +79,9 @@ function entry(value: unknown, where: string): ProviderEntry {
     }
     if (parsed.username !== '' || parsed.password !== '') {
       fail(`${where}.baseUrl: must not embed credentials`);
+    }
+    if (parsed.search !== '' || parsed.hash !== '') {
+      fail(`${where}.baseUrl: must not carry a query or fragment`);
     }
   }
   return {
