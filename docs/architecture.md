@@ -4,7 +4,7 @@ This document is the **map between the concepts and the code**. It is the entry 
 
 The rest of the corpus answers different questions: [vision.md](vision.md) says *why* the project exists and *what* it demonstrates; [seed.md](seed.md) and [direction.md](direction.md) specify the cold start and the co-negotiated direction; [kernel.md](kernel.md) is the authoritative technical spec, written *before* the code, with the rejected alternatives; [research/](research/) holds the evidence base; the per-checkpoint construction plans live in `docs/plans/` — a local, git-ignored working directory that is intentionally not published. This document is the one that goes **from the running code back up to the concepts** — it is maintained at each checkpoint closure, because the code is hardened beyond what the plans sketched, and the plans are journals, not maps.
 
-Scope as of today: **C1.1 (the journal), C1.2 (the node driver) and C1.3 (the durable context and provider boundary) are implemented and tested.** So are the C1.3 pieces a future host will drive: the context assembler, the fold, the committed surface, compaction, the bounded Git perception, one canonical provider wire with its adapter and transport, the foreground raw shell tool, and disposable projection snapshots. Everything beyond them is drawn here in dotted lines, as specified but not yet built: the confinement of `execute` (Landlock/PTY) and the credential broker (C1.4), the Package layer (C1.5), agent zero, chat and the disposable SQLite index (C1.6), and the boot-time invariant and kill switch (C1.7). There is no CLI, main process or running product yet — the implemented surface is the library source plus the runtime a future host would drive, not a launchable kernel.
+Scope as of today: **C1.1 (the journal), C1.2 (the node driver) and C1.3 (the durable context and provider boundary) are implemented and tested.** So are the C1.3 pieces a future host will drive: the context assembler, the fold, the committed surface, compaction, the bounded Git perception, one canonical provider wire with its adapter and transport, the foreground raw shell tool, and disposable projection snapshots. Everything beyond them is drawn here in dotted lines, as specified but not yet built: the web tools and their kernel-side credential store (C1.4a), the persistent PTY (C1.4b), the confinement of `execute` (Landlock, C1.4c) and the credential broker's placeholder substitution, the Package layer (C1.5), agent zero, chat and the disposable SQLite index (C1.6), and the boot-time invariant and kill switch (C1.7). There is no CLI, main process or running product yet — the implemented surface is the library source plus the runtime a future host would drive, not a launchable kernel.
 
 ---
 
@@ -106,9 +106,9 @@ flowchart TB
         end
     end
 
-    subgraph FUTUR["C1.4+ — specified, not yet implemented"]
-        TOOLSX["execute (Landlock + PTY) / speak / web / extend"]
-        AZ["agent zero + human chat + SQLite index"]
+    subgraph FUTUR["C1.4-C1.6 — specified, not yet implemented"]
+        TOOLSX["web + credential store / execute (PTY + Landlock) / extend"]
+        AZ["agent zero + speak + human chat + SQLite index"]
     end
 
     subgraph DISK["cell-home/ (the disk)"]
@@ -168,7 +168,7 @@ How to read this map:
 
 - **The driver is the writer's only client.** The runtime (and any trusted C1.3 handler) gets a narrow `TurnContext` — no journal, no commit, only the boundary gate. That is the guarantee that *only the kernel emits*.
 - **Replay refuses an incomplete vocabulary before it takes the writer.** With hooks, the driver checks the whole contract up front: `readHistory`, `readBlob` and `acknowledgedWorld` must all be present, and the `knownTypes` set must cover both the node lifecycle types and every type in the registry — a set missing either is refused explicitly and early, rather than surfacing later as an unknown-event replay failure.
-- **The provider path is the only *mediated* one.** `src/provider/` is the only kernel-mediated LLM provider transport — the raw shell is not confined and can open its own sockets, so this is not an exclusive network claim; the C1.4 credential broker and its egress policy remain open.
+- **The provider path is the only *mediated* one today.** `src/provider/` is the only kernel-mediated LLM provider transport — the raw shell is not confined and can open its own sockets, so this is not an exclusive network claim; egress is left open by explicit decision for the experimentation phase, and the web tools' credential store (C1.4a) is not built.
 - **The gate is the runtime's effect boundary.** `src/node/gate.ts` owns chunking, artifact manifests and the claim-check inline threshold, so a handler never touches the writer; its `flush()` is a durable barrier that re-reads and digest/size-verifies every pending claim-check before the effect is allowed.
 - **The driver also owns the world**: every turn ends in a commit → HEAD moves → the shared watcher (one per world) announces the movement → each parked node evaluates *its own* predicate (a commit I did not author?) → its latch wakes it.
 - **The C1.3 runtime is the trusted handler.** `createAgentRuntime` folds the journal, presents one bounded world perception per turn, assembles exactly one plan per logical request, sends it through the adapter, and dispatches the resulting tool calls. It never hands the writer to the model and never invents a second message, request, artifact or state shape.
@@ -359,9 +359,9 @@ Bootstrap is still the **full history fold**: a checkpoint is an accelerator hin
 
 Next, in the order of `kernel.md` §10:
 
-- **C1.4** — tools: `execute` (persistent PTY under a Landlock sandbox — the API key physically unreadable from the agent's shell), `speak`, `web_search`/`web_fetch`, and the **credential broker** (named providers held kernel-side, endpoint-bound placeholders substituted at the gate — third-party APIs without any secret entering the world).
+- **C1.4** — tools, in three lots: **C1.4a** the kernel-mediated web tools (`web_search`/`web_fetch`) over a kernel-side credential store (the broker's mediated subset — the full placeholder↔endpoint substitution, third-party APIs without any secret entering the world, stays the documented target); **C1.4b** the persistent PTY `execute`; **C1.4c** Landlock filesystem confinement, the step that makes the API key physically unreadable from the agent's shell. Egress stays open by explicit decision for the experimentation phase, and no filesystem sandbox exists today.
 - **C1.5** — `extend`: Plugin → immutable Packages → Runs, persisted by journal replay, executed in `node:vm` behind a restricted facade; the C1.3 context and compaction policies are mounted here as seed Packages.
-- **C1.6** — agent zero (root custody node, sole holder of the human channel, direction drafting) + chat + the disposable SQLite index and projections; also the main host that owns process lifetime.
+- **C1.6** — agent zero (root custody node, sole holder of the human channel, direction drafting) + chat + `speak` + the disposable SQLite index and projections; also the main host that owns process lifetime.
 - **C1.7** — reconstructability invariant at boot + escalating kill switch.
 - **Then** — the monitoring session: the 3 sensors (semantic trajectory, structure graph, value registry) + the metronome (versioned direction), read-side projections feeding the cockpit. Specified in [research/monitoring-architecture.md](research/monitoring-architecture.md).
 
@@ -388,7 +388,7 @@ Next, in the order of `kernel.md` §10:
 | Verified provenance at the boundary | `src/context/loader.ts` (`ArtifactMismatchError`, `BlobIntegrityError`) + `src/context/artifacts.ts` (`resolveArtifact`, `resolveStored`) |
 | The durable context | `src/context/fold.ts` (`ContextFold`), `surface.ts` (`Surface`), `compaction.ts` + `groups.ts` |
 | The one canonical request | `src/context/assembler.ts` (`assemble`) → `src/provider/wire.ts` (`serializeWire`) |
-| The only kernel-mediated provider path | `src/provider/adapter.ts` + `transport.ts` (raw body journaled before projection; bounded retries). Raw-shell egress is unconfined; the C1.4 broker and its egress policy are open |
+| The only kernel-mediated provider path today | `src/provider/adapter.ts` + `transport.ts` (raw body journaled before projection; bounded retries). Raw-shell egress is unconfined — left open by explicit decision for the experimentation phase — and the web tools' credential store (C1.4a) is not built |
 | The trusted effect boundary | `src/node/gate.ts` (chunking, manifests, verified flush) + the C1.3 runtime `src/node/loop.ts` |
 | Raw shell (experimental, unconfined) | `src/node/tools/shell.ts` (process group + env allowlist) + `dispatch.ts` |
 | Disposable projection cache | `src/context/snapshots.ts` (retention 2, best effort) |

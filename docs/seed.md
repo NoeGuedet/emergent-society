@@ -57,8 +57,8 @@ Cut order if reducing: I5, I2, I1, I4, never I3. Each instinct has a known **cou
 | Tool | Semantics | Frontier |
 |---|---|---|
 | `speak` | speech channel toward the human — agent zero alone (`direction.md` §1) | — |
-| `execute` | **persistent** PTY shell (cwd, variables, jobs survive between calls), sandbox confined to the world; the kernel commits the world at the end of each turn, author = node uid (→ practical `undo` = revert) | inside |
-| `web_search` / `web_fetch` | reading the world, GET only | almost inside (stateless emission), journaled |
+| `execute` | current: foreground raw shell, unconfined — target: **persistent** PTY shell (C1.4b), sandbox confined to the world (C1.4c); the kernel commits the world at the end of each turn, author = node uid (→ practical `undo` = revert) | inside |
+| `web_search` / `web_fetch` | read-only web access (no world write) through a **kernel-mediated provider** — **target, not built: C1.4a** | almost inside (stateless emission), journaled |
 | `extend` | **the Cordis gate in a single tool**: `inspect` (read-only catalogue of the runtime, generated from the source) / `define` (immutable Package, no effect) / `run` / `stop` (reversible) / `undefine` (irreversible) | the gate |
 
 Five effective tools, the empirical cap (~5) respected.
