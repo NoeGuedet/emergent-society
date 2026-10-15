@@ -19,7 +19,7 @@ describe('defaultAgentConfig', () => {
       heading: 'Work on the current shared direction.',
       model: 'mock-model',
       parameters: { temperature: 0 },
-      allowedTools: ['execute', 'wait'],
+      allowedTools: ['execute', 'wait', 'web_search', 'web_fetch'],
       tools: [
         {
           name: 'execute', description: 'Run a foreground command in the shared world.',
@@ -31,6 +31,27 @@ describe('defaultAgentConfig', () => {
         {
           name: 'wait', description: 'Wait for a foreign world commit.',
           parameters: { type: 'object', properties: {}, additionalProperties: false },
+        },
+        {
+          name: 'web_search',
+          description: 'Search the web through the kernel-mediated provider. Returns ranked results: title, url, snippet.',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', minLength: 1 },
+              max_results: { type: 'integer', minimum: 1, maximum: 20 },
+            },
+            required: ['query'], additionalProperties: false,
+          },
+        },
+        {
+          name: 'web_fetch',
+          description: 'Fetch one web page through the kernel-mediated provider and return its extracted text.',
+          parameters: {
+            type: 'object',
+            properties: { url: { type: 'string', minLength: 1 } },
+            required: ['url'], additionalProperties: false,
+          },
         },
       ],
       policy: {
