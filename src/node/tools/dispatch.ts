@@ -4,9 +4,10 @@ import type {
 import type { BoundaryGate } from '../gate.js';
 import type { WorldRepo } from '../world.js';
 import {
-  boundShellText, renderShellText, runShell, shellArtifactBytes, shellFailure, shellIsError,
+  renderShellText, runShell, shellArtifactBytes, shellFailure, shellIsError,
 } from './shell.js';
 import type { ShellPolicy, ShellResult } from './shell.js';
+import { boundToolText } from './text.js';
 
 /**
  * Foreground tool dispatch (T7, kernel.md §4).
@@ -106,7 +107,7 @@ async function appendShellResult(
 ): Promise<void> {
   const complete = !result.truncated && !result.drainExpired;
   const raw = await gate.capture(shellArtifactBytes(result), 'utf8', complete);
-  const content = boundShellText(renderShellText(result), maxToolResultBytes, raw);
+  const content = boundToolText(renderShellText(result), maxToolResultBytes, raw);
   gate.append('tool/result', {
     turn: id.turn, request: id, callId,
     message: { role: 'tool', content, tool_call_id: callId },
