@@ -1,5 +1,5 @@
 import type {
-  AgentConfig, AssistantProjection, FunctionCall, RequestId, SafeFailure,
+  AgentConfig, ArtifactRef, AssistantProjection, FunctionCall, RequestId, SafeFailure,
 } from '../../context/contracts.js';
 import type { BoundaryGate } from '../gate.js';
 import type { WorldRepo } from '../world.js';
@@ -7,18 +7,24 @@ import {
   renderShellText, runShell, shellArtifactBytes, shellFailure, shellIsError,
 } from './shell.js';
 import type { ShellPolicy, ShellResult } from './shell.js';
-import { boundToolText } from './text.js';
+import { boundToolText, decodeToolText } from './text.js';
+import { renderExtract, renderSearch } from './web.js';
+import type { WebOutcome, WebTools } from './web.js';
 
 /**
  * Foreground tool dispatch (T7, kernel.md §4).
  *
  * `dispatchCalls` turns an assistant projection's advertised calls into durable
  * `tool/call` + `tool/result` facts. Tool names are recognized exactly: `execute`
- * runs one foreground shell command, `wait` is loop control, and any other name
- * is an unknown tool that never becomes bash. Arguments stay raw until here,
- * where they are parsed as a plain JSON object; a malformed, unknown or denied
- * call yields a fixed error result with the matching `tool_call_id` and no shell.
- * `called` counts the calls actually accepted (each has its own `tool/call`).
+ * runs one foreground shell command, `wait` is loop control, `web_search` and
+ * `web_fetch` run through the injected `WebTools` port (its client is the only
+ * place the credential is written, and only into an `Authorization` header), and
+ * any other name is an unknown tool that never becomes bash. Arguments stay raw
+ * until here, where they are parsed as a plain JSON object; a malformed, unknown
+ * or denied call yields a fixed error result with the matching `tool_call_id` and
+ * no shell. An extract-level `failed: true` render is an error result with a null
+ * `SafeFailure`, the ordinary-nonzero-exit precedent. `called` counts the calls
+ * actually accepted (each has its own `tool/call`).
  */
 
 export type DispatchResult = { readonly waited: boolean; readonly called: number };
@@ -30,6 +36,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 type Decision =
   | { readonly kind: 'execute'; readonly cmd: string }
   | { readonly kind: 'wait' }
+  | { readonly kind: 'web_search'; readonly query: string;
+      readonly maxResults: number | undefined }
+  | { readonly kind: 'web_fetch'; readonly url: string }
   | { readonly kind: 'error'; readonly failure: SafeFailure };
 
 const INVALID: Decision = { kind: 'error', failure: { code: 'invalid-tool', status: null } };
@@ -42,7 +51,8 @@ const INVALID: Decision = { kind: 'error', failure: { code: 'invalid-tool', stat
 function decide(call: FunctionCall, config: AgentConfig): Decision {
   const name = call.function.name;
   const offered = config.tools.some((tool) => tool.name === name);
-  const hasHandler = name === 'execute' || name === 'wait';
+  const hasHandler = name === 'execute' || name === 'wait'
+    || name === 'web_search' || name === 'web_fetch';
   if (!offered || !hasHandler) {
     return { kind: 'error', failure: { code: 'unknown-tool', status: null } };
   }
@@ -61,6 +71,30 @@ function decide(call: FunctionCall, config: AgentConfig): Decision {
   if (name === 'wait') {
     // `wait` accepts only an empty object.
     return Object.keys(parsed).length === 0 ? { kind: 'wait' } : INVALID;
+  }
+
+  if (name === 'web_search') {
+    const keys = Object.keys(parsed);
+    if (!keys.every((key) => key === 'query' || key === 'max_results')) return INVALID;
+    const query = parsed['query'];
+    if (typeof query !== 'string' || query.trim().length === 0) return INVALID;
+    const maxResults = parsed['max_results'];
+    if (maxResults !== undefined
+      && (typeof maxResults !== 'number'
+        || !Number.isSafeInteger(maxResults) || maxResults < 1 || maxResults > 20)) {
+      return INVALID;
+    }
+    return { kind: 'web_search', query, maxResults: maxResults as number | undefined };
+  }
+  if (name === 'web_fetch') {
+    const keys = Object.keys(parsed);
+    if (keys.length !== 1 || keys[0] !== 'url') return INVALID;
+    const url = parsed['url'];
+    if (typeof url !== 'string') return INVALID;
+    let parsedUrl: URL;
+    try { parsedUrl = new URL(url); } catch { return INVALID; }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') return INVALID;
+    return { kind: 'web_fetch', url };
   }
 
   // `execute` requires its own non-whitespace string `cmd` and no unknown keys.
@@ -118,9 +152,48 @@ async function appendShellResult(
   });
 }
 
+/** Captures the raw provider body and appends the bounded web result. */
+async function appendWebResult(
+  gate: BoundaryGate, id: RequestId, callId: string,
+  kind: 'web_search' | 'web_fetch', outcome: WebOutcome, maxToolResultBytes: number,
+): Promise<void> {
+  const append = (
+    content: string, isError: boolean, raw: ArtifactRef | null, failure: SafeFailure | null,
+  ): void => {
+    gate.append('tool/result', {
+      turn: id.turn, request: id, callId,
+      message: { role: 'tool', content, tool_call_id: callId },
+      isError, raw, failure, synthetic: false,
+    });
+  };
+  if (!outcome.ok) {
+    // No capture for an empty failure body; a kept prefix has its real complete flag.
+    const raw = outcome.body.length > 0
+      ? await gate.capture(outcome.body, 'utf8', outcome.complete) : null;
+    const head = outcome.status === null
+      ? `error: ${outcome.failure.code}`
+      : `error: ${outcome.failure.code}\nstatus: ${outcome.status}`;
+    append(raw === null ? head
+      : boundToolText(`${head}\nbody:\n${decodeToolText(outcome.body)}`, maxToolResultBytes, raw),
+      true, raw, outcome.failure);
+    return;
+  }
+  const raw = await gate.capture(outcome.body, 'utf8', true);
+  const rendered = kind === 'web_search' ? renderSearch(outcome.body) : renderExtract(outcome.body);
+  if (rendered === null) {
+    append(boundToolText(
+      `error: malformed\nstatus: ${outcome.status}\nbody:\n${decodeToolText(outcome.body)}`,
+      maxToolResultBytes, raw), true, raw, { code: 'malformed', status: outcome.status });
+    return;
+  }
+  const text = typeof rendered === 'string' ? rendered : rendered.text;
+  const failed = typeof rendered === 'string' ? false : rendered.failed;
+  append(boundToolText(text, maxToolResultBytes, raw), failed, raw, null);
+}
+
 export async function dispatchCalls(
   projection: AssistantProjection, id: RequestId, world: WorldRepo, gate: BoundaryGate,
-  config: AgentConfig, shellPolicy: ShellPolicy,
+  config: AgentConfig, shellPolicy: ShellPolicy, web?: WebTools,
 ): Promise<DispatchResult> {
   const calls = projection.message.tool_calls;
   let called = 0;
@@ -149,6 +222,19 @@ export async function dispatchCalls(
     if (decision.kind === 'wait') {
       waited = true;
       appendWaitResult(gate, id, call.id);
+      await gate.flush();
+      continue;
+    }
+    if (decision.kind === 'web_search' || decision.kind === 'web_fetch') {
+      if (web === undefined) {
+        appendErrorResult(gate, id, call.id, { code: 'denied', status: null });
+        await gate.flush();
+        continue;
+      }
+      const outcome = decision.kind === 'web_search'
+        ? await web.search(decision.query, decision.maxResults, gate.signal)
+        : await web.extract(decision.url, gate.signal);
+      await appendWebResult(gate, id, call.id, decision.kind, outcome, config.policy.maxToolResultBytes);
       await gate.flush();
       continue;
     }

@@ -14,6 +14,7 @@ import type { BoundaryGate, GateCallbacks, GateScope } from '../gate.js';
 import { dispatchCalls } from '../tools/dispatch.js';
 import { DEFAULT_SHELL_ENV, DRAIN_NOTICE } from '../tools/shell.js';
 import type { ShellPolicy } from '../tools/shell.js';
+import type { WebOutcome, WebTools } from '../tools/web.js';
 import { useWorld } from './helpers.js';
 import type {
   AgentConfig, ArtifactRef, AssistantProjection, FunctionCall, RequestId, Source,
@@ -464,6 +465,324 @@ describe('dispatchCalls: abort and durability faults', () => {
       expect(await readFile(join(repo.path, 'a.txt'), 'utf8')).toBe('one');
       expect(await readFile(join(repo.path, 'b.txt'), 'utf8')).toBe('two');
       expect(ofType(await events(home), 'tool/result')).toHaveLength(2);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+});
+
+describe('dispatchCalls: web tools', () => {
+  const WEB_OFFERING = [
+    { name: 'web_search', description: 'Search.', parameters: {
+      type: 'object', properties: { query: { type: 'string' }, max_results: { type: 'integer' } },
+      required: ['query'], additionalProperties: false } },
+    { name: 'web_fetch', description: 'Fetch.', parameters: {
+      type: 'object', properties: { url: { type: 'string' } },
+      required: ['url'], additionalProperties: false } },
+  ];
+  const WEB_NAMES = new Set(['web_search', 'web_fetch']);
+
+  function webConfig(over: Partial<AgentConfig> = {}): AgentConfig {
+    const base = config();
+    return { ...base,
+      tools: [...base.tools.filter((tool) => !WEB_NAMES.has(tool.name)), ...WEB_OFFERING],
+      allowedTools: [...base.allowedTools.filter((name) => !WEB_NAMES.has(name)),
+        'web_search', 'web_fetch'],
+      ...over };
+  }
+
+  function withoutWeb(base: AgentConfig): AgentConfig {
+    return { ...base,
+      tools: base.tools.filter((tool) => !WEB_NAMES.has(tool.name)),
+      allowedTools: base.allowedTools.filter((name) => !WEB_NAMES.has(name)) };
+  }
+
+  type StubCall = { readonly method: string; readonly args: unknown[] };
+
+  function stubWeb(outcomes: WebOutcome[], calls: StubCall[]): WebTools {
+    const next = (): WebOutcome => {
+      const outcome = outcomes.shift();
+      if (outcome === undefined) throw new Error('stubWeb: no outcome queued');
+      return outcome;
+    };
+    return {
+      search: (query, maxResults, _signal) => {
+        calls.push({ method: 'search', args: [query, maxResults] });
+        return Promise.resolve(next());
+      },
+      extract: (url, _signal) => {
+        calls.push({ method: 'extract', args: [url] });
+        return Promise.resolve(next());
+      },
+    };
+  }
+
+  const SEARCH_JSON = JSON.stringify({
+    request_id: 'req-dispatch', query: 'q',
+    results: [{ title: 'One', url: 'https://one.example', content: 'first snippet' }],
+  });
+  const EXTRACT_FAILED_JSON = JSON.stringify({
+    results: [],
+    failed_results: [{ url: 'https://a.example/', error: 'Failed to retrieve content' }],
+  });
+
+  function okSearch(body = SEARCH_JSON): WebOutcome {
+    return { ok: true, status: 200, body: Buffer.from(body, 'utf8') };
+  }
+
+  async function rawText(home: string): Promise<string> {
+    const durable = await events(home);
+    const data = ofType(durable, 'tool/result')[0]!.data as unknown as { raw: ArtifactRef | null };
+    return Buffer.from(resolveArtifact(durable, data.raw!)).toString('utf8');
+  }
+
+  it('journals a bounded web_search result with its raw artifact', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    try {
+      const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
+      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(),
+        shellPolicy(), stubWeb([okSearch()], []));
+      expect(result).toEqual({ waited: false, called: 1 });
+      const durable = await events(home);
+      expect(ofType(durable, 'tool/call')).toHaveLength(1);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(false);
+      expect(data.failure).toBeNull();
+      expect(data.synthetic).toBe(false);
+      expect(data.message.content).toBe([
+        'provider: tavily', 'request: req-dispatch', 'results: 1', '',
+        '[1] One', 'https://one.example', 'first snippet',
+      ].join('\n'));
+      expect(await rawText(home)).toBe(SEARCH_JSON);
+      expect(await artifactComplete(home)).toBe(true);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('web tools are denied when no provider is configured', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    try {
+      const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
+      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy());
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'denied', status: null });
+      expect(data.raw).toBeNull();
+      expect(data.message.content).toBe('error: denied');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('a web tool not in allowedTools is denied', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    const calls: StubCall[] = [];
+    try {
+      const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
+      await dispatchCalls(proj, ID, repo, s.gate('turn', 0),
+        webConfig({ allowedTools: ['execute', 'wait'] }), shellPolicy(), stubWeb([], calls));
+      const data = await firstResult(home);
+      expect(data.failure).toEqual({ code: 'denied', status: null });
+      expect(calls).toHaveLength(0);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('a web tool that is not offered is unknown-tool', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    const calls: StubCall[] = [];
+    try {
+      const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
+      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), withoutWeb(config()),
+        shellPolicy(), stubWeb([], calls));
+      const data = await firstResult(home);
+      expect(data.failure).toEqual({ code: 'unknown-tool', status: null });
+      expect(calls).toHaveLength(0);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  const INVALID_WEB_ARGS: ReadonlyArray<readonly [string, string]> = [
+    ['web_search', '{}'],
+    ['web_search', '{"query":""}'],
+    ['web_search', '{"query":"q","max_results":0}'],
+    ['web_search', '{"query":"q","max_results":21}'],
+    ['web_search', '{"query":"q","extra":1}'],
+    ['web_fetch', '{}'],
+    ['web_fetch', '{"url":7}'],
+    ['web_fetch', '{"url":"ftp://x"}'],
+    ['web_fetch', '{"url":"not a url"}'],
+    ['web_fetch', '{"url":"https://a","extra":1}'],
+  ];
+
+  it.each(INVALID_WEB_ARGS)('rejects invalid %s arguments %s with invalid-tool and no provider call',
+    async (name, args) => {
+      const { home, world: repo } = world();
+      const s = await openSession(home);
+      const calls: StubCall[] = [];
+      try {
+        const proj = projection([call('bad', name, args)]);
+        const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(),
+          shellPolicy(), stubWeb([], calls));
+        expect(result).toEqual({ waited: false, called: 1 });
+        expect(calls).toHaveLength(0);
+        const durable = await events(home);
+        expect(ofType(durable, 'artifact/end')).toHaveLength(0);
+        const data = await firstResult(home);
+        expect(data.failure).toEqual({ code: 'invalid-tool', status: null });
+        expect(data.raw).toBeNull();
+      } finally {
+        await s.shutdown();
+      }
+    }, 15000);
+
+  it('a failed outcome keeps its failure and captured prefix', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    try {
+      const outcome: WebOutcome = {
+        ok: false, failure: { code: 'http', status: 429 }, status: 429,
+        body: Buffer.from('{"detail":"rate limited"}', 'utf8'), complete: true,
+      };
+      const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
+      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy(),
+        stubWeb([outcome], []));
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'http', status: 429 });
+      expect(data.message.content).toBe('error: http\nstatus: 429\nbody:\n{"detail":"rate limited"}');
+      expect(await rawText(home)).toBe('{"detail":"rate limited"}');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('a malformed success body is a malformed failure with the raw kept', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    try {
+      const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
+      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy(),
+        stubWeb([okSearch('not json')], []));
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'malformed', status: 200 });
+      expect(data.message.content).toBe('error: malformed\nstatus: 200\nbody:\nnot json');
+      expect(await rawText(home)).toBe('not json');
+      expect(await artifactComplete(home)).toBe(true);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('a failed extraction is an error result without a SafeFailure', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    try {
+      const proj = projection([call('w1', 'web_fetch', JSON.stringify({ url: 'https://a.example/' }))]);
+      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy(),
+        stubWeb([okSearch(EXTRACT_FAILED_JSON)], []));
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toBeNull();
+      expect(data.message.content)
+        .toBe('provider: tavily\nurl: https://a.example/\nerror: Failed to retrieve content');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('an empty failure body keeps raw null and writes no artifact', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    try {
+      const outcome: WebOutcome = {
+        ok: false, failure: { code: 'network', status: null }, status: null,
+        body: new Uint8Array(), complete: false,
+      };
+      const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
+      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy(),
+        stubWeb([outcome], []));
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'network', status: null });
+      expect(data.raw).toBeNull();
+      expect(data.message.content).toBe('error: network');
+      const durable = await events(home);
+      expect(ofType(durable, 'artifact/end')).toHaveLength(0);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('a body-limit outcome captures an incomplete prefix', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    try {
+      const outcome: WebOutcome = {
+        ok: false, failure: { code: 'body-limit', status: 200 }, status: 200,
+        body: Buffer.alloc(2048, 120), complete: false,
+      };
+      const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
+      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy(),
+        stubWeb([outcome], []));
+      const data = await firstResult(home);
+      expect(data.failure).toEqual({ code: 'body-limit', status: 200 });
+      expect(data.message.content.startsWith('error: body-limit\nstatus: 200\nbody:\n')).toBe(true);
+      expect(data.raw!.complete).toBe(false);
+      expect(await artifactComplete(home)).toBe(false);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('bounds a long successful render with the truncation notice', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    try {
+      const big = JSON.stringify({
+        results: [{ title: 'Big', url: 'https://big.example', content: 'x'.repeat(4096) }],
+      });
+      const policy = { ...defaultAgentConfig().policy, maxToolResultBytes: 256 };
+      const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
+      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig({ policy }),
+        shellPolicy(), stubWeb([okSearch(big)], []));
+      const data = await firstResult(home);
+      const raw = data.raw!;
+      // Every byte of the render is ASCII, so the retained prefix is exactly the
+      // 256-byte bound; the notice must name that real size and the raw's own facts.
+      const notice = /\n\[output truncated: showing (\d+) of (\d+) bytes; raw sha256 ([0-9a-f]{64})\]$/
+        .exec(data.message.content);
+      expect(notice).not.toBeNull();
+      expect(Number(notice![1])).toBe(256);
+      expect(Number(notice![2])).toBe(raw.bytes);
+      expect(notice![3]).toBe(raw.sha256);
+      expect(data.message.content.startsWith('provider: tavily')).toBe(true);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('forwards the valid max_results bounds to the web port', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    const calls: StubCall[] = [];
+    try {
+      const proj = projection([
+        call('w1', 'web_search', JSON.stringify({ query: 'q', max_results: 1 })),
+        call('w2', 'web_search', JSON.stringify({ query: 'q', max_results: 20 })),
+      ]);
+      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(),
+        shellPolicy(), stubWeb([okSearch(), okSearch()], calls));
+      expect(result).toEqual({ waited: false, called: 2 });
+      expect(calls.map((entry) => entry.args[1])).toEqual([1, 20]);
     } finally {
       await s.shutdown();
     }

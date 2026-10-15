@@ -14,6 +14,7 @@ import type { AgentConfig, ProjectionState, RequestId } from '../context/contrac
 import type { BoundaryGate, DriverHooks, DurableWatermark } from './gate.js';
 import type { TurnContext, TurnHandler, TurnResult } from './driver.js';
 import type { ShellPolicy } from './tools/shell.js';
+import type { WebTools } from './tools/web.js';
 import type { WorldRepo } from './world.js';
 
 /**
@@ -37,6 +38,8 @@ export type RuntimeOptions = {
   readonly home: string; readonly uid: string; readonly world: WorldRepo;
   readonly initialConfig: AgentConfig; readonly adapter: ProviderAdapter;
   readonly shellPolicy: ShellPolicy;
+  /** Kernel-mediated web tools; when absent, offered web calls resolve as `denied`. */
+  readonly webTools?: WebTools;
 };
 
 export interface AgentRuntime {
@@ -222,6 +225,7 @@ class Runtime implements AgentRuntime {
       const calls = sent.projection.message.tool_calls;
       const dispatched = await dispatchCalls(
         sent.projection, id, this.options.world, ctx.gate, config, this.shellPolicyFor(config),
+        this.options.webTools,
       );
       accepted += dispatched.called;
       ordinal += 1;
