@@ -108,15 +108,6 @@ describe('the world as the only channel', () => {
 
   it('parks a recoverable error turn and wakes on a foreign commit', async () => {
     const { home, world } = fixture();
-    const hooks: DriverHooks = {
-      registry: createBoundaryRegistry(),
-      onDurable: async () => {},
-      onReady: async () => {},
-      onTurnStart: async () => {},
-      readHistory: (path, uid, knownTypes) => loadVerifiedEvents(path, uid, knownTypes),
-      readBlob: (hash) => new BlobStore(home).get(hash),
-      acknowledgedWorld: () => null,
-    };
     const seen: TurnTrigger[] = [];
     const d = await NodeDriver.open(home, 'n1', async (ctx) => {
       seen.push(ctx.trigger);
@@ -125,7 +116,7 @@ describe('the world as the only channel', () => {
         return { outcome: 'error', toolCalls: false, error: { code: 'network', status: null } };
       }
       return wait();
-    }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+    }, world, { knownTypes: C13_EVENT_TYPES, worldPollMs: 0 });
     const running = d.run();
     await parked(d, world);
     const events = await loadVerifiedEvents(home, 'n1', C13_EVENT_TYPES);

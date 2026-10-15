@@ -263,7 +263,18 @@ describe('fatal seams', () => {
 describe('recoverable error results', () => {
   it('commits the effect, closes the turn durably, parks, and wakes on a foreign commit', async () => {
     const { home, world } = fixture();
-    const hooks = hooksFor(home);
+    let ack: WorldAcknowledgement | null = null;
+    const hooks = hooksFor(home, {
+      onTurnStart: async (ctx) => {
+        const source = ctx.gate.append('world/perception', {
+          turn: ctx.turn, range: ctx.world,
+          value: { kind: 'inline', value: perceptionValue(ctx.world) },
+        } as never);
+        await ctx.gate.flush();
+        ack = { turn: ctx.turn, range: ctx.world, source };
+      },
+      acknowledgedWorld: () => ack,
+    });
     const seen: number[] = [];
     const d = await NodeDriver.open(home, 'n1', async (ctx) => {
       seen.push(ctx.turn);
