@@ -74,7 +74,7 @@ function guardedTerminalFactory(): TerminalFactory {
         }
         return real.run(cmd, limits, signal);
       },
-      dispose: (reason, grace) => real.dispose(reason, grace),
+      dispose: (grace) => real.dispose(grace),
     };
   };
 }

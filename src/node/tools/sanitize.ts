@@ -3,7 +3,9 @@
  *
  * A session's output is a tty stream: programs emit ANSI escapes (they see a
  * terminal, unlike the old pipe shell), CRLF endings and carriage-return
- * redraws. The render strips them; the raw artifact keeps the verbatim bytes.
+ * redraws. The render strips them — OSC, CSI, the DCS/APC/PM string sequences,
+ * single-character escapes, and residual C0/C1 controls; the raw artifact keeps
+ * the verbatim bytes.
  * Order is load-bearing: escapes, then newline normalization, then per-line
  * carriage returns, then residual control bytes. No replacement can split a
  * surrogate pair. This is display hygiene, never a security boundary.
@@ -12,6 +14,11 @@ export function sanitizePtyText(text: string): string {
   return text
     // OSC: ESC ] ... terminated by BEL or ST (ESC \).
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    // DCS (ESC P), APC (ESC _) and PM (ESC ^): string sequences whose payload
+    // runs to ST (ESC \), defensively to BEL, or to the capture's end. Their
+    // introducers are in the generic short-escape range, so the payload must
+    // be consumed here or it would survive after the introducer is removed.
+    .replace(/\x1b[P^_][\s\S]*?(?:\x1b\\|\x07|$)/g, '')
     // CSI: ESC [ params intermediates final.
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
     // Charset/designate: ESC ( X, ESC ) X, ESC # X. (Other short escapes: the generic rule below.)
@@ -36,6 +43,6 @@ export function sanitizePtyText(text: string): string {
       return line.slice(last + 1);
     })
     .join('\n')
-    // Residual C0 controls and DEL, tab and newline excepted.
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+    // Residual C0 controls, DEL and raw C1 controls, tab and newline excepted.
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]/g, '');
 }

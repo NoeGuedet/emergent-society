@@ -6,7 +6,7 @@ import * as pty from '@lydell/node-pty';
 import { stdinWaitPids, sessionTtyTarget } from './proc.js';
 
 /**
- * The persistent PTY shell (C1.4b, kernel.md §4/§7): one bash session per
+ * The persistent PTY shell (C1.4b, kernel.md §7): one bash session per
  * node, marker-encapsulated commands, typed statuses, reset-on-timeout.
  * The mechanics follow DeepSeek Harness's tool-bash-persistent; the divergences
  * are deliberate and documented in docs/plans/2026-10-15-c1-4b (arbitrations):
@@ -35,6 +35,20 @@ export type CommandOutcome = {
   readonly fresh: 'stdin-wedge' | null;
 };
 
+/**
+ * The empty outcome of a run that never touches the session: a disposed or
+ * spawn-failed runtime, or a pre-write cancellation. `reset` is true only when
+ * the wedge reset already ran before the abort, and `fresh` still carries it.
+ */
+export function failedOutcome(
+  status: CommandStatus, fresh: 'stdin-wedge' | null, reset = false,
+): CommandOutcome {
+  return {
+    status, exitCode: null, signal: null,
+    output: new Uint8Array(), truncated: false, reset, fresh,
+  };
+}
+
 /** The narrow port dispatch depends on; the runtime binds its session to it. */
 export type TerminalPort = {
   run(cmd: string, limits: CommandLimits, signal: AbortSignal): Promise<CommandOutcome>;
@@ -43,7 +57,7 @@ export type TerminalPort = {
 export interface TerminalRuntime {
   run(cmd: string, limits: CommandLimits, signal: AbortSignal): Promise<CommandOutcome>;
   /** Kills the session and refuses later runs; safe to call twice. */
-  dispose(reason: string, killGraceMs: number): Promise<void>;
+  dispose(killGraceMs: number): Promise<void>;
 }
 
 export type TerminalFactory =
@@ -58,7 +72,17 @@ export const DEFAULT_TERMINAL_ENV: Readonly<Record<string, string>> = Object.fre
 });
 
 const POLL_MS = 25;
-/** No stdin probe is consulted before this much time has passed since the write. */
+/**
+ * How long the death path waits for node-pty's exit event before reporting an
+ * unknown exit code: the event usually lands within a tick, and keeping the
+ * shell's real code is worth a few polls — never the command timeout.
+ */
+const EXIT_REPORT_GRACE_MS = 250;
+/**
+ * No stdin probe is consulted before this much time has passed since the
+ * command's start marker was SEEN, not since the write: a slow shell startup
+ * must not eat the probe's grace window.
+ */
 const STDIN_GRACE_MS = 150;
 /** Consecutive positive probes before a stdin_read settles. */
 const STDIN_PROBES = 2;
@@ -73,10 +97,16 @@ const STDIN_PROBE_INTERVAL_MS = 200;
 /**
  * A reverse map built once from the platform's signal table: pty onExit reports
  * the signal as a number, and the renderer wants the name (`SIGSEGV`, not
- * `SIG11`). Unknown numbers still fall back to `SIG<n>`.
+ * `SIG11`). Aliases share a number (SIGABRT/SIGIOT): the first entry wins, so
+ * the canonical name renders. Unknown numbers still fall back to `SIG<n>`.
  */
-const SIGNAL_NAMES: Readonly<Record<number, string>> =
-  Object.fromEntries(Object.entries(osConstants.signals).map(([name, number]) => [number, name]));
+const SIGNAL_NAMES: Readonly<Record<number, string>> = (() => {
+  const names: Record<number, string> = {};
+  for (const [name, number] of Object.entries(osConstants.signals)) {
+    names[number] ??= name;
+  }
+  return names;
+})();
 
 /**
  * DSH's exact quoting: the wrapped line stays one physical line, no PS2 ever
@@ -96,6 +126,15 @@ function pause(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
+/**
+ * A pid-level liveness check: node-pty's write never throws on a dead pty (it
+ * console.errors and clears its queue), so the runtime must ask the kernel
+ * itself. `kill(pid, 0)` only tests existence — it sends nothing.
+ */
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
 /** The longest suffix of `text` that is a prefix of `wanted` (0 when none). */
 function suffixOverlap(text: string, wanted: string): number {
   const max = Math.min(text.length, wanted.length - 1);
@@ -108,7 +147,7 @@ function suffixOverlap(text: string, wanted: string): number {
 type Session = {
   readonly proc: pty.IPty;
   readonly pid: number;
-  exited: { readonly code: number; readonly signal: string | null } | null;
+  exited: { readonly code: number | null; readonly signal: string | null } | null;
   /**
    * The pts path the shell's fd 0 resolved to at spawn (or the first pre-write
    * retry): the stdin proof is bound to this frozen target, so a later
@@ -117,17 +156,94 @@ type Session = {
   ttyTarget: string | null;
 };
 
-type CommandState = {
-  readonly startRe: RegExp;
-  readonly endRe: RegExp;
-  readonly endPartial: RegExp;
-  carry: string;
-  startSeen: boolean;
-  readonly chunks: Buffer[];
-  captured: number;
-  truncated: boolean;
-  exitCode: number | null;
-};
+/**
+ * One command's stream-level capture: start/end marker framing, the held-back
+ * suffix that may be the beginning of a marker split across chunks, and the
+ * bounded payload. Timeout/abort/reset policy stays in `runExclusive`.
+ */
+class CommandCapture {
+  private readonly startRe: RegExp;
+  private readonly endRe: RegExp;
+  private readonly endPartial: RegExp;
+  private carry = '';
+  private startSeen = false;
+  private startedAtMs: number | null = null;
+  private readonly chunks: Buffer[] = [];
+  private captured = 0;
+  private truncatedFlag = false;
+  /** Set when the end marker names the command's exit status. */
+  exitCode: number | null = null;
+
+  constructor(
+    private readonly start: string,
+    private readonly end: string,
+    private readonly maxBytes: number,
+  ) {
+    this.startRe = new RegExp(`${start}\r?\n`);
+    this.endRe = new RegExp(`${end}(\\d{1,3})\r?\n`);
+    // A chunk may end inside the end marker: within the fixed part (covered by
+    // suffixOverlap) or within the digits/CR that follow it (covered by this
+    // partial). (Marker characters are [A-Za-z0-9_:.-], regex-safe.)
+    this.endPartial = new RegExp(`${end}[0-9]{0,3}\r?$`);
+  }
+
+  /** When the start marker was seen; the stdin grace is anchored here, not at the write. */
+  get startedAt(): number | null { return this.startedAtMs; }
+
+  get truncated(): boolean { return this.truncatedFlag; }
+
+  /** The captured payload; a held-back marker prefix is never included. */
+  output(): Uint8Array { return Buffer.concat(this.chunks); }
+
+  private capture(text: string): void {
+    if (text.length === 0 || this.truncatedFlag) return;
+    const bytes = Buffer.from(text, 'utf8');
+    const remaining = this.maxBytes - this.captured;
+    if (bytes.length <= remaining) {
+      this.chunks.push(bytes);
+      this.captured += bytes.length;
+      return;
+    }
+    if (remaining > 0) {
+      this.chunks.push(bytes.subarray(0, remaining));
+      this.captured += remaining;
+    }
+    // The command still runs to its own end; only the capture stops.
+    this.truncatedFlag = true;
+  }
+
+  feed(raw: string): void {
+    if (this.exitCode !== null) return;
+    let text = this.carry + raw;
+    this.carry = '';
+    if (!this.startSeen) {
+      const m = this.startRe.exec(text);
+      if (m === null) {
+        this.carry = text.slice(text.length - suffixOverlap(text, `${this.start}\r\n`));
+        return;
+      }
+      this.startSeen = true;
+      this.startedAtMs = Date.now();
+      text = text.slice(m.index + m[0].length);
+    }
+    const endMatch = this.endRe.exec(text);
+    if (endMatch !== null) {
+      this.capture(text.slice(0, endMatch.index));
+      this.exitCode = Number(endMatch[1]);
+      return;
+    }
+    // Hold back whatever could be the beginning of an end marker split
+    // across chunks: a suffix that prefixes the fixed marker, or the marker
+    // plus a not-yet-complete `\d{1,3}\r?\n` tail at the string end.
+    const partial = this.endPartial.exec(text);
+    const hold = Math.max(
+      partial === null ? 0 : text.length - partial.index,
+      suffixOverlap(text, this.end),
+    );
+    this.capture(text.slice(0, text.length - hold));
+    this.carry = text.slice(text.length - hold);
+  }
+}
 
 export class PtyTerminalRuntime implements TerminalRuntime {
   private session: Session | null = null;
@@ -156,7 +272,7 @@ export class PtyTerminalRuntime implements TerminalRuntime {
    * and the wait is bounded only by that command's own timeout. A caller
    * shutting down must abort in-flight work first (the driver does).
    */
-  async dispose(_reason: string, killGraceMs: number): Promise<void> {
+  async dispose(killGraceMs: number): Promise<void> {
     const task = this.queue.then(async () => {
       this.disposed = true;
       await this.killSession(killGraceMs);
@@ -224,30 +340,43 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     this.wedged = false;
   }
 
+  /**
+   * The pty's own exit record, or an unknown one when the event has not landed
+   * yet. A pid probe can notice a death before SIGCHLD reaches node-pty; the
+   * short grace keeps the real exit code (an `exit 3` must not render as an
+   * unknown code) without ever approaching the command timeout. The synthetic
+   * state is stored so a later kill does not wait a second grace for an event
+   * that already happened.
+   */
+  private async exitedOrUnknown(
+    session: Session,
+  ): Promise<{ readonly code: number | null; readonly signal: string | null }> {
+    const deadline = Date.now() + EXIT_REPORT_GRACE_MS;
+    while (session.exited === null && Date.now() < deadline) await pause(POLL_MS);
+    session.exited ??= { code: null, signal: null };
+    return session.exited;
+  }
+
   private async runExclusive(
     cmd: string, limits: CommandLimits, signal: AbortSignal,
   ): Promise<CommandOutcome> {
-    if (this.disposed) {
-      return {
-        status: 'spawn-failed', exitCode: null, signal: null,
-        output: new Uint8Array(), truncated: false, reset: false, fresh: null,
-      };
-    }
+    if (this.disposed) return failedOutcome('spawn-failed', null);
+    let wedgeReset = false;
     if (this.wedged) {
       // A session waiting on stdin cannot accept a new command line: reset it
       // first, and let the outcome say so. (The interactive `write` verb is
       // deliberately not built yet.)
       await this.reset(limits.killGraceMs);
       this.wedgedFresh = 'stdin-wedge';
+      wedgeReset = true;
     }
     // Consumed by this call, whatever path it takes — never leaked to a later one.
     const fresh = this.wedgedFresh;
     this.wedgedFresh = null;
     if (signal.aborted) {
-      return {
-        status: 'cancelled', exitCode: null, signal: null,
-        output: new Uint8Array(), truncated: false, reset: false, fresh,
-      };
+      // The wedge reset above DID kill the session: report it truthfully even
+      // though this call itself writes nothing.
+      return failedOutcome('cancelled', fresh, wedgeReset);
     }
     let session = this.session;
     if (session !== null && session.exited !== null) {
@@ -261,10 +390,7 @@ export class PtyTerminalRuntime implements TerminalRuntime {
       try {
         session = this.spawnFresh();
       } catch {
-        return {
-          status: 'spawn-failed', exitCode: null, signal: null,
-          output: new Uint8Array(), truncated: false, reset: false, fresh,
-        };
+        return failedOutcome('spawn-failed', fresh);
       }
     }
     // Freeze the session's tty target while the shell is idle — before this
@@ -276,69 +402,9 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     const nonce = randomUUID();
     const start = `__ES_EXECUTE_START_${nonce}__`;
     const end = `__ES_EXECUTE_END_${nonce}:`;
-    const state: CommandState = {
-      startRe: new RegExp(`${start}\r?\n`),
-      endRe: new RegExp(`${end}(\\d{1,3})\r?\n`),
-      // A chunk may end inside the end marker: within the fixed part (covered
-      // by suffixOverlap) or within the digits/CR that follow it (covered by
-      // this partial). (Marker characters are [A-Za-z0-9_:.-], regex-safe.)
-      endPartial: new RegExp(`${end}[0-9]{0,3}\r?$`),
-      carry: '',
-      startSeen: false,
-      chunks: [],
-      captured: 0,
-      truncated: false,
-      exitCode: null,
-    };
-    const capture = (text: string): void => {
-      if (text.length === 0 || state.truncated) return;
-      const bytes = Buffer.from(text, 'utf8');
-      const remaining = limits.maxCaptureBytes - state.captured;
-      if (bytes.length <= remaining) {
-        state.chunks.push(bytes);
-        state.captured += bytes.length;
-        return;
-      }
-      if (remaining > 0) {
-        state.chunks.push(bytes.subarray(0, remaining));
-        state.captured += remaining;
-      }
-      // The command still runs to its own end; only the capture stops.
-      state.truncated = true;
-    };
-    const onData = (raw: string): void => {
-      if (state.exitCode !== null) return;
-      let text = state.carry + raw;
-      state.carry = '';
-      if (!state.startSeen) {
-        const m = state.startRe.exec(text);
-        if (m === null) {
-          state.carry = text.slice(text.length - suffixOverlap(text, `${start}\r\n`));
-          return;
-        }
-        state.startSeen = true;
-        text = text.slice(m.index + m[0].length);
-      }
-      const endMatch = state.endRe.exec(text);
-      if (endMatch !== null) {
-        capture(text.slice(0, endMatch.index));
-        state.exitCode = Number(endMatch[1]);
-        return;
-      }
-      // Hold back whatever could be the beginning of an end marker split
-      // across chunks: a suffix that prefixes the fixed marker, or the marker
-      // plus a not-yet-complete `\d{1,3}\r?\n` tail at the string end.
-      const partial = state.endPartial.exec(text);
-      const hold = Math.max(
-        partial === null ? 0 : text.length - partial.index,
-        suffixOverlap(text, end),
-      );
-      capture(text.slice(0, text.length - hold));
-      state.carry = text.slice(text.length - hold);
-    };
-    const subscription = session.proc.onData(onData);
+    const capture = new CommandCapture(start, end, limits.maxCaptureBytes);
+    const subscription = session.proc.onData((raw) => { capture.feed(raw); });
 
-    const output = (): Uint8Array => Buffer.concat(state.chunks);
     const settle = async (
       status: CommandStatus, exitCode: number | null, signalName: string | null,
       reset: boolean,
@@ -348,11 +414,11 @@ export class PtyTerminalRuntime implements TerminalRuntime {
       // held back BECAUSE it is a prefix of the end marker (or the marker plus
       // partial digits) — protocol bytes, or output indistinguishable from
       // them. On the completed path the same bytes DO join the capture: the
-      // end match slices the stream before itself.
-      state.carry = '';
+      // end match slices the stream before itself, so CommandCapture.output()
+      // is exactly the payload either way.
       const outcome: CommandOutcome = {
         status, exitCode, signal: signalName,
-        output: output(), truncated: state.truncated, reset, fresh,
+        output: capture.output(), truncated: capture.truncated, reset, fresh,
       };
       // A timeout, a cancellation and a session death all reset the session;
       // stdin_read deliberately leaves it wedged.
@@ -361,6 +427,13 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     };
 
     try {
+      // node-pty's write never throws on a dead pty: it console.errors and
+      // clears its queue, so without this probe a shell that died in the
+      // check-to-write window would stay silent until the command timeout.
+      if (!alive(session.pid)) {
+        const exit = await this.exitedOrUnknown(session);
+        return settle('session_exit', exit.code, exit.signal, true);
+      }
       session.proc.write(
         `printf '%s\\n' ${quoteForBash(start)}; eval -- ${quoteForBash(cmd)}; `
         + `__es_status=$?; printf '%s%s\\n' ${quoteForBash(end)} "$__es_status"\n`,
@@ -371,11 +444,19 @@ export class PtyTerminalRuntime implements TerminalRuntime {
       let lastProbeAt = 0;
       for (;;) {
         await pause(POLL_MS);
-        if (state.exitCode !== null) {
-          return settle('completed', state.exitCode, null, false);
+        if (capture.exitCode !== null) {
+          return settle('completed', capture.exitCode, null, false);
         }
         if (session.exited !== null) {
           return settle('session_exit', session.exited.code, session.exited.signal, true);
+        }
+        // The exit event can lag a killed pid (or the pty can swallow the
+        // write): fail fast with the bytes captured so far instead of
+        // stalling to the timeout. The completed check above is first, so a
+        // command whose end marker already landed still wins.
+        if (!alive(session.pid)) {
+          const exit = await this.exitedOrUnknown(session);
+          return settle('session_exit', exit.code, exit.signal, true);
         }
         if (signal.aborted) {
           return settle('cancelled', null, null, true);
@@ -383,8 +464,8 @@ export class PtyTerminalRuntime implements TerminalRuntime {
         if (Date.now() >= deadline) {
           return settle('timeout', null, null, true);
         }
-        if (state.startSeen
-          && Date.now() >= writeAt + STDIN_GRACE_MS
+        if (capture.startedAt !== null
+          && Date.now() >= capture.startedAt + STDIN_GRACE_MS
           && Date.now() >= lastProbeAt + STDIN_PROBE_INTERVAL_MS) {
           lastProbeAt = Date.now();
           probes = stdinWaitPids(session.pid, session.ttyTarget).length > 0 ? probes + 1 : 0;

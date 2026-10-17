@@ -13,7 +13,7 @@ import type { ProviderAdapter } from '../provider/adapter.js';
 import type { AgentConfig, ProjectionState, RequestId } from '../context/contracts.js';
 import type { BoundaryGate, DriverHooks, DurableWatermark } from './gate.js';
 import type { TurnContext, TurnHandler, TurnResult } from './driver.js';
-import { PtyTerminalRuntime } from './tools/terminal.js';
+import { PtyTerminalRuntime, failedOutcome } from './tools/terminal.js';
 import type { TerminalFactory, TerminalPort, TerminalRuntime } from './tools/terminal.js';
 import type { WebTools } from './tools/web.js';
 import type { WorldRepo } from './world.js';
@@ -105,10 +105,7 @@ class Runtime implements AgentRuntime {
     this.terminalPort = {
       run: (cmd, limits, signal) => {
         if (this.terminalStopped) {
-          return Promise.resolve({
-            status: 'spawn-failed', exitCode: null, signal: null,
-            output: new Uint8Array(), truncated: false, reset: false, fresh: null,
-          });
+          return Promise.resolve(failedOutcome('spawn-failed', null));
         }
         return this.session().run(cmd, limits, signal);
       },
@@ -185,7 +182,7 @@ class Runtime implements AgentRuntime {
     try {
       grace = this.fold.snapshot().config?.value.policy.killGraceMs ?? FALLBACK_KILL_GRACE_MS;
     } catch { /* teardown must run even if the fold cannot be read */ }
-    await session.dispose('driver stop', grace);
+    await session.dispose(grace);
   }
 
   /**

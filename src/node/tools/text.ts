@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer';
 import type { ArtifactRef } from '../../context/contracts.js';
 
 /**
- * Bounded, deterministically-decoded tool text shared by the shell and web
+ * Bounded, deterministically-decoded tool text shared by the terminal and web
  * tools. The bound cuts at a code-point boundary; the truncation notice names
  * the retained raw artifact's own digest and byte count.
  */

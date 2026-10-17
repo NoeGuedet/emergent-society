@@ -179,7 +179,7 @@ describe('dispatchCalls: execute', () => {
       expect(data.raw).toBeNull();
       expect(ofType(durable, 'artifact/end')).toHaveLength(0);
     } finally {
-      await terminal.dispose('test', 100);
+      await terminal.dispose(100);
       await s.shutdown();
     }
   }, 15000);
@@ -198,7 +198,7 @@ describe('dispatchCalls: execute', () => {
       expect(Buffer.from(rawBytes).toString('utf8')).toMatch(/hello-42\r?\n/);
       expect(await artifactComplete(home)).toBe(true);
     } finally {
-      await terminal.dispose('test', 100);
+      await terminal.dispose(100);
       await s.shutdown();
     }
   }, 15000);
@@ -450,7 +450,7 @@ describe('dispatchCalls: wait', () => {
       expect(results[1]!.callId).toBe('e1');
       expect(results[1]!.raw).not.toBeNull();
     } finally {
-      await terminal.dispose('test', 100);
+      await terminal.dispose(100);
       await s.shutdown();
     }
   }, 15000);
@@ -485,7 +485,7 @@ describe('dispatchCalls: abort and durability faults', () => {
       expect(data.failure).toEqual({ code: 'cancelled', status: null });
       expect(data.isError).toBe(true);
     } finally {
-      await terminal.dispose('test', 100);
+      await terminal.dispose(100);
       await s.shutdown();
     }
   }, 15000);
@@ -531,7 +531,7 @@ describe('dispatchCalls: abort and durability faults', () => {
         .rejects.toThrow('injected flush failure');
       expect(await exists(join(repo.path, 'fault1.txt'))).toBe(false);
     } finally {
-      await terminal.dispose('test', 100);
+      await terminal.dispose(100);
       await s.shutdown();
     }
   }, 15000);
@@ -547,7 +547,7 @@ describe('dispatchCalls: abort and durability faults', () => {
         .rejects.toThrow('injected flush failure');
       expect(await readFile(join(repo.path, 'fault2.txt'), 'utf8')).toBe('x');
     } finally {
-      await terminal.dispose('test', 100);
+      await terminal.dispose(100);
       await s.shutdown();
     }
   }, 15000);
@@ -567,7 +567,7 @@ describe('dispatchCalls: abort and durability faults', () => {
       expect(await readFile(join(repo.path, 'b.txt'), 'utf8')).toBe('two');
       expect(ofType(await events(home), 'tool/result')).toHaveLength(2);
     } finally {
-      await terminal.dispose('test', 100);
+      await terminal.dispose(100);
       await s.shutdown();
     }
   }, 15000);

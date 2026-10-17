@@ -222,15 +222,15 @@ describe('turn control', () => {
 
   it('stopping the driver disposes the terminal session with the journaled grace', async () => {
     const fx = fixture();
-    const disposed: string[] = [];
+    let disposals = 0;
     const graces: number[] = [];
     const create = (): TerminalRuntime => ({
       run: () => Promise.resolve({
         status: 'completed', exitCode: 0, signal: null,
         output: new Uint8Array(), truncated: false, reset: false, fresh: null,
       }),
-      dispose: (reason, grace) => {
-        disposed.push(reason);
+      dispose: (grace) => {
+        disposals += 1;
         graces.push(grace);
         return Promise.resolve();
       },
@@ -248,19 +248,19 @@ describe('turn control', () => {
     driver.stop();
     await running;
 
-    expect(disposed).toEqual(['driver stop']);
+    expect(disposals).toBe(1);
     expect(graces).toEqual([config.policy.killGraceMs]);
   });
 
   it('disposes the terminal on the fatal path, not only on a clean stop', async () => {
     const fx = fixture();
-    const disposed: string[] = [];
+    let disposals = 0;
     const create = (): TerminalRuntime => ({
       run: () => Promise.resolve({
         status: 'completed', exitCode: 0, signal: null,
         output: new Uint8Array(), truncated: false, reset: false, fresh: null,
       }),
-      dispose: (reason) => { disposed.push(reason); return Promise.resolve(); },
+      dispose: () => { disposals += 1; return Promise.resolve(); },
     });
     const config = configWith({ policy: { stepsPerTurn: 1, retryDelayMs: 1 } });
     const transport = new ScriptedTransport([calling([execute('f1', 'true')])]);
@@ -279,7 +279,7 @@ describe('turn control', () => {
       knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
     });
     await expect(driver.run()).rejects.toThrow('fatal after effect');
-    expect(disposed).toEqual(['driver stop']);
+    expect(disposals).toBe(1);
     expect(driver.state).toBe('stopped');
     expect((await eventsOf(fx)).find((event) => event.type === 'node/shutdown')?.data)
       .toMatchObject({ reason: 'handler-error' });
@@ -290,7 +290,7 @@ describe('runtime reuse across sequential drivers', () => {
   it('scopes the terminal latch to one driver session and fails closed between them', async () => {
     const fx = fixture();
     let spawned = 0;
-    const disposed: string[] = [];
+    let disposals = 0;
     const create = (): TerminalRuntime => {
       spawned += 1;
       return {
@@ -298,7 +298,7 @@ describe('runtime reuse across sequential drivers', () => {
           status: 'completed', exitCode: 0, signal: null,
           output: new Uint8Array(), truncated: false, reset: false, fresh: null,
         }),
-        dispose: (reason) => { disposed.push(reason); return Promise.resolve(); },
+        dispose: () => { disposals += 1; return Promise.resolve(); },
       };
     };
     const config = configWith({ policy: { stepsPerTurn: 1, retryDelayMs: 1 } });
@@ -320,7 +320,7 @@ describe('runtime reuse across sequential drivers', () => {
     first.stop();
     await firstRun;
     expect(spawned).toBe(1);
-    expect(disposed).toEqual(['driver stop']);
+    expect(disposals).toBe(1);
 
     // Between sessions the latch still holds: a handler invoked directly after
     // shutdown cannot respawn the terminal and sees a failed execute.
@@ -354,7 +354,7 @@ describe('runtime reuse across sequential drivers', () => {
     second.stop();
     await secondRun;
     expect(spawned).toBe(2);
-    expect(disposed).toEqual(['driver stop', 'driver stop']);
+    expect(disposals).toBe(2);
     const e2 = (await eventsOf(fx)).find((event) => event.type === 'tool/result'
       && (event.data as { callId?: string }).callId === 'e2');
     expect(e2).toBeDefined();
