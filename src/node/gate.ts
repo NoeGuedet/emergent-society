@@ -108,14 +108,16 @@ export interface DriverHooks {
    * history — the `world/perception` it has recorded and observed — or null when
    * it owns no perception (a trusted handler that operates without one).
    *
-   * The driver calls this after `onTurnStart` and, on resume, after the whole
-   * history has been delivered; it advances the watermark only on a proof whose
-   * turn, opening range and receipt match a delivered `world/perception`
-   * observation. Null alone never advances the watermark, so a handler that
-   * makes no perception claim is never falsely acknowledged — the prior
-   * watermark simply stands.
+   * The driver calls this with the live turn after `onTurnStart` and, on resume,
+   * without a turn after the whole history has been delivered; it advances the
+   * watermark only on a proof whose turn, opening range and receipt match a
+   * delivered `world/perception` observation. A live call whose proof is not for
+   * that turn returns null (the handler owns no perception this turn); a resume
+   * call without a turn takes the latest durable proof. Null alone never advances
+   * the watermark, so a handler that makes no perception claim is never falsely
+   * acknowledged — the prior watermark simply stands.
    */
-  acknowledgedWorld(): WorldAcknowledgement | null;
+  acknowledgedWorld(turn?: number): WorldAcknowledgement | null;
   /**
    * The handler's own teardown at driver stop (the C1.4b terminal session),
    * called during shutdown after the `node/shutdown` event and before the

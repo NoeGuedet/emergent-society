@@ -517,7 +517,7 @@ export class NodeDriver {
    * acknowledged, and its prior watermark simply stands.
    */
   private advanceAcknowledgement(ctx: TurnContext): void {
-    const ack = this.hooks!.acknowledgedWorld();
+    const ack = this.hooks!.acknowledgedWorld(ctx.turn);
     if (ack === null) return;
     if (ack.turn !== ctx.turn) {
       throw new Error(

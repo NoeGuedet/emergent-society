@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { BlobStore, CLAIM_CHECK_THRESHOLD, isBlobRef, JournalWriter } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
 import { sha256HexOf } from '../../journal/canon.js';
@@ -58,6 +61,7 @@ function projection(calls: FunctionCall[], raw: ArtifactRef): AssistantProjectio
 }
 
 interface Session {
+  readonly path: string;
   readonly writer: JournalWriter;
   readonly gate: (phase: 'ready' | 'turn', turn: number | null) =>
     { readonly gate: BoundaryGate };
@@ -90,7 +94,7 @@ async function openSession(path: string): Promise<Session> {
     record((writer.append as unknown as (
       t: string, d: JsonValue, o?: { ignorable?: boolean },
     ) => EventEnvelope)(type, data, opts));
-  return { writer, gate, lifecycle, close: () => writer.close() };
+  return { path, writer, gate, lifecycle, close: () => writer.close() };
 }
 
 async function startConfig(s: Session): Promise<Source> {
@@ -501,7 +505,7 @@ function hooksFor(fold: ContextFold, path: string, over: Partial<DriverHooks> = 
     onTurnStart: async () => {},
     readHistory: (path2, uid, knownTypes) => loadVerifiedEvents(path2, uid, knownTypes),
     readBlob: (hash) => new BlobStore(path).get(hash),
-    acknowledgedWorld: () => fold.acknowledgedWorld(),
+    acknowledgedWorld: (turn) => fold.acknowledgedWorld(turn),
     ...over,
   };
 }
@@ -923,15 +927,15 @@ describe('fold: compaction and refusal sequencing invariants', () => {
   });
 });
 
-describe('fold: acknowledgement is bound to the current turn', () => {
-  it('returns null for a perception-less turn instead of the previous turn proof', async () => {
+describe('fold: acknowledgement is filtered by turn on the live path only', () => {
+  it('returns null for a live perception-less turn and keeps the prior proof for resume', async () => {
     const s = await openSession(home());
     try {
       const cfg = await startConfig(s);
       const t0 = await pipeline(s, 0, cfg, { perceptionText: 'first evidence' });
       await t0.gate.flush();
       const live = await foldOf(home());
-      expect(live.acknowledgedWorld()?.turn).toBe(0);
+      expect(live.acknowledgedWorld(0)?.turn).toBe(0);
 
       s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' }, { ignorable: true });
       await s.writer.flush();
@@ -942,14 +946,57 @@ describe('fold: acknowledgement is bound to the current turn', () => {
       await s.writer.flush();
       const next = await foldOf(home());
       expect(next.snapshot().open?.turn).toBe(1);
-      // This turn recorded no perception: the durable turn-0 proof is stale and
-      // must not be offered to the driver as this turn's acknowledgement.
-      expect(next.acknowledgedWorld()).toBeNull();
-      expect(next.acknowledgedWorld(0)).toBeNull();
+      // Live path: this turn recorded no perception, so the durable turn-0 proof
+      // is stale and must not be offered as this turn's acknowledgement.
       expect(next.acknowledgedWorld(1)).toBeNull();
+      // Resume path: a replayed open turn/start with no perception still needs
+      // the prior proof to rebuild the watermark.
+      expect(next.acknowledgedWorld()?.turn).toBe(0);
     } finally {
       await s.close();
     }
+  });
+
+  it('rebuilds the resume watermark from the prior proof after a crash mid-turn', async () => {
+    const { home: path, world } = fixture();
+    const previous = 'b'.repeat(64);
+    const s = await openSession(path);
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', {
+        turn: 0, trigger: 'boot', world: { from: null, to: previous },
+      });
+      const gate = s.gate('turn', 0).gate;
+      gate.append('world/perception', {
+        turn: 0, range: { from: null, to: previous },
+        value: { kind: 'inline', value: perception('shown', { from: null, to: previous }) },
+      });
+      // A dialogue is not needed: the perception is the acknowledgement.
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
+      await s.writer.flush();
+      // Crash mid-turn: turn 1's opening is durable, its perception is not.
+      s.lifecycle('turn/start', {
+        turn: 1, trigger: 'wakeup', world: { from: previous, to: null },
+      });
+      await s.writer.flush();
+    } finally {
+      await s.close();
+    }
+
+    const fold = new ContextFold();
+    const seen: WorldRange[] = [];
+    let driver: NodeDriver | null = null;
+    driver = await NodeDriver.open(path, 'n1', (ctx) => {
+      seen.push(ctx.world);
+      driver!.stop();
+      return { outcome: 'waiting', toolCalls: false };
+    }, world, { knownTypes: C13_EVENT_TYPES, hooks: hooksFor(fold, path), worldPollMs: 0 });
+    await driver.run();
+
+    // Resume returned the prior turn's proof, so the interrupted turn's range is
+    // re-presented and the next turn opens from the last perceived HEAD.
+    expect(seen).toEqual([{ from: previous, to: await world.headHash() }]);
+    expect(fold.acknowledgedWorld()?.turn).toBe(0);
   });
 });
 
@@ -1072,6 +1119,69 @@ describe('fold: forged chain-valid payloads fail as typed invariants', () => {
       expectInvariant(await foldError(home()), /compaction\/abort/);
     } finally {
       await s.close();
+    }
+  });
+
+  it('rejects forged payloads at every remaining handler boundary', async () => {
+    const cases: Array<{
+      readonly type: string; readonly data: JsonValue; readonly pattern: RegExp;
+      readonly turn: boolean;
+    }> = [
+      {
+        type: 'system/message', data: { version: 0, value: null },
+        pattern: /system\/message\.value/, turn: false,
+      },
+      {
+        type: 'world/perception',
+        data: { turn: 0, range: null, value: { kind: 'inline', value: {} } },
+        pattern: /world\/perception\.range/, turn: true,
+      },
+      {
+        type: 'request/plan', data: { id: null, value: { kind: 'inline', value: {} } },
+        pattern: /request\/plan\.id/, turn: true,
+      },
+      {
+        type: 'request/refused', data: { id: null, bytes: 1, limit: 2, phase: 'plan' },
+        pattern: /request\/refused\.id/, turn: true,
+      },
+      {
+        type: 'request/wire',
+        data: { id: null, attempt: 0, body: null },
+        pattern: /request\/wire\.id/, turn: true,
+      },
+      {
+        type: 'response/raw',
+        data: { id: null, attempt: 0, status: 200, body: null, complete: true },
+        pattern: /response\/raw\.id/, turn: true,
+      },
+      {
+        type: 'assistant/message', data: { id: null, value: { kind: 'inline', value: {} } },
+        pattern: /assistant\/message\.id/, turn: true,
+      },
+      {
+        type: 'tool/call', data: { turn: 0, request: null, call: null },
+        pattern: /tool\/call\.request/, turn: true,
+      },
+    ];
+
+    for (const c of cases) {
+      // Each case needs its own journal: `home()` is one directory per test.
+      const path = await mkdtemp(join(tmpdir(), 'c13-forged-'));
+      const s = await openSession(path);
+      try {
+        if (c.turn) {
+          await startConfig(s);
+          s.lifecycle('turn/start', {
+            turn: 0, trigger: 'boot', world: { from: null, to: null },
+          });
+        }
+        rawAppend(s, c.type, c.data);
+        await s.writer.flush();
+        expectInvariant(await foldError(path), c.pattern);
+      } finally {
+        await s.close();
+        await rm(path, { recursive: true, force: true });
+      }
     }
   });
 });

@@ -525,7 +525,7 @@ function resumingProofHooks(home: string): DriverHooks {
     onTurnStart: async () => { moving = true; },
     readHistory: (path, uid, knownTypes) => loadVerifiedEvents(path, uid, knownTypes),
     readBlob: (hash) => new BlobStore(home).get(hash),
-    acknowledgedWorld: () => (moving ? null : fold.acknowledgedWorld()),
+    acknowledgedWorld: (turn) => (moving ? null : fold.acknowledgedWorld(turn)),
   };
 }
 

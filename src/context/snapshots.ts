@@ -281,7 +281,7 @@ function compactionStart(value: unknown, where: string): CompactionStart {
   const o = record(value, where);
   onlyKeys(o, ['id', 'revision', 'groupIds', 'sources', 'shadowHash', 'shadowBytes'], where);
   return {
-    id: text(o['id'], `${where}.id`),
+    id: hash(o['id'], `${where}.id`),
     revision: hash(o['revision'], `${where}.revision`),
     groupIds: array(o['groupIds'], `${where}.groupIds`)
       .map((entry, i) => source(entry, `${where}.groupIds[${i}]`)),

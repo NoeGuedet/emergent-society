@@ -78,6 +78,41 @@ function dataArray(value: unknown, where: string): unknown[] {
   return value as unknown[];
 }
 
+function dataBool(value: unknown, where: string): boolean {
+  if (typeof value !== 'boolean') invariant(`${where} is not a boolean`);
+  return value as boolean;
+}
+
+function dataRequestId(value: unknown, where: string): RequestId {
+  const o = dataRecord(value, where);
+  return {
+    turn: dataInt(o['turn'], `${where}.turn`),
+    ordinal: dataInt(o['ordinal'], `${where}.ordinal`),
+  };
+}
+
+function dataStored<T>(value: unknown, where: string): Stored<T> {
+  const o = dataRecord(value, where);
+  if (o['kind'] !== 'inline' && o['kind'] !== 'artifact-json') {
+    invariant(`${where} has an unknown kind`);
+  }
+  return o as unknown as Stored<T>;
+}
+
+function dataFunctionCall(value: unknown, where: string): FunctionCall {
+  const o = dataRecord(value, where);
+  if (o['type'] !== 'function') invariant(`${where}.type is not 'function'`);
+  const fn = dataRecord(o['function'], `${where}.function`);
+  return {
+    id: dataString(o['id'], `${where}.id`),
+    type: 'function',
+    function: {
+      name: dataString(fn['name'], `${where}.function.name`),
+      arguments: dataString(fn['arguments'], `${where}.function.arguments`),
+    },
+  };
+}
+
 function dataSource(value: unknown, where: string): Source {
   const o = dataRecord(value, where);
   return {
@@ -269,10 +304,12 @@ export class ContextFold {
   // --- config -----------------------------------------------------------------
 
   private onConfig(event: VerifiedEvent): void {
-    const data = event.data as unknown as { version: number; value: Stored<AgentConfig> };
+    const data = dataRecord(event.data, 'system/message data');
+    const version = dataInt(data['version'], 'system/message.version');
+    const value = dataStored<AgentConfig>(data['value'], 'system/message.value');
     const source = sourceOf(event);
-    const config = resolveStored(this.verifiedIndex, data.value, validateAgentConfig);
-    if (config.version !== data.version) {
+    const config = resolveStored(this.verifiedIndex, value, validateAgentConfig);
+    if (config.version !== version) {
       invariant('system/message version does not equal the resolved config version');
     }
     if (this.config === null) {
@@ -349,8 +386,11 @@ export class ContextFold {
 
   private onPerception(event: VerifiedEvent): void {
     const open = this.requireOpen('world/perception');
-    const data = event.data as unknown as {
-      turn: number; range: WorldRange; value: Stored<WorldPerception>;
+    const raw = dataRecord(event.data, 'world/perception data');
+    const data = {
+      turn: dataInt(raw['turn'], 'world/perception.turn'),
+      range: dataWorldRange(raw['range'], 'world/perception.range'),
+      value: dataStored<WorldPerception>(raw['value'], 'world/perception.value'),
     };
     if (data.turn !== open.turn) invariant('world/perception turn mismatch');
     if (open.perceptionSeen) invariant('duplicate world/perception for the turn');
@@ -379,7 +419,11 @@ export class ContextFold {
 
   private onPlan(event: VerifiedEvent): void {
     const open = this.requireOpen('request/plan');
-    const data = event.data as unknown as { id: RequestId; value: Stored<RequestPlan> };
+    const raw = dataRecord(event.data, 'request/plan data');
+    const data = {
+      id: dataRequestId(raw['id'], 'request/plan.id'),
+      value: dataStored<RequestPlan>(raw['value'], 'request/plan.value'),
+    };
     if (data.id.turn !== open.turn) invariant('request/plan id.turn mismatch');
     const buffer = this.buffer(open, data.id);
     if (buffer.refused) invariant('request/plan after request/refused');
@@ -394,7 +438,8 @@ export class ContextFold {
 
   private onRefused(event: VerifiedEvent): void {
     const open = this.requireOpen('request/refused');
-    const data = event.data as unknown as { id: RequestId };
+    const raw = dataRecord(event.data, 'request/refused data');
+    const data = { id: dataRequestId(raw['id'], 'request/refused.id') };
     if (data.id.turn !== open.turn) invariant('request/refused id.turn mismatch');
     const buffer = this.buffer(open, data.id);
     if (buffer.refused) invariant('duplicate request/refused for a request');
@@ -406,7 +451,12 @@ export class ContextFold {
 
   private onWire(event: VerifiedEvent): void {
     const open = this.requireOpen('request/wire');
-    const data = event.data as unknown as { id: RequestId; attempt: number; body: ArtifactRef };
+    const raw = dataRecord(event.data, 'request/wire data');
+    const data = {
+      id: dataRequestId(raw['id'], 'request/wire.id'),
+      attempt: dataInt(raw['attempt'], 'request/wire.attempt'),
+      body: raw['body'] as ArtifactRef,
+    };
     if (data.id.turn !== open.turn) invariant('request/wire id.turn mismatch');
     const buffer = this.buffer(open, data.id);
     if (buffer.refused) invariant('request/wire after request/refused');
@@ -433,8 +483,13 @@ export class ContextFold {
 
   private onResponse(event: VerifiedEvent): void {
     const open = this.requireOpen('response/raw');
-    const data = event.data as unknown as {
-      id: RequestId; attempt: number; status: number; body: ArtifactRef; complete: boolean;
+    const raw = dataRecord(event.data, 'response/raw data');
+    const data = {
+      id: dataRequestId(raw['id'], 'response/raw.id'),
+      attempt: dataInt(raw['attempt'], 'response/raw.attempt'),
+      status: dataInt(raw['status'], 'response/raw.status'),
+      body: raw['body'] as ArtifactRef,
+      complete: dataBool(raw['complete'], 'response/raw.complete'),
     };
     if (data.id.turn !== open.turn) invariant('response/raw id.turn mismatch');
     const buffer = this.buffer(open, data.id);
@@ -464,7 +519,11 @@ export class ContextFold {
 
   private onAssistant(event: VerifiedEvent): void {
     const open = this.requireOpen('assistant/message');
-    const data = event.data as unknown as { id: RequestId; value: Stored<AssistantProjection> };
+    const raw = dataRecord(event.data, 'assistant/message data');
+    const data = {
+      id: dataRequestId(raw['id'], 'assistant/message.id'),
+      value: dataStored<AssistantProjection>(raw['value'], 'assistant/message.value'),
+    };
     if (data.id.turn !== open.turn) invariant('assistant/message id.turn mismatch');
     const buffer = this.buffer(open, data.id);
     if (buffer.refused) invariant('assistant/message after request/refused');
@@ -502,7 +561,12 @@ export class ContextFold {
 
   private onToolCall(event: VerifiedEvent): void {
     const open = this.requireOpen('tool/call');
-    const data = event.data as unknown as { turn: number; request: RequestId; call: FunctionCall };
+    const raw = dataRecord(event.data, 'tool/call data');
+    const data = {
+      turn: dataInt(raw['turn'], 'tool/call.turn'),
+      request: dataRequestId(raw['request'], 'tool/call.request'),
+      call: dataFunctionCall(raw['call'], 'tool/call.call'),
+    };
     if (data.turn !== open.turn || data.request.turn !== open.turn) {
       invariant('tool/call turn mismatch');
     }
@@ -823,20 +887,18 @@ export class ContextFold {
    * history and only from events delivered as durable — never from a
    * `turn/start` or a closer, and never from a cache or snapshot.
    *
-   * The contract is *this turn's* proof. After a new `turn/start` is folded, an
-   * open turn names the turn being acknowledged; a perception proof from an
-   * earlier turn means the handler recorded none for this one, so it returns
-   * null rather than a stale proof that would make the driver throw. When no
-   * turn is open (the resume path, after the last turn closed) the latest proof
-   * is the one the watermark rebuild needs. An explicit `turn` argument, when
-   * supplied, must match the proof's turn. The returned object is a fresh copy,
-   * so no caller can mutate fold state through it.
+   * The live path passes the turn it is acknowledging: a proof from another turn
+   * means the handler recorded no perception for this one, so this returns null
+   * rather than a stale proof the driver would reject. The resume path omits the
+   * turn and gets the unfiltered latest proof — including when a replayed
+   * `turn/start` is open after a crash before its perception, because the prior
+   * turn's proof is exactly what rebuilds the watermark. The returned object is a
+   * fresh copy, so no caller can mutate fold state through it.
    */
   acknowledgedWorld(turn?: number): WorldAcknowledgement | null {
     const proof = this.perceptionProof;
     if (proof === null) return null;
     if (turn !== undefined && proof.turn !== turn) return null;
-    if (this.open !== null && proof.turn !== this.open.turn) return null;
     return {
       turn: proof.turn,
       range: { from: proof.range.from, to: proof.range.to },

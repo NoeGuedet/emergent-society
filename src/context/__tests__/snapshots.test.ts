@@ -403,6 +403,15 @@ describe('snapshots: round-trip', () => {
     await expect(writeSnapshot(path, 'n1', snap)).resolves.toBe(true);
     const read = await readSnapshot(path, 'n1', events);
     expect(read?.val.pendingCompactions).toEqual([validated]);
+
+    // The snapshot parser is now as strict as the gate about the id schema.
+    const badId = {
+      ...clone(state),
+      pendingCompactions: [{ ...(validated as Record<string, JsonValue>), id: 'not-a-hash' }],
+    } as unknown as ProjectionState;
+    await expect(writeSnapshot(path, 'n1', {
+      ver: 1, seq: mark.seq, hash: mark.hash, val: badId,
+    })).resolves.toBe(false);
   });
 });
 
