@@ -1,7 +1,6 @@
 import type { EventEnvelope, JsonValue } from '../journal/index.js';
 import {
-  MAX_BLOB_BYTES, ReservedBlobRefError, assertBlobBytes, assertBlobRefReadable,
-  canonicalizeJson, isBlobRef, throwBlobReadError,
+  MAX_BLOB_BYTES, ReservedBlobRefError, canonicalizeJson, isBlobRef, readVerifiedBlob,
 } from '../journal/index.js';
 import { sha256HexOf } from '../journal/canon.js';
 import type {
@@ -254,16 +253,9 @@ class Gate implements BoundaryGate {
     for (const envelope of batch) {
       if (!isBlobRef(envelope.data)) continue;
       const ref = envelope.data;
-      assertBlobRefReadable(ref);
-      let bytes: Uint8Array;
-      try {
-        bytes = await this.callbacks.readBlob(ref.blob);
-      } catch (err) {
-        // Only a missing blob (ENOENT) becomes an integrity error; EACCES/EIO
-        // keep their own type so an environment failure is not called corruption.
-        throwBlobReadError(ref, err);
-      }
-      assertBlobBytes(ref, Buffer.from(bytes));
+      // The barrier's own verification: the shared read refuses a truncated
+      // reference, maps only ENOENT to integrity, and proves length and digest.
+      await readVerifiedBlob(ref, (hash) => this.callbacks.readBlob(hash));
     }
     this.pending = this.pending.slice(batch.length);
   }

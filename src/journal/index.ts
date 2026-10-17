@@ -64,6 +64,8 @@ export {
   assertBlobBytes,
   isBlobRef,
   parseBlobJson,
+  readVerifiedBlob,
+  resolveBlobRef,
   throwBlobReadError,
   type BlobRef,
 } from './blobs.js';

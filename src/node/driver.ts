@@ -1,6 +1,6 @@
 import {
   BlobStore, JournalReader, JournalWriter, TornTailError,
-  assertBlobBytes, assertBlobRefReadable, isBlobRef, repair, throwBlobReadError,
+  isBlobRef, readVerifiedBlob, repair,
   type EventDataFor, type EventEnvelope, type JsonValue, type JournalWriterOptions,
 } from '../journal/index.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
@@ -500,18 +500,11 @@ export class NodeDriver {
     for (const obs of batch) {
       if (!isBlobRef(obs.raw.data)) continue;
       const ref = obs.raw.data;
-      // A flagged prefix is refused before any read, so it can never reach
-      // `onDurable` or an effect even when its blob digest and size would match.
-      assertBlobRefReadable(ref);
-      let bytes: Uint8Array;
-      try {
-        bytes = await this.readBlob(ref.blob);
-      } catch (err) {
-        // Only a missing blob (ENOENT) becomes an integrity error; EACCES/EIO
-        // keep their own type so an environment failure is not called corruption.
-        throwBlobReadError(ref, err);
-      }
-      assertBlobBytes(ref, Buffer.from(bytes));
+      // The delivery barrier re-verifies through the shared read: a flagged
+      // prefix is refused before any read, so it can never reach `onDurable` or
+      // an effect even when its blob digest and size would match. Gate verify and
+      // this one sit at different trust transitions; neither is skipped.
+      await readVerifiedBlob(ref, (hash) => this.readBlob(hash));
     }
   }
 

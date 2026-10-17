@@ -1,7 +1,5 @@
 import { readFile, rm, truncate } from 'node:fs/promises';
-import {
-  BlobStore, assertBlobRefReadable, isBlobRef, parseBlobJson, throwBlobReadError,
-} from './blobs.js';
+import { BlobStore, isBlobRef, resolveBlobRef } from './blobs.js';
 import { scanBatches } from './framing.js';
 import { readFileOrNull, syncPath } from './fsutil.js';
 import { headPath, journalPath, nodeDir, parseHead, type Head } from './layout.js';
@@ -130,17 +128,12 @@ export class JournalReader {
    * non-JSON body is refused rather than served as the payload.
    */
   private async resolveData(e: EventEnvelope): Promise<EventEnvelope> {
-    if (this.blobs === null || !isBlobRef(e.data)) return e;
+    const blobs = this.blobs;
+    if (blobs === null || !isBlobRef(e.data)) return e;
     const ref = e.data;
-    // Refuse a flagged prefix *before* the read: resolution of a truncated
-    // reference must stay TruncatedBlobError even if its blob file is gone.
-    assertBlobRefReadable(ref);
-    // The boundary's one verified-read mapping: a missing blob is an
-    // unrecoverable integrity failure, not a transient environment error, while
-    // an unreadable one (EACCES, EIO) keeps its own type.
-    const bytes = await this.blobs.get(ref.blob)
-      .catch((err: unknown) => throwBlobReadError(ref, err));
-    return { ...e, data: parseBlobJson(ref, bytes) };
+    // The shared verified read refuses a flagged prefix before the read, so a
+    // truncated reference stays TruncatedBlobError even if its blob is gone.
+    return { ...e, data: await resolveBlobRef(ref, (hash) => blobs.get(hash)) };
   }
 }
 

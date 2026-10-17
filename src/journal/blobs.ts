@@ -107,6 +107,45 @@ export function parseBlobJson(ref: BlobRef, bytes: Buffer): JsonValue {
 }
 
 /**
+ * The one verified read of a claim-checked blob's raw bytes, shared by every
+ * trust transition. It refuses a truncated reference before the read, maps only
+ * a missing blob to `BlobIntegrityError`, then proves the exact length and
+ * digest; any other read failure keeps its own type and cause.
+ *
+ * Double verification is deliberate, not duplication: `gate.flush` verifies
+ * before a capture becomes durably referenced, and `driver.flushObservations`
+ * re-verifies at delivery (and after a resume), which are different trust
+ * transitions. Both call this mechanism, but neither may skip its own check.
+ */
+export async function readVerifiedBlob(
+  ref: BlobRef,
+  read: (hash: string) => Promise<Uint8Array>,
+): Promise<Buffer> {
+  assertBlobRefReadable(ref);
+  let raw: Uint8Array;
+  try {
+    raw = await read(ref.blob);
+  } catch (err) {
+    throwBlobReadError(ref, err);
+  }
+  const bytes = Buffer.from(raw);
+  assertBlobBytes(ref, bytes);
+  return bytes;
+}
+
+/**
+ * The one verified resolution of a claim-checked payload: the verified bytes,
+ * then the JSON body they must stand for. A body that is not JSON is an
+ * integrity failure, never a raw `SyntaxError`.
+ */
+export async function resolveBlobRef(
+  ref: BlobRef,
+  read: (hash: string) => Promise<Uint8Array>,
+): Promise<JsonValue> {
+  return parseBlobJson(ref, await readVerifiedBlob(ref, read));
+}
+
+/**
  * The boundary's mapping of a failed blob read. Only a *missing* blob (ENOENT)
  * is an integrity failure — the payload is unrecoverable — so it becomes
  * `BlobIntegrityError`. Every other failure (EACCES, EIO, or an

@@ -1,6 +1,5 @@
 import {
-  BlobIntegrityError, BlobStore, JournalReader, assertBlobRefReadable, isBlobRef,
-  parseBlobJson, throwBlobReadError,
+  BlobIntegrityError, BlobStore, JournalReader, isBlobRef, resolveBlobRef,
 } from '../journal/index.js';
 import type { EventEnvelope } from '../journal/index.js';
 import type { Source } from './contracts.js';
@@ -59,18 +58,9 @@ export async function loadVerifiedEvents(
       continue;
     }
     const ref = event.data;
-    // Refuse a flagged prefix before the read, so a truncated reference is
-    // never resolved as whole regardless of what its blob file contains.
-    assertBlobRefReadable(ref);
-    let bytes: Buffer;
-    try {
-      bytes = await blobs.get(ref.blob);
-    } catch (err) {
-      // Only a missing blob is an integrity failure; EACCES/EIO/InvalidBlobHash
-      // keep their own type and cause.
-      throwBlobReadError(ref, err);
-    }
-    out.push({ ...event, data: parseBlobJson(ref, bytes), raw: event });
+    // The shared verified read refuses a flagged prefix before the read, so a
+    // truncated reference is never resolved as whole regardless of its blob.
+    out.push({ ...event, data: await resolveBlobRef(ref, (hash) => blobs.get(hash)), raw: event });
   }
   return out;
 }
