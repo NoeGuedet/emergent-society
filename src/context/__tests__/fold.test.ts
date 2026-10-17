@@ -860,7 +860,7 @@ describe('fold: compaction and refusal sequencing invariants', () => {
       s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
       const gate = s.gate('turn', 0).gate;
       gate.append('compaction/summary', {
-        id: 'ghost', message: { role: 'user', content: 'x' }, sources: [cfg], replacementBytes: 1,
+        id: 'e'.repeat(64), message: { role: 'user', content: 'x' }, sources: [cfg], replacementBytes: 1,
       });
       await gate.flush();
       await expect(foldOf(home())).rejects.toThrow(/start|matching/);
@@ -876,11 +876,11 @@ describe('fold: compaction and refusal sequencing invariants', () => {
       s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
       const gate = s.gate('turn', 0).gate;
       const start: CompactionStart = {
-        id: 's1', revision: 'a'.repeat(64), groupIds: [cfg], sources: [cfg],
+        id: 'e'.repeat(64), revision: 'a'.repeat(64), groupIds: [cfg], sources: [cfg],
         shadowHash: 'b'.repeat(64), shadowBytes: 10,
       };
       const summary: CompactionSummary = {
-        id: 's1', message: { role: 'user', content: 'x' }, sources: [cfg], replacementBytes: 1,
+        id: 'e'.repeat(64), message: { role: 'user', content: 'x' }, sources: [cfg], replacementBytes: 1,
       };
       gate.append('compaction/start', start);
       gate.append('compaction/summary', summary);
@@ -917,6 +917,159 @@ describe('fold: compaction and refusal sequencing invariants', () => {
       gate.append('request/refused', { id, bytes: 5, limit: 10, phase: 'plan' });
       await gate.flush();
       await expect(foldOf(home())).rejects.toThrow(/refused/);
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe('fold: acknowledgement is bound to the current turn', () => {
+  it('returns null for a perception-less turn instead of the previous turn proof', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const t0 = await pipeline(s, 0, cfg, { perceptionText: 'first evidence' });
+      await t0.gate.flush();
+      const live = await foldOf(home());
+      expect(live.acknowledgedWorld()?.turn).toBe(0);
+
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' }, { ignorable: true });
+      await s.writer.flush();
+      // With no open turn the latest proof is the resume acknowledgement.
+      expect((await foldOf(home())).acknowledgedWorld()?.turn).toBe(0);
+
+      s.lifecycle('turn/start', { turn: 1, trigger: 'boot', world: { from: null, to: null } });
+      await s.writer.flush();
+      const next = await foldOf(home());
+      expect(next.snapshot().open?.turn).toBe(1);
+      // This turn recorded no perception: the durable turn-0 proof is stale and
+      // must not be offered to the driver as this turn's acknowledgement.
+      expect(next.acknowledgedWorld()).toBeNull();
+      expect(next.acknowledgedWorld(0)).toBeNull();
+      expect(next.acknowledgedWorld(1)).toBeNull();
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe('fold: forged chain-valid payloads fail as typed invariants', () => {
+  async function foldError(path: string): Promise<unknown> {
+    try {
+      await foldOf(path);
+      return null;
+    } catch (err) {
+      return err;
+    }
+  }
+
+  function expectInvariant(err: unknown, pattern: RegExp): void {
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(TypeError);
+    expect((err as Error).message).toMatch(/context fold invariant failure/);
+    expect((err as Error).message).toMatch(pattern);
+  }
+
+  function rawAppend(s: Session, type: string, data: JsonValue): void {
+    (s.writer.append as unknown as (t: string, d: JsonValue) => EventEnvelope)(type, data);
+  }
+
+  it('rejects a malformed turn/start world', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: null });
+      await s.writer.flush();
+      expectInvariant(await foldError(home()), /turn\/start\.world/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects an unknown turn/end outcome instead of treating it as failure', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      s.lifecycle('turn/end', { turn: 0, outcome: 'mystery' });
+      await s.writer.flush();
+      expectInvariant(await foldError(home()), /outcome/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects a tool/result whose message is null', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const t = await pipeline(s, 0, cfg, { calls: [call('c1')] });
+      await t.gate.flush();
+      rawAppend(s, 'tool/result', {
+        turn: 0, request: t.id, callId: 'c1', message: null,
+        isError: false, raw: null, failure: null, synthetic: false,
+      } as unknown as JsonValue);
+      await s.writer.flush();
+      expectInvariant(await foldError(home()), /tool\/result\.message/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects a compaction/start without a sources array', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      const hash = 'a'.repeat(64);
+      rawAppend(s, 'compaction/start', {
+        id: hash, revision: hash, groupIds: [], shadowHash: hash, shadowBytes: 1,
+      });
+      await s.writer.flush();
+      expectInvariant(await foldError(home()), /compaction\/start\.sources/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects a compaction/summary with a null message', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      rawAppend(s, 'compaction/summary', {
+        id: 'a'.repeat(64), message: null, sources: [], replacementBytes: 1,
+      } as unknown as JsonValue);
+      await s.writer.flush();
+      expectInvariant(await foldError(home()), /compaction\/summary\.message/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects a compaction/end whose summary is null', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      rawAppend(s, 'compaction/end', {
+        id: 'a'.repeat(64), summary: null,
+      } as unknown as JsonValue);
+      await s.writer.flush();
+      expectInvariant(await foldError(home()), /compaction\/end\.summary/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('rejects a compaction/abort with a non-object payload', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      rawAppend(s, 'compaction/abort', null);
+      await s.writer.flush();
+      expectInvariant(await foldError(home()), /compaction\/abort/);
     } finally {
       await s.close();
     }

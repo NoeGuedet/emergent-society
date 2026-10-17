@@ -1,9 +1,9 @@
 import { readdir, realpath, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { HASH_RE } from '../journal/canon.js';
+import { HASH_RE, sha256HexOf } from '../journal/canon.js';
 import { atomicWriteFile, ensureDurableDirectory, readFileOrNull, syncPath } from '../journal/fsutil.js';
 import { nodeDir } from '../journal/index.js';
-import { toJson } from './artifacts.js';
+import { canonicalBytes, toJson } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
 import type {
   AgentConfig, ChatMessage, CompactionStart, FunctionCall, OpenTurn, ProjectionState, RecoveryGroup,
@@ -195,27 +195,52 @@ function surfaceGroup(value: unknown, where: string): SurfaceGroup {
   };
 }
 
+function sameSource(a: Source, b: Source): boolean {
+  return a.seq === b.seq && a.hash === b.hash;
+}
+
 function surfaceSnapshot(value: unknown, where: string): SurfaceSnapshot {
   const o = record(value, where);
   onlyKeys(o, ['heading', 'nodes', 'revision'], where);
-  const heading = record(o['heading'], `${where}.heading`);
-  onlyKeys(heading, ['text', 'source'], `${where}.heading`);
-  return {
-    heading: {
-      text: text(heading['text'], `${where}.heading.text`),
-      source: source(heading['source'], `${where}.heading.source`),
-    },
-    nodes: array(o['nodes'], `${where}.nodes`).map((node, i) => {
-      const at = `${where}.nodes[${i}]`;
-      const n = record(node, at);
-      onlyKeys(n, ['position', 'group'], at);
-      return {
-        position: safeInt(n['position'], `${at}.position`, 0),
-        group: surfaceGroup(n['group'], `${at}.group`),
-      };
-    }),
-    revision: hash(o['revision'], `${where}.revision`),
+  const rawHeading = record(o['heading'], `${where}.heading`);
+  onlyKeys(rawHeading, ['text', 'source'], `${where}.heading`);
+  const heading = {
+    text: text(rawHeading['text'], `${where}.heading.text`),
+    source: source(rawHeading['source'], `${where}.heading.source`),
   };
+  const nodes = array(o['nodes'], `${where}.nodes`).map((node, i) => {
+    const at = `${where}.nodes[${i}]`;
+    const n = record(node, at);
+    onlyKeys(n, ['position', 'group'], at);
+    return {
+      position: safeInt(n['position'], `${at}.position`, 0),
+      group: surfaceGroup(n['group'], `${at}.group`),
+    };
+  });
+  // The emitted shape has one invariant surface structure: node 0 is the heading
+  // pin, positions are the array indexes, and the revision is a pure function of
+  // those two. A checkpoint that omits the pin, leaves a gap or carries a
+  // revision unrelated to its nodes is not a state this module ever wrote.
+  if (nodes.length === 0) fail(`${where}.nodes`, 'must contain the heading pin');
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (nodes[i]!.position !== i) fail(`${where}.nodes[${i}].position`, `expected ${i}`);
+  }
+  const head = nodes[0]!;
+  if (head.group.kind !== 'heading') fail(`${where}.nodes[0].group.kind`, "expected 'heading'");
+  if (!sameSource(head.group.id, heading.source)) {
+    fail(`${where}.nodes[0].group.id`, 'does not equal the heading source');
+  }
+  if (!head.group.sources.some((entry) => sameSource(entry, heading.source))) {
+    fail(`${where}.nodes[0].group.sources`, 'does not contain the heading source');
+  }
+  const first = head.group.messages[0];
+  if (first === undefined || first.role !== 'system' || first.content !== heading.text) {
+    fail(`${where}.nodes[0].group.messages`, 'does not encode the heading text');
+  }
+  const revision = hash(o['revision'], `${where}.revision`);
+  const recomputed = sha256HexOf(Buffer.from(canonicalBytes({ heading, nodes })));
+  if (revision !== recomputed) fail(`${where}.revision`, 'does not match the heading and nodes');
+  return { heading, nodes, revision };
 }
 
 function openTurn(value: unknown, where: string): OpenTurn {

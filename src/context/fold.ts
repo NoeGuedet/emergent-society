@@ -48,6 +48,54 @@ function invariant(message: string): never {
   throw new Error(`context fold invariant failure: ${message}`);
 }
 
+/**
+ * Replay-boundary field validators. A chain-verified event proves the journal
+ * bytes, not that a raw lifecycle/compaction payload has the shape its producer
+ * promised; a forged but chain-valid event must fail as a fold invariant, never
+ * as a `TypeError` from dereferencing a null field.
+ */
+function dataRecord(value: unknown, where: string): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    invariant(`${where} is not an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function dataInt(value: unknown, where: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    invariant(`${where} is not a nonnegative safe integer`);
+  }
+  return value as number;
+}
+
+function dataString(value: unknown, where: string): string {
+  if (typeof value !== 'string') invariant(`${where} is not a string`);
+  return value as string;
+}
+
+function dataArray(value: unknown, where: string): unknown[] {
+  if (!Array.isArray(value)) invariant(`${where} is not an array`);
+  return value as unknown[];
+}
+
+function dataSource(value: unknown, where: string): Source {
+  const o = dataRecord(value, where);
+  return {
+    seq: dataInt(o['seq'], `${where}.seq`),
+    hash: dataString(o['hash'], `${where}.hash`),
+  };
+}
+
+function dataWorldRange(value: unknown, where: string): WorldRange {
+  const o = dataRecord(value, where);
+  const edge = (v: unknown, at: string): string | null =>
+    (v === null ? null : dataString(v, at));
+  return {
+    from: edge(o['from'], `${where}.from`),
+    to: edge(o['to'], `${where}.to`),
+  };
+}
+
 interface ResultEntry {
   readonly message: ToolMessage;
   readonly source: Source;
@@ -244,10 +292,11 @@ export class ContextFold {
 
   private onTurnStart(event: VerifiedEvent): void {
     if (this.open !== null) invariant('turn/start while a turn is already open');
-    const data = event.data as unknown as { turn: number; world: WorldRange };
+    const data = dataRecord(event.data, 'turn/start data');
+    const turn = dataInt(data['turn'], 'turn/start.turn');
+    const world = dataWorldRange(data['world'], 'turn/start.world');
     this.open = {
-      start: sourceOf(event), turn: data.turn,
-      world: { from: data.world.from, to: data.world.to },
+      start: sourceOf(event), turn, world,
       perceptionGroup: null, perceptionSeen: false, perceptionConsumed: false,
       dialogues: new Map(),
     };
@@ -470,49 +519,61 @@ export class ContextFold {
   }
 
   private onToolResult(event: VerifiedEvent): void {
-    const data = event.data as unknown as {
-      turn: number; request: RequestId; callId: string; message: ToolMessage;
-      raw: ArtifactRef | null; synthetic: boolean;
+    const data = dataRecord(event.data, 'tool/result data');
+    const turn = dataInt(data['turn'], 'tool/result.turn');
+    const requestData = dataRecord(data['request'], 'tool/result.request');
+    const request: RequestId = {
+      turn: dataInt(requestData['turn'], 'tool/result.request.turn'),
+      ordinal: dataInt(requestData['ordinal'], 'tool/result.request.ordinal'),
     };
-    if (data.message.tool_call_id !== data.callId) {
+    const callId = dataString(data['callId'], 'tool/result.callId');
+    const messageData = dataRecord(data['message'], 'tool/result.message');
+    if (messageData['role'] !== 'tool') invariant('tool/result.message is not a tool message');
+    dataString(messageData['content'], 'tool/result.message.content');
+    if (messageData['tool_call_id'] !== callId) {
       invariant('tool/result message.tool_call_id does not match its callId');
     }
-    if (data.raw !== null) resolveArtifact(this.verifiedIndex, data.raw);
+    const message = messageData as unknown as ToolMessage;
+    const syntheticValue = data['synthetic'];
+    if (typeof syntheticValue !== 'boolean') invariant('tool/result.synthetic is not a boolean');
+    const synthetic = syntheticValue;
+    const rawValue = data['raw'];
+    if (rawValue !== null && (typeof rawValue !== 'object' || Array.isArray(rawValue))) {
+      invariant('tool/result.raw is neither null nor an artifact reference');
+    }
+    const raw = rawValue as ArtifactRef | null;
+    if (raw !== null) resolveArtifact(this.verifiedIndex, raw);
 
-    if (this.open !== null && this.open.turn === data.turn && data.request.turn === this.open.turn) {
+    if (this.open !== null && this.open.turn === turn && request.turn === this.open.turn) {
       const open = this.open;
-      const buffer = this.buffer(open, data.request);
+      const buffer = this.buffer(open, request);
       if (buffer.assistant === null) invariant('tool/result before its assistant message');
-      if (!buffer.advertised.some((call) => call.id === data.callId)) {
-        invariant(`tool/result ${data.callId} is not an advertised call`);
+      if (!buffer.advertised.some((call) => call.id === callId)) {
+        invariant(`tool/result ${callId} is not an advertised call`);
       }
-      if (!data.synthetic && !buffer.callReceipts.has(data.callId)) {
+      if (!synthetic && !buffer.callReceipts.has(callId)) {
         invariant('tool/result without a preceding tool/call');
       }
-      if (buffer.results.has(data.callId)) invariant(`duplicate tool/result for ${data.callId}`);
-      buffer.results.set(data.callId, {
-        message: data.message, source: sourceOf(event), synthetic: data.synthetic,
-      });
+      if (buffer.results.has(callId)) invariant(`duplicate tool/result for ${callId}`);
+      buffer.results.set(callId, { message, source: sourceOf(event), synthetic });
       return;
     }
 
     // Outside its turn, only a synthetic ready-scope result may complete an
     // advertised call left unresolved by an interrupted/error closer.
-    if (!data.synthetic) invariant('non-synthetic tool/result outside its turn');
-    if (data.raw !== null) invariant('a synthetic recovery result must carry no raw ref');
+    if (!synthetic) invariant('non-synthetic tool/result outside its turn');
+    if (raw !== null) invariant('a synthetic recovery result must carry no raw ref');
     const entry = this.recovery.find(
-      (candidate) => candidate.turn === data.turn && SAME_ID(candidate.request, data.request),
+      (candidate) => candidate.turn === turn && SAME_ID(candidate.request, request),
     );
     if (entry === undefined) {
-      invariant(`tool/result ${data.callId} does not match an unresolved recovery call`);
+      invariant(`tool/result ${callId} does not match an unresolved recovery call`);
     }
-    if (!entry.advertised.some((call) => call.id === data.callId)) {
-      invariant(`tool/result ${data.callId} is not an advertised recovery call`);
+    if (!entry.advertised.some((call) => call.id === callId)) {
+      invariant(`tool/result ${callId} is not an advertised recovery call`);
     }
-    if (entry.results.has(data.callId)) invariant(`duplicate recovery result for ${data.callId}`);
-    entry.results.set(data.callId, {
-      message: data.message, source: sourceOf(event), synthetic: true,
-    });
+    if (entry.results.has(callId)) invariant(`duplicate recovery result for ${callId}`);
+    entry.results.set(callId, { message, source: sourceOf(event), synthetic: true });
     if (entry.advertised.every((call) => entry.results.has(call.id))) {
       this.promoteRecovered(entry);
     }
@@ -522,10 +583,19 @@ export class ContextFold {
 
   private onTurnEnd(event: VerifiedEvent): void {
     const open = this.requireOpen('turn/end');
-    const data = event.data as unknown as { turn: number; outcome: string };
-    if (data.turn !== open.turn) invariant('turn/end turn mismatch');
+    const data = dataRecord(event.data, 'turn/end data');
+    const turn = dataInt(data['turn'], 'turn/end.turn');
+    if (turn !== open.turn) invariant('turn/end turn mismatch');
+    const outcome = data['outcome'];
+    // The closer outcome is a typed fact: an unknown value is a forged/invalid
+    // payload, not a recoverable failure. Silently mapping it to the failure
+    // branch would promote or recover the wrong groups.
+    if (outcome !== 'chained' && outcome !== 'waiting'
+      && outcome !== 'error' && outcome !== 'interrupted') {
+      invariant(`turn/end outcome ${JSON.stringify(outcome)} is not a known outcome`);
+    }
     const ignorable = event.raw.ignorable === true;
-    const success = data.outcome === 'chained' || data.outcome === 'waiting';
+    const success = outcome === 'chained' || outcome === 'waiting';
 
     // Validate the whole turn before mutating anything: a fatal invariant must not
     // leave the cached surface half-applied (perception appended, dialogue not).
@@ -605,7 +675,17 @@ export class ContextFold {
   // --- compaction -------------------------------------------------------------
 
   private onCompactionStart(event: VerifiedEvent): void {
-    const data = event.data as unknown as CompactionStart;
+    const raw = dataRecord(event.data, 'compaction/start data');
+    const data: CompactionStart = {
+      id: dataString(raw['id'], 'compaction/start.id'),
+      revision: dataString(raw['revision'], 'compaction/start.revision'),
+      groupIds: dataArray(raw['groupIds'], 'compaction/start.groupIds')
+        .map((entry, i) => dataSource(entry, `compaction/start.groupIds[${i}]`)),
+      sources: dataArray(raw['sources'], 'compaction/start.sources')
+        .map((entry, i) => dataSource(entry, `compaction/start.sources[${i}]`)),
+      shadowHash: dataString(raw['shadowHash'], 'compaction/start.shadowHash'),
+      shadowBytes: dataInt(raw['shadowBytes'], 'compaction/start.shadowBytes'),
+    };
     if (this.surface === null) invariant('compaction/start before any config');
     if (this.pendingCompactions.some((pending) => pending.id === data.id)) {
       invariant(`duplicate compaction/start ${data.id}`);
@@ -617,7 +697,20 @@ export class ContextFold {
   }
 
   private onCompactionSummary(event: VerifiedEvent): void {
-    const data = event.data as unknown as CompactionSummary;
+    const raw = dataRecord(event.data, 'compaction/summary data');
+    const id = dataString(raw['id'], 'compaction/summary.id');
+    const messageData = dataRecord(raw['message'], 'compaction/summary.message');
+    if (messageData['role'] !== 'user') {
+      invariant('compaction/summary.message is not a user message');
+    }
+    const message = messageData as unknown as CompactionSummary['message'];
+    const data: CompactionSummary = {
+      id,
+      message,
+      sources: dataArray(raw['sources'], 'compaction/summary.sources')
+        .map((entry, i) => dataSource(entry, `compaction/summary.sources[${i}]`)),
+      replacementBytes: dataInt(raw['replacementBytes'], 'compaction/summary.replacementBytes'),
+    };
     const source = sourceOf(event);
     // A summary completes exactly one open start and is recorded once: validate
     // everything before mutating, so a refusal never leaves a half-set map.
@@ -634,29 +727,32 @@ export class ContextFold {
   }
 
   private onCompactionEnd(event: VerifiedEvent): void {
-    const data = event.data as unknown as { id: string; summary: Source };
-    const index = this.pendingCompactions.findIndex((pending) => pending.id === data.id);
+    const raw = dataRecord(event.data, 'compaction/end data');
+    const id = dataString(raw['id'], 'compaction/end.id');
+    const summary = dataSource(raw['summary'], 'compaction/end.summary');
+    const index = this.pendingCompactions.findIndex((pending) => pending.id === id);
     if (index < 0) invariant('compaction/end without a matching start');
-    const offered = this.pendingSummaries.get(data.id);
+    const offered = this.pendingSummaries.get(id);
     if (offered === undefined) invariant('compaction/end without a matching summary');
-    if (!SAME(offered.source, data.summary)) {
+    if (!SAME(offered.source, summary)) {
       invariant('compaction/end summary source does not match the recorded summary');
     }
     if (this.surface === null) invariant('compaction/end without a heading surface');
     const start = this.pendingCompactions[index]!;
     this.surface.replaceCommitted(start, offered.summary, offered.source);
     this.pendingCompactions.splice(index, 1);
-    this.pendingSummaries.delete(data.id);
+    this.pendingSummaries.delete(id);
   }
 
   private onCompactionAbort(event: VerifiedEvent): void {
-    const data = event.data as unknown as { id: string };
+    const raw = dataRecord(event.data, 'compaction/abort data');
+    const id = dataString(raw['id'], 'compaction/abort.id');
     // The producer aborts once, and only a recorded transaction can be aborted;
     // an unknown id is an invalid sequence, not a no-op.
-    const index = this.pendingCompactions.findIndex((pending) => pending.id === data.id);
-    if (index < 0) invariant(`compaction/abort without a matching start ${data.id}`);
+    const index = this.pendingCompactions.findIndex((pending) => pending.id === id);
+    if (index < 0) invariant(`compaction/abort without a matching start ${id}`);
     this.pendingCompactions.splice(index, 1);
-    this.pendingSummaries.delete(data.id);
+    this.pendingSummaries.delete(id);
   }
 
   // --- queries ----------------------------------------------------------------
@@ -725,12 +821,22 @@ export class ContextFold {
    * The proof a driver verifies before advancing its watermark: the latest
    * durable world perception this fold folded, derived from the full observed
    * history and only from events delivered as durable — never from a
-   * `turn/start` or a closer, and never from a cache or snapshot. The returned
-   * object is a fresh copy, so no caller can mutate fold state through it.
+   * `turn/start` or a closer, and never from a cache or snapshot.
+   *
+   * The contract is *this turn's* proof. After a new `turn/start` is folded, an
+   * open turn names the turn being acknowledged; a perception proof from an
+   * earlier turn means the handler recorded none for this one, so it returns
+   * null rather than a stale proof that would make the driver throw. When no
+   * turn is open (the resume path, after the last turn closed) the latest proof
+   * is the one the watermark rebuild needs. An explicit `turn` argument, when
+   * supplied, must match the proof's turn. The returned object is a fresh copy,
+   * so no caller can mutate fold state through it.
    */
-  acknowledgedWorld(): WorldAcknowledgement | null {
+  acknowledgedWorld(turn?: number): WorldAcknowledgement | null {
     const proof = this.perceptionProof;
     if (proof === null) return null;
+    if (turn !== undefined && proof.turn !== turn) return null;
+    if (this.open !== null && proof.turn !== this.open.turn) return null;
     return {
       turn: proof.turn,
       range: { from: proof.range.from, to: proof.range.to },

@@ -338,12 +338,12 @@ export function validateRequestPlan(value: unknown): RequestPlan {
   const plan = {
     id: requestId(o['id'], 'request/plan.id'),
     config: source(o['config'], 'request/plan.config'),
-    stateHash: text(o['stateHash'], 'request/plan.stateHash'),
+    stateHash: hash(o['stateHash'], 'request/plan.stateHash'),
     model: text(o['model'], 'request/plan.model'),
     parameters: parameters(o['parameters'], 'request/plan.parameters'),
     policy: policy(o['policy'], 'request/plan.policy'),
     tools: array(o['tools'], 'request/plan.tools').map((t, i) => toolSchema(t, `request/plan.tools[${i}]`)),
-    toolsHash: text(o['toolsHash'], 'request/plan.toolsHash'),
+    toolsHash: hash(o['toolsHash'], 'request/plan.toolsHash'),
     sections: array(o['sections'], 'request/plan.sections').map((s, i) =>
       planSection(s, `request/plan.sections[${i}]`)),
     history: array(o['history'], 'request/plan.history').map((m, i) =>
@@ -630,8 +630,8 @@ export function createBoundaryRegistry(): BoundaryRegistry {
       receipts(scope, groupIds, 'compaction/start.groupIds');
       receipts(scope, sources, 'compaction/start.sources');
       return toJson({
-        id: text(o['id'], 'compaction/start.id'),
-        revision: text(o['revision'], 'compaction/start.revision'),
+        id: hash(o['id'], 'compaction/start.id'),
+        revision: hash(o['revision'], 'compaction/start.revision'),
         groupIds, sources,
         shadowHash: hash(o['shadowHash'], 'compaction/start.shadowHash'),
         shadowBytes: safeInt(o['shadowBytes'], 'compaction/start.shadowBytes', 0),
@@ -648,7 +648,7 @@ export function createBoundaryRegistry(): BoundaryRegistry {
         source(s, `compaction/summary.sources[${i}]`));
       receipts(scope, sources, 'compaction/summary.sources');
       return toJson({
-        id: text(o['id'], 'compaction/summary.id'), message, sources,
+        id: hash(o['id'], 'compaction/summary.id'), message, sources,
         replacementBytes: safeInt(o['replacementBytes'], 'compaction/summary.replacementBytes', 0),
       });
     },

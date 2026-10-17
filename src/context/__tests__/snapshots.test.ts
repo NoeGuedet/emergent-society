@@ -4,9 +4,11 @@ import { access, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:f
 import { isAbsolute, join, relative } from 'node:path';
 import { BlobStore, ChainBreakError, JournalWriter, nodeDir } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
+import { sha256HexOf } from '../../journal/canon.js';
 import { logPath, rewriteLog, useTempHome } from '../../journal/__tests__/helpers.js';
 import { createBoundaryGate } from '../../node/gate.js';
-import type { BoundaryGate, GateCallbacks } from '../../node/gate.js';
+import type { BoundaryGate, GateCallbacks, GateScope } from '../../node/gate.js';
+import { canonicalBytes } from '../artifacts.js';
 import { defaultAgentConfig } from '../config.js';
 import type {
   ArtifactRef, AssistantProjection, FunctionCall, ProjectionState, RequestId, RequestPlan, Source,
@@ -278,20 +280,23 @@ describe('snapshots: round-trip', () => {
       id: 'c1', type: 'function', function: { name: 'execute', arguments: '{}' },
     };
     const fake = 'c'.repeat(64);
+    if (state.surface === null) throw new Error('expected a folded surface');
+    const heading = state.surface.heading;
+    const nodes = [
+      state.surface.nodes[0]!,
+      {
+        position: 1,
+        group: {
+          id: { seq: mark.seq, hash: mark.hash }, kind: 'perception' as const, turn: 0,
+          messages: [{ role: 'user' as const, content: 'evidence' }],
+          sources: [{ seq: mark.seq, hash: mark.hash }],
+        },
+      },
+    ];
+    const revision = sha256HexOf(Buffer.from(canonicalBytes({ heading, nodes })));
     const enriched = {
       ...clone(state),
-      surface: {
-        heading: { text: 'heading', source: { seq: mark.seq, hash: mark.hash } },
-        nodes: [{
-          position: 1,
-          group: {
-            id: { seq: mark.seq, hash: mark.hash }, kind: 'perception', turn: 0,
-            messages: [{ role: 'user', content: 'evidence' }],
-            sources: [{ seq: mark.seq, hash: mark.hash }],
-          },
-        }],
-        revision: fake,
-      },
+      surface: { heading, nodes, revision },
       recovery: [{
         turn: 0, request: { turn: 0, ordinal: 0 },
         assistant: { role: 'assistant', content: null, tool_calls: [call] },
@@ -310,10 +315,101 @@ describe('snapshots: round-trip', () => {
     const read = await readSnapshot(path, 'n1', events);
     expect(read).toEqual(snap);
     expect(read?.val.recovery[0]?.missing[0]?.id).toBe('c1');
-    expect(read?.val.surface?.nodes[0]?.group.kind).toBe('perception');
+    expect(read?.val.surface?.nodes[1]?.group.kind).toBe('perception');
     expect(read?.val.pendingCompactions[0]?.shadowBytes).toBe(8);
   });
+
+  it('rejects a surface without the heading pin, with a position gap or a stale revision', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const mark = state.watermark!;
+    const valid = clone(state);
+    const surface = valid['surface'] as {
+      heading: { text: string; source: { seq: number; hash: string } };
+      nodes: Array<{ position: number; group: { kind: string } }>;
+      revision: string;
+    };
+
+    const noPin = JSON.parse(JSON.stringify(valid)) as typeof valid;
+    const noPinSurface = noPin['surface'] as typeof surface;
+    noPinSurface.nodes = [noPinSurface.nodes[1]!];
+    noPinSurface.nodes[0]!.position = 0;
+
+    const gap = JSON.parse(JSON.stringify(valid)) as typeof valid;
+    (gap['surface'] as typeof surface).nodes[1]!.position = 2;
+
+    const staleRevision = JSON.parse(JSON.stringify(valid)) as typeof valid;
+    (staleRevision['surface'] as typeof surface).revision = 'd'.repeat(64);
+
+    const wrongHeading = JSON.parse(JSON.stringify(valid)) as typeof valid;
+    (wrongHeading['surface'] as typeof surface).heading.source = {
+      seq: mark.seq, hash: 'e'.repeat(64),
+    };
+
+    for (const val of [noPin, gap, staleRevision, wrongHeading]) {
+      await putValue(path, `${mark.seq}.json`, {
+        ver: 1, seq: mark.seq, hash: mark.hash, val,
+      });
+      await expect(readSnapshot(path, 'n1', events)).resolves.toBeNull();
+      expect(await writeSnapshot(path, 'n1', {
+        ver: 1, seq: mark.seq, hash: mark.hash, val: val as unknown as ProjectionState,
+      })).toBe(false);
+    }
+    // The untouched state still round-trips.
+    await expect(writeSnapshot(path, 'n1', checkpoint(state))).resolves.toBe(true);
+    await expect(readSnapshot(path, 'n1', events)).resolves.toEqual(checkpoint(state));
+  });
+
+  it('accepts the hash schema the gate writes for plans and compaction starts', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const mark = state.watermark!;
+    const config = state.config!;
+    const receipts = new Map(events.map((event) => [eventKeyOf(event.raw), event.raw]));
+    const scope: GateScope = {
+      phase: 'turn', turn: 0, signal: new AbortController().signal,
+      lookup: (source) => receipts.get(eventKeyOf(source)) ?? null,
+    };
+    const registry = createBoundaryRegistry();
+    const plan = minimalPlan({ turn: 0, ordinal: 0 }, config.source);
+
+    for (const field of ['stateHash', 'toolsHash'] as const) {
+      expect(() => registry['request/plan']({
+        id: plan.id,
+        value: { kind: 'inline', value: { ...plan, [field]: 'not-a-hash' } },
+      }, scope)).toThrow(new RegExp(field));
+    }
+
+    const hash = mark.hash;
+    const start = {
+      id: hash, revision: hash, groupIds: [config.source], sources: [config.source],
+      shadowHash: hash, shadowBytes: 1,
+    };
+    expect(() => registry['compaction/start']({ ...start, revision: 'not-a-hash' }, scope))
+      .toThrow(/revision/);
+    expect(() => registry['compaction/start']({ ...start, id: 'not-a-hash' }, scope))
+      .toThrow(/id/);
+    expect(() => registry['request/plan']({
+      id: plan.id, value: { kind: 'inline', value: plan },
+    }, scope)).not.toThrow();
+    const validated = registry['compaction/start'](start, scope);
+
+    const val = {
+      ...clone(state), pendingCompactions: [validated],
+    } as unknown as ProjectionState;
+    const snap: Snapshot = { ver: 1, seq: mark.seq, hash: mark.hash, val };
+    await expect(writeSnapshot(path, 'n1', snap)).resolves.toBe(true);
+    const read = await readSnapshot(path, 'n1', events);
+    expect(read?.val.pendingCompactions).toEqual([validated]);
+  });
 });
+
+/** The `(seq, hash)` identity of a raw or verified envelope. */
+function eventKeyOf(source: { seq: number; hash: string }): string {
+  return `${source.seq}:${source.hash}`;
+}
 
 describe('snapshots: write is best-effort and never throws', () => {
   it.each([Number.NaN, 1.5, -1, Number.MAX_SAFE_INTEGER + 1])(
