@@ -17,7 +17,9 @@ afterEach(async () => {
   }
 });
 
-type Request = { readonly path: string; readonly authorization: string | undefined; readonly body: Buffer };
+type Request = { readonly path: string; readonly method: string;
+  readonly contentType: string | undefined; readonly authorization: string | undefined;
+  readonly body: Buffer };
 
 async function serve(
   answer: (req: Request, res: ServerResponse) => void,
@@ -29,8 +31,9 @@ async function serve(
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
     req.on('end', () => {
-      const record = { path: req.url ?? '', authorization: req.headers.authorization,
-        body: Buffer.concat(chunks) };
+      const record = { path: req.url ?? '', method: req.method ?? '',
+        contentType: req.headers['content-type'],
+        authorization: req.headers.authorization, body: Buffer.concat(chunks) };
       requests.push(record);
       answer(record, res);
     });
@@ -64,7 +67,9 @@ describe('TavilyWebTools', () => {
       .search('q', 5, new AbortController().signal);
     expect(outcome).toMatchObject({ ok: true, status: 200 });
     expect(requests).toHaveLength(1);
-    expect(requests[0]!.path).toBe('/search');
+    expect(requests[0]).toMatchObject({
+      path: '/search', method: 'POST', contentType: 'application/json',
+    });
     expect(requests[0]!.authorization).toBe(`Bearer ${KEY}`);
     expect(requests[0]!.body.toString('utf8'))
       .toBe(JSON.stringify({ query: 'q', max_results: 5, search_depth: 'basic' }));
@@ -85,7 +90,9 @@ describe('TavilyWebTools', () => {
     const outcome = await new TavilyWebTools(entry(baseUrl))
       .extract('https://a.example/', new AbortController().signal);
     expect(outcome).toMatchObject({ ok: true, status: 200 });
-    expect(requests[0]!.path).toBe('/extract');
+    expect(requests[0]).toMatchObject({
+      path: '/extract', method: 'POST', contentType: 'application/json',
+    });
     expect(requests[0]!.body.toString('utf8'))
       .toBe(JSON.stringify({ urls: ['https://a.example/'], extract_depth: 'basic' }));
   });
@@ -152,9 +159,10 @@ describe('TavilyWebTools', () => {
   it('an interrupted body keeps the captured prefix', async () => {
     const { baseUrl } = await serve((_req, res) => {
       res.setHeader('content-type', 'application/json');
-      res.write('{"results":[');
-      // Destroy without ending, one tick later, so the prefix reaches the client first.
-      setTimeout(() => { res.destroy(); }, 20);
+      // Destroy without ending only once the prefix has been handed to the
+      // kernel (the write callback), so the client deterministically sees the
+      // captured prefix before the stream errors — no wall-clock timer.
+      res.write('{"results":[', () => { res.destroy(); });
     });
     const outcome = await new TavilyWebTools(entry(baseUrl))
       .search('q', undefined, new AbortController().signal);

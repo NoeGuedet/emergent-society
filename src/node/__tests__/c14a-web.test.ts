@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { createServer, type Server } from 'node:http';
-import { writeFile } from 'node:fs/promises';
+import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { canonicalizeJson } from '../../journal/index.js';
@@ -51,6 +51,18 @@ function artifactRefs(value: unknown, out: ArtifactRef[] = []): ArtifactRef[] {
   return out;
 }
 
+/** Every regular file under the world's working tree, excluding the `.git` dir. */
+async function worldFiles(dir: string): Promise<Buffer[]> {
+  const out: Buffer[] = [];
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    if (entry.name === '.git') continue;
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...await worldFiles(path));
+    else if (entry.isFile()) out.push(await readFile(path));
+  }
+  return out;
+}
+
 describe('C1.4a web tools end to end', () => {
   it('journals mediated web calls and never leaks the credential', async () => {
     const { home, world } = fixture();
@@ -59,12 +71,16 @@ describe('C1.4a web tools end to end', () => {
     // The fake provider: one search call, one extract call, one final answer.
     const tavilyBodies: Buffer[] = [];
     const tavilyAuth: (string | undefined)[] = [];
+    const tavilyCalls: { path: string; method: string;
+      contentType: string | undefined }[] = [];
     const tavily = createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on('data', (chunk: Buffer) => chunks.push(chunk));
       req.on('end', () => {
         tavilyBodies.push(Buffer.concat(chunks));
         tavilyAuth.push(req.headers.authorization);
+        tavilyCalls.push({ path: req.url ?? '', method: req.method ?? '',
+          contentType: req.headers['content-type'] });
         res.setHeader('content-type', 'application/json');
         res.end(req.url === '/search' ? SEARCH_RESPONSE : EXTRACT_RESPONSE);
       });
@@ -100,7 +116,9 @@ describe('C1.4a web tools end to end', () => {
     const llmAddress = llm.address();
     if (!llmAddress || typeof llmAddress === 'string') throw new Error('missing TCP address');
 
-    // The credential store: the only place the key exists besides the kernel process.
+    // The credential store under test. The key also literal-exists in this test
+    // and in the fake provider's Authorization headers; what the assertions below
+    // prove is that the kernel never copies it into a journaled or rendered surface.
     await writeFile(join(home, 'providers.json'), JSON.stringify({ tavily: {
       key: TAVILY_KEY, baseUrl: `http://127.0.0.1:${tavilyAddress.port}`,
       timeoutMs: 5000,
@@ -149,6 +167,10 @@ describe('C1.4a web tools end to end', () => {
       // Both provider calls went out with the key in the header, exactly once each.
       expect(tavilyBodies).toHaveLength(2);
       expect(tavilyAuth).toEqual([`Bearer ${TAVILY_KEY}`, `Bearer ${TAVILY_KEY}`]);
+      expect(tavilyCalls.map((call) => ({ path: call.path, method: call.method }))).toEqual([
+        { path: '/search', method: 'POST' }, { path: '/extract', method: 'POST' },
+      ]);
+      expect(tavilyCalls.every((call) => call.contentType === 'application/json')).toBe(true);
       expect(JSON.parse(tavilyBodies[0]!.toString('utf8')))
         .toEqual({ query: 'emergent societies', max_results: 8, search_depth: 'basic' });
       expect(JSON.parse(tavilyBodies[1]!.toString('utf8')))
@@ -156,6 +178,18 @@ describe('C1.4a web tools end to end', () => {
 
       // The journal carries the calls, the results and the raw provider bodies.
       const events = await loadVerifiedEvents(home, 'n1', C13_EVENT_TYPES);
+      const calls = events.filter((event) => event.type === 'tool/call');
+      expect(calls).toHaveLength(2);
+      expect(calls.map((event) => {
+        const call = (event.data as { call: { id: string;
+          function: { name: string; arguments: string } } }).call;
+        return { id: call.id, name: call.function.name, arguments: call.function.arguments };
+      })).toEqual([
+        { id: 'w1', name: 'web_search',
+          arguments: JSON.stringify({ query: 'emergent societies' }) },
+        { id: 'w2', name: 'web_fetch',
+          arguments: JSON.stringify({ url: 'https://example.com/emergence' }) },
+      ]);
       const results = events.filter((event) => event.type === 'tool/result');
       expect(results).toHaveLength(2);
       for (const [index, body] of [SEARCH_RESPONSE, EXTRACT_RESPONSE].entries()) {
@@ -184,6 +218,14 @@ describe('C1.4a web tools end to end', () => {
         }
       }
       for (const body of llmBodies) expect(body.toString('utf8')).not.toContain(keyNeedle);
+      // The same key-absence holds for the world's working tree (every file,
+      // committed or not) and for the terminal allowlist the runtime received.
+      for (const file of await worldFiles(world.path)) {
+        expect(file.includes(keyNeedle)).toBe(false);
+      }
+      for (const value of Object.values(DEFAULT_TERMINAL_ENV)) {
+        expect(value).not.toContain(keyNeedle);
+      }
     } finally {
       if (running !== null) { driver!.stop(); await running; }
       await closeServer(tavily);
