@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -79,6 +80,18 @@ describe('loadProviders', () => {
   it('an oversize store is refused before parsing', async () => {
     await write('x'.repeat(1024 * 1024 + 1));
     await expect(loadProviders(home)).rejects.toThrow(/too large/);
+  });
+
+  it('a store that grows past the cap while being read is refused', async () => {
+    // A FIFO has no size to pre-flight: this proves the read itself stops at
+    // the cap, which also makes a regular file's stat→read race harmless.
+    const fifo = join(home, 'providers.json');
+    await new Promise<void>((resolve, reject) => {
+      execFile('mkfifo', [fifo], (err) => { if (err) reject(err); else resolve(); });
+    });
+    const pending = loadProviders(home).catch((err: unknown) => err);
+    await writeFile(fifo, Buffer.alloc(1024 * 1024 + 1, 0x78));
+    expect(String(await pending)).toMatch(/invalid providers\.json: too large/);
   });
 
   it('plain http is allowed only for a loopback host', async () => {

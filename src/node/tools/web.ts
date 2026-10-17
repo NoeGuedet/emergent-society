@@ -155,12 +155,13 @@ function requestId(o: Record<string, unknown>): string[] {
 
 /**
  * Provider-controlled short fields stay on one line: every line or paragraph
- * separator (CR, LF, U+2028, U+2029) collapses to a space, so a hostile
- * provider cannot forge the structural lines of the model-visible render.
- * Long content (snippets, extracted text) deliberately keeps its newlines.
+ * separator (CR, LF, VT, FF, NEL, U+2028, U+2029) collapses to a space, so a
+ * hostile provider cannot forge the structural lines of the model-visible
+ * render. Long content (snippets, extracted text) deliberately keeps its
+ * newlines.
  */
 function shortField(text: string): string {
-  return text.replace(/\s*[\r\n\u2028\u2029]\s*/g, ' ').trim();
+  return text.replace(/\s*[\r\n\u000b\u000c\u0085\u2028\u2029]\s*/g, ' ').trim();
 }
 
 export function renderSearch(body: Uint8Array): string | null {

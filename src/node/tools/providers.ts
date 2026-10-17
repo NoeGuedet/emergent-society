@@ -1,4 +1,4 @@
-import { readFile, stat } from 'node:fs/promises';
+import { open, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { toJson } from '../../context/artifacts.js';
 
@@ -130,22 +130,42 @@ function freezeRegistry(value: unknown): ProviderRegistry {
   }
 }
 
-export async function loadProviders(home: string): Promise<ProviderRegistry> {
-  const path = join(home, PROVIDERS_BASENAME);
-  let bytes: Buffer;
+/**
+ * Reads the store with a hard memory bound instead of trusting metadata: at
+ * most `MAX_PROVIDERS_BYTES + 1` bytes are ever fetched, so a file that grows
+ * after any pre-flight — or a FIFO/stream with no trustworthy size — cannot
+ * force an unbounded read. The extra byte is what makes "over the cap"
+ * observable; the read stops there and the caller refuses the store.
+ */
+async function readStore(path: string): Promise<Buffer | null> {
+  let handle: FileHandle;
   try {
-    // Refuse an oversize store before reading it, then re-check the bytes that
-    // actually arrived (the file can change between the two calls). Either way
-    // an oversize store never reaches JSON.parse.
-    if ((await stat(path)).size > MAX_PROVIDERS_BYTES) fail('too large');
-    bytes = await readFile(path);
+    handle = await open(path, 'r');
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return freezeRegistry({});
-    }
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw err;
   }
-  if (bytes.length > MAX_PROVIDERS_BYTES) fail('too large');
+  try {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (total <= MAX_PROVIDERS_BYTES) {
+      const want = Math.min(64 * 1024, MAX_PROVIDERS_BYTES + 1 - total);
+      const chunk = Buffer.allocUnsafe(want);
+      const { bytesRead } = await handle.read(chunk, 0, want, null);
+      if (bytesRead === 0) break;
+      chunks.push(chunk.subarray(0, bytesRead));
+      total += bytesRead;
+    }
+    if (total > MAX_PROVIDERS_BYTES) fail('too large');
+    return Buffer.concat(chunks, total);
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function loadProviders(home: string): Promise<ProviderRegistry> {
+  const bytes = await readStore(join(home, PROVIDERS_BASENAME));
+  if (bytes === null) return freezeRegistry({});
   const text = bytes.toString('utf8');
   let value: unknown;
   try { value = JSON.parse(text); } catch { fail('not valid JSON'); }
