@@ -30,6 +30,14 @@ export interface JournalReaderOptions {
  * otherwise stateless and never mutates the log.
  */
 export class JournalReader {
+  /**
+   * Torn bytes reported by the most recent `events()` scan. Informational only:
+   * `events()` still serves the verified prefix and stops at the tear. It lets a
+   * concurrent reader of a live journal distinguish "the writer has not landed
+   * the tail yet" from "the log ended cleanly".
+   */
+  private lastTornBytes = 0;
+
   private constructor(
     private readonly dir: string,
     private readonly known: ReadonlySet<string>,
@@ -54,6 +62,15 @@ export class JournalReader {
       nodeDir(home, nodeUid), opts.knownTypes,
       opts.resolveBlobs === true ? new BlobStore(home) : null,
     );
+  }
+
+  /**
+   * The torn trailing bytes seen by the last `events()` scan (0 before the
+   * first scan, or when the log was missing). This is a diagnostic, not a
+   * gate: it never changes which events are served.
+   */
+  tornBytes(): number {
+    return this.lastTornBytes;
   }
 
   /**
@@ -92,7 +109,10 @@ export class JournalReader {
     // be mistaken for genesis, so readFileOrNull rethrows it.
     const raw = await readFileOrNull(journalPath(this.dir));
     if (raw === null) return;
-    const { batches } = scanBatches(raw);
+    const { batches, tornBytes } = scanBatches(raw);
+    // Record the scan outcome before yielding: a caller iterating a live log
+    // can see whether the prefix it just read ends in an in-flight write.
+    this.lastTornBytes = tornBytes;
     for (const e of verifyChain(batches, this.known, genesisState())) {
       if (e.seq >= fromSeq) yield await this.resolveData(e);
     }

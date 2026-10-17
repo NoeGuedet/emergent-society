@@ -38,7 +38,9 @@ export {
 // measure the writer applies before claim-checking: a caller that must stay
 // under a size bound (the node's lossless-message limit) has to measure the
 // same bytes the writer will, not the raw input.
-export { NonCanonicalizableError, canonicalizeJson, type JsonValue } from './canon.js';
+export {
+  NonCanonicalizableError, canonicalizeJson, type JsonValue,
+} from './canon.js';
 
 // Verification, framing damage and the frozen decompressed frame bound.
 export { ChainBreakError } from './verify.js';
@@ -56,6 +58,7 @@ export {
   MAX_BLOB_BYTES,
   BlobIntegrityError,
   InvalidBlobHashError,
+  ReservedBlobRefError,
   TruncatedBlobError,
   assertBlobRefReadable,
   assertBlobBytes,

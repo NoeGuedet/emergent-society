@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
 import {
-  BlobIntegrityError, BlobStore, JournalWriter, MAX_BLOB_BYTES, TruncatedBlobError,
-  isBlobRef, isCorruption, isRetryable,
+  BlobIntegrityError, BlobStore, CLAIM_CHECK_THRESHOLD, JournalWriter, MAX_BLOB_BYTES,
+  TruncatedBlobError, isBlobRef, isCorruption, isRetryable,
 } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
 import { useTempHome } from '../../journal/__tests__/helpers.js';
@@ -133,9 +133,12 @@ describe('BoundaryGate.append', () => {
     const h = await harness('turn', 0, { registry: permissive });
     try {
       const spy = vi.spyOn(h.writer, 'append');
+      // The size matters: a reference is only recognizable at or beyond the
+      // claim-check threshold, which is what distinguishes it from a caller's
+      // own small `{ blob, size }` payload.
       expect(() => h.created.gate.append(
         'artifact/chunk' as never,
-        { blob: 'a'.repeat(64), size: 5 } as never,
+        { blob: 'a'.repeat(64), size: CLAIM_CHECK_THRESHOLD } as never,
       )).toThrow();
       expect(spy).not.toHaveBeenCalled();
     } finally {

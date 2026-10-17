@@ -2,7 +2,7 @@ import { afterEach, beforeEach, vi } from 'vitest';
 import { appendFile, mkdir, mkdtemp, rm, open as openFile, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BlobStore } from '../blobs.js';
+import { BlobStore, CLAIM_CHECK_THRESHOLD } from '../blobs.js';
 import { canonicalizeJson, sha256HexOf } from '../canon.js';
 import { encodeBatch, scanBatches } from '../framing.js';
 import { journalPath, nodeDir } from '../layout.js';
@@ -95,10 +95,17 @@ export async function rewriteLog(
  * `body`. The writer never references a non-JSON body, so this stands in for a
  * direct writer: the chain verifies exactly (correct `prev_hash` and `hash`),
  * leaving only the blob read able to catch a forged or non-JSON body.
+ *
+ * `body` must reach CLAIM_CHECK_THRESHOLD: below it the exact-key-set pair is
+ * not a reference at all under `isBlobRef`, so the forgery would be served as
+ * ordinary inline data instead of resolved.
  */
 export async function appendForgedBlobRef(
   home: string, body: Buffer, node = 'n1',
 ): Promise<{ blob: string; size: number; seq: number }> {
+  if (body.length < CLAIM_CHECK_THRESHOLD) {
+    throw new Error('a forged blob body must be at least CLAIM_CHECK_THRESHOLD bytes');
+  }
   const path = logPath(home, node);
   const { batches } = scanBatches(await readFile(path));
   const lines = batches.flatMap((b) => b.lines);

@@ -231,8 +231,12 @@ describe('JournalReader verification and repair edges', () => {
     w.append('test/ping', { n: 0 });
     await w.close();
     await appendTear(home());
-    const events = await collect(await JournalReader.open(home(), 'n1', { knownTypes: KNOWN }));
-    expect(events).toHaveLength(1);
+    const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN });
+    // No scan yet: the accessor is informational and reports nothing stale.
+    expect(r.tornBytes()).toBe(0);
+    expect(await collect(r)).toHaveLength(1);
+    // The scan saw the tear but still served only the verified prefix.
+    expect(r.tornBytes()).toBe(9);
   });
   it('repair is a no-op on an intact journal', async () => {
     const w = await JournalWriter.open(home(), 'n1');
@@ -643,7 +647,9 @@ describe('JournalReader verified blob resolution', () => {
     const w = await JournalWriter.open(home(), 'n1');
     w.append('test/ping', { n: 0 });
     await w.close();
-    await appendForgedBlobRef(home(), Buffer.from('{ not json'));
+    // Digest- and length-verified, but not JSON. The body reaches the
+    // claim-check threshold so it is a genuine reference under isBlobRef.
+    await appendForgedBlobRef(home(), Buffer.from(`{ not json${' '.repeat(CLAIM_CHECK_THRESHOLD)}`));
     const err = await collectFailure(await openResolving());
     expect(err).toBeInstanceOf(BlobIntegrityError);
     expect(isCorruption(err)).toBe(true);

@@ -1,8 +1,10 @@
 import { open as openFile, truncate } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { canonicalizeJson, sha256HexOf, type JsonValue } from './canon.js';
+import { canonicalJsonForm, sha256HexOf, type JsonValue } from './canon.js';
 import { GENESIS_HASH, makeEvent, eventLine, type EventDataFor, type EventEnvelope } from './envelope.js';
-import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from './blobs.js';
+import {
+  BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, isBlobRef, ReservedBlobRefError,
+} from './blobs.js';
 import {
   encodeBatch, scanBatches, MAX_DECOMPRESSED_BATCH_BYTES, OversizedEventError,
 } from './framing.js';
@@ -134,6 +136,8 @@ export class JournalWriter {
   private pendingBlobs = new Map<string, Buffer>();
   private timer: NodeJS.Timeout | null = null;
   private closed = false;
+  /** The one in-flight (or settled) close, shared by every concurrent caller. */
+  private closing: Promise<void> | null = null;
   /** Serializes flushes so a burst can never be written twice. */
   private flushChain: Promise<void> = Promise.resolve();
   /** On-disk watermark, which lags `seq` while a batch is still pending. */
@@ -281,14 +285,22 @@ export class JournalWriter {
    * Substitutes a claim-check reference and registers its blob. `addedBlob`
    * names the entry only when this call inserted it: a refused `append` may
    * roll back exactly its own entry, never one an earlier event references.
+   *
+   * The caller's root payload is never aliased into the envelope: the canonical
+   * form's validated deep copy is what `append` keeps, so mutating the input
+   * after the call cannot make the returned envelope stop verifying.
    */
   private claimCheck(data: JsonValue): { data: JsonValue; addedBlob: string | null } {
-    const canonical = canonicalizeJson(data);
+    // A root that already matches the reserved reference shape is refused: the
+    // reader (and the gate) would otherwise resolve, or refuse, an ordinary
+    // caller payload as if the writer had stored it as a blob.
+    if (isBlobRef(data)) throw new ReservedBlobRefError();
+    const { canonical, copy } = canonicalJsonForm(data);
     const bytes = Buffer.from(canonical, 'utf8');
     // The threshold is a byte count, and so is the reported size: measuring in
     // UTF-16 code units would let a multibyte payload far over 16 KB stay
     // inline, and would understate the size of what was stored.
-    if (bytes.length < CLAIM_CHECK_THRESHOLD) return { data, addedBlob: null };
+    if (bytes.length < CLAIM_CHECK_THRESHOLD) return { data: copy, addedBlob: null };
     // Past MAX_BLOB_BYTES the payload is not stored whole: the blob holds a
     // prefix and the reference says so (`truncated: true` + original size).
     const truncated = bytes.length >= MAX_BLOB_BYTES;
@@ -482,15 +494,23 @@ export class JournalWriter {
    * release in a `finally`, so the writer is never left holding the node after
    * a rejected flush.
    *
+   * Every caller shares one completion: a second `close()` while the first is
+   * still flushing awaits (and sees the rejection of) that same operation
+   * instead of resolving early while the handle or lock is still held.
+   *
    * @throws JournalPoisonedError once a batch has failed to commit twice.
    * @throws the underlying fs error when the final flush cannot commit; the
    * lock and handle are released regardless.
    */
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.closing ??= this.closeOnce();
+    return this.closing;
+  }
+
+  private async closeOnce(): Promise<void> {
     // `closed` is set on entry so an append racing the flush is refused rather
     // than accepted and then dropped. `finally` guarantees the handle and lock
     // are released even when the flush rejects.
-    if (this.closed) return;
     this.closed = true;
     let failure: unknown;
     try {

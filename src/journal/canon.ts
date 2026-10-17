@@ -226,11 +226,18 @@ function copyArray(value: unknown[], path: string, seen: Set<object>): JsonValue
   return out;
 }
 
-export function canonicalizeJson(value: JsonValue): string {
-  const stable = copyJsonValue(value);
+/**
+ * The canonical string together with the validated deep copy it serializes.
+ *
+ * `copy` is the exact plain-data value `canonicalize` saw, so a caller that must
+ * not alias its input (the writer's payload) can keep it instead of performing a
+ * second full copy on the hot path.
+ */
+export function canonicalJsonForm(value: JsonValue): { canonical: string; copy: JsonValue } {
+  const copy = copyJsonValue(value);
   let result: string | undefined;
   try {
-    result = canonicalize(stable);
+    result = canonicalize(copy);
   } catch (err) {
     throw new NonCanonicalizableError(
       err instanceof Error ? err.message : 'serialization failed',
@@ -240,7 +247,11 @@ export function canonicalizeJson(value: JsonValue): string {
   // Unreachable for a plain object/array root, but the library's type allows
   // `undefined` and the journal must never hash the string "undefined".
   if (result === undefined) throw new NonCanonicalizableError('top-level value has no JSON form');
-  return result;
+  return { canonical: result, copy };
+}
+
+export function canonicalizeJson(value: JsonValue): string {
+  return canonicalJsonForm(value).canonical;
 }
 
 export function sha256Hex(input: string): string {

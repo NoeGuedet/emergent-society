@@ -5,10 +5,12 @@ import { repair, JournalReader } from '../reader.js';
 import { ChainBreakError } from '../verify.js';
 import { encodeBatch } from '../framing.js';
 import { verifyEvent, makeEvent, eventLine, GENESIS_HASH } from '../envelope.js';
-import { CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, BlobStore } from '../blobs.js';
+import { CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, BlobStore, ReservedBlobRefError } from '../blobs.js';
 import { canonicalizeJson } from '../canon.js';
 import { journalPath, lockPath, nodeDir } from '../layout.js';
-import { appendTear, EPOCH, forgedEnvelope, logPath, rewriteLog, useTempHome } from './helpers.js';
+import {
+  appendTear, EPOCH, forgedEnvelope, logPath, rewriteLog, useTempHome, withFailingWrite,
+} from './helpers.js';
 
 const home = useTempHome('cell-writer-');
 
@@ -111,6 +113,40 @@ describe('JournalWriter', () => {
     expect(data.truncated).toBeUndefined();
     await w.close();
   });
+  it('treats a caller-shaped { blob, size } below the threshold as data', async () => {
+    // The writer only substitutes a reference for payloads at or past the
+    // threshold, so a small pair with the same keys is ordinary data and must
+    // round-trip untouched (the reader must not resolve it either).
+    const payload = { blob: 'a'.repeat(64), size: 5 };
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    const e = w.append('test/ping', payload);
+    expect(e.data).toEqual(payload);
+    await w.close();
+    const events = [];
+    for await (const ev of (await JournalReader.open(home(), 'n1', {
+      knownTypes: new Set(['test/ping']),
+    })).events()) events.push(ev);
+    expect(events[0]?.data).toEqual(payload);
+  });
+  it('refuses a root payload shaped like a blob reference', async () => {
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    expect(() => w.append('test/ping', {
+      blob: 'a'.repeat(64), size: CLAIM_CHECK_THRESHOLD,
+    })).toThrow(ReservedBlobRefError);
+    // Refused before seq advances: the writer is still clean and usable.
+    expect(w.append('test/ping', { n: 0 }).seq).toBe(0);
+    await w.close();
+  });
+  it('keeps the canonical copy, not the caller object, in the returned envelope', async () => {
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    const payload = { nested: { n: 1 }, list: [1, 2] };
+    const e = w.append('test/ping', payload);
+    payload.nested.n = 99;
+    payload.list.push(3);
+    expect(e.data).toEqual({ nested: { n: 1 }, list: [1, 2] });
+    expect(verifyEvent(e)).toBe(true);
+    await w.close();
+  });
 });
 
 describe('JournalWriter durability and ownership', () => {
@@ -166,6 +202,27 @@ describe('JournalWriter durability and ownership', () => {
       events.push(e);
     }
     expect(events.map((e) => e.seq)).toEqual([0]);
+  });
+  it('shares one in-flight close between concurrent callers', async () => {
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    w.append('test/ping', { n: 0 });
+    const first = w.close();
+    const second = w.close();
+    // The same completion, not an early resolve while the first still flushes.
+    expect(second).toBe(first);
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toBeUndefined();
+  });
+  it('rejects every concurrent closer when the final flush fails', async () => {
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    w.append('test/ping', { n: 0 });
+    const outcomes = await withFailingWrite(home(), () =>
+      Promise.allSettled([w.close(), w.close()]));
+    expect(outcomes.map((o) => o.status)).toEqual(['rejected', 'rejected']);
+    const a = outcomes[0] as PromiseRejectedResult;
+    const b = outcomes[1] as PromiseRejectedResult;
+    expect(a.reason).toBe(b.reason);
+    expect((a.reason as Error).message).toContain('injected EIO');
   });
   it('rejects appends after close', async () => {
     const w = await JournalWriter.open(home(), 'n1');

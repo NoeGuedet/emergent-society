@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { chmod, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  BlobStore, JournalWriter, MAX_BLOB_BYTES, TruncatedBlobError,
+  BlobStore, CLAIM_CHECK_THRESHOLD, JournalWriter, MAX_BLOB_BYTES, TruncatedBlobError,
   isBlobRef, isCorruption, isRetryable,
 } from '../../journal/index.js';
 import {
@@ -150,7 +150,9 @@ describe('loadVerifiedEvents', () => {
     const writer = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60000 });
     writer.append('test/big', { n: 0 });
     await writer.close();
-    await appendForgedBlobRef(home(), Buffer.from('{ not json'));
+    // Digest- and length-verified, but not JSON. The body reaches the
+    // claim-check threshold so it is a genuine reference under isBlobRef.
+    await appendForgedBlobRef(home(), Buffer.from(`{ not json${' '.repeat(CLAIM_CHECK_THRESHOLD)}`));
     const err = await loadVerifiedEvents(home(), 'n1', KNOWN).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(BlobIntegrityError);
     expect(err).not.toBeInstanceOf(SyntaxError);

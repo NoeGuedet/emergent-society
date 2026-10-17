@@ -120,9 +120,30 @@ export function throwBlobReadError(ref: BlobRef, err: unknown): never {
 }
 
 /**
- * Recognizes the exact shape claimCheck writes. The key set must match exactly:
- * a caller's own `{ blob, size, … }` payload must never be mistaken for a
- * reference and rewritten under it.
+ * A payload root carrying the reserved reference shape. Claim-check references
+ * are produced by the writer and resolved by the reader; accepting one as a
+ * caller's payload would make an ordinary event indistinguishable from a store
+ * reference, so the writer refuses it outright.
+ */
+export class ReservedBlobRefError extends JournalError {
+  constructor() {
+    super('event payload root must not be a journal blob reference');
+  }
+}
+
+/**
+ * Recognizes the exact shape claimCheck writes. Every writer-produced reference
+ * satisfies both invariants checked here:
+ *  - the key set matches exactly (`blob`, `size`, plus `truncated` when set);
+ *  - `blob` is a SHA-256 hash and `size` is at or beyond CLAIM_CHECK_THRESHOLD,
+ *    because the writer only ever substitutes a reference for a payload that
+ *    large.
+ *
+ * The size bound is what keeps a caller's own small `{ blob, size }` payload
+ * from being mistaken for a reference: a payload below the threshold was kept
+ * inline by the writer, so it cannot be a reference, whatever its keys look
+ * like. A caller-shaped pair at or beyond the threshold is still ambiguous, so
+ * the writer refuses such a root outright (see `ReservedBlobRefError`).
  */
 export function isBlobRef(data: unknown): data is BlobRef {
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
@@ -130,7 +151,8 @@ export function isBlobRef(data: unknown): data is BlobRef {
   const expected = 'truncated' in data ? ['blob', 'size', 'truncated'] : ['blob', 'size'];
   if (keys.length !== expected.length || !keys.every((k, i) => k === expected[i])) return false;
   const ref = data as Record<string, unknown>;
-  return typeof ref['blob'] === 'string' && typeof ref['size'] === 'number'
+  return typeof ref['blob'] === 'string' && BLOB_HASH_RE.test(ref['blob'])
+    && typeof ref['size'] === 'number' && ref['size'] >= CLAIM_CHECK_THRESHOLD
     && (ref['truncated'] === undefined || ref['truncated'] === true);
 }
 
