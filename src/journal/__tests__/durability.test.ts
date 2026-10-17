@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdir, mkdtemp, readFile, readlink, rm, open as openFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, readlink, rm, open as openFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -188,7 +188,10 @@ describe('decompressed frame bound', () => {
   it('refuses one event that alone reaches the bound and stays usable', async () => {
     const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
     const hugeType = 'x'.repeat(MAX_DECOMPRESSED_BATCH_BYTES);
-    expect(() => w.append(hugeType, { n: 0 }, { ignorable: true })).toThrow(OversizedEventError);
+    // The payload is claim-checked before the line bound is measured, so the
+    // refusal must roll the registered blob back rather than leave an orphan.
+    expect(() => w.append(hugeType, { payload: 'a'.repeat(BIG_PAYLOAD_CHARS) }, { ignorable: true }))
+      .toThrow(OversizedEventError);
     // The refused event consumed no seq and nothing was framed: the journal is
     // still writable and readable, and the next event is seq 0.
     expect(w.append('test/ping', { n: 0 }).seq).toBe(0);
@@ -196,7 +199,10 @@ describe('decompressed frame bound', () => {
     await w.close();
     const events = await collectEvents(home());
     expect(events.map((e) => [e.seq, e.type])).toEqual([[0, 'test/ping']]);
-  });
+    // An orphan would have been drained by the flush; the blobs directory was
+    // never even created for the refused event.
+    await expect(readdir(join(home(), 'blobs'))).rejects.toMatchObject({ code: 'ENOENT' });
+  }, 30_000);
 });
 
 describe('durable directory creation', () => {

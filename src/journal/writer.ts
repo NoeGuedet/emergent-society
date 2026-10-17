@@ -18,8 +18,9 @@ export { SessionAlreadyOwnedError };
  * The append side of the journal: the only writer of a node's canonical log.
  *
  * Appends are synchronous and in-memory; a bounded write-behind window turns a
- * burst into one framed batch with one `write` + `fsync`, and `flush` is the
- * explicit barrier callers use before a model request or a top-level tool
+ * burst into consecutive length-prefixed frames — split so that no frame
+ * reaches the decompressed bound — with one `fsync` per flush, and `flush` is
+ * the explicit barrier callers use before a model request or a top-level tool
  * effect. Ownership is exclusive (see `lock.ts`), and a batch is never dropped:
  * a failed write is retried, and a writer that cannot make progress ends in a
  * typed terminal state rather than silently skipping events the caller was told
@@ -239,8 +240,9 @@ export class JournalWriter {
     // the caller has to know the previous burst is not durable.
     this.throwIfUnusable();
     if (this.closed) throw new JournalClosedError();
+    const claimed = this.claimCheck(data);
     const e = makeEvent({
-      type, data: this.claimCheck(data), seq: this.seq, time: this.now(),
+      type, data: claimed.data, seq: this.seq, time: this.now(),
       prevHash: this.prevHash, ...opts,
     });
     // The canonical line is captured here, once: `flush` writes these exact
@@ -253,7 +255,13 @@ export class JournalWriter {
     // writer and the journal usable instead of admitting an event that no
     // reader could ever accept.
     const lineBytes = Buffer.byteLength(line, 'utf8');
-    if (lineBytes >= MAX_DECOMPRESSED_BATCH_BYTES) throw new OversizedEventError(lineBytes);
+    if (lineBytes >= MAX_DECOMPRESSED_BATCH_BYTES) {
+      // `claimCheck` may already have registered this payload. Roll back only
+      // the blob this very append added, so the refusal leaves no orphan for a
+      // later drain and cannot remove one an earlier pending event still needs.
+      if (claimed.addedBlob !== null) this.pendingBlobs.delete(claimed.addedBlob);
+      throw new OversizedEventError(lineBytes);
+    }
 
     this.seq += 1;
     this.prevHash = e.hash;
@@ -269,26 +277,32 @@ export class JournalWriter {
     return e;
   }
 
-  private claimCheck(data: JsonValue): JsonValue {
+  /**
+   * Substitutes a claim-check reference and registers its blob. `addedBlob`
+   * names the entry only when this call inserted it: a refused `append` may
+   * roll back exactly its own entry, never one an earlier event references.
+   */
+  private claimCheck(data: JsonValue): { data: JsonValue; addedBlob: string | null } {
     const canonical = canonicalizeJson(data);
     const bytes = Buffer.from(canonical, 'utf8');
     // The threshold is a byte count, and so is the reported size: measuring in
     // UTF-16 code units would let a multibyte payload far over 16 KB stay
     // inline, and would understate the size of what was stored.
-    if (bytes.length < CLAIM_CHECK_THRESHOLD) return data;
+    if (bytes.length < CLAIM_CHECK_THRESHOLD) return { data, addedBlob: null };
     // Past MAX_BLOB_BYTES the payload is not stored whole: the blob holds a
     // prefix and the reference says so (`truncated: true` + original size).
     const truncated = bytes.length >= MAX_BLOB_BYTES;
     const stored = truncated ? bytes.subarray(0, MAX_BLOB_BYTES) : bytes;
     const blobHash = sha256HexOf(stored);
+    const added = !this.pendingBlobs.has(blobHash);
     this.pendingBlobs.set(blobHash, stored);
     const ref: Record<string, JsonValue> = { blob: blobHash, size: bytes.length };
     if (truncated) ref['truncated'] = true;
-    return ref;
+    return { data: ref, addedBlob: added ? blobHash : null };
   }
 
   /**
-   * The barrier: pending burst → one frame, one write, one fsync.
+   * The barrier: pending burst → consecutive split frames, one fsync.
    *
    * Total in promise style: `async` so the closed guard becomes a rejection
    * rather than a synchronous throw, which a caller reaching it through a

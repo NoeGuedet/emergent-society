@@ -40,9 +40,14 @@ export {
 // same bytes the writer will, not the raw input.
 export { NonCanonicalizableError, canonicalizeJson, type JsonValue } from './canon.js';
 
-// Verification and framing damage.
+// Verification, framing damage and the frozen decompressed frame bound.
 export { ChainBreakError } from './verify.js';
-export { CorruptFrameError } from './framing.js';
+export {
+  CorruptFrameError,
+  MAX_DECOMPRESSED_BATCH_BYTES,
+  OversizedBatchError,
+  OversizedEventError,
+} from './framing.js';
 
 // Claim-check blobs and the one verified read of their bytes.
 export {

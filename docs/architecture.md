@@ -230,9 +230,9 @@ This is closer to **git than to a blockchain**: one writer per journal (enforced
 
 Two constraints fight each other: `fsync` costs too much to run per event, yet "model-visible means logged" forbids any external effect without a durable trace. Three mechanisms reconcile them.
 
-**Frames.** The log file is a concatenation of independent, length-prefixed, checksummed zstd frames. One frame = one batch = one `write` + one `fsync` — the unit of durability. Appending never touches existing bytes (the file is opened in `'a'` mode), and the length prefix lets a reader walk frames without decompressing the whole file.
+**Frames.** The log file is a concatenation of independent, length-prefixed, checksummed zstd frames. A flush writes one or more consecutive frames — a burst is split when its decompressed size would reach the frozen `MAX_DECOMPRESSED_BATCH_BYTES` — all covered by one `fsync`, the unit of durability. Appending never touches existing bytes (the file is opened in `'a'` mode), and the length prefix lets a reader walk frames without decompressing the whole file.
 
-**Write-behind.** `append()` is synchronous and in-memory: hash, capture the canonical line, push to `pending`, return. The *first* event of a burst starts a 200 ms timer (no debounce — the window never resets); when it elapses, the whole burst is written as one frame, one fsync. The hot path never blocks on I/O, and a failed write restores the batch for retry instead of dropping it.
+**Write-behind.** `append()` is synchronous and in-memory: hash, capture the canonical line, push to `pending`, return. The *first* event of a burst starts a 200 ms timer (no debounce — the window never resets); when it elapses, the whole burst is written as consecutive frames, one fsync. The hot path never blocks on I/O, and a failed write restores the batch for retry instead of dropping it.
 
 **The flush barrier.** Before every model request and every top-level tool effect, the caller invokes `flush()` — durability *before* effect. The driver flushes at `turn/start` (before the handler can act) and at `turn/end` (before the loop unwinds, because the closer carries the world commit hash: an orphan commit would be an effect without a trace).
 

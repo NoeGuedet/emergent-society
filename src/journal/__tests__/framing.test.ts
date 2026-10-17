@@ -64,9 +64,11 @@ describe('framed zstd batches', () => {
   it('refuses a batch at or over the decompressed bound at encode time', () => {
     const line = 'a'.repeat(MAX_DECOMPRESSED_BATCH_BYTES);
     expect(() => encodeBatch([line])).toThrow(OversizedBatchError);
-    // The separator counts too: two half-bound lines joined by `\n` reach it.
-    const half = 'a'.repeat(MAX_DECOMPRESSED_BATCH_BYTES / 2);
-    expect(() => encodeBatch([half, half])).toThrow(OversizedBatchError);
+    // The separator is the edge: the two lines sum to exactly bound - 1, so
+    // only counting the joining `\n` pushes the decompressed size to the bound.
+    const first = 'a'.repeat(MAX_DECOMPRESSED_BATCH_BYTES / 2);
+    const second = 'b'.repeat(MAX_DECOMPRESSED_BATCH_BYTES / 2 - 1);
+    expect(() => encodeBatch([first, second])).toThrow(OversizedBatchError);
   });
   it('bounds decompression to the documented per-batch maximum', () => {
     expect(MAX_DECOMPRESSED_BATCH_BYTES).toBe(64 * 1024 * 1024);
