@@ -209,8 +209,15 @@ export class NodeDriver {
   ): Promise<NodeDriver> {
     if (opts.hooks !== undefined) {
       // The whole hooks contract is checked before the writer exists: a missing
-      // port must not leave a lock taken by a driver that can never run.
-      for (const port of ['readHistory', 'readBlob', 'acknowledgedWorld'] as const) {
+      // port must not leave a lock taken by a driver that can never run. The
+      // lifecycle callbacks are as required as the replay ports — a bundle that
+      // omits one would otherwise fail later, mid-run, after effects are possible.
+      if (typeof opts.hooks.registry !== 'object' || opts.hooks.registry === null) {
+        throw new Error('C1.3 hooks require registry');
+      }
+      for (const port of [
+        'readHistory', 'readBlob', 'acknowledgedWorld', 'onDurable', 'onReady', 'onTurnStart',
+      ] as const) {
         if (typeof (opts.hooks as unknown as Record<string, unknown>)[port] !== 'function') {
           throw new Error(`C1.3 hooks require ${port}`);
         }
@@ -271,11 +278,18 @@ export class NodeDriver {
       let trigger: TurnTrigger = (await this.wakeDue()) ? 'wakeup' : 'boot';
       while (!this.stopRequested) {
         const world = await this.worldRange();
+        // stop() aborts `activeController`, which is null between turns: a stop
+        // that lands while the opening HEAD read is in flight has no controller
+        // to cancel and would otherwise be lost, letting the handler start with
+        // a live signal. Re-check after the read and open no turn at all; the
+        // post-creation abort is the defensive half of the same boundary.
+        if (this.stopRequested) break;
         this.writeEvent('turn/start', {
           turn: this.turn, trigger, world: { from: world.from, to: world.to },
         });
         const controller = new AbortController();
         this.activeController = controller;
+        if (this.stopRequested) controller.abort();
         this.turnToolCalls = 0;
         const created = this.makeGate('turn', this.turn, controller.signal);
         this.closeTurnGate = created.close;
@@ -295,10 +309,17 @@ export class NodeDriver {
           // instead of skipping it.
           if (this.hooks === undefined) this.watermark = world.to;
           let result: TurnResult;
+          // True only while the driver validates the handler's acknowledgement:
+          // that proof is the driver's own kernel invariant, so its failure is a
+          // driver error, never a handler error. The journal still carries the
+          // bounded 'kernel invariant failure' label.
+          let kernelFault = false;
           try {
             if (this.hooks !== undefined) {
               await this.hooks.onTurnStart(ctx);
+              kernelFault = true;
               this.advanceAcknowledgement(ctx);
+              kernelFault = false;
             }
             result = await this.handler(ctx);
             if (this.hooks !== undefined && (this.turnToolCalls > 0) !== result.toolCalls) {
@@ -306,7 +327,7 @@ export class NodeDriver {
             }
           } catch (err) {
             await this.endFailedTurn(this.turn, err);
-            this.stopReason = 'handler-error';
+            this.stopReason = kernelFault ? 'driver-error' : 'handler-error';
             throw err;
           }
           // The world is committed before the closer is journaled, so the closer

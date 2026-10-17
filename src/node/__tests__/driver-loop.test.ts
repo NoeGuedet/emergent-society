@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { collectEvents, withFailingWrite } from '../../journal/__tests__/helpers.js';
 import { NodeDriver, type TurnContext, type TurnTrigger } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
+import { WorldRepo } from '../world.js';
 import { useWorld } from './helpers.js';
 
 const fixture = useWorld('node-loop-');
@@ -150,6 +151,31 @@ describe('NodeDriver run loop', () => {
     await running;
     expect(d.state).toBe('stopped');
     expect((await log(home)).filter((e) => e.type === 'turn/start')).toHaveLength(1);
+  });
+
+  it('honors a stop that lands during the turn-opening HEAD read', async () => {
+    const { home, world } = fixture();
+    // Stall the opening range's HEAD read: the loop is inside `worldRange()`
+    // with no active controller, the exact window in which stop() had nothing
+    // to abort. The stop must still prevent the turn from opening at all.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const reached = new Promise<void>((resolve) => { entered = resolve; });
+    const real = WorldRepo.prototype.headHash;
+    vi.spyOn(WorldRepo.prototype, 'headHash').mockImplementation(async function (this: WorldRepo) {
+      entered();
+      await held;
+      return real.call(this);
+    });
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const running = d.run();
+    await reached;
+    d.stop();
+    release();
+    await running;
+    expect(d.state).toBe('stopped');
+    expect((await log(home)).filter((e) => e.type === 'turn/start')).toHaveLength(0);
   });
 
   it('shuts down with reason maintenance-error when the maintenance hook throws', async () => {

@@ -243,6 +243,10 @@ class Runtime implements AgentRuntime {
       }
       const sent = await this.options.adapter.send(plan, ctx.gate);
       if (sent.kind === 'failure') {
+        // A failure the aborted signal caused is a boundary cancellation, not a
+        // failed turn: park like the dispatch policy below, so a clean stop
+        // never journals an error closer.
+        if (ctx.signal.aborted) return { outcome: 'waiting', toolCalls: accepted > 0 };
         return { outcome: 'error', toolCalls: accepted > 0, error: sent.failure };
       }
       const calls = sent.projection.message.tool_calls;

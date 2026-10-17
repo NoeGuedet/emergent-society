@@ -646,6 +646,26 @@ describe('the world acknowledgement proof', () => {
     expect(handlerCalls).toBe(0);
   });
 
+  it('labels an invalid acknowledgement as a driver error, not a handler error', async () => {
+    const { home, world } = fixture();
+    let ack: WorldAcknowledgement | null = null;
+    let handlerCalls = 0;
+    const hooks = hooksFor(home, { acknowledgedWorld: () => ack });
+    const ref: { d: NodeDriver | null } = { d: null };
+    ref.d = await NodeDriver.open(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
+      { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
+    ack = { turn: 7, range: { from: null, to: null }, source: { seq: 0, hash: 'a'.repeat(64) } };
+    await expect(ref.d.run()).rejects.toThrow(/current turn/);
+    expect(handlerCalls).toBe(0);
+    const events = await read(home);
+    // No handler threw: the driver's own proof invariant failed. The journal
+    // keeps the bounded label but the shutdown names the correct actor.
+    expect(events.find((e) => e.type === 'turn/end')?.data)
+      .toMatchObject({ outcome: 'error', error: 'kernel invariant failure' });
+    expect(events.find((e) => e.type === 'node/shutdown')?.data)
+      .toEqual({ reason: 'driver-error', error: 'kernel invariant failure' });
+  });
+
   it('rejects a proof whose range is not the turn opening range, before any effect', async () => {
     const { home, world } = fixture();
     let ack: WorldAcknowledgement | null = null;
@@ -680,6 +700,22 @@ describe('hook contract refusals', () => {
     const hooks = withoutPort(hooksFor(home), 'acknowledgedWorld');
     await expect(NodeDriver.open(home, 'n1', wait, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 })).rejects.toThrow(/acknowledgedWorld/);
+  });
+
+  it('refuses a missing lifecycle callback before the writer exists', async () => {
+    for (const port of ['onDurable', 'onReady', 'onTurnStart']) {
+      const { home, world } = fixture();
+      const hooks = withoutPort(hooksFor(home), port);
+      await expect(NodeDriver.open(home, 'n1', wait, world,
+        { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 }))
+        .rejects.toThrow(new RegExp(port));
+      // The refusal happened before the writer was taken: a valid bundle still
+      // opens the same node home afterwards.
+      const d = await NodeDriver.open(home, 'n1', wait, world,
+        { knownTypes: C13_EVENT_TYPES, hooks: hooksFor(home), worldPollMs: 0 });
+      d.stop();
+      await d.run();
+    }
   });
 
   it('refuses provided knownTypes that omit a node lifecycle type', async () => {

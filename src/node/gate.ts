@@ -92,9 +92,10 @@ export type GateCallbacks = {
 };
 
 /**
- * The driver's trusted hooks (T2). `readHistory`, `readBlob` and
- * `acknowledgedWorld` are required when hooks exist; the driver refuses a bundle
- * that omits any of them, before it takes the writer.
+ * The driver's trusted hooks (T2). `readHistory`, `readBlob`,
+ * `acknowledgedWorld`, `onDurable`, `onReady` and `onTurnStart` are required
+ * when hooks exist; the driver refuses a bundle that omits any of them, before
+ * it takes the writer. Only `onStop` is optional.
  */
 export interface DriverHooks {
   readonly registry: BoundaryRegistry;

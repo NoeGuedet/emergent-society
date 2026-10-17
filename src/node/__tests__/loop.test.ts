@@ -290,6 +290,35 @@ describe('recoverable provider failure', () => {
 });
 
 describe('stop', () => {
+  it('parks instead of journaling an error turn when a stop reaches the send', async () => {
+    const fx = fixture();
+    const transport = new ScriptedTransport([]);
+    const runtime = runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
+    // Stop after the turn's start barrier (so the perception is durable) but
+    // before the provider send. The adapter reports a cancelled failure; that
+    // is a boundary cancellation, not a failed turn.
+    let driver: NodeDriver | null = null;
+    const hooks: DriverHooks = {
+      ...runtime.hooks,
+      onTurnStart: async (ctx) => {
+        await runtime.hooks.onTurnStart(ctx);
+        driver!.stop();
+      },
+    };
+    driver = await NodeDriver.open(fx.home, 'n1', runtime.handler, fx.world, {
+      knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0, batchWindowMs: 10000,
+    });
+    await driver.run();
+
+    expect(transport.sends).toHaveLength(0);
+    const events = await eventsOf(fx);
+    const ends = events.filter((event) => event.type === 'turn/end');
+    expect(ends).toHaveLength(1);
+    expect(ends[0]!.data).toMatchObject({ outcome: 'waiting' });
+    expect(events.find((event) => event.type === 'node/shutdown')?.data)
+      .toEqual({ reason: 'stop-requested' });
+  });
+
   it('aborts an active shell process and appends no later request', async () => {
     const fx = fixture();
     const transport = new ScriptedTransport([
