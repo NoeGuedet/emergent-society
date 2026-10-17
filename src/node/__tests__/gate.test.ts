@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
 import {
   BlobIntegrityError, BlobStore, CLAIM_CHECK_THRESHOLD, JournalWriter, MAX_BLOB_BYTES,
-  TruncatedBlobError, isBlobRef, isCorruption, isRetryable,
+  ReservedBlobRefError, TruncatedBlobError, isBlobRef, isCorruption, isRetryable,
 } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
 import { useTempHome } from '../../journal/__tests__/helpers.js';
@@ -139,7 +139,7 @@ describe('BoundaryGate.append', () => {
       expect(() => h.created.gate.append(
         'artifact/chunk' as never,
         { blob: 'a'.repeat(64), size: CLAIM_CHECK_THRESHOLD } as never,
-      )).toThrow();
+      )).toThrow(ReservedBlobRefError);
       expect(spy).not.toHaveBeenCalled();
     } finally {
       h.created.close();

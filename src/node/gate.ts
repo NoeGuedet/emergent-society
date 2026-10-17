@@ -1,7 +1,7 @@
 import type { EventEnvelope, JsonValue } from '../journal/index.js';
 import {
-  MAX_BLOB_BYTES, assertBlobBytes, assertBlobRefReadable, canonicalizeJson, isBlobRef,
-  throwBlobReadError,
+  MAX_BLOB_BYTES, ReservedBlobRefError, assertBlobBytes, assertBlobRefReadable,
+  canonicalizeJson, isBlobRef, throwBlobReadError,
 } from '../journal/index.js';
 import { sha256HexOf } from '../journal/canon.js';
 import type {
@@ -170,7 +170,7 @@ class Gate implements BoundaryGate {
   /** Refuses a payload whose canonical event data reaches the v0 ceiling, or an exact BlobRef root. */
   private preflight(validated: JsonValue): void {
     if (isBlobRef(validated)) {
-      throw new Error('boundary payload root must not be a journal BlobRef');
+      throw new ReservedBlobRefError();
     }
     const bytes = Buffer.byteLength(canonicalizeJson(validated), 'utf8');
     if (bytes >= MAX_BLOB_BYTES) {

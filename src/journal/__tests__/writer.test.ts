@@ -5,7 +5,9 @@ import { repair, JournalReader } from '../reader.js';
 import { ChainBreakError } from '../verify.js';
 import { encodeBatch } from '../framing.js';
 import { verifyEvent, makeEvent, eventLine, GENESIS_HASH } from '../envelope.js';
-import { CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, BlobStore, ReservedBlobRefError } from '../blobs.js';
+import {
+  CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, BlobStore, ReservedBlobRefError, isBlobRef,
+} from '../blobs.js';
 import { canonicalizeJson } from '../canon.js';
 import { journalPath, lockPath, nodeDir } from '../layout.js';
 import {
@@ -74,10 +76,24 @@ describe('JournalWriter', () => {
     const framingBytes = Buffer.byteLength(canonicalizeJson({ payload: '' }), 'utf8');
     for (const [delta, claimed] of [[-1, false], [0, true], [1, true]] as const) {
       const payload = 'a'.repeat(CLAIM_CHECK_THRESHOLD - framingBytes + delta);
-      const w = await JournalWriter.open(home(), `b${delta}`, { batchWindowMs: 60_000 });
-      const e = w.append('test/big', { payload });
-      expect(typeof (e.data as { blob?: unknown }).blob === 'string').toBe(claimed);
+      const input = { payload };
+      const node = `b${delta}`;
+      const w = await JournalWriter.open(home(), node, { batchWindowMs: 60_000 });
+      const e = w.append('test/big', input);
+      // Both sides of the boundary are asserted by shape, not only by whether
+      // some `blob` key exists: a produced reference must pass `isBlobRef`.
+      expect(isBlobRef(e.data)).toBe(claimed);
+      if (!claimed) expect(e.data).toEqual(input);
       await w.close();
+      // And the event round-trips through the reader's verified resolution:
+      // the original payload comes back on both sides of the threshold.
+      const r = await JournalReader.open(home(), node, {
+        knownTypes: new Set(['test/big']), resolveBlobs: true,
+      });
+      const events = [];
+      for await (const ev of r.events()) events.push(ev);
+      expect(events).toHaveLength(1);
+      expect(events[0]?.data).toEqual(input);
     }
   });
   it('measures the threshold and the reported size in UTF-8 bytes, not code units', async () => {

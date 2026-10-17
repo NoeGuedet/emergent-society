@@ -238,6 +238,30 @@ describe('JournalReader verification and repair edges', () => {
     // The scan saw the tear but still served only the verified prefix.
     expect(r.tornBytes()).toBe(9);
   });
+  it('resets the torn-byte record on every read attempt', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/ping', { n: 0 });
+    await w.close();
+    await appendTear(home());
+    const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN });
+    expect(await collect(r)).toHaveLength(1);
+    expect(r.tornBytes()).toBe(9);
+
+    // A scan that throws is not a scan that still reports the old tear.
+    const raw = await readFile(logPath(home()));
+    const { batches } = scanBatches(raw);
+    const first = batches[0]!;
+    const corrupt = Buffer.from(raw);
+    corrupt.fill(0xff, first.offset + 4, first.offset + first.size);
+    await writeFile(logPath(home()), corrupt);
+    await expect(collect(r)).rejects.toThrow(CorruptFrameError);
+    expect(r.tornBytes()).toBe(0);
+
+    // A missing log is an empty journal, not the previous scan's tear.
+    await rm(logPath(home()));
+    expect(await collect(r)).toEqual([]);
+    expect(r.tornBytes()).toBe(0);
+  });
   it('repair is a no-op on an intact journal', async () => {
     const w = await JournalWriter.open(home(), 'n1');
     w.append('test/ping', { n: 0 });

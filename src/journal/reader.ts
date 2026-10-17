@@ -65,9 +65,9 @@ export class JournalReader {
   }
 
   /**
-   * The torn trailing bytes seen by the last `events()` scan (0 before the
-   * first scan, or when the log was missing). This is a diagnostic, not a
-   * gate: it never changes which events are served.
+   * The torn trailing bytes seen by the last `events()` read attempt (0 before
+   * the first attempt, when the log is missing, or when the scan threw). This
+   * is a diagnostic, not a gate: it never changes which events are served.
    */
   tornBytes(): number {
     return this.lastTornBytes;
@@ -105,6 +105,10 @@ export class JournalReader {
    * unreadable blob.
    */
   async *events(fromSeq = 0): AsyncGenerator<EventEnvelope> {
+    // Every read attempt starts from a clean slate: a log that vanished, or a
+    // scan that throws, must not leave a prior attempt's torn tail on the
+    // accessor. The field is only set again when a scan completes.
+    this.lastTornBytes = 0;
     // A missing log is an empty journal. Anything else (EACCES, EIO) must not
     // be mistaken for genesis, so readFileOrNull rethrows it.
     const raw = await readFileOrNull(journalPath(this.dir));
