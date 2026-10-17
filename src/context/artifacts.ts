@@ -1,6 +1,5 @@
-import { canonicalizeJson } from '../journal/index.js';
+import { HASH_RE, canonicalizeJson, copyJsonValue, sha256HexOf } from '../journal/index.js';
 import type { JsonValue } from '../journal/index.js';
-import { HASH_RE, copyJsonValue, sha256HexOf } from '../journal/canon.js';
 import type { ArtifactRef, ArtifactChunk, ArtifactManifest, Source, Stored } from './contracts.js';
 import { ArtifactMismatchError } from './loader.js';
 import type { VerifiedEvent, VerifiedEvents } from './loader.js';

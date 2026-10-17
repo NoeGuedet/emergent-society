@@ -7,7 +7,7 @@ import {
   canonicalizeJson, isBlobRef,
 } from '../../journal/index.js';
 import type { EventEnvelope } from '../../journal/index.js';
-import { sha256HexOf } from '../../journal/canon.js';
+import { sha256HexOf } from '../../journal/index.js';
 import { payloadOfCanonicalBytes, useTempHome } from '../../journal/__tests__/helpers.js';
 import { createBoundaryGate } from '../../node/gate.js';
 import type { GateCallbacks, GateScope, BoundaryGate } from '../../node/gate.js';

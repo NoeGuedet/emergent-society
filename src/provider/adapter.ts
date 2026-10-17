@@ -1,6 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { toJson } from '../context/artifacts.js';
 import { truncationNotice, utf8Prefix } from '../text.js';
+import { isRecord } from '../util.js';
 import { serializeWire } from './wire.js';
 import { normalizeUsage } from './usage.js';
 import type { BoundaryGate } from '../node/gate.js';
@@ -44,10 +45,6 @@ export type SendResult = { readonly kind: 'response'; readonly projection: Assis
 const RETRYABLE_STATUS: ReadonlySet<number> = new Set([408, 429, 500, 502, 503, 504]);
 
 type AssistantMessage = Extract<ChatMessage, { role: 'assistant' }>;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 /** A nonempty string, or `null` when the value is not one. */
 function nonEmptyString(value: unknown): string | null {

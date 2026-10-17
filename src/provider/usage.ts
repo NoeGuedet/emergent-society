@@ -1,4 +1,5 @@
 import type { CanonicalUsage } from '../context/contracts.js';
+import { isRecord } from '../util.js';
 
 /**
  * The one usage normalizer (T6, kernel.md §4).
@@ -11,10 +12,6 @@ import type { CanonicalUsage } from '../context/contracts.js';
  * to invent a total. Raw data is never mutated; a malformed counter is simply
  * `null`. These are local normalization rules, not certification of any provider.
  */
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 /** A safe nonnegative integer, or `null` when absent/malformed (never a guess). */
 function counter(value: unknown): number | null {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Buffer } from 'node:buffer';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
-import { sha256HexOf } from '../../journal/canon.js';
+import { sha256HexOf } from '../../journal/index.js';
 import { defaultAgentConfig } from '../config.js';
 import { ArtifactMismatchError, type VerifiedEvent, type VerifiedEvents } from '../loader.js';
 import { canonicalBytes, resolveArtifact } from '../artifacts.js';

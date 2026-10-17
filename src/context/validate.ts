@@ -1,4 +1,5 @@
-import { HASH_RE } from '../journal/canon.js';
+import { HASH_RE } from '../journal/index.js';
+import { isRecord } from '../util.js';
 import type { WorldRange } from '../node/world.js';
 import type {
   ChatMessage, CompactionStart, FunctionCall, RequestId, Source,
@@ -66,10 +67,8 @@ export const SNAPSHOT_DIALECT: ShapeDialect = {
   unknownRoleAt: (where) => `${where}.role`,
 };
 
-/** The non-throwing object test shared by the replay and config paths. */
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
+/** Re-exported from `src/util.ts`, the one definition shared by every parser. */
+export { isRecord };
 
 export function createValidator(fail: Fail, dialect: ShapeDialect = GATE_DIALECT) {
   function record(value: unknown, where: string): Record<string, unknown> {

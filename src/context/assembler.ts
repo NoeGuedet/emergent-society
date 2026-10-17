@@ -1,10 +1,10 @@
-import { canonicalizeJson } from '../journal/index.js';
-import { sha256HexOf } from '../journal/canon.js';
+import { canonicalizeJson, sha256HexOf } from '../journal/index.js';
 import { canonicalBytes, eventKey, resolveArtifact, resolveStored, toJson } from './artifacts.js';
 import type { VerifiedEventIndex } from './artifacts.js';
 import { RENDER_POLICY, presentWorld } from './diff.js';
 import { createBoundaryRegistry, validateRequestPlan } from './events.js';
 import { ContextFold } from './fold.js';
+import { sortUnique } from './groups.js';
 import { sourceOf } from './loader.js';
 import { serializeWire } from '../provider/wire.js';
 import { isRecord } from './validate.js';
@@ -43,20 +43,6 @@ function refuse(message: string): never {
 /** UTF-16 code-unit order, the same comparison the serializer's hash uses. */
 function byName(a: ToolSchema, b: ToolSchema): number {
   return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
-}
-
-/** Deduplicated, receipt-ordered provenance: the same discipline the fold and surface use. */
-function sortUnique(sources: readonly Source[]): Source[] {
-  const seen = new Set<string>();
-  const out: Source[] = [];
-  for (const source of sources) {
-    const key = `${source.seq}:${source.hash}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(source);
-  }
-  out.sort((a, b) => (a.seq - b.seq) || (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
-  return out;
 }
 
 function sortedTools(tools: readonly ToolSchema[]): ToolSchema[] {

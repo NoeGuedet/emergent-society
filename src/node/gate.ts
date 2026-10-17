@@ -2,7 +2,7 @@ import type { EventEnvelope, JsonValue } from '../journal/index.js';
 import {
   MAX_BLOB_BYTES, ReservedBlobRefError, canonicalizeJson, isBlobRef, readVerifiedBlob,
 } from '../journal/index.js';
-import { sha256HexOf } from '../journal/canon.js';
+import { sha256HexOf } from '../journal/index.js';
 import type {
   ArtifactChunk, ArtifactManifest, ArtifactRef, Source, Stored,
 } from '../context/contracts.js';
@@ -128,8 +128,12 @@ export interface DriverHooks {
   readonly onStop?: () => Promise<void>;
 }
 
-/** Fixed artifact ingest ceiling (algorithm 2); lower runtime limits apply before capture. */
-const MAX_CAPTURE_BYTES = 32 * 1024 * 1024;
+/**
+ * Fixed artifact ingest ceiling (algorithm 2); lower runtime limits apply before
+ * capture. Exported as the one home: the runtime's plan-refusal check must
+ * refuse at the same byte count the gate enforces.
+ */
+export const MAX_CAPTURE_BYTES = 32 * 1024 * 1024;
 /** Artifact chunks are 64 KiB of raw bytes; base64 keeps split points from corrupting UTF-8. */
 const CHUNK_BYTES = 64 * 1024;
 /** Bounded batch so a giant capture cannot pin unbounded pending journal/blob memory. */

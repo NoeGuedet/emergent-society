@@ -1,6 +1,7 @@
 import type {
   AgentConfig, ArtifactRef, AssistantProjection, FunctionCall, RequestId, SafeFailure,
 } from '../../context/contracts.js';
+import { isRecord } from '../../util.js';
 import type { BoundaryGate } from '../gate.js';
 import { sanitizePtyText } from './sanitize.js';
 import type { CommandOutcome, TerminalPort } from './terminal.js';
@@ -26,10 +27,6 @@ import type { WebOutcome, WebTools } from './web.js';
  */
 
 export type DispatchResult = { readonly waited: boolean; readonly called: number };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 type Decision =
   | { readonly kind: 'execute'; readonly cmd: string }

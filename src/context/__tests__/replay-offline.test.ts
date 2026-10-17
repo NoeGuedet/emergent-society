@@ -10,7 +10,7 @@ import { canonicalMessagesBytes, serializeWire } from '../../provider/wire.js';
 import { loadVerifiedEvents } from '../loader.js';
 import { canonicalBytes, resolveArtifact, resolveStored } from '../artifacts.js';
 import { defaultAgentConfig } from '../config.js';
-import { sha256HexOf } from '../../journal/canon.js';
+import { sha256HexOf } from '../../journal/index.js';
 import type {
   AgentConfig, ArtifactRef, AssistantProjection, CompactionStart, FunctionCall,
   RequestId, RequestPlan, Source, Stored, WorldPerception,

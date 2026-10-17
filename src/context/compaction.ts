@@ -1,4 +1,4 @@
-import { sha256HexOf } from '../journal/canon.js';
+import { sha256HexOf } from '../journal/index.js';
 import { canonicalMessagesBytes } from '../provider/wire.js';
 import { canonicalBytes, toJson } from './artifacts.js';
 import {

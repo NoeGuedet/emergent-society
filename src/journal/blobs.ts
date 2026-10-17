@@ -1,6 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { sha256HexOf, type JsonValue } from './canon.js';
+import { HASH_RE, sha256HexOf, type JsonValue } from './canon.js';
 import { CorruptionError, JournalError } from './errors.js';
 import { atomicWriteFile, ensureDurableDirectory, isErrno, syncPath } from './fsutil.js';
 
@@ -20,9 +20,6 @@ export const CLAIM_CHECK_THRESHOLD = 16 * 1024;
  * (`v: 1`).
  */
 export const MAX_BLOB_BYTES = 4 * 1024 * 1024;
-
-/** A blob name is the lowercase hex SHA-256 of its content. */
-const BLOB_HASH_RE = /^[0-9a-f]{64}$/;
 
 export class InvalidBlobHashError extends JournalError {
   constructor(hash: string) {
@@ -190,7 +187,7 @@ export function isBlobRef(data: unknown): data is BlobRef {
   const expected = 'truncated' in data ? ['blob', 'size', 'truncated'] : ['blob', 'size'];
   if (keys.length !== expected.length || !keys.every((k, i) => k === expected[i])) return false;
   const ref = data as Record<string, unknown>;
-  return typeof ref['blob'] === 'string' && BLOB_HASH_RE.test(ref['blob'])
+  return typeof ref['blob'] === 'string' && HASH_RE.test(ref['blob'])
     && typeof ref['size'] === 'number' && ref['size'] >= CLAIM_CHECK_THRESHOLD
     && (ref['truncated'] === undefined || ref['truncated'] === true);
 }
@@ -205,7 +202,7 @@ export class BlobStore {
   private pathFor(hash: string): string {
     // The hash names a path component, so it is validated before use: an
     // unchecked value like `../secret` would escape `home` on the read path.
-    if (!BLOB_HASH_RE.test(hash)) throw new InvalidBlobHashError(hash);
+    if (!HASH_RE.test(hash)) throw new InvalidBlobHashError(hash);
     return join(this.dirFor(hash), hash);
   }
 

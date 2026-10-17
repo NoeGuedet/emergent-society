@@ -4,7 +4,7 @@ import { access, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:f
 import { isAbsolute, join, relative } from 'node:path';
 import { BlobStore, ChainBreakError, JournalWriter, nodeDir } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
-import { sha256HexOf } from '../../journal/canon.js';
+import { sha256HexOf } from '../../journal/index.js';
 import { logPath, rewriteLog, useTempHome } from '../../journal/__tests__/helpers.js';
 import { createBoundaryGate } from '../../node/gate.js';
 import type { BoundaryGate, GateCallbacks, GateScope } from '../../node/gate.js';

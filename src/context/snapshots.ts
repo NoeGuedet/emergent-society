@@ -1,8 +1,8 @@
 import { readdir, realpath, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { sha256HexOf } from '../journal/canon.js';
-import { atomicWriteFile, ensureDurableDirectory, readFileOrNull, syncPath } from '../journal/fsutil.js';
-import { nodeDir } from '../journal/index.js';
+import {
+  atomicWriteFile, ensureDurableDirectory, nodeDir, readFileOrNull, sha256HexOf, syncPath,
+} from '../journal/index.js';
 import { canonicalBytes, toJson } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
 import { SNAPSHOT_DIALECT, createValidator } from './validate.js';

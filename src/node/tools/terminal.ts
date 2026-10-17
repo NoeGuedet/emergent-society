@@ -54,8 +54,7 @@ export type TerminalPort = {
   run(cmd: string, limits: CommandLimits, signal: AbortSignal): Promise<CommandOutcome>;
 };
 
-export interface TerminalRuntime {
-  run(cmd: string, limits: CommandLimits, signal: AbortSignal): Promise<CommandOutcome>;
+export interface TerminalRuntime extends TerminalPort {
   /** Kills the session and refuses later runs; safe to call twice. */
   dispose(killGraceMs: number): Promise<void>;
 }

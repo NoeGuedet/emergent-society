@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BlobStore, CLAIM_CHECK_THRESHOLD, isBlobRef, JournalWriter } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
-import { sha256HexOf } from '../../journal/canon.js';
+import { sha256HexOf } from '../../journal/index.js';
 import { canonicalMessagesBytes } from '../../provider/wire.js';
 import { useTempHome, withFailingWrite } from '../../journal/__tests__/helpers.js';
 import type { BoundaryGate, DriverHooks, GateCallbacks } from '../../node/gate.js';

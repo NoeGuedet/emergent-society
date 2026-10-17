@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { BlobStore, JournalWriter } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
-import { sha256HexOf } from '../../journal/canon.js';
+import { sha256HexOf } from '../../journal/index.js';
 import { createBoundaryGate } from '../../node/gate.js';
 import type { BoundaryGate } from '../../node/gate.js';
 import { canonicalMessagesBytes } from '../../provider/wire.js';

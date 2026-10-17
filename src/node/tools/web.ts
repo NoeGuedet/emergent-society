@@ -1,6 +1,7 @@
 import { Buffer } from 'node:buffer';
 import type { SafeFailure } from '../../context/contracts.js';
 import { readBoundedBody } from '../../net/bounded-body.js';
+import { isRecord } from '../../util.js';
 import { decodeToolText } from './text.js';
 import type { ProviderEntry, ProviderRegistry } from './providers.js';
 
@@ -117,9 +118,9 @@ export class TavilyWebTools implements WebTools {
   }
 }
 
+/** The shared predicate, narrowed to the null-on-miss shape this renderer reads. */
 function asRecord(value: unknown): Record<string, unknown> | null {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown> : null;
+  return isRecord(value) ? value : null;
 }
 
 function parseBody(body: Uint8Array): Record<string, unknown> | null {

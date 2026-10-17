@@ -3,7 +3,7 @@ import type { Stats } from 'node:fs';
 import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
-import { assertNodeUid } from '../journal/layout.js';
+import { assertNodeUid } from '../journal/index.js';
 import { utf8Prefix } from '../text.js';
 import {
   GitCommandError, UnsafeWorldPathError, WorldHeadError, WorldNotARepoError,

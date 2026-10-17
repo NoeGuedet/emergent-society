@@ -4,7 +4,7 @@ import { accessSync, constants } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { InvalidNodeUidError } from '../../journal/errors.js';
+import { InvalidNodeUidError } from '../../journal/index.js';
 import {
   GitCommandError, UnsafeWorldPathError, WorldHeadError, WorldNotARepoError,
 } from '../errors.js';

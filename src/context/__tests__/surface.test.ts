@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { EventEnvelope } from '../../journal/index.js';
-import { sha256HexOf } from '../../journal/canon.js';
+import { sha256HexOf } from '../../journal/index.js';
 import { canonicalBytes } from '../artifacts.js';
 import { canonicalMessagesBytes } from '../../provider/wire.js';
 import type {

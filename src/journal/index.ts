@@ -37,9 +37,11 @@ export {
 // Canonicalization. `canonicalizeJson` is exported because it is the exact
 // measure the writer applies before claim-checking: a caller that must stay
 // under a size bound (the node's lossless-message limit) has to measure the
-// same bytes the writer will, not the raw input.
+// same bytes the writer will, not the raw input. `HASH_RE`, `copyJsonValue` and
+// `sha256HexOf` are the canonical hash shape, the validated copy and the digest
+// every other layer must share; `HASH_RE` is the one hash-pattern home.
 export {
-  NonCanonicalizableError, canonicalizeJson, type JsonValue,
+  HASH_RE, NonCanonicalizableError, canonicalizeJson, copyJsonValue, sha256HexOf, type JsonValue,
 } from './canon.js';
 
 // Verification, framing damage and the frozen decompressed frame bound.
@@ -75,4 +77,9 @@ export { LOG_FILE, LOCK_FILE, NODE_UID_RE, assertNodeUid, journalPath, headPath,
 
 // The typed error family.
 export { InvalidNodeUidError, JournalError, isCorruption, isRetryable } from './errors.js';
-export { JournalWriteStalledError } from './fsutil.js';
+// The durable-write primitives are part of the contract for callers that keep
+// derived state beside a journal (the context snapshots): they must use the same
+// fsync/rename discipline, not their own.
+export {
+  JournalWriteStalledError, atomicWriteFile, ensureDurableDirectory, readFileOrNull, syncPath,
+} from './fsutil.js';

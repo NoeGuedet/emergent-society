@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readdir } from 'node:fs/promises';
-import { InvalidNodeUidError } from '../../journal/errors.js';
+import { InvalidNodeUidError } from '../../journal/index.js';
 import { NodeDriver } from '../driver.js';
 import { createAgentRuntime, defaultAgentConfig } from '../loop.js';
 import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';

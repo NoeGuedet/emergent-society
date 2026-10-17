@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { sha256HexOf } from '../../journal/canon.js';
+import { sha256HexOf } from '../../journal/index.js';
 import { canonicalBytes } from '../artifacts.js';
 import {
   MAX_COMPACTION_SOURCES, candidateIdentity, groupCitations, isBalancedGroup, sameSourceSet,

@@ -11,6 +11,7 @@ import { writeSnapshot } from '../context/snapshots.js';
 import { dispatchCalls } from './tools/dispatch.js';
 import type { ProviderAdapter } from '../provider/adapter.js';
 import type { AgentConfig, ProjectionState, RequestId } from '../context/contracts.js';
+import { MAX_CAPTURE_BYTES } from './gate.js';
 import type { BoundaryGate, DriverHooks, DurableWatermark } from './gate.js';
 import type { TurnContext, TurnHandler, TurnResult } from './driver.js';
 import { PtyTerminalRuntime, failedOutcome } from './tools/terminal.js';
@@ -62,9 +63,6 @@ export interface AgentRuntime {
 // `defaultAgentConfig`/`validateAgentConfig` live in `src/context/config.ts` (T1)
 // and are re-exported here for runtime consumers; they are never redefined.
 export { defaultAgentConfig, validateAgentConfig };
-
-/** The fixed artifact ingest ceiling; a plan at or above it is refused before storage. */
-const CAPTURE_CEILING = 32 * 1024 * 1024;
 
 /** Stop-time kill grace when no config was ever journaled (pre-ready stop). */
 const FALLBACK_KILL_GRACE_MS = 200;
@@ -235,8 +233,8 @@ class Runtime implements AgentRuntime {
       const id: RequestId = { turn: ctx.turn, ordinal };
       const plan = assemble({ id, state: this.fold.snapshot() });
       const bytes = canonicalBytes(plan).length;
-      if (bytes >= CAPTURE_CEILING) {
-        ctx.gate.append('request/refused', { id, bytes, limit: CAPTURE_CEILING, phase: 'plan' });
+      if (bytes >= MAX_CAPTURE_BYTES) {
+        ctx.gate.append('request/refused', { id, bytes, limit: MAX_CAPTURE_BYTES, phase: 'plan' });
         await ctx.gate.flush();
         return {
           outcome: 'error', toolCalls: accepted > 0,
