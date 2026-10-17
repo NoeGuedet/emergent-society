@@ -49,6 +49,18 @@ describe('framed zstd batches', () => {
     expect(caught).toBeInstanceOf(CorruptFrameError);
     expect((caught as CorruptFrameError).offset).toBe(first.length);
   });
+  it('detects a single flipped byte in a compressed payload via the content checksum', () => {
+    // A real frame's compressed payload ends with the 4-byte zstd content
+    // checksum. Flipping one bit there leaves the length prefix, magic and
+    // compressed content well-formed, so decompression runs but the checksum
+    // rejects the output — the detection this format relies on.
+    const frame = Buffer.from(encodeBatch(['{"checksum":true}']));
+    const last = frame.length - 1;
+    frame.writeUInt8(frame.readUInt8(last) ^ 0x01, last);
+    let caught: unknown;
+    try { scanBatches(frame); } catch (err) { caught = err; }
+    expect(caught).toBeInstanceOf(CorruptFrameError);
+  });
   it('rejects a zero-length frame instead of mistaking it for a torn tail', () => {
     const buf = Buffer.concat([Buffer.alloc(4), encodeBatch(['after'])]);
     expect(() => scanBatches(buf)).toThrow(CorruptFrameError);
@@ -75,7 +87,9 @@ describe('framed zstd batches', () => {
     // A frame that expands past the bound is refused rather than allocated.
     const bomb = Buffer.from(zstdCompressBomb());
     expect(() => decodeBatch(bomb)).toThrow();
-  });
+    // The bomb construction materializes 70 MiB; keep a generous explicit
+    // timeout rather than weakening the output-bound assertion.
+  }, 30_000);
 });
 
 function zstdCompressBomb(): Buffer {
