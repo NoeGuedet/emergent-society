@@ -17,6 +17,23 @@ const fixture = useWorld('node-world-');
 
 const delay = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
 
+/** Runs git with stdin and returns stdout — for hand-crafted objects only. */
+function gitWithInput(dir: string, args: readonly string[], input: string): Promise<string> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn('git', [...args], { cwd: dir });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolvePromise(stdout);
+      else reject(new Error(stderr));
+    });
+    child.stdin.end(input);
+  });
+}
+
 /** The index lock path of a world repo. */
 function indexLock(world: WorldRepo): string {
   return join(world.path, '.git', 'index.lock');
@@ -244,6 +261,25 @@ describe('the world repo', () => {
     // the sixteen own commits behind it.
     expect(await world.hasForeignCommit(null, 'n1')).toBe(true);
     expect(await world.hasForeignCommit(head, 'n1')).toBe(false);
+  });
+
+  it('treats a hand-crafted empty author as foreign, never as silence', async () => {
+    const { world } = fixture();
+    const first = await commitAs(world, 'n2', { 'a.txt': 'one' });
+    const tree = (await gitIn(world.path, ['rev-parse', `${first}^{tree}`])).trim();
+    // A raw commit object outside the kernel's writer: `author <>` has no name,
+    // so `%an` is the empty string. `--literally` is required because fsck would
+    // otherwise refuse to write the deliberately malformed object.
+    const raw = `tree ${tree}\nparent ${first}\nauthor <> 1700000000 +0000\n`
+      + 'committer n2 <n2@world.local> 1700000000 +0000\n\nempty author\n';
+    const crafted = (await gitWithInput(
+      world.path, ['hash-object', '--literally', '-t', 'commit', '-w', '--stdin'], raw,
+    )).trim();
+    await gitIn(world.path, ['update-ref', 'refs/heads/main', crafted]);
+    // commitsSince reports the empty author as ''; the wake predicate refuses an
+    // unprovable author, so the two agree instead of the latter missing a wake.
+    expect((await world.commitsSince(first)).map((c) => c.author)).toEqual(['']);
+    expect(await world.hasForeignCommit(first, 'n2')).toBe(true);
   });
 
   it('serializes concurrent commits so the loser waits instead of failing', async () => {

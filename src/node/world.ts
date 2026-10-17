@@ -63,11 +63,12 @@ const MAX_RECONCILE_SCAN = 4096;
 const MAX_GIT_STDERR_BYTES = 8 * 1024;
 
 /**
- * The longest author line the wake scan will hold while waiting for its
- * terminator. A uid is at most 128 characters, so a longer line cannot be this
- * node's author: it is answered as foreign rather than buffered without bound.
+ * The longest author record the wake scan will hold while waiting for its
+ * terminator. A uid is at most 128 characters, so a longer record cannot be
+ * this node's author: it is answered as foreign rather than buffered without
+ * bound.
  */
-const MAX_AUTHOR_LINE_CHARS = 4096;
+const MAX_AUTHOR_RECORD_CHARS = 4096;
 
 /**
  * The git context variables the kernel strips from every call. Each one lets an
@@ -553,16 +554,21 @@ export class WorldRepo {
 
   /**
    * Whether `spec`'s history holds an author other than `author`, from the
-   * streamed `git log --format=%an`. At most one partial line and bounded stderr
-   * are held, and the child is killed as soon as a foreign line is seen. The
-   * stream is not a bounded render of history: it is an existence test, so
-   * stopping early is the answer, not a truncation. `empty` distinguishes an
-   * empty range from one whose commits are all the node's own.
+   * streamed `git log --format=format:%an%x00`. At most one partial record and
+   * bounded stderr are held, and the child is killed as soon as a foreign record
+   * is seen. The stream is not a bounded render of history: it is an existence
+   * test, so stopping early is the answer, not a truncation. `empty`
+   * distinguishes an empty range from one whose commits are all the node's own.
+   *
+   * The record separator is NUL, not LF, so a commit with an empty author is a
+   * record of its own: an unprovable author is classified foreign (a spurious
+   * wake costs a turn; a missed commit costs a fact), exactly as `commitsSince`
+   * reports the empty author as `''` and the wake predicate refuses it.
    */
   private foreignAuthorIn(
     spec: readonly string[], author: string,
   ): Promise<'foreign' | 'empty' | 'self-only'> {
-    const args = ['log', '--format=%an', ...spec];
+    const args = ['log', '--format=format:%an%x00', ...spec];
     return new Promise<'foreign' | 'empty' | 'self-only'>((resolvePromise, reject) => {
       const child = spawn('git', args, { cwd: this.path, env: gitEnv(), windowsHide: true });
       child.stdout.setEncoding('utf8');
@@ -579,26 +585,30 @@ export class WorldRepo {
         if (failure !== null) reject(failure);
         else resolvePromise(answer);
       };
+      const foreign = (record: string): boolean => {
+        // `format:` separates records with LF; the record itself carries none.
+        const name = record.startsWith('\n') ? record.slice(1) : record;
+        // An empty author cannot be proven to be this node: foreign.
+        return name === '' || name !== author;
+      };
       child.stdout.on('data', (chunk: string) => {
         if (settled) return;
         partial += chunk;
-        let newline = partial.indexOf('\n');
-        while (newline !== -1) {
-          const line = partial.slice(0, newline);
-          partial = partial.slice(newline + 1);
-          if (line !== '') {
-            seen = true;
-            if (line !== author) {
-              child.kill();
-              settle(null, 'foreign');
-              return;
-            }
+        let end = partial.indexOf('\0');
+        while (end !== -1) {
+          const record = partial.slice(0, end);
+          partial = partial.slice(end + 1);
+          seen = true;
+          if (foreign(record)) {
+            child.kill();
+            settle(null, 'foreign');
+            return;
           }
-          newline = partial.indexOf('\n');
+          end = partial.indexOf('\0');
         }
-        // An unterminated line past the bound cannot be a uid: answer foreign
+        // An unterminated record past the bound cannot be a uid: answer foreign
         // rather than hold an unbounded identity in memory.
-        if (partial.length > MAX_AUTHOR_LINE_CHARS) {
+        if (partial.length > MAX_AUTHOR_RECORD_CHARS) {
           child.kill();
           settle(null, 'foreign');
         }
@@ -610,10 +620,11 @@ export class WorldRepo {
       child.on('error', (err) => settle(new GitCommandError(args, null, String(err)), 'empty'));
       child.on('close', (code) => {
         if (settled) return;
-        // The final line may carry no trailing newline.
+        // A trailing record without its separator is only possible from a
+        // truncated stream; classify it the same conservative way.
         if (partial !== '') {
           seen = true;
-          if (partial !== author) {
+          if (foreign(partial)) {
             settle(null, 'foreign');
             return;
           }

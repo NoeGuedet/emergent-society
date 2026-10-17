@@ -6,7 +6,7 @@ import type { DriverHooks } from '../gate.js';
 import { NodeDriver, type TurnResult, type TurnTrigger } from '../driver.js';
 import type { EventEnvelope } from '../../journal/index.js';
 import { HeadWatcher } from '../watcher.js';
-import { WorldReconciliationError } from '../errors.js';
+import { GitCommandError, WorldReconciliationError } from '../errors.js';
 import { WorldRepo, type WorldRange } from '../world.js';
 import {
   commitAs, committedContent, gitIn, readNode, useWorld, worldLog, writeWorldFile,
@@ -488,6 +488,55 @@ describe('the wake predicate', () => {
     // Bounded and secret-free: a fixed label, never the underlying message.
     expect(diagnostics[0]?.message).toBe('wake predicate failed: world read failed');
     spy.mockRestore();
+    d.stop();
+    await running;
+  });
+
+  it('names a git exit status in the wake diagnostic', async () => {
+    const { home, world } = fixture();
+    const diagnostics: Error[] = [];
+    const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
+    const d = await NodeDriver.open(home, 'n1', wait, world, {
+      worldPollMs: 0,
+      onError: (err) => { diagnostics.push(err); },
+      onMaintenance: () => {
+        spy.mockRejectedValue(new GitCommandError(['log'], 128, 'fatal: boom'));
+      },
+    });
+    const running = d.run();
+    await parked(d, world);
+    await vi.waitFor(() => expect(diagnostics).toHaveLength(1));
+    // The exit status is a bounded fact; git's stderr (which could carry a
+    // path or worse) never reaches the host.
+    expect(diagnostics[0]?.message).toBe('wake predicate failed: git exit 128');
+    spy.mockRestore();
+    d.stop();
+    await running;
+  });
+
+  it('swallows a throwing diagnostic reporter without changing the park policy', async () => {
+    const { home, world } = fixture();
+    const seen: number[] = [];
+    const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
+    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+      seen.push(ctx.turn);
+      return wait();
+    }, world, {
+      worldPollMs: 0,
+      onError: () => { throw new Error('reporter boom'); },
+      onMaintenance: () => { spy.mockRejectedValue(new Error('git dead')); },
+    });
+    const running = d.run();
+    // The report throws, the predicate still answers "no wake", and the node
+    // stays parked rather than dying on its own diagnostic.
+    await parked(d, world);
+    expect(d.state).toBe('waiting');
+    expect(seen).toEqual([0]);
+    // The delay is all it was: a later movement still wakes the node.
+    spy.mockRestore();
+    await commitAs(world, 'n2', { 'n2/a.md': 'a' });
+    await HeadWatcher.for(world).check();
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
     d.stop();
     await running;
   });
