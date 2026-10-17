@@ -8,8 +8,8 @@ import type { ProviderEntry, ProviderRegistry } from './providers.js';
  * are executed by the kernel itself against the configured provider (Tavily),
  * so every request crosses the gate and is journaled by `tool/call`/`tool/result`,
  * and the credential only ever travels in an `Authorization` header this module
- * writes. No streaming, no retry: a failure is an agent-visible classified
- * outcome. `WebOutcome` never carries request URLs, error objects, or the key —
+ * writes. No streaming to the model and no retry: a failure is an agent-visible
+ * classified outcome. `WebOutcome` never carries request URLs, error objects, or the key —
  * only a status, bounded body bytes and a `SafeFailure`. That is one half of the
  * bound: a provider response body is captured and journaled verbatim, so a
  * hostile provider could reflect the credential back into the journal —
@@ -149,12 +149,18 @@ function parseBody(body: Uint8Array): Record<string, unknown> | null {
 }
 
 function requestId(o: Record<string, unknown>): string[] {
-  return typeof o['request_id'] === 'string' ? [`request: ${o['request_id']}`] : [];
+  const id = o['request_id'];
+  return typeof id === 'string' ? [`request: ${shortField(id)}`] : [];
 }
 
-/** Short provider-controlled fields stay on one line; long content keeps its newlines. */
-function singleLine(text: string): string {
-  return text.replace(/\s*\r?\n\s*/g, ' ').trim();
+/**
+ * Provider-controlled short fields stay on one line: every line or paragraph
+ * separator (CR, LF, U+2028, U+2029) collapses to a space, so a hostile
+ * provider cannot forge the structural lines of the model-visible render.
+ * Long content (snippets, extracted text) deliberately keeps its newlines.
+ */
+function shortField(text: string): string {
+  return text.replace(/\s*[\r\n\u2028\u2029]\s*/g, ' ').trim();
 }
 
 export function renderSearch(body: Uint8Array): string | null {
@@ -167,8 +173,8 @@ export function renderSearch(body: Uint8Array): string | null {
       return null;
     }
     items.push({
-      title: singleLine(typeof item['title'] === 'string' ? item['title'] : ''),
-      url: item['url'], content: item['content'],
+      title: shortField(typeof item['title'] === 'string' ? item['title'] : ''),
+      url: shortField(item['url']), content: item['content'],
     });
   }
   // An empty result page is a valid answer: it renders 'results: 0'.
@@ -194,7 +200,8 @@ export function renderExtract(body: Uint8Array): { readonly text: string; readon
       return null;
     }
     return { failed: false, text: [
-      'provider: tavily', ...requestId(o), `url: ${item['url']}`, 'content:', item['raw_content'],
+      'provider: tavily', ...requestId(o), `url: ${shortField(item['url'])}`,
+      'content:', item['raw_content'],
     ].join('\n') };
   }
   const item = asRecord(failed[0]);
@@ -202,7 +209,7 @@ export function renderExtract(body: Uint8Array): { readonly text: string; readon
     return null;
   }
   return { failed: true, text: [
-    'provider: tavily', ...requestId(o), `url: ${item['url']}`,
-    `error: ${singleLine(item['error'])}`,
+    'provider: tavily', ...requestId(o), `url: ${shortField(item['url'])}`,
+    `error: ${shortField(item['error'])}`,
   ].join('\n') };
 }

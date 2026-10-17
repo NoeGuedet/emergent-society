@@ -50,14 +50,18 @@ describe('loadProviders', () => {
     await expect(loadProviders(home)).rejects.toThrow(/invalid providers\.json/);
   });
 
-  it('unknown providers and unknown fields are refused', async () => {
-    await write({ brave: { key: 'x' } });
-    await expect(loadProviders(home)).rejects.toThrow(/unknown provider/);
-    await write({ tavily: { key: 'x', secret: 1 } });
-    await expect(loadProviders(home)).rejects.toThrow(/unexpected field/);
+  it('unknown providers and fields are refused by position, never echoed', async () => {
+    await write({ 'tvly-provider-SECRET': { key: 'x' } });
+    const providerError = await loadProviders(home).catch((err: unknown) => err);
+    expect(String(providerError)).toMatch(/unknown provider at position 1/);
+    expect(String(providerError)).not.toContain('tvly-provider-SECRET');
+    await write({ tavily: { key: 'x', 'tvly-field-SECRET': 1 } });
+    const fieldError = await loadProviders(home).catch((err: unknown) => err);
+    expect(String(fieldError)).toMatch(/unexpected field at position 2/);
+    expect(String(fieldError)).not.toContain('tvly-field-SECRET');
   });
 
-  it('bounds are enforced', async () => {
+  it('numeric bounds and base-url shape are refused', async () => {
     for (const bad of [
       { key: 'k', timeoutMs: 0 }, { key: 'k', timeoutMs: 120001 },
       { key: 'k', maxResults: 0 }, { key: 'k', maxResults: 21 },
@@ -69,6 +73,24 @@ describe('loadProviders', () => {
     ]) {
       await write({ tavily: bad });
       await expect(loadProviders(home)).rejects.toThrow(/invalid providers\.json/);
+    }
+  });
+
+  it('an oversize store is refused before parsing', async () => {
+    await write('x'.repeat(1024 * 1024 + 1));
+    await expect(loadProviders(home)).rejects.toThrow(/too large/);
+  });
+
+  it('plain http is allowed only for a loopback host', async () => {
+    for (const baseUrl of ['http://localhost:8080', 'http://127.0.0.1:8080',
+      'http://127.8.9.10:8080', 'http://[::1]:8080']) {
+      await write({ tavily: { key: 'k', baseUrl } });
+      await expect(loadProviders(home)).resolves.toMatchObject({ tavily: { baseUrl } });
+    }
+    for (const baseUrl of ['http://api.tavily.com', 'http://127.0.0.1.evil.example',
+      'http://localhost.evil.example']) {
+      await write({ tavily: { key: 'k', baseUrl } });
+      await expect(loadProviders(home)).rejects.toThrow(/https/);
     }
   });
 

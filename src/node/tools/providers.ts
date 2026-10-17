@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { toJson } from '../../context/artifacts.js';
 
@@ -9,16 +9,20 @@ import { toJson } from '../../context/artifacts.js';
  * outside the project checkout; a missing file is an empty registry, never an
  * error, and a malformed file is refused loudly. Keeping `<home>` outside the
  * world and outside the project checkout is a host responsibility — documented,
- * not enforced by a runtime guard. Validation errors name fields and never quote
- * values, so a credential cannot leak through an exception.
+ * not enforced by a runtime guard. Validation errors name positions (never
+ * file-controlled text) and never quote values, so a credential mistakenly
+ * written as a field or provider name cannot leak through an exception.
  * Honesty bound: until Landlock containment (C1.4c) the unconfined raw shell
- * runs as the same OS user with `cwd = <home>/world`, so this file IS readable
- * by an agent (`cat ../providers.json`) — the guarantee bought here is that the
- * kernel interpolates the key into no event, artifact, world write or model
- * request, not that the key is unreadable; and a provider response body is
- * captured verbatim, so a hostile provider could still reflect the key into the
- * journal. Library-only composition (no host exists yet): load the store, build
- * the port, and pass it as the optional `webTools` field — under
+ * runs as the same OS user with `cwd = <home>/world`, so this file IS both
+ * readable (`cat ../providers.json`) and writable by an agent — an overwrite
+ * (`echo ... > ../providers.json`) can replace `baseUrl`, so the next load
+ * would send the key wherever that rewrite points. The guarantee bought here is
+ * narrower: the kernel interpolates the key into no event, artifact, world write
+ * or model request, not that the key is unreadable or this store is reserved;
+ * and a provider response body is captured verbatim, so a hostile provider could
+ * still reflect the key into the journal. Library-only composition (no host
+ * exists yet): load the store, build the port, and pass it as the optional
+ * `webTools` field — under
  * `exactOptionalPropertyTypes` that property is spread conditionally, never
  * assigned `undefined`:
  * `const webTools = webToolsFromProviders(await loadProviders(home));`
@@ -42,6 +46,22 @@ const TIMEOUT_CEILING_MS = 120000;
 const MAX_RESULTS_CEILING = 20;
 const MAX_RESPONSE_BYTES_CEILING = 8 * 1024 * 1024;
 const ENTRY_FIELDS = ['key', 'baseUrl', 'timeoutMs', 'maxResults', 'maxResponseBytes'];
+/** The provider store's ceiling: an oversize file is refused before parsing. */
+const MAX_PROVIDERS_BYTES = 1024 * 1024;
+
+/**
+ * A loopback host may use plain `http:`; everything else must be `https:`, so a
+ * base-url typo cannot send the Bearer key across the network in cleartext.
+ * `URL.hostname` keeps IPv6 brackets, so `[::1]` is unwrapped first.
+ */
+function isLoopback(hostname: string): boolean {
+  const host = hostname.startsWith('[') && hostname.endsWith(']')
+    ? hostname.slice(1, -1) : hostname;
+  if (host === 'localhost' || host === '::1') return true;
+  const octets = host.split('.');
+  return octets.length === 4 && octets[0] === '127'
+    && octets.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
 
 function fail(message: string): never {
   throw new Error(`invalid ${PROVIDERS_BASENAME}: ${message}`);
@@ -62,8 +82,8 @@ function entry(value: unknown, where: string): ProviderEntry {
     fail(`${where}: expected an object`);
   }
   const o = value as Record<string, unknown>;
-  for (const key of Object.keys(o)) {
-    if (!ENTRY_FIELDS.includes(key)) fail(`${where}: unexpected field ${JSON.stringify(key)}`);
+  for (const [index, key] of Object.keys(o).entries()) {
+    if (!ENTRY_FIELDS.includes(key)) fail(`${where}: unexpected field at position ${index + 1}`);
   }
   if (typeof o['key'] !== 'string' || o['key'].length === 0) {
     fail(`${where}.key: expected a nonempty string`);
@@ -74,8 +94,9 @@ function entry(value: unknown, where: string): ProviderEntry {
     baseUrl = o['baseUrl'].replace(/\/+$/, '');
     let parsed: URL;
     try { parsed = new URL(baseUrl); } catch { fail(`${where}.baseUrl: not a URL`); }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      fail(`${where}.baseUrl: must be http or https`);
+    if (parsed.protocol !== 'https:'
+      && !(parsed.protocol === 'http:' && isLoopback(parsed.hostname))) {
+      fail(`${where}.baseUrl: must be https unless it is a loopback host`);
     }
     if (parsed.username !== '' || parsed.password !== '') {
       fail(`${where}.baseUrl: must not embed credentials`);
@@ -110,23 +131,30 @@ function freezeRegistry(value: unknown): ProviderRegistry {
 }
 
 export async function loadProviders(home: string): Promise<ProviderRegistry> {
-  let text: string;
+  const path = join(home, PROVIDERS_BASENAME);
+  let bytes: Buffer;
   try {
-    text = await readFile(join(home, PROVIDERS_BASENAME), 'utf8');
+    // Refuse an oversize store before reading it, then re-check the bytes that
+    // actually arrived (the file can change between the two calls). Either way
+    // an oversize store never reaches JSON.parse.
+    if ((await stat(path)).size > MAX_PROVIDERS_BYTES) fail('too large');
+    bytes = await readFile(path);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       return freezeRegistry({});
     }
     throw err;
   }
+  if (bytes.length > MAX_PROVIDERS_BYTES) fail('too large');
+  const text = bytes.toString('utf8');
   let value: unknown;
   try { value = JSON.parse(text); } catch { fail('not valid JSON'); }
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     fail('expected an object');
   }
   const root = value as Record<string, unknown>;
-  for (const name of Object.keys(root)) {
-    if (name !== 'tavily') fail(`unknown provider ${JSON.stringify(name)}`);
+  for (const [index, name] of Object.keys(root).entries()) {
+    if (name !== 'tavily') fail(`unknown provider at position ${index + 1}`);
   }
   const registry: { tavily?: ProviderEntry } = {};
   if ('tavily' in root) registry.tavily = entry(root['tavily'], 'tavily');
