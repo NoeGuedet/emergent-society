@@ -63,6 +63,13 @@ const MAX_RECONCILE_SCAN = 4096;
 const MAX_GIT_STDERR_BYTES = 8 * 1024;
 
 /**
+ * The longest author line the wake scan will hold while waiting for its
+ * terminator. A uid is at most 128 characters, so a longer line cannot be this
+ * node's author: it is answered as foreign rather than buffered without bound.
+ */
+const MAX_AUTHOR_LINE_CHARS = 4096;
+
+/**
  * The git context variables the kernel strips from every call. Each one lets an
  * inherited environment point git at a different repository, index, object store
  * or namespace — the difference between committing the world and committing
@@ -478,6 +485,12 @@ export class WorldRepo {
    *
    * A range is also the wake unit: several commits landing before a node looks
    * again are one list, hence one wake (§5.2).
+   *
+   * HEAD can move *backward* behind the watermark: a peer force-resets the
+   * branch to an ancestor. Then HEAD !== `from` while `from..HEAD` is empty, and
+   * an empty range is not "no movement" — the node cannot prove it has seen this
+   * history either, so it is given all of it. The ancestor test runs only for an
+   * empty range; a non-empty one is ordinary forward movement.
    */
   async commitsSince(from: string | null): Promise<WorldCommitInfo[]> {
     const head = await this.headHash();
@@ -485,7 +498,11 @@ export class WorldRepo {
     if (head === null || head === from) return [];
     try {
       const out = await git(this.path, ['log', LOG_FORMAT, from === null ? 'HEAD' : `${from}..HEAD`]);
-      return out.split('\n').filter((line) => line !== '').map(parseCommit).reverse();
+      const commits = out.split('\n').filter((line) => line !== '').map(parseCommit).reverse();
+      if (commits.length === 0 && from !== null && (await this.isAncestor(head, from))) {
+        return this.commitsSince(null);
+      }
+      return commits;
     } catch (err) {
       // The watermark is not a reachable object any more (a rewritten history,
       // a gc). The node cannot prove it has seen the current history, so it is
@@ -494,6 +511,117 @@ export class WorldRepo {
       if (from !== null && err instanceof GitCommandError) return this.commitsSince(null);
       throw err;
     }
+  }
+
+  /**
+   * Whether HEAD carries a commit `from` does not that someone other than
+   * `author` wrote — the wake predicate's whole question (kernel.md §5.2),
+   * answered without materializing the range.
+   *
+   * The author stream is read line by line and the child is stopped at the first
+   * foreign author, so memory is bounded by one line however long the history
+   * is: a fresh node joining a large world, or an unreachable watermark, cannot
+   * overflow the exec bound and park forever on a swallowed failure.
+   *
+   * Watermark physics mirrors `commitsSince`: an unmoved HEAD is no movement; a
+   * watermark git can no longer resolve is unprovable, so the whole history is
+   * scanned; a non-zero exit after the first read retries the whole history; and
+   * an empty range under a moved HEAD is checked for a backward reset (HEAD an
+   * ancestor of the watermark), which is likewise scanned in full.
+   *
+   * @throws GitCommandError when git fails and there is no watermark to blame.
+   */
+  async hasForeignCommit(from: string | null, author: string): Promise<boolean> {
+    const head = await this.headHash();
+    if (head === null || head === from) return false;
+    try {
+      const scan = await this.foreignAuthorIn(
+        from === null ? ['HEAD'] : [`${from}..HEAD`], author);
+      if (scan === 'foreign') return true;
+      // An empty `head !== from` range cannot be forward movement: HEAD may have
+      // moved backward behind the watermark (a peer's force-reset). The node
+      // cannot prove what it has seen, so the whole history answers instead.
+      if (from !== null && scan === 'empty' && (await this.isAncestor(head, from))) {
+        return (await this.foreignAuthorIn(['HEAD'], author)) === 'foreign';
+      }
+      return false;
+    } catch (err) {
+      if (from !== null && err instanceof GitCommandError) return this.hasForeignCommit(null, author);
+      throw err;
+    }
+  }
+
+  /**
+   * Whether `spec`'s history holds an author other than `author`, from the
+   * streamed `git log --format=%an`. At most one partial line and bounded stderr
+   * are held, and the child is killed as soon as a foreign line is seen. The
+   * stream is not a bounded render of history: it is an existence test, so
+   * stopping early is the answer, not a truncation. `empty` distinguishes an
+   * empty range from one whose commits are all the node's own.
+   */
+  private foreignAuthorIn(
+    spec: readonly string[], author: string,
+  ): Promise<'foreign' | 'empty' | 'self-only'> {
+    const args = ['log', '--format=%an', ...spec];
+    return new Promise<'foreign' | 'empty' | 'self-only'>((resolvePromise, reject) => {
+      const child = spawn('git', args, { cwd: this.path, env: gitEnv(), windowsHide: true });
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      let partial = '';
+      let stderr = '';
+      let seen = false;
+      let settled = false;
+      const settle = (
+        failure: GitCommandError | null, answer: 'foreign' | 'empty' | 'self-only',
+      ): void => {
+        if (settled) return;
+        settled = true;
+        if (failure !== null) reject(failure);
+        else resolvePromise(answer);
+      };
+      child.stdout.on('data', (chunk: string) => {
+        if (settled) return;
+        partial += chunk;
+        let newline = partial.indexOf('\n');
+        while (newline !== -1) {
+          const line = partial.slice(0, newline);
+          partial = partial.slice(newline + 1);
+          if (line !== '') {
+            seen = true;
+            if (line !== author) {
+              child.kill();
+              settle(null, 'foreign');
+              return;
+            }
+          }
+          newline = partial.indexOf('\n');
+        }
+        // An unterminated line past the bound cannot be a uid: answer foreign
+        // rather than hold an unbounded identity in memory.
+        if (partial.length > MAX_AUTHOR_LINE_CHARS) {
+          child.kill();
+          settle(null, 'foreign');
+        }
+      });
+      child.stderr.on('data', (chunk: string) => {
+        const room = MAX_GIT_STDERR_BYTES - stderr.length;
+        if (room > 0) stderr += chunk.slice(0, room);
+      });
+      child.on('error', (err) => settle(new GitCommandError(args, null, String(err)), 'empty'));
+      child.on('close', (code) => {
+        if (settled) return;
+        // The final line may carry no trailing newline.
+        if (partial !== '') {
+          seen = true;
+          if (partial !== author) {
+            settle(null, 'foreign');
+            return;
+          }
+        }
+        if (code === 0) settle(null, seen ? 'self-only' : 'empty');
+        else settle(new GitCommandError(args, code, stderr), 'empty');
+      });
+    });
   }
 
   /** The visible git directory of the world (a normal non-worktree repository). */

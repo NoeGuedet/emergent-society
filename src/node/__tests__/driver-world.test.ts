@@ -9,7 +9,7 @@ import { HeadWatcher } from '../watcher.js';
 import { WorldReconciliationError } from '../errors.js';
 import { WorldRepo, type WorldRange } from '../world.js';
 import {
-  commitAs, committedContent, readNode, useWorld, worldLog, writeWorldFile,
+  commitAs, committedContent, gitIn, readNode, useWorld, worldLog, writeWorldFile,
 } from './helpers.js';
 
 const fixture = useWorld('node-world-physics-');
@@ -333,14 +333,14 @@ describe('the wake predicate', () => {
     // its git call, so it will still be in flight — and still answering about
     // the world as it was — when the wake it belongs to has been consumed by
     // the evaluation that follows it.
-    const real = WorldRepo.prototype.commitsSince;
+    const real = WorldRepo.prototype.hasForeignCommit;
     let stall = true;
-    vi.spyOn(WorldRepo.prototype, 'commitsSince').mockImplementation(
-      async function (this: WorldRepo, from: string | null) {
+    vi.spyOn(WorldRepo.prototype, 'hasForeignCommit').mockImplementation(
+      async function (this: WorldRepo, from: string | null, author: string) {
         const stalled = stall;
         stall = false;
         if (stalled) await quiet(150);
-        return real.call(this, from);
+        return real.call(this, from, author);
       },
     );
 
@@ -369,7 +369,7 @@ describe('the wake predicate', () => {
   it('parks instead of dying when the check a park opens with fails', async () => {
     const { home, world } = fixture();
     const seen: number[] = [];
-    const spy = vi.spyOn(WorldRepo.prototype, 'commitsSince');
+    const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
     const d = await NodeDriver.open(home, 'n1', (ctx) => { seen.push(ctx.turn); return wait(); }, world, {
       worldPollMs: 0,
       // Runs after the turn closed and before the park: the read that fails is
@@ -398,7 +398,7 @@ describe('the wake predicate', () => {
     const running = d.run();
     await parked(d, world);
 
-    const spy = vi.spyOn(WorldRepo.prototype, 'commitsSince')
+    const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit')
       .mockRejectedValue(new Error('git dead'));
     await commitAs(world, 'n2', { 'n2/a.md': 'a' });
     await HeadWatcher.for(world).check(); // the listener's read fails
@@ -427,6 +427,67 @@ describe('the wake predicate', () => {
     // The first turn of a node with no journal is a wakeup when the world
     // already holds commits it has never been shown.
     expect(seen[0]).toEqual({ trigger: 'wakeup', world: { from: null, to: head } });
+    d.stop();
+    await running;
+  });
+
+  it('wakes when a peer resets HEAD backward behind the watermark', async () => {
+    const { home, world } = fixture();
+    const root = await commitAs(world, 'n2', { 'n2/root.md': 'root' });
+    await commitAs(world, 'n2', { 'n2/tip.md': 'tip' });
+    const triggers: TurnTrigger[] = [];
+    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+      triggers.push(ctx.trigger);
+      return wait();
+    }, world, { worldPollMs: 0 });
+    const running = d.run();
+    await parked(d, world);
+    // The first turn perceived both peer commits, so the watermark is the tip.
+    // A force-reset to the root leaves HEAD !== watermark and an empty
+    // `watermark..HEAD` range: the shape that must not read as "no movement".
+    expect(triggers).toEqual(['wakeup']);
+    await gitIn(world.path, ['reset', '--hard', root]);
+    await HeadWatcher.for(world).check();
+    await vi.waitFor(() => expect(triggers).toHaveLength(2));
+    expect(triggers[1]).toBe('wakeup');
+    d.stop();
+    await running;
+  });
+
+  it('asks the bounded author question, not the whole range, to decide a wake', async () => {
+    const { home, world } = fixture();
+    await commitAs(world, 'n2', { 'n2/earlier.md': 'earlier' });
+    const range = vi.spyOn(WorldRepo.prototype, 'commitsSince');
+    const bounded = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const running = d.run();
+    await vi.waitFor(() => expect(d.state).toBe('waiting'));
+    // The predicate holds its answer to existence: it streams authors and stops
+    // at the first foreign one, never materializing the range.
+    expect(bounded).toHaveBeenCalled();
+    expect(range).not.toHaveBeenCalled();
+    d.stop();
+    await running;
+  });
+
+  it('reports a failing wake predicate instead of parking silently', async () => {
+    const { home, world } = fixture();
+    const diagnostics: Error[] = [];
+    const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
+    const d = await NodeDriver.open(home, 'n1', wait, world, {
+      worldPollMs: 0,
+      onError: (err) => { diagnostics.push(err); },
+      // Runs after the turn closed and before the park: the read that fails is
+      // the park's own pre-check.
+      onMaintenance: () => { spy.mockRejectedValue(new Error('git dead')); },
+    });
+    const running = d.run();
+    await parked(d, world);
+    expect(d.state).toBe('waiting');
+    await vi.waitFor(() => expect(diagnostics).toHaveLength(1));
+    // Bounded and secret-free: a fixed label, never the underlying message.
+    expect(diagnostics[0]?.message).toBe('wake predicate failed: world read failed');
+    spy.mockRestore();
     d.stop();
     await running;
   });

@@ -4,7 +4,7 @@ import {
   type EventDataFor, type EventEnvelope, type JsonValue, type JournalWriterOptions,
 } from '../journal/index.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
-import { NodeStateError, WorldReconciliationError } from './errors.js';
+import { NodeStateError, WorldReconciliationError, GitCommandError } from './errors.js';
 import { WakeLatch } from './latch.js';
 import {
   createBoundaryGate,
@@ -663,13 +663,28 @@ export class NodeDriver {
   /**
    * Whether a wake is due, with the wake path's failure policy applied (see
    * `armIfAwake`). The predicate itself is `wakeNeeded`.
+   *
+   * A failure is reported to the host's existing diagnostic channel before it is
+   * read as "no wake": silence there would make a world the predicate can never
+   * read look exactly like a quiet one. The report is bounded and secret-free —
+   * a fixed label (plus a git exit status), never an arbitrary message that may
+   * carry a payload — and a throwing reporter cannot change the policy's answer.
    */
   private async wakeDue(): Promise<boolean> {
     try {
       return await this.wakeNeeded();
-    } catch {
+    } catch (err) {
+      try { this.opts.onError?.(this.wakeDiagnostic(err)); } catch { /* the diagnostic is not the failure */ }
       return false;
     }
+  }
+
+  /** The bounded label for a failed wake read: a kind and, for git, its exit status. */
+  private wakeDiagnostic(err: unknown): Error {
+    if (err instanceof GitCommandError) {
+      return new Error(`wake predicate failed: git exit ${err.exitCode ?? 'none'}`);
+    }
+    return new Error('wake predicate failed: world read failed');
   }
 
   /**
@@ -677,10 +692,13 @@ export class NodeDriver {
    * commit this node did not author. A static world is silent, a node's own
    * commits never wake it, and several foreign commits landing before the node
    * looks again are one list, hence one wake.
+   *
+   * The question is asked of the bounded author stream, never of the whole
+   * range: the node stops at the first foreign author, so a fresh node joining a
+   * large world cannot buffer a `git log` past its exec bound.
    */
   private async wakeNeeded(): Promise<boolean> {
-    const commits = await this.world.commitsSince(this.watermark);
-    return commits.some((commit) => commit.author !== this.uid);
+    return this.world.hasForeignCommit(this.watermark, this.uid);
   }
 
   /** The range a turn opening now would present: the watermark to HEAD. */

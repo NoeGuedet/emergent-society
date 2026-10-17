@@ -205,6 +205,47 @@ describe('the world repo', () => {
     expect((await world.commitsSince('a'.repeat(40))).map((c) => c.author)).toEqual(['n1']);
   });
 
+  it('serves the whole history when HEAD moved backward behind the watermark', async () => {
+    const { world } = fixture();
+    await writeWorldFile(world, 'a.txt', 'one');
+    const first = await world.commitAll('n1', 'turn 0');
+    const second = await commitAs(world, 'n2', { 'b.txt': 'two' });
+    // A peer's force-reset to an ancestor leaves HEAD !== watermark but an empty
+    // `watermark..HEAD` range. That is not "no movement": the node cannot prove
+    // it has seen this history, so it is given the whole of it.
+    await gitIn(world.path, ['reset', '--hard', first?.hash ?? '']);
+    expect((await world.commitsSince(second)).map((c) => c.hash)).toEqual([first?.hash]);
+  });
+
+  it('answers the wake predicate from authors without materializing the range', async () => {
+    const { world } = fixture();
+    await writeWorldFile(world, 'a.txt', 'one');
+    const first = await world.commitAll('n1', 'turn 0');
+    const second = await commitAs(world, 'n2', { 'b.txt': 'two' });
+    expect(await world.hasForeignCommit(null, 'n1')).toBe(true);
+    expect(await world.hasForeignCommit(first?.hash ?? null, 'n1')).toBe(true);
+    expect(await world.hasForeignCommit(first?.hash ?? null, 'n2')).toBe(false);
+    expect(await world.hasForeignCommit(second, 'n1')).toBe(false);
+    expect(await world.hasForeignCommit(second, 'n2')).toBe(false);
+    // An unreachable watermark is unprovable, so the whole history answers.
+    expect(await world.hasForeignCommit('a'.repeat(40), 'n1')).toBe(true);
+  });
+
+  it('stops the author scan at the first foreign commit in a long history', async () => {
+    const { world } = fixture();
+    for (let i = 0; i < 16; i += 1) {
+      await writeWorldFile(world, `own/${i}.md`, String(i));
+      await world.commitAll('n1', `turn ${i}`);
+    }
+    // A history of this node's own commits alone is silent.
+    expect(await world.hasForeignCommit(null, 'n1')).toBe(false);
+    const head = await commitAs(world, 'n2', { 'n2/last.md': 'last' });
+    // The newest commit is foreign, so the streamed scan answers without walking
+    // the sixteen own commits behind it.
+    expect(await world.hasForeignCommit(null, 'n1')).toBe(true);
+    expect(await world.hasForeignCommit(head, 'n1')).toBe(false);
+  });
+
   it('serializes concurrent commits so the loser waits instead of failing', async () => {
     const { world } = fixture();
     // Two writers on one working tree, which is what two drivers sharing the

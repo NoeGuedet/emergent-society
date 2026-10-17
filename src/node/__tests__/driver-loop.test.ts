@@ -155,10 +155,10 @@ describe('NodeDriver run loop', () => {
 
   it('honors a stop that lands during the turn-opening HEAD read', async () => {
     const { home, world } = fixture();
-    // `wakeDue()` enters `commitsSince()`, which reads HEAD first; stalling that
-    // call would let the loop's own `!stopRequested` guard end the run before
-    // the window under test. Stall the second HEAD read instead: the loop is
-    // past its guard, inside `worldRange()`, with no active controller — the
+    // `wakeDue()` enters `hasForeignCommit()`, which reads HEAD first; stalling
+    // that call would let the loop's own `!stopRequested` guard end the run
+    // before the window under test. Stall the second HEAD read instead: the loop
+    // is past its guard, inside `worldRange()`, with no active controller — the
     // exact window in which stop() had nothing to abort.
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
