@@ -12,13 +12,13 @@
  */
 export function sanitizePtyText(text: string): string {
   return text
-    // OSC: ESC ] ... terminated by BEL or ST (ESC \).
-    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    // OSC: ESC ] ... terminated by BEL or ST (ESC \ or the 8-bit C1 ST 0x9C).
+    .replace(/\x1b\][^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)/g, '')
     // DCS (ESC P), APC (ESC _) and PM (ESC ^): string sequences whose payload
-    // runs to ST (ESC \), defensively to BEL, or to the capture's end. Their
-    // introducers are in the generic short-escape range, so the payload must
-    // be consumed here or it would survive after the introducer is removed.
-    .replace(/\x1b[P^_][\s\S]*?(?:\x1b\\|\x07|$)/g, '')
+    // runs to ST (ESC \ or 0x9C), defensively to BEL, or to the capture's end.
+    // Their introducers are in the generic short-escape range, so the payload
+    // must be consumed here or it would survive after the introducer is removed.
+    .replace(/\x1b[P^_][\s\S]*?(?:\x1b\\|\x07|\x9c|$)/g, '')
     // CSI: ESC [ params intermediates final.
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
     // Charset/designate: ESC ( X, ESC ) X, ESC # X. (Other short escapes: the generic rule below.)

@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,6 +39,21 @@ function limits(over: Partial<CommandLimits> = {}): CommandLimits {
 
 function text(outcome: CommandOutcome): string {
   return Buffer.from(outcome.output).toString('utf8');
+}
+
+/** Existence probe, the same one the runtime uses: a reaped pid answers ESRCH. */
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/** Poll-with-deadline (the house pattern) rather than a fixed settle. */
+async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => { setTimeout(resolve, 25); });
+  }
+  expect(predicate()).toBe(true);
 }
 
 describe('PtyTerminalRuntime', () => {
@@ -93,22 +109,26 @@ describe('PtyTerminalRuntime', () => {
   it('completes the idle-death path: a shell killed at rest respawns silently', async () => {
     const rt = terminal();
     const signal = new AbortController().signal;
-    // The background subshell kills the shell ~200 ms later and then proves it
-    // happened by touching the marker. `$$` (not `$PPID`) is the invoking
-    // shell's pid inside a subshell; `$PPID` would signal the kernel process.
+    // The background subshell records the shell pid, kills it ~200 ms later.
+    // `$$` (not `$PPID`) is the invoking shell's pid inside a subshell;
+    // `$PPID` would signal the kernel process.
     const first = await rt.run(
-      '(sleep 0.2; kill -9 $$; : > killed.marker) & echo scheduled', limits(), signal);
+      '(echo $$ > killed.pid; sleep 0.2; kill -9 $$) & echo scheduled', limits(), signal);
     expect(first).toMatchObject({ status: 'completed', exitCode: 0 });
-    const marker = join(dir, 'killed.marker');
-    const deadline = Date.now() + 5000;
-    for (;;) {
-      try { await readFile(marker); break; } catch { /* not yet */ }
-      expect(Date.now()).toBeLessThan(deadline);
-      await new Promise((resolve) => { setTimeout(resolve, 50); });
-    }
-    // Let node-pty deliver the exit event: this test exercises the idle-death
-    // respawn, not the pre-write liveness fallback.
-    await new Promise((resolve) => { setTimeout(resolve, 500); });
+    const pidFile = join(dir, 'killed.pid');
+    let pid = 0;
+    await waitFor(() => {
+      try {
+        pid = Number(readFileSync(pidFile, 'utf8'));
+        return Number.isSafeInteger(pid) && pid > 0;
+      } catch {
+        return false;
+      }
+    });
+    // Poll until the shell is reaped. From then on either its exit event has
+    // landed (idle-death branch) or the pre-write probe sees the death — both
+    // now take the same silent-respawn path, so no fixed settle is needed.
+    await waitFor(() => !alive(pid));
     const outcome = await rt.run('echo alive', limits(), signal);
     expect(outcome).toMatchObject({
       status: 'completed', exitCode: 0, reset: false, fresh: null,
@@ -171,6 +191,24 @@ describe('PtyTerminalRuntime', () => {
     expect(outcome).toMatchObject({
       status: 'cancelled', reset: true, fresh: 'stdin-wedge',
     });
+  }, 15000);
+
+  it('a redirected-stdin read completes without wedging or resetting the session', async () => {
+    const rt = terminal();
+    const signal = new AbortController().signal;
+    // The proof must not mistake this builtin's pipe fd 0 for the tty: the
+    // command runs to completion, and the session survives for the next call.
+    const redirected = await rt.run(
+      'read x < <(sleep 1; echo hi); echo "got:$x"', limits(), signal);
+    expect(redirected).toMatchObject({
+      status: 'completed', exitCode: 0, reset: false, fresh: null,
+    });
+    expect(text(redirected)).toContain('got:hi');
+    const followUp = await rt.run('echo same-session', limits(), signal);
+    expect(followUp).toMatchObject({
+      status: 'completed', exitCode: 0, reset: false, fresh: null,
+    });
+    expect(text(followUp)).toContain('same-session');
   }, 15000);
 
   it('a timeout returns the partial output and resets the session', async () => {

@@ -55,6 +55,12 @@ describe('sanitizePtyText', () => {
     expect(sanitizePtyText(`abc${ESC}^payload`)).toBe('abc');
   });
 
+  it('treats the 8-bit C1 ST (0x9C) as a terminator', () => {
+    expect(sanitizePtyText(`${ESC}Ppayload\x9cvisible`)).toBe('visible');
+    expect(sanitizePtyText(`${ESC}_payload\x9cvisible`)).toBe('visible');
+    expect(sanitizePtyText(`${ESC}]0;title\x9cvisible`)).toBe('visible');
+  });
+
   it('strips raw C1 control bytes', () => {
     expect(sanitizePtyText('a\x85b\x9bc')).toBe('abc');
     expect(sanitizePtyText('x\x90y\x9dz\x9f')).toBe('xyz');

@@ -79,6 +79,13 @@ const POLL_MS = 25;
  */
 const EXIT_REPORT_GRACE_MS = 250;
 /**
+ * How long the first pre-write freeze polls for the shell's pts fd 0. The
+ * child's login_tty normally completes in a few milliseconds; this bound only
+ * decides when the stdin proof is abandoned for the session (a missed proof
+ * costs a timeout), never when the command is allowed to start.
+ */
+const TTY_FREEZE_DEADLINE_MS = 1000;
+/**
  * No stdin probe is consulted before this much time has passed since the
  * command's start marker was SEEN, not since the write: a slow shell startup
  * must not eat the probe's grace window.
@@ -357,6 +364,24 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     return session.exited;
   }
 
+  /**
+   * Freezes the session's pts target before its first write. `pty.spawn`
+   * returns before the child's login_tty, so an immediate read can still see
+   * the inherited socket fd 0: poll until the slave pts appears. The value is
+   * kept for the session once frozen. On deadline expiry the target stays null
+   * and the stdin proof is disabled for that session — a missed proof costs a
+   * timeout, never a false positive.
+   */
+  private async freezeTtyTarget(session: Session): Promise<void> {
+    if (session.ttyTarget !== null) return;
+    const deadline = Date.now() + TTY_FREEZE_DEADLINE_MS;
+    for (;;) {
+      session.ttyTarget = sessionTtyTarget(session.pid);
+      if (session.ttyTarget !== null || Date.now() >= deadline) return;
+      await pause(POLL_MS);
+    }
+  }
+
   private async runExclusive(
     cmd: string, limits: CommandLimits, signal: AbortSignal,
   ): Promise<CommandOutcome> {
@@ -379,10 +404,11 @@ export class PtyTerminalRuntime implements TerminalRuntime {
       return failedOutcome('cancelled', fresh, wedgeReset);
     }
     let session = this.session;
-    if (session !== null && session.exited !== null) {
-      // The shell died while IDLE (a stray SIGHUP, a background job's signal):
-      // an idle spawn has no state to lose, so respawn silently rather than
-      // write into a dead pty and settle a stale session_exit.
+    if (session !== null && (session.exited !== null || !alive(session.pid))) {
+      // The shell died while IDLE (a stray SIGHUP, a background job's signal),
+      // including a death whose exit event has not landed yet: an idle spawn
+      // has no state to lose, so respawn silently rather than write into a
+      // dead pty and settle a stale session_exit.
       this.session = null;
       session = null;
     }
@@ -393,11 +419,20 @@ export class PtyTerminalRuntime implements TerminalRuntime {
         return failedOutcome('spawn-failed', fresh);
       }
     }
-    // Freeze the session's tty target while the shell is idle — before this
-    // command's own redirections can touch fd 0. A spawn-time read can lose a
-    // race with node-pty's setup; retrying here keeps the proof available
-    // without ever freezing a non-pts fd 0.
-    if (session.ttyTarget === null) session.ttyTarget = sessionTtyTarget(session.pid);
+    await this.freezeTtyTarget(session);
+    // A freshly forked shell can still die before this command is written;
+    // that is still an idle death (nothing was written), so respawn once and
+    // proceed silently.
+    if (!alive(session.pid)) {
+      this.session = null;
+      try {
+        session = this.spawnFresh();
+      } catch {
+        return failedOutcome('spawn-failed', fresh);
+      }
+      await this.freezeTtyTarget(session);
+    }
+    if (signal.aborted) return failedOutcome('cancelled', fresh, wedgeReset);
 
     const nonce = randomUUID();
     const start = `__ES_EXECUTE_START_${nonce}__`;
@@ -427,13 +462,6 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     };
 
     try {
-      // node-pty's write never throws on a dead pty: it console.errors and
-      // clears its queue, so without this probe a shell that died in the
-      // check-to-write window would stay silent until the command timeout.
-      if (!alive(session.pid)) {
-        const exit = await this.exitedOrUnknown(session);
-        return settle('session_exit', exit.code, exit.signal, true);
-      }
       session.proc.write(
         `printf '%s\\n' ${quoteForBash(start)}; eval -- ${quoteForBash(cmd)}; `
         + `__es_status=$?; printf '%s%s\\n' ${quoteForBash(end)} "$__es_status"\n`,
