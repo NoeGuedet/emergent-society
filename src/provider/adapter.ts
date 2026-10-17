@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { toJson } from '../context/artifacts.js';
+import { truncationNotice, utf8Prefix } from '../text.js';
 import { serializeWire } from './wire.js';
 import { normalizeUsage } from './usage.js';
 import type { BoundaryGate } from '../node/gate.js';
@@ -147,24 +148,11 @@ function project(body: Uint8Array, plan: RequestPlan): Projected {
 }
 
 /**
- * A prefix of `text` at most `maxBytes` UTF-8 bytes long, cut only at a code-point
- * boundary. Continuation bytes (`10xxxxxx`) back the cut up over the character they
- * belong to, so a multibyte character is never split and no U+FFFD is introduced.
- */
-function truncateUtf8(text: string, maxBytes: number): string {
-  const bytes = Buffer.from(text, 'utf8');
-  if (bytes.length <= maxBytes) return text;
-  let end = maxBytes;
-  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
-  return bytes.subarray(0, end).toString('utf8');
-}
-
-/**
  * Bounds the model-visible assistant content to `policy.maxAssistantBytes` UTF-8
- * bytes (artifact algorithm 7). The raw record is never altered; only the
- * projection changes. The notice names the captured raw response artifact's
- * digest and byte count — the retained prefix's own facts when capture was
- * incomplete, never the complete original's.
+ * bytes (artifact algorithm 7) with the neutral code-point-safe cut. The raw
+ * record is never altered; only the projection changes. The notice reports the
+ * model-text cap separately from the raw response artifact's captured byte count
+ * and completeness, never conflating the two.
  */
 function boundAssistant(
   message: AssistantMessage, maxBytes: number, raw: ArtifactRef,
@@ -172,11 +160,11 @@ function boundAssistant(
   const content = message.content;
   if (content === null) return { message, contentTruncated: false };
   if (Buffer.byteLength(content, 'utf8') <= maxBytes) return { message, contentTruncated: false };
-  const retained = truncateUtf8(content, maxBytes);
-  const retainedBytes = Buffer.byteLength(retained, 'utf8');
-  const notice = `\n[content truncated: showing ${retainedBytes} of ${raw.bytes} bytes; `
-    + `raw sha256 ${raw.sha256}]`;
-  return { message: { ...message, content: retained + notice }, contentTruncated: true };
+  const retained = utf8Prefix(content, maxBytes).text;
+  return {
+    message: { ...message, content: retained + truncationNotice('content', maxBytes, raw) },
+    contentTruncated: true,
+  };
 }
 
 export class ProviderAdapter {

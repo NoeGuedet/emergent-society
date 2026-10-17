@@ -4,6 +4,7 @@ import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { assertNodeUid } from '../journal/layout.js';
+import { utf8Prefix } from '../text.js';
 import {
   GitCommandError, UnsafeWorldPathError, WorldHeadError, WorldNotARepoError,
   WorldReconciliationError,
@@ -167,23 +168,6 @@ interface BoundedText {
   readonly text: string;
   readonly truncated: boolean;
   readonly bytesRetained: number;
-}
-
-/**
- * The longest prefix of `s` whose UTF-8 encoding is at most `maxBytes`, cut on a
- * code-point boundary so truncation never splits a character.
- */
-function utf8Prefix(s: string, maxBytes: number): { text: string; bytes: number } {
-  let bytes = 0;
-  let i = 0;
-  while (i < s.length) {
-    const cp = s.codePointAt(i) ?? 0;
-    const size = cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
-    if (bytes + size > maxBytes) break;
-    bytes += size;
-    i += cp > 0xffff ? 2 : 1;
-  }
-  return { text: s.slice(0, i), bytes };
 }
 
 /** Full-hex validation, sized to the repository's object format (T4 step 1). */

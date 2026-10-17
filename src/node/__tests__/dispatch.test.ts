@@ -272,12 +272,14 @@ describe('dispatchCalls: execute', () => {
       expect(data.isError).toBe(true);
       expect(data.failure).toEqual({ code: 'output-limit', status: null });
       const raw = data.raw!;
-      const notice = /\n\[output truncated: showing (\d+) of (\d+) bytes; raw sha256 ([0-9a-f]{64})\]$/
+      const notice = /\n\[output truncated: model text capped at (\d+) bytes; raw artifact: (\d+) captured bytes, complete: (yes|no); raw sha256 ([0-9a-f]{64})\]$/
         .exec(data.message.content);
       expect(notice).not.toBeNull();
+      // The cap describes the model text; the raw facts describe the capture.
       expect(Number(notice![1])).toBe(256);
       expect(Number(notice![2])).toBe(raw.bytes);
-      expect(notice![3]).toBe(raw.sha256);
+      expect(notice![3]).toBe('no');
+      expect(notice![4]).toBe(raw.sha256);
       expect(data.message.content).toContain('[output truncated at the capture limit; the command kept running]');
       expect(await artifactComplete(home)).toBe(false);
     } finally {
@@ -859,13 +861,14 @@ describe('dispatchCalls: web tools', () => {
       const data = await firstResult(home);
       const raw = data.raw!;
       // Every byte of the render is ASCII, so the retained prefix is exactly the
-      // 256-byte bound; the notice must name that real size and the raw's own facts.
-      const notice = /\n\[output truncated: showing (\d+) of (\d+) bytes; raw sha256 ([0-9a-f]{64})\]$/
+      // 256-byte model cap; the notice must name the cap and the raw's own facts.
+      const notice = /\n\[output truncated: model text capped at (\d+) bytes; raw artifact: (\d+) captured bytes, complete: (yes|no); raw sha256 ([0-9a-f]{64})\]$/
         .exec(data.message.content);
       expect(notice).not.toBeNull();
       expect(Number(notice![1])).toBe(256);
       expect(Number(notice![2])).toBe(raw.bytes);
-      expect(notice![3]).toBe(raw.sha256);
+      expect(notice![3]).toBe('yes');
+      expect(notice![4]).toBe(raw.sha256);
       expect(data.message.content.startsWith('provider: tavily')).toBe(true);
     } finally {
       await s.shutdown();

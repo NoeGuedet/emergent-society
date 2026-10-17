@@ -1234,7 +1234,7 @@ async function rawRef(): Promise<ArtifactRef> {
   return (ofType(durable, 'response/raw')[0]!.data as unknown as { body: ArtifactRef }).body;
 }
 
-const NOTICE = /^\[content truncated: showing (\d+) of (\d+) bytes; raw sha256 ([0-9a-f]{64})\]$/;
+const NOTICE = /^\[content truncated: model text capped at (\d+) bytes; raw artifact: (\d+) captured bytes, complete: (yes|no); raw sha256 ([0-9a-f]{64})\]$/;
 
 describe('ProviderAdapter: assistant content bounding', () => {
   it('truncates to maxAssistantBytes and appends a notice naming the raw artifact', async () => {
@@ -1255,14 +1255,17 @@ describe('ProviderAdapter: assistant content bounding', () => {
       const projection = await journaledProjection();
       expect(projection.contentTruncated).toBe(true);
       const raw = await rawRef();
-      const expectedNotice =
-        `\n[content truncated: showing 256 of ${raw.bytes} bytes; raw sha256 ${raw.sha256}]`;
+      const expectedNotice = `\n[content truncated: model text capped at 256 bytes; `
+        + `raw artifact: ${raw.bytes} captured bytes, complete: ${raw.complete ? 'yes' : 'no'}; `
+        + `raw sha256 ${raw.sha256}]`;
       expect(projection.message.content).toBe('a'.repeat(256) + expectedNotice);
       // The notice matches the binding format and names the raw artifact exactly.
       const match = NOTICE.exec(expectedNotice.slice(1));
       expect(match).not.toBeNull();
+      expect(match![1]).toBe('256');
       expect(match![2]).toBe(String(raw.bytes));
-      expect(match![3]).toBe(raw.sha256);
+      expect(match![3]).toBe(raw.complete ? 'yes' : 'no');
+      expect(match![4]).toBe(raw.sha256);
       // The truncated text (before the notice) is exactly maxAssistantBytes.
       expect(Buffer.byteLength(projection.message.content!.slice(0, 256), 'utf8')).toBe(256);
     } finally {
@@ -1293,7 +1296,9 @@ describe('ProviderAdapter: assistant content bounding', () => {
       expect(projection.message.content!.startsWith('a'.repeat(255) + '\n[content truncated:')).toBe(true);
       expect(projection.message.content).not.toContain('\uFFFD');
       expect(Buffer.byteLength(projection.message.content!.slice(0, 255), 'utf8')).toBe(255);
-      expect(projection.message.content).toContain(`showing 255 of ${raw.bytes} bytes`);
+      // The notice states the cap, not the retained prefix's smaller size.
+      expect(projection.message.content).toContain('model text capped at 256 bytes');
+      expect(projection.message.content).toContain(`raw artifact: ${raw.bytes} captured bytes`);
       expect(Buffer.from(projection.message.content!.slice(0, 255), 'utf8').toString('utf8')).toBe('a'.repeat(255));
     } finally {
       await session.shutdown();
