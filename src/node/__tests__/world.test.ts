@@ -8,7 +8,7 @@ import { InvalidNodeUidError } from '../../journal/index.js';
 import {
   GitCommandError, UnsafeWorldPathError, WorldHeadError, WorldNotARepoError,
 } from '../errors.js';
-import { WorldRepo, type WorldCommitInfo } from '../world.js';
+import { WorldRepo, gitEnv, type WorldCommitInfo } from '../world.js';
 import {
   commitAs, committedContent, committedPaths, gitIn, useWorld, worldLog, writeWorldFile,
 } from './helpers.js';
@@ -20,7 +20,7 @@ const delay = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, 
 /** Runs git with stdin and returns stdout — for hand-crafted objects only. */
 function gitWithInput(dir: string, args: readonly string[], input: string): Promise<string> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn('git', [...args], { cwd: dir });
+    const child = spawn('git', [...args], { cwd: dir, env: gitEnv() });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
@@ -375,8 +375,10 @@ describe('the world repo', () => {
 
     const script = join(dirname(world.path), 'peer.mjs');
     await writeFile(script, PEER_SCRIPT);
+    // The peer inherits the controlled git environment, so its own `process.env`
+    // (spread into the commit env below) cannot carry a host GIT_DIR or config.
     const peer: ChildProcess = spawn(process.execPath, [script, world.path, 'peer', '30'],
-      { stdio: ['ignore', 'ignore', 'pipe'] });
+      { stdio: ['ignore', 'ignore', 'pipe'], env: gitEnv() });
     let peerStderr = '';
     peer.stderr?.on('data', (chunk: Buffer) => { peerStderr += chunk.toString('utf8'); });
     let exitCode: number | null = null;

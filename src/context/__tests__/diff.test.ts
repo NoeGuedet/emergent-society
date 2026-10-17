@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { commitAs, gitIn, useWorld, writeWorldFile } from '../../node/__tests__/helpers.js';
-import { WorldRepo } from '../../node/world.js';
+import { WorldRepo, gitEnv } from '../../node/world.js';
 import { presentWorld } from '../diff.js';
 
 /**
@@ -28,11 +28,10 @@ async function commitBytes(worldPath: string, author: string, rel: string, bytes
   await new Promise<void>((resolve, reject) => {
     execFile('git', ['commit', '--quiet', '-m', 'bytes'], {
       cwd: worldPath,
-      env: {
-        ...process.env,
+      env: gitEnv({
         GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: email,
         GIT_COMMITTER_NAME: author, GIT_COMMITTER_EMAIL: email,
-      },
+      }),
     }, (err, _out, stderr) => { if (err) reject(new Error(stderr)); else resolve(); });
   });
   return (await gitIn(worldPath, ['rev-parse', 'HEAD'])).trim();
@@ -131,11 +130,10 @@ describe('world reads ignore a refs/replace projection', () => {
     return new Promise<string>((resolve, reject) => {
       execFile('git', ['commit-tree', tree, '-m', message], {
         cwd: worldPath,
-        env: {
-          ...process.env,
+        env: gitEnv({
           GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: email,
           GIT_COMMITTER_NAME: author, GIT_COMMITTER_EMAIL: email,
-        },
+        }),
       }, (err, stdout, stderr) => { if (err) reject(new Error(stderr)); else resolve(stdout.trim()); });
     });
   }
@@ -147,7 +145,8 @@ describe('world reads ignore a refs/replace projection', () => {
     const replacement = await commitTreeAs(world.path, tree, 'forged subject', 'attacker');
     await gitIn(world.path, ['replace', c1, replacement]);
 
-    // Sanity: a plain git read without the kernel's env does project the forgery.
+    // Deliberately the host env, not gitEnv: only an uncontrolled read projects
+    // the forgery, so this proves the kernel's env is what neutralizes it below.
     expect(await gitIn(world.path, ['log', '--format=%an', '-1', c1], process.env)).toBe('attacker\n');
     expect(await gitIn(world.path, ['log', '--format=%s', '-1', c1], process.env)).toBe('forged subject\n');
 
@@ -366,7 +365,7 @@ async function fastImportCommits(worldPath: string, count: number): Promise<void
   }
   chunks.push('done\n');
   await new Promise<void>((resolve, reject) => {
-    const child = spawn('git', ['fast-import', '--quiet'], { cwd: worldPath });
+    const child = spawn('git', ['fast-import', '--quiet'], { cwd: worldPath, env: gitEnv() });
     child.on('error', reject);
     child.stderr.setEncoding('utf8');
     let stderr = '';
