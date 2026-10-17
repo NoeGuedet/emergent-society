@@ -536,6 +536,32 @@ describe('resume and the world', () => {
     await d.run();
   });
 
+  it('sweeps a peer’s dirty file into the zero-candidate recovery commit', async () => {
+    const { home, world } = fixture();
+    const base = await commitAs(world, 'n2', { 'n2/start.md': 'start' });
+    // The crash shape: turn 0 opened on `base` and never closed.
+    const w = await JournalWriter.open(home, 'n1');
+    w.append('node/boot', { reason: 'start' });
+    w.append('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: base } });
+    await w.close();
+    await writeWorldFile(world, 'n1/half.md', 'unfinished');
+    // A peer's in-flight write sits in the same working tree. With no commit of
+    // this turn to name, recovery stages the whole tree (`add --all`), so the
+    // peer's file lands in the node's recovery commit — accepted commit-granular
+    // attribution, not a lost effect.
+    await writeWorldFile(world, 'peer/inflight.md', 'not mine');
+
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const closer = (await readNode(home)).find((e) => e.type === 'turn/end');
+    const commit = (closer?.data as { commit?: string } | undefined)?.commit;
+    expect(commit).toBe(await world.headHash());
+    expect((await worldLog(world)).map((line) => line.split(' ')[1])).toEqual(['n2', 'n1']);
+    expect(await committedContent(world, 'n1/half.md')).toBe('unfinished');
+    expect(await committedContent(world, 'peer/inflight.md')).toBe('not mine');
+    d.stop();
+    await d.run();
+  });
+
   it('commits nothing at resume when no turn was left open', async () => {
     const { home, world } = fixture();
     // A dirty tree with no open turn is somebody else's in-flight work: only the

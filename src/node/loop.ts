@@ -145,6 +145,11 @@ class Runtime implements AgentRuntime {
    * to compare.
    */
   private async ready(gate: BoundaryGate): Promise<void> {
+    // A new driver session begins its ready phase here: the latch above is
+    // scoped to one driver run, so a sequential second driver on this runtime
+    // may spawn again, while an execute after a stop and before any next open
+    // still fails closed. The runtime stays single-terminal — one live session.
+    this.terminalStopped = false;
     if (this.fold.snapshot().config === null) {
       const stored = await gate.store(this.initialConfig);
       gate.append('system/message', { version: this.initialConfig.version, value: stored });

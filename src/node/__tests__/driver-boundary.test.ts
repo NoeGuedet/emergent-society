@@ -258,6 +258,25 @@ describe('fatal seams', () => {
     expect(events.find((e) => e.type === 'turn/end')?.data)
       .toMatchObject({ outcome: 'error', error: 'Error: boom' });
   });
+
+  it('invokes onStop when open fails and keeps the resume error', async () => {
+    const { home, world } = fixture();
+    let stops = 0;
+    const hooks = hooksFor(home, {
+      readHistory: async () => { throw new Error('resume boom'); },
+      // A failing teardown must not displace the resume error either.
+      onStop: async () => { stops += 1; throw new Error('stop boom'); },
+    });
+    await expect(NodeDriver.open(home, 'n1', wait, world,
+      { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 }))
+      .rejects.toThrow('resume boom');
+    expect(stops).toBe(1);
+    // The writer was released: a valid bundle opens the same home afterwards.
+    const d = await NodeDriver.open(home, 'n1', wait, world,
+      { knownTypes: C13_EVENT_TYPES, hooks: hooksFor(home), worldPollMs: 0 });
+    d.stop();
+    await d.run();
+  });
 });
 
 describe('recoverable error results', () => {

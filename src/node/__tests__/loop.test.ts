@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
 import { access } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { NodeDriver } from '../driver.js';
+import { NodeDriver, type TurnHandler } from '../driver.js';
 import { HeadWatcher } from '../watcher.js';
 import { WorldRepo, type WorldRange } from '../world.js';
 import { BlobStore } from '../../journal/index.js';
@@ -14,7 +14,7 @@ import { rederivePlans } from '../../context/assembler.js';
 import { canonicalBytes } from '../../context/artifacts.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../../context/events.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
-import type { DriverHooks } from '../gate.js';
+import type { BoundaryGate, DriverHooks } from '../gate.js';
 import { ProviderAdapter, type ProviderPolicy } from '../../provider/adapter.js';
 import type { SerializedTransport, TransportResult } from '../../provider/transport.js';
 import type {
@@ -250,6 +250,115 @@ describe('turn control', () => {
 
     expect(disposed).toEqual(['driver stop']);
     expect(graces).toEqual([config.policy.killGraceMs]);
+  });
+
+  it('disposes the terminal on the fatal path, not only on a clean stop', async () => {
+    const fx = fixture();
+    const disposed: string[] = [];
+    const create = (): TerminalRuntime => ({
+      run: () => Promise.resolve({
+        status: 'completed', exitCode: 0, signal: null,
+        output: new Uint8Array(), truncated: false, reset: false, fresh: null,
+      }),
+      dispose: (reason) => { disposed.push(reason); return Promise.resolve(); },
+    });
+    const config = configWith({ policy: { stepsPerTurn: 1, retryDelayMs: 1 } });
+    const transport = new ScriptedTransport([calling([execute('f1', 'true')])]);
+    const runtime = createAgentRuntime({
+      home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
+      terminal: { env: DEFAULT_TERMINAL_ENV, create },
+      adapter: new ProviderAdapter(transport, providerPolicy),
+    });
+    // The turn performs a real effect, then the handler fails: the run ends
+    // through the fatal path, which must still tear the session down.
+    const failing: TurnHandler = async (ctx) => {
+      await runtime.handler(ctx);
+      throw new Error('fatal after effect');
+    };
+    const driver = await NodeDriver.open(fx.home, 'n1', failing, fx.world, {
+      knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
+    });
+    await expect(driver.run()).rejects.toThrow('fatal after effect');
+    expect(disposed).toEqual(['driver stop']);
+    expect(driver.state).toBe('stopped');
+    expect((await eventsOf(fx)).find((event) => event.type === 'node/shutdown')?.data)
+      .toMatchObject({ reason: 'handler-error' });
+  });
+});
+
+describe('runtime reuse across sequential drivers', () => {
+  it('scopes the terminal latch to one driver session and fails closed between them', async () => {
+    const fx = fixture();
+    let spawned = 0;
+    const disposed: string[] = [];
+    const create = (): TerminalRuntime => {
+      spawned += 1;
+      return {
+        run: () => Promise.resolve({
+          status: 'completed', exitCode: 0, signal: null,
+          output: new Uint8Array(), truncated: false, reset: false, fresh: null,
+        }),
+        dispose: (reason) => { disposed.push(reason); return Promise.resolve(); },
+      };
+    };
+    const config = configWith({ policy: { stepsPerTurn: 1, retryDelayMs: 1 } });
+    const transport = new ScriptedTransport([
+      calling([execute('e1', 'true')]),
+      noCalls('done'),
+      calling([execute('late', 'true')]),
+      calling([execute('e2', 'true'), waitCall('w1')]),
+    ]);
+    const runtime = createAgentRuntime({
+      home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
+      terminal: { env: DEFAULT_TERMINAL_ENV, create },
+      adapter: new ProviderAdapter(transport, providerPolicy),
+    });
+
+    const first = await openRuntime(fx, runtime);
+    const firstRun = first.run();
+    await vi.waitFor(() => expect(first.state).toBe('waiting'));
+    first.stop();
+    await firstRun;
+    expect(spawned).toBe(1);
+    expect(disposed).toEqual(['driver stop']);
+
+    // Between sessions the latch still holds: a handler invoked directly after
+    // shutdown cannot respawn the terminal and sees a failed execute.
+    const controller = new AbortController();
+    const appends: Array<{ type: string; data: Record<string, unknown> }> = [];
+    const gate = {
+      signal: controller.signal,
+      append: (type: string, data: Record<string, unknown>) => {
+        appends.push({ type, data });
+        return { seq: appends.length, hash: 'f'.repeat(64) };
+      },
+      flush: async (): Promise<void> => {},
+      capture: async () => ({ kind: 'inline', value: {} }),
+      store: async (value: unknown) => ({ kind: 'inline', value }),
+    } as unknown as BoundaryGate;
+    const late = await runtime.handler({
+      turn: 99, trigger: 'wakeup', world: { from: null, to: null },
+      gate, signal: controller.signal, now: () => Date.now(),
+    });
+    expect(late.outcome).toBe('chained');
+    const lateResult = appends.find(
+      (entry) => entry.type === 'tool/result' && entry.data['callId'] === 'late');
+    expect(lateResult?.data['failure']).toEqual({ code: 'spawn', status: null });
+    expect(spawned).toBe(1);
+
+    // A second sequential driver on the same runtime starts a new session and
+    // executes for real.
+    const second = await openRuntime(fx, runtime);
+    const secondRun = second.run();
+    await vi.waitFor(() => expect(second.state).toBe('waiting'));
+    second.stop();
+    await secondRun;
+    expect(spawned).toBe(2);
+    expect(disposed).toEqual(['driver stop', 'driver stop']);
+    const e2 = (await eventsOf(fx)).find((event) => event.type === 'tool/result'
+      && (event.data as { callId?: string }).callId === 'e2');
+    expect(e2).toBeDefined();
+    expect((e2!.data as { isError: boolean }).isError).toBe(false);
   });
 });
 

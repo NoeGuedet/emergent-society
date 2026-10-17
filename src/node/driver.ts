@@ -238,8 +238,13 @@ export class NodeDriver {
     } catch (err) {
       // Mirror the writer's own failed-open force-close: a driver whose replay
       // failed must not keep the node locked behind the live pid, or every
-      // in-process retry hits SessionAlreadyOwnedError. The close is
-      // best-effort — the resume failure is the one that propagates.
+      // in-process retry hits SessionAlreadyOwnedError. The handler's own
+      // teardown runs first — `onReady` may already have acquired resources —
+      // and its failure, like the close's, must never mask the resume error,
+      // which is the one that propagates.
+      try {
+        await opts.hooks?.onStop?.();
+      } catch { /* the resume error stands */ }
       try {
         await writer.close();
       } catch { /* the resume error stands */ }
@@ -860,10 +865,13 @@ export class NodeDriver {
    * working-tree writes now make. The search base is the range the turn opened
    * on (`to`), never the prior acknowledgement: only commits *after* the turn
    * opened can belong to it, and the node's uid and the exact `turn N` subject
-   * must both match. Zero candidates is the existing dirty-tree recovery; exactly
-   * one is named as-is, without staging anything a peer left in the tree; a
-   * bounded-out search, an unreachable base or more than one match is refused by
-   * `commitsForTurn`.
+   * must both match. Zero candidates is the existing dirty-tree recovery: the
+   * whole working tree is committed as this node's own recovery commit, and
+   * because `commitWorld` stages everything (`git add --all`), a peer's dirty
+   * files are swept in with the node's own — commit-granular attribution, the
+   * accepted behavior of the zero-candidate path. Exactly one candidate is
+   * named as-is and stages nothing. A bounded-out search, an unreachable base
+   * or more than one match is refused by `commitsForTurn`.
    */
   private async reconcileInterrupted(turn: number, base: string | null): Promise<string | null> {
     const candidates = await this.world.commitsForTurn(base, this.uid, turn);
