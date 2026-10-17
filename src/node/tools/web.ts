@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import type { SafeFailure } from '../../context/contracts.js';
+import { readBoundedBody } from '../../net/bounded-body.js';
 import { decodeToolText } from './text.js';
 import type { ProviderEntry, ProviderRegistry } from './providers.js';
 
@@ -13,9 +14,10 @@ import type { ProviderEntry, ProviderRegistry } from './providers.js';
  * only a status, bounded body bytes and a `SafeFailure`. That is one half of the
  * bound: a provider response body is captured and journaled verbatim, so a
  * hostile provider could reflect the credential back into the journal —
- * unfiltered, accepted for the experiment phase. The bounded streamed
- * read deliberately mirrors `src/provider/transport.ts` instead of importing it:
- * importing provider code from node would invert the layering.
+ * unfiltered, accepted for the experiment phase. The bounded streamed read is
+ * the neutral `src/net/bounded-body.ts` helper, shared with the transport: node
+ * must not import provider code (that would invert the layering), so the loop
+ * itself lives below both.
  */
 
 export type WebOutcome =
@@ -84,39 +86,15 @@ export class TavilyWebTools implements WebTools {
           null, new Uint8Array(), false);
       }
       const status = response.status;
-      const collected: Buffer[] = [];
-      let total = 0;
-      let complete = true;
-      let failure: SafeFailure | null = null;
-      const stream = response.body;
-      if (stream !== null) {
-        const reader = stream.getReader();
-        try {
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value === undefined) continue;
-            const chunk = Buffer.from(value);
-            if (total + chunk.length > this.entry.maxResponseBytes) {
-              const remaining = this.entry.maxResponseBytes - total;
-              if (remaining > 0) collected.push(chunk.subarray(0, remaining));
-              total = this.entry.maxResponseBytes;
-              complete = false;
-              failure = { code: 'body-limit', status };
-              try { await reader.cancel(); } catch { /* the prefix is still returned */ }
-              break;
-            }
-            collected.push(chunk);
-            total += chunk.length;
-          }
-        } catch {
-          complete = false;
-          failure = signal.aborted ? { code: 'cancelled', status }
-            : timedOut ? { code: 'timeout', status }
-            : { code: 'network', status };
-        }
-      }
-      const body = Buffer.concat(collected);
+      const { body, complete, outcome } = await readBoundedBody(
+        response.body, this.entry.maxResponseBytes, () => signal.aborted);
+      // Web's vocabulary: an in-stream timeout has no transport analogue; every
+      // other neutral outcome maps to the same safe code the old inline loop used.
+      const failure: SafeFailure | null = outcome === 'body-limit'
+        ? { code: 'body-limit', status }
+        : outcome === 'cancelled-by-caller' ? { code: 'cancelled', status }
+        : outcome === 'read-error' ? (timedOut ? { code: 'timeout', status } : { code: 'network', status })
+        : null;
       if (failure !== null) {
         // A gate abort or the timeout that landed during the final reads — including
         // inside `reader.cancel()` — still outranks a recorded body-limit or network.

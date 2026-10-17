@@ -1,5 +1,5 @@
-import { Buffer } from 'node:buffer';
 import type { SafeFailure } from '../context/contracts.js';
+import { readBoundedBody } from '../net/bounded-body.js';
 
 /**
  * The one HTTP transport (T6, kernel.md §4).
@@ -64,40 +64,15 @@ export class OpenAITransport implements SerializedTransport {
     }
 
     const status = response.status;
-    const collected: Buffer[] = [];
-    let total = 0;
-    let complete = true;
-    let failure: SafeFailure | null = null;
-
-    const stream = response.body;
-    if (stream !== null) {
-      const reader = stream.getReader();
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value === undefined) continue;
-          const chunk = Buffer.from(value);
-          if (total + chunk.length > maxBytes) {
-            const remaining = maxBytes - total;
-            if (remaining > 0) collected.push(chunk.subarray(0, remaining));
-            total = maxBytes;
-            complete = false;
-            failure = { code: 'body-limit', status };
-            try { await reader.cancel(); } catch { /* the prefix is still returned */ }
-            break;
-          }
-          collected.push(chunk);
-          total += chunk.length;
-        }
-      } catch {
-        complete = false;
-        failure = aborted(signal)
-          ? { code: 'cancelled', status }
-          : { code: 'network', status };
-      }
-    }
-
-    return { status, body: Buffer.concat(collected), complete, failure };
+    const { body: captured, complete, outcome } = await readBoundedBody(
+      response.body, maxBytes, () => aborted(signal));
+    // The transport's own vocabulary: a cap and an interrupted read are safe
+    // failures; a caller abort wins over the read error it caused.
+    const failure: SafeFailure | null = outcome === 'body-limit'
+      ? { code: 'body-limit', status }
+      : outcome === 'cancelled-by-caller' ? { code: 'cancelled', status }
+      : outcome === 'read-error' ? { code: 'network', status }
+      : null;
+    return { status, body: captured, complete, failure };
   }
 }
