@@ -11,12 +11,13 @@ import { COMPACTION_NOTICE, runCompaction, selectCompaction } from '../compactio
 import { defaultAgentConfig } from '../config.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../events.js';
 import { ContextFold } from '../fold.js';
+import { SAME, isBalancedGroup, sortUnique } from '../groups.js';
 import { loadVerifiedEvents } from '../loader.js';
 import type { VerifiedEvents } from '../loader.js';
 import { useTempHome } from '../../journal/__tests__/helpers.js';
 import type {
-  AgentConfig, AssistantProjection, ChatMessage, CompactionStart, FunctionCall,
-  RequestId, SeedPolicy, Source, SurfaceGroup, WorldPerception,
+  AgentConfig, AssistantProjection, CompactionStart, FunctionCall,
+  RequestId, SeedPolicy, Source, WorldPerception,
 } from '../contracts.js';
 
 const home = useTempHome('c13-compaction-');
@@ -24,21 +25,6 @@ const home = useTempHome('c13-compaction-');
 /** Structural receipt identity: works for an `EventEnvelope` or a `VerifiedEvent`. */
 const source = (event: { seq: number; hash: string }): Source =>
   ({ seq: event.seq, hash: event.hash });
-
-const SAME = (a: Source, b: Source): boolean => a.seq === b.seq && a.hash === b.hash;
-
-function sortUnique(sources: readonly Source[]): Source[] {
-  const seen = new Set<string>();
-  const out: Source[] = [];
-  for (const s of sources) {
-    const key = `${s.seq}:${s.hash}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ seq: s.seq, hash: s.hash });
-  }
-  out.sort((a, b) => (a.seq - b.seq) || (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
-  return out;
-}
 
 function eventsAt(path: string): Promise<VerifiedEvents> {
   return loadVerifiedEvents(path, 'n1', C13_EVENT_TYPES);
@@ -237,25 +223,6 @@ async function closedPerception(session: Session, turn: number, text: string): P
   }
 }
 
-function balanced(group: SurfaceGroup): boolean {
-  if (group.kind === 'heading') {
-    const only = group.messages[0];
-    return group.messages.length === 1 && only !== undefined && only.role === 'system';
-  }
-  if (group.kind === 'summary' || group.kind === 'perception') {
-    const only = group.messages[0];
-    return group.messages.length === 1 && only !== undefined && only.role === 'user';
-  }
-  if (group.kind !== 'dialogue') return false;
-  const assistant = group.messages[0];
-  if (assistant === undefined || assistant.role !== 'assistant') return false;
-  const ids = assistant.tool_calls.map((c) => c.id);
-  const results = group.messages.slice(1);
-  if (group.messages.length !== 1 + ids.length) return false;
-  return results.every((m, i): m is Extract<ChatMessage, { role: 'tool' }> =>
-    m.role === 'tool' && m.tool_call_id === ids[i]);
-}
-
 // ==================================================================================
 // C. Durable compaction applies only after end (installed as written)
 // ==================================================================================
@@ -368,8 +335,11 @@ describe('selectCompaction and whole committed groups', () => {
       expect(after.surface?.nodes[0]?.group.messages[0]?.content).toBe(config.heading);
       expect(after.surface?.nodes[1]?.group.kind).toBe('summary');
       expect(after.surface?.nodes[1]?.group.messages[0]?.content).toBe(COMPACTION_NOTICE);
-      // The kept tail is the two most recent dialogues, still balanced.
-      for (const node of after.surface?.nodes ?? []) expect(balanced(node.group)).toBe(true);
+      // The kept tail is the two most recent dialogues, still balanced. The
+      // heading pin is deliberately never a removable unit (isBalancedGroup).
+      for (const node of after.surface?.nodes ?? []) {
+        if (node.group.kind !== 'heading') expect(isBalancedGroup(node.group)).toBe(true);
+      }
 
       const firstRevision = candidate!.revision;
 
@@ -429,8 +399,10 @@ describe('selectCompaction and whole committed groups', () => {
       // No dangling result: every surviving dialogue is a balanced assistant+results group.
       const dialogues = (final.surface?.nodes ?? []).filter((node) => node.group.kind === 'dialogue');
       expect(dialogues.length).toBe(2);
-      for (const node of dialogues) expect(balanced(node.group)).toBe(true);
-      for (const node of final.surface?.nodes ?? []) expect(balanced(node.group)).toBe(true);
+      for (const node of dialogues) expect(isBalancedGroup(node.group)).toBe(true);
+      for (const node of final.surface?.nodes ?? []) {
+        if (node.group.kind !== 'heading') expect(isBalancedGroup(node.group)).toBe(true);
+      }
     } finally {
       await session.shutdown();
     }
