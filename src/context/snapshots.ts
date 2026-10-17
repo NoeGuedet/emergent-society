@@ -1,10 +1,11 @@
 import { readdir, realpath, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  atomicWriteFile, ensureDurableDirectory, nodeDir, readFileOrNull, sha256HexOf, syncPath,
+  atomicWriteFile, ensureDurableDirectory, nodeDir, readFileOrNull, syncPath,
 } from '../journal/index.js';
-import { canonicalBytes, toJson } from './artifacts.js';
+import { toJson } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
+import { surfaceHeading, surfaceRevision } from './groups.js';
 import { SNAPSHOT_DIALECT, createValidator } from './validate.js';
 import type {
   AgentConfig, OpenTurn, ProjectionState, RecoveryGroup, Source, SurfaceGroup, SurfaceSnapshot,
@@ -122,8 +123,17 @@ function surfaceSnapshot(value: unknown, where: string): SurfaceSnapshot {
     fail(`${where}.nodes[0].group.messages`, 'does not encode the heading text');
   }
   const revision = hash(o['revision'], `${where}.revision`);
-  const recomputed = sha256HexOf(Buffer.from(canonicalBytes({ heading, nodes })));
-  if (revision !== recomputed) fail(`${where}.revision`, 'does not match the heading and nodes');
+  const groups = nodes.map((node) => node.group);
+  const derivedHeading = surfaceHeading(groups);
+  if (derivedHeading.text !== heading.text
+    || !sameSource(derivedHeading.source, heading.source)) {
+    fail(`${where}.heading`, 'does not match the heading pin');
+  }
+  // The revision is the shared groups.ts formula, not a local copy: the writer
+  // and the checkpoint reader must never drift from the surface it describes.
+  if (revision !== surfaceRevision(groups)) {
+    fail(`${where}.revision`, 'does not match the heading and nodes');
+  }
   return { heading, nodes, revision };
 }
 

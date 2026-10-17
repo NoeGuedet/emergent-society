@@ -1,5 +1,4 @@
 import { Buffer } from 'node:buffer';
-import type { ArtifactRef } from './context/contracts.js';
 
 /**
  * The one UTF-8 boundary module. Three paths bound model-visible text by a byte
@@ -7,6 +6,14 @@ import type { ArtifactRef } from './context/contracts.js';
  * between their cut rules would let one path split a character or miscount the
  * retained bytes, so the cut and the notice live here once.
  */
+
+/**
+ * The artifact-reference fields the notice reads. Structural by design: this
+ * neutral boundary module must not depend on the context layer's contracts.
+ */
+type TruncationArtifact = {
+  readonly sha256: string; readonly bytes: number; readonly complete: boolean;
+};
 
 /**
  * Non-fatal UTF-8 decoding: each invalid sequence becomes U+FFFD, the same
@@ -45,7 +52,7 @@ export function utf8Prefix(text: string, maxBytes: number): { text: string; byte
  * provider-controlled content, and it stays on one line.
  */
 export function truncationNotice(
-  kind: 'output' | 'content', maxBytes: number, raw: ArtifactRef,
+  kind: 'output' | 'content', maxBytes: number, raw: TruncationArtifact,
 ): string {
   return `\n[${kind} truncated: model text capped at ${maxBytes} bytes; `
     + `raw artifact: ${raw.bytes} captured bytes, complete: ${raw.complete ? 'yes' : 'no'}; `

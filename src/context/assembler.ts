@@ -149,6 +149,33 @@ function canonicalText(value: unknown): string {
 }
 
 /**
+ * The replay's own data guard. Chain verification proves bytes, not shapes: a
+ * chain-valid fact can carry a null/malformed payload, and the fold's typed
+ * handlers would classify it only AFTER this utility has already dereferenced
+ * it. Refuse it here with the replay's own vocabulary instead of a TypeError.
+ */
+function replayData(event: VerifiedEvent, what: string): Record<string, unknown> {
+  if (!isRecord(event.data)) {
+    const at = sourceOf(event);
+    throw new Error(`replay: ${what} data at ${at.seq}:${at.hash} is not an object`);
+  }
+  return event.data;
+}
+
+/** The id fields the replay dereferences before the fold's sequencing refusal. */
+function replayRequestId(
+  raw: Record<string, unknown>, event: VerifiedEvent, what: string,
+): RequestId {
+  const id = raw['id'];
+  if (!isRecord(id) || typeof id['turn'] !== 'number' || !Number.isSafeInteger(id['turn'])
+    || typeof id['ordinal'] !== 'number' || !Number.isSafeInteger(id['ordinal'])) {
+    const at = sourceOf(event);
+    throw new Error(`replay: ${what} data at ${at.seq}:${at.hash} has no request id`);
+  }
+  return { turn: id['turn'] as number, ordinal: id['ordinal'] as number };
+}
+
+/**
  * Resolves a recorded `world/perception` through the same T1 registry the gate
  * and fold use (so the wrapper/value range equality is enforced), refusing an
  * incompatible renderer policy with an explicit message before shape validation.
@@ -185,7 +212,7 @@ function recordedPerception(
 async function verifyPerception(
   events: VerifiedEvents | VerifiedEventIndex, world: WorldRepo, event: VerifiedEvent,
 ): Promise<void> {
-  const data = event.data as unknown as PerceptionPayload;
+  const data = replayData(event, 'world/perception') as unknown as PerceptionPayload;
   const recorded = recordedPerception(events, data);
   const rederived = await presentWorld(
     world, recorded.uid, recorded.range, recorded.maxBytes, recorded.maxCommits,
@@ -232,7 +259,11 @@ export async function rederivePlans(
     if (event.type === 'world/perception') {
       await verifyPerception(prefix, world, event);
     } else if (event.type === 'request/plan') {
-      const data = event.data as unknown as { id: RequestId; value: Stored<RequestPlan> };
+      const raw = replayData(event, 'request/plan');
+      const data = {
+        id: replayRequestId(raw, event, 'request/plan'),
+        value: raw['value'] as Stored<RequestPlan>,
+      };
       const recorded = resolveStored(prefix, data.value, validateRequestPlan);
       const rederived = assemble({ id: data.id, state: fold.snapshot() });
       const source = sourceOf(event);
@@ -244,7 +275,12 @@ export async function rederivePlans(
       comparisons.push({ source, recorded, rederived });
       plans.set(`${data.id.turn}:${data.id.ordinal}`, recorded);
     } else if (event.type === 'request/wire') {
-      const data = event.data as unknown as { id: RequestId; attempt: number; body: ArtifactRef };
+      const raw = replayData(event, 'request/wire');
+      const data = {
+        id: replayRequestId(raw, event, 'request/wire'),
+        attempt: raw['attempt'] as number,
+        body: raw['body'] as ArtifactRef,
+      };
       const recorded = plans.get(`${data.id.turn}:${data.id.ordinal}`);
       // Without a recorded plan the fold owns the sequencing refusal below.
       if (recorded !== undefined) {

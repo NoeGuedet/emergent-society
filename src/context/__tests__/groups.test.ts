@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { sha256HexOf } from '../../journal/index.js';
 import { canonicalBytes } from '../artifacts.js';
+import { canonicalMessagesBytes } from '../../provider/wire.js';
 import {
   MAX_COMPACTION_SOURCES, candidateIdentity, groupCitations, isBalancedGroup, sameSourceSet,
-  sortUnique,
+  sortUnique, surfaceRevision, validateCompactionSpan,
 } from '../groups.js';
 import type {
   CompactionStart, FunctionCall, Source, SurfaceGroup,
@@ -237,5 +238,83 @@ describe('candidateIdentity: the five hashed fields and the excluded id', () => 
 describe('MAX_COMPACTION_SOURCES: the pinned per-transaction citation bound', () => {
   it('stays at the documented 4096 receipts', () => {
     expect(MAX_COMPACTION_SOURCES).toBe(4096);
+  });
+});
+
+describe('validateCompactionSpan: every failure code is pinned', () => {
+  const assistant = (calls: FunctionCall[]) =>
+    ({ role: 'assistant' as const, content: calls.length === 0 ? 'done' : null, tool_calls: calls });
+  const heading = group({
+    kind: 'heading', id: src(0), messages: [{ role: 'system', content: 'direction' }],
+  });
+  const userGroup = (id: Source): SurfaceGroup => group({
+    kind: 'perception', id, messages: [{ role: 'user', content: `u${id.seq}` }],
+  });
+  const a = userGroup(src(1));
+  const b = userGroup(src(2));
+  const c = userGroup(src(3));
+  const broken = group({
+    kind: 'dialogue', id: src(4), messages: [assistant([call('c1')])],
+  });
+  const surface = [heading, a, b, c, broken];
+  const shadowOf = (groups: readonly SurfaceGroup[]): Buffer =>
+    Buffer.from(canonicalMessagesBytes(groups.flatMap((entry) => entry.messages)));
+
+  /**
+   * A sealed candidate for the canonical a+b span: every field valid, id derived
+   * last so a mutation reaches the check it targets instead of failing identity.
+   */
+  function sealed(over: Partial<CompactionStart> = {}): CompactionStart {
+    const shadow = shadowOf([a, b]);
+    const base = {
+      revision: surfaceRevision(surface),
+      groupIds: [a.id, b.id],
+      sources: [...groupCitations(a), ...groupCitations(b)],
+      shadowHash: sha256HexOf(shadow),
+      shadowBytes: shadow.length,
+      ...over,
+    };
+    return { ...base, id: candidateIdentity(base as CompactionStart) };
+  }
+
+  it('accepts the legal span and re-derives its shadow', () => {
+    const verdict = validateCompactionSpan(surface, sealed());
+    expect(verdict.ok).toBe(true);
+    if (!verdict.ok) return;
+    expect(verdict.first).toBe(1);
+    expect(verdict.length).toBe(2);
+    expect(verdict.span.map((entry) => entry.id)).toEqual([a.id, b.id]);
+    expect(Buffer.from(verdict.shadow).equals(shadowOf([a, b]))).toBe(true);
+  });
+
+  it.each([
+    { name: 'revision', code: 'revision', candidate: () => sealed({ revision: 'c'.repeat(64) }) },
+    { name: 'identity', code: 'identity', candidate: () => ({ ...sealed(), id: '0'.repeat(64) }) },
+    { name: 'no-group-ids', code: 'no-group-ids', candidate: () => sealed({ groupIds: [] }) },
+    { name: 'no-sources', code: 'no-sources', candidate: () => sealed({ sources: [] }) },
+    {
+      name: 'too-many-sources',
+      code: 'too-many-sources',
+      candidate: () => sealed({
+        sources: Array.from({ length: MAX_COMPACTION_SOURCES + 1 }, (_, i) => src(100 + i)),
+      }),
+    },
+    { name: 'unknown-group', code: 'unknown-group', candidate: () => sealed({ groupIds: [a.id, src(99)] }) },
+    { name: 'duplicate-group', code: 'duplicate-group', candidate: () => sealed({ groupIds: [a.id, a.id] }) },
+    { name: 'heading-pin', code: 'heading-pin', candidate: () => sealed({ groupIds: [heading.id] }) },
+    { name: 'non-contiguous', code: 'non-contiguous', candidate: () => sealed({ groupIds: [a.id, c.id] }) },
+    { name: 'unbalanced', code: 'unbalanced', candidate: () => sealed({ groupIds: [broken.id] }) },
+    {
+      name: 'citations',
+      code: 'citations',
+      candidate: () => sealed({ sources: [a.id, b.id, src(77)] }),
+    },
+    { name: 'shadow-bytes', code: 'shadow-bytes', candidate: () => sealed({ shadowBytes: 1 }) },
+    { name: 'shadow-hash', code: 'shadow-hash', candidate: () => sealed({ shadowHash: 'd'.repeat(64) }) },
+  ])('reports $code for $name', ({ code, candidate }) => {
+    const verdict = validateCompactionSpan(surface, candidate());
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) return;
+    expect(verdict.reason.code).toBe(code);
   });
 });

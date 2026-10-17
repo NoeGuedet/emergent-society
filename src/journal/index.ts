@@ -62,13 +62,9 @@ export {
   InvalidBlobHashError,
   ReservedBlobRefError,
   TruncatedBlobError,
-  assertBlobRefReadable,
-  assertBlobBytes,
   isBlobRef,
-  parseBlobJson,
   readVerifiedBlob,
   resolveBlobRef,
-  throwBlobReadError,
   type BlobRef,
 } from './blobs.js';
 

@@ -13,7 +13,7 @@ import type {
   SurfaceGroup, WorldPerception,
 } from './contracts.js';
 import type { VerifiedEvent, VerifiedEvents } from './loader.js';
-import { sourceOf } from './loader.js';
+import { ArtifactMismatchError, sourceOf } from './loader.js';
 import { Surface } from './surface.js';
 
 /**
@@ -223,8 +223,18 @@ export class ContextFold {
    * the real payload even when a raw v0 envelope carried a claim-check reference.
    */
   private readonly verifiedIndex = new Map<string, VerifiedEvent>();
-  private readonly lookup = (source: Source): EventEnvelope | null =>
-    this.verifiedIndex.get(eventKey(source)) ?? null;
+  private readonly lookup = (source: Source): EventEnvelope | null => {
+    try {
+      return this.verifiedIndex.get(eventKey(source)) ?? null;
+    } catch (err) {
+      // A malformed receipt is an unknown citation, not an artifact mismatch:
+      // `eventKey`'s typed mismatch classifies a forged artifact manifest, and
+      // the fold's callers own the citation vocabulary ("cites an unknown
+      // receipt"/"missing receipt"). Let the actual artifact paths keep it.
+      if (err instanceof ArtifactMismatchError) return null;
+      throw err;
+    }
+  };
   /**
    * A fatal invariant is fail-stop: once `observe` throws, the fold may hold a
    * partially-mutated cache (index registered before `process`, handlers partway),
@@ -769,7 +779,18 @@ export class ContextFold {
     if (messageData['role'] !== 'user') {
       invariant('compaction/summary.message is not a user message');
     }
-    const message = messageData as unknown as CompactionSummary['message'];
+    // The summary is exactly one user message; a bare cast here would let a
+    // chain-valid null/non-string content reach the surface and fail far away.
+    for (const key of Object.keys(messageData)) {
+      if (key !== 'role' && key !== 'content') {
+        invariant(`compaction/summary.message has an unknown field ${JSON.stringify(key)}`);
+      }
+    }
+    const content = messageData['content'];
+    if (typeof content !== 'string') {
+      invariant('compaction/summary.message.content is not a string');
+    }
+    const message: CompactionSummary['message'] = { role: 'user', content };
     const data: CompactionSummary = {
       id,
       message,
