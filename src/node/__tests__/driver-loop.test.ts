@@ -155,17 +155,23 @@ describe('NodeDriver run loop', () => {
 
   it('honors a stop that lands during the turn-opening HEAD read', async () => {
     const { home, world } = fixture();
-    // Stall the opening range's HEAD read: the loop is inside `worldRange()`
-    // with no active controller, the exact window in which stop() had nothing
-    // to abort. The stop must still prevent the turn from opening at all.
+    // `wakeDue()` enters `commitsSince()`, which reads HEAD first; stalling that
+    // call would let the loop's own `!stopRequested` guard end the run before
+    // the window under test. Stall the second HEAD read instead: the loop is
+    // past its guard, inside `worldRange()`, with no active controller — the
+    // exact window in which stop() had nothing to abort.
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     let entered!: () => void;
     const reached = new Promise<void>((resolve) => { entered = resolve; });
     const real = WorldRepo.prototype.headHash;
+    let reads = 0;
     vi.spyOn(WorldRepo.prototype, 'headHash').mockImplementation(async function (this: WorldRepo) {
-      entered();
-      await held;
+      reads += 1;
+      if (reads === 2) {
+        entered();
+        await held;
+      }
       return real.call(this);
     });
     const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });

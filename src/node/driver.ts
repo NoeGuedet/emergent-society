@@ -286,15 +286,13 @@ export class NodeDriver {
         // stop() aborts `activeController`, which is null between turns: a stop
         // that lands while the opening HEAD read is in flight has no controller
         // to cancel and would otherwise be lost, letting the handler start with
-        // a live signal. Re-check after the read and open no turn at all; the
-        // post-creation abort is the defensive half of the same boundary.
+        // a live signal. Re-check after the read and open no turn at all.
         if (this.stopRequested) break;
         this.writeEvent('turn/start', {
           turn: this.turn, trigger, world: { from: world.from, to: world.to },
         });
         const controller = new AbortController();
         this.activeController = controller;
-        if (this.stopRequested) controller.abort();
         this.turnToolCalls = 0;
         const created = this.makeGate('turn', this.turn, controller.signal);
         this.closeTurnGate = created.close;

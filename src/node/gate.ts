@@ -121,8 +121,10 @@ export interface DriverHooks {
   acknowledgedWorld(turn?: number): WorldAcknowledgement | null;
   /**
    * The handler's own teardown at driver stop (the C1.4b terminal session),
-   * called during shutdown after the `node/shutdown` event and before the
-   * writer closes. Optional: a handler holding no host resources omits it.
+   * called during shutdown after `node/shutdown` and before the writer closes,
+   * and — best-effort, with no shutdown event and before `writer.close()` —
+   * when `open()` fails after the writer was taken. Optional: a handler holding
+   * no host resources omits it.
    */
   readonly onStop?: () => Promise<void>;
 }

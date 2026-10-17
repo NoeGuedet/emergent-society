@@ -428,6 +428,42 @@ describe('stop', () => {
       .toEqual({ reason: 'stop-requested' });
   });
 
+  it('keeps a real malformed failure an error even when a stop races it', async () => {
+    const fx = fixture();
+    // The transport stops the driver while it posts, then returns a 200 whose
+    // body cannot be projected. The abort is real, but the failure is not a
+    // cancellation: only a `cancelled` code may park.
+    class StopOnPostTransport implements SerializedTransport {
+      driver: NodeDriver | null = null;
+      sends = 0;
+      async post(): Promise<TransportResult> {
+        this.sends += 1;
+        this.driver?.stop();
+        return {
+          status: 200, complete: true, failure: null,
+          body: Buffer.from('not json'),
+        };
+      }
+    }
+    const transport = new StopOnPostTransport();
+    const runtime = createAgentRuntime({
+      home: fx.home, uid: 'n1', world: fx.world,
+      initialConfig: configWith({ policy: { retryDelayMs: 1 } }),
+      terminal: { env: DEFAULT_TERMINAL_ENV },
+      adapter: new ProviderAdapter(transport, providerPolicy),
+    });
+    const driver = await openRuntime(fx, runtime);
+    transport.driver = driver;
+    await driver.run();
+
+    expect(transport.sends).toBe(1);
+    const events = await eventsOf(fx);
+    expect(events.find((event) => event.type === 'turn/end')?.data)
+      .toMatchObject({ outcome: 'error', error: 'malformed 200' });
+    expect(events.find((event) => event.type === 'node/shutdown')?.data)
+      .toEqual({ reason: 'stop-requested' });
+  });
+
   it('aborts an active shell process and appends no later request', async () => {
     const fx = fixture();
     const transport = new ScriptedTransport([
