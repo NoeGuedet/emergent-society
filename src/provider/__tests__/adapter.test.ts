@@ -179,6 +179,11 @@ describe('ProviderAdapter: real HTTP acceptance', () => {
     const responses: Buffer[] = [];
     const requestBodies: Buffer[] = [];
     const auth: Array<string | undefined> = [];
+    // A failed barrier must fail the test, never resolve it. In particular an
+    // assertion thrown in the async check and the not-durable error both land
+    // here; the server then never answers, so the adapter's own timeout keeps
+    // the test from hanging.
+    const errors: unknown[] = [];
     let index = 0;
     const server = createServer((req, res) => {
       const i = index;
@@ -187,7 +192,10 @@ describe('ProviderAdapter: real HTTP acceptance', () => {
       const chunks: Buffer[] = [];
       let checked = false;
       let resolveCheck!: () => void;
-      const check = new Promise<void>((resolve) => { resolveCheck = resolve; });
+      let rejectCheck!: (error: unknown) => void;
+      const check = new Promise<void>((resolve, reject) => {
+        resolveCheck = resolve; rejectCheck = reject;
+      });
       req.on('data', (chunk: Buffer) => {
         chunks.push(chunk);
         if (checked) return;
@@ -206,11 +214,17 @@ describe('ProviderAdapter: real HTTP acceptance', () => {
           expect(wireData.id).toEqual(planData.id);
           expect(Buffer.from(serializeWire(recorded)).equals(durableBody)).toBe(true);
           resolveCheck();
-        })().catch(() => { resolveCheck(); });
+        })().catch(rejectCheck);
       });
       req.on('end', () => {
         void (async () => {
-          await check;
+          try {
+            await check;
+          } catch (error) {
+            // Already recorded by the barrier; do not answer a failed check.
+            errors.push(error);
+            return;
+          }
           requestBodies.push(Buffer.concat(chunks));
           const body = Buffer.from(JSON.stringify({
             choices: [{
@@ -261,6 +275,8 @@ describe('ProviderAdapter: real HTTP acceptance', () => {
       expect(auth).toEqual(['Bearer test-key-never-log']);
       expect(Buffer.from(requestBodies[0]!).equals(Buffer.from(serializeWire(request)))).toBe(true);
       expect(JSON.stringify(durable.map((event) => event.data))).not.toContain('test-key-never-log');
+      // The durability barrier's failures are assertions, not swallowed work.
+      expect(errors).toEqual([]);
     } finally {
       await session.shutdown();
       await close(server);
@@ -382,6 +398,174 @@ describe('ProviderAdapter: bounded retries', () => {
     } finally {
       await session.shutdown();
       await close(server);
+    }
+  });
+});
+
+// --- the retry-status matrix and the anti-abuse projection bounds ----------------
+
+const RETRYABLE_STATUS = [408, 429, 500, 502, 503, 504] as const;
+const TERMINAL_STATUS = [400, 401, 403, 404, 422] as const;
+
+describe('ProviderAdapter: retry-status matrix', () => {
+  it.each(RETRYABLE_STATUS)('retries HTTP %i exactly once more under maxAttempts 2', async (status) => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([
+      transportResult('{"error":"retry me"}', status),
+      transportResult(validBody()),
+    ]);
+    try {
+      const adapter = new ProviderAdapter(transport, policies());
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxAttempts: 2 }) }), session.gate('turn', 0),
+      );
+      expect(result.kind).toBe('response');
+      expect(transport.sends).toBe(2);
+      const attempts = ofType(await events(), 'assistant/attempt');
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]!.data).toMatchObject({
+        terminal: false, failure: { code: 'http', status },
+      });
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it.each(TERMINAL_STATUS)('treats HTTP %i as terminal with no second send', async (status) => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult('{"error":"no"}', status)]);
+    try {
+      const adapter = new ProviderAdapter(transport, policies());
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxAttempts: 2 }) }), session.gate('turn', 0),
+      );
+      expect(result).toEqual({ kind: 'failure', failure: { code: 'http', status } });
+      expect(transport.sends).toBe(1);
+      expect(ofType(await events(), 'assistant/attempt')).toHaveLength(1);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('never retries a malformed projection under maxAttempts 2', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult('not json at all')]);
+    try {
+      const adapter = new ProviderAdapter(transport, policies());
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxAttempts: 2 }) }), session.gate('turn', 0),
+      );
+      expect(result).toEqual({
+        kind: 'failure', failure: { code: 'malformed', status: 200 },
+      });
+      expect(transport.sends).toBe(1);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('never retries a body-limit under maxAttempts 2', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([{
+      status: 200, body: Buffer.from('{"choices":'), complete: false,
+      failure: { code: 'body-limit', status: 200 },
+    }]);
+    try {
+      const adapter = new ProviderAdapter(transport, policies());
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxAttempts: 2 }) }), session.gate('turn', 0),
+      );
+      expect(result).toEqual({
+        kind: 'failure', failure: { code: 'body-limit', status: 200 },
+      });
+      expect(transport.sends).toBe(1);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('never retries a request-limit: the refusal precedes any send', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult(validBody())]);
+    try {
+      const adapter = new ProviderAdapter(transport, policies());
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxAttempts: 2, maxRequestBytes: 1 }) }),
+        session.gate('turn', 0),
+      );
+      expect(result).toEqual({
+        kind: 'failure', failure: { code: 'request-limit', status: null },
+      });
+      expect(transport.sends).toBe(0);
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+describe('ProviderAdapter: anti-abuse projection bounds', () => {
+  const twoCalls = JSON.stringify({
+    choices: [{
+      message: {
+        role: 'assistant', content: null,
+        tool_calls: [
+          { id: 'c1', type: 'function', function: { name: 'execute', arguments: '{}' } },
+          { id: 'c2', type: 'function', function: { name: 'execute', arguments: '{}' } },
+        ],
+      },
+    }],
+  });
+
+  it('refuses more calls than maxCallsPerResponse as a bounded malformed failure', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult(twoCalls)]);
+    try {
+      const adapter = new ProviderAdapter(transport, policies());
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxCallsPerResponse: 1 }) }), session.gate('turn', 0),
+      );
+      expect(result).toEqual({
+        kind: 'failure', failure: { code: 'malformed', status: 200 },
+      });
+      // The refusal happens after the one response: no retry, no projection.
+      expect(transport.sends).toBe(1);
+      const durable = await events();
+      expect(ofType(durable, 'response/raw')).toHaveLength(1);
+      expect(ofType(durable, 'assistant/message')).toHaveLength(0);
+      expect(ofType(durable, 'request/usage')).toHaveLength(0);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('refuses arguments over maxToolArgumentBytes as a bounded malformed failure', async () => {
+    const session = await openSession();
+    const body = JSON.stringify({
+      choices: [{
+        message: {
+          role: 'assistant', content: null,
+          tool_calls: [{
+            id: 'c1', type: 'function',
+            function: { name: 'execute', arguments: JSON.stringify({ cmd: 'x'.repeat(64) }) },
+          }],
+        },
+      }],
+    });
+    const transport = new ScriptedTransport([transportResult(body)]);
+    try {
+      const adapter = new ProviderAdapter(transport, policies());
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxToolArgumentBytes: 8 }) }), session.gate('turn', 0),
+      );
+      expect(result).toEqual({
+        kind: 'failure', failure: { code: 'malformed', status: 200 },
+      });
+      expect(transport.sends).toBe(1);
+      const durable = await events();
+      expect(ofType(durable, 'response/raw')).toHaveLength(1);
+      expect(ofType(durable, 'assistant/message')).toHaveLength(0);
+    } finally {
+      await session.shutdown();
     }
   });
 });
