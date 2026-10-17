@@ -65,7 +65,10 @@ function fd0Of(pid: number): string | null {
 }
 
 /** /proc/<pid>/stat, split after the LAST ')' so a comm holding spaces or parens cannot shift the fields. */
-function statFields(pid: number): { readonly comm: string; readonly pgrp: number; readonly tpgid: number } | null {
+function statFields(pid: number): {
+  readonly comm: string; readonly session: number; readonly pgrp: number;
+  readonly ttyNr: number; readonly tpgid: number;
+} | null {
   let text: string;
   try {
     text = readFileSync(`/proc/${pid}/stat`, 'utf8');
@@ -76,10 +79,13 @@ function statFields(pid: number): { readonly comm: string; readonly pgrp: number
   const close = text.lastIndexOf(')');
   if (open < 0 || close < open) return null;
   const rest = text.slice(close + 2).split(' ');
+  const session = Number(rest[3]);
   const pgrp = Number(rest[2]);
+  const ttyNr = Number(rest[4]);
   const tpgid = Number(rest[5]);
-  return Number.isSafeInteger(pgrp) && Number.isSafeInteger(tpgid)
-    ? { comm: text.slice(open + 1, close), pgrp, tpgid }
+  return Number.isSafeInteger(session) && Number.isSafeInteger(pgrp)
+    && Number.isSafeInteger(ttyNr) && Number.isSafeInteger(tpgid)
+    ? { comm: text.slice(open + 1, close), session, pgrp, ttyNr, tpgid }
     : null;
 }
 
@@ -188,6 +194,57 @@ describe('stdinWaitPids', () => {
       expect(stdinWaitPids(shell.pid, target)).toEqual([]);
     } finally {
       shell.kill();
+    }
+  }, 10000);
+
+  proofOnly('refuses a child that shares the pts but does not lead the session', async () => {
+    // The counter-audit's parent-tty freeze: before login_tty, a forked child
+    // inherits the spawner's session, ctty and fd 0 — and tty_nr/against-fd-0
+    // agree, so only the session-leader test tells it apart from the new slave.
+    // A foreground child is the same shape: same pts, sole difference is that
+    // it does not lead the session.
+    const shell = spawnBash();
+    let childPid = 0;
+    try {
+      let seen = '';
+      shell.onData((chunk) => { seen += chunk; });
+      const target = await frozenTarget(shell);
+      expect(target).toMatch(/^\/dev\/pts\/\d+$/);
+      expect(sessionTtyTarget(shell.pid)).toBe(target);
+      shell.write("bash -c 'echo CHILD:$$; exec sleep 30'\n");
+      await waitFor(() => /CHILD:\d+/.test(seen));
+      childPid = Number(/CHILD:(\d+)/.exec(seen)![1]);
+      await waitFor(() => {
+        const stat = statFields(childPid);
+        return stat !== null && stat.ttyNr !== 0 && fd0Of(childPid) === target;
+      });
+      expect(statFields(childPid)!.session).not.toBe(childPid);
+      expect(sessionTtyTarget(childPid)).toBeNull();
+    } finally {
+      if (childPid !== 0) { try { process.kill(childPid, 'SIGKILL'); } catch { /* already gone */ } }
+      shell.kill();
+    }
+  }, 10000);
+
+  proofOnly('refuses fd 0 redirected away from the session pts', async () => {
+    const first = spawnBash();
+    const second = spawnBash();
+    try {
+      first.onData(() => {});
+      second.onData(() => {});
+      const own = await frozenTarget(first);
+      const other = await frozenTarget(second);
+      expect(other).not.toBe(own);
+      // The shell keeps its own ctty and session; only fd 0 now names the
+      // other pty. Freezing `other` would bind the stdin proof to a tty the
+      // shell does not own.
+      first.write(`exec 0<${other}; sleep 30\n`);
+      await waitFor(() => fd0Of(first.pid) === other);
+      expect(statFields(first.pid)!.session).toBe(first.pid);
+      expect(sessionTtyTarget(first.pid)).toBeNull();
+    } finally {
+      first.kill();
+      second.kill();
     }
   }, 10000);
 

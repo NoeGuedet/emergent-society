@@ -369,14 +369,19 @@ export class PtyTerminalRuntime implements TerminalRuntime {
    * the inherited socket fd 0: poll until the slave pts appears. The value is
    * kept for the session once frozen. On deadline expiry the target stays null
    * and the stdin proof is disabled for that session — a missed proof costs a
-   * timeout, never a false positive.
+   * timeout, never a false positive. Off Linux (or after an abort, or a death
+   * before login_tty) there is nothing to wait for: return without burning the
+   * deadline, and let the caller's respawn/abort path decide.
    */
-  private async freezeTtyTarget(session: Session): Promise<void> {
-    if (session.ttyTarget !== null) return;
+  private async freezeTtyTarget(session: Session, signal: AbortSignal): Promise<void> {
+    if (session.ttyTarget !== null || process.platform !== 'linux') return;
     const deadline = Date.now() + TTY_FREEZE_DEADLINE_MS;
     for (;;) {
       session.ttyTarget = sessionTtyTarget(session.pid);
-      if (session.ttyTarget !== null || Date.now() >= deadline) return;
+      if (session.ttyTarget !== null || signal.aborted || !alive(session.pid)
+        || Date.now() >= deadline) {
+        return;
+      }
       await pause(POLL_MS);
     }
   }
@@ -415,10 +420,10 @@ export class PtyTerminalRuntime implements TerminalRuntime {
       try {
         session = this.spawnFresh();
       } catch {
-        return failedOutcome('spawn-failed', fresh);
+        return failedOutcome('spawn-failed', fresh, wedgeReset);
       }
     }
-    await this.freezeTtyTarget(session);
+    await this.freezeTtyTarget(session, signal);
     // A freshly forked shell can still die before this command is written;
     // that is still an idle death (nothing was written), so respawn once and
     // proceed silently.
@@ -427,9 +432,9 @@ export class PtyTerminalRuntime implements TerminalRuntime {
       try {
         session = this.spawnFresh();
       } catch {
-        return failedOutcome('spawn-failed', fresh);
+        return failedOutcome('spawn-failed', fresh, wedgeReset);
       }
-      await this.freezeTtyTarget(session);
+      await this.freezeTtyTarget(session, signal);
     }
     if (signal.aborted) return failedOutcome('cancelled', fresh, wedgeReset);
 

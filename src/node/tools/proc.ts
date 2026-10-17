@@ -22,7 +22,9 @@ import { readFileSync, readdirSync, readlinkSync } from 'node:fs';
  * Off Linux (or off x86-64) the answer is always "not provable" ([]).
  */
 
-type ProcStat = { readonly pgrp: number; readonly ttyNr: number; readonly tpgid: number };
+type ProcStat = {
+  readonly session: number; readonly pgrp: number; readonly ttyNr: number; readonly tpgid: number;
+};
 
 /**
  * x86-64 syscall numbers: read and splice take the fd as a0. (`readv`, 19,
@@ -49,12 +51,14 @@ function readStat(pid: number): ProcStat | null {
   const rest = text.slice(close + 2).split(' ');
   // Fields after comm: 3 state, 4 ppid, 5 pgrp, 6 session, 7 tty_nr, 8 tpgid.
   const pgrp = Number(rest[2]);
+  const session = Number(rest[3]);
   const ttyNr = Number(rest[4]);
   const tpgid = Number(rest[5]);
-  if (!Number.isSafeInteger(pgrp) || !Number.isSafeInteger(ttyNr) || !Number.isSafeInteger(tpgid)) {
+  if (!Number.isSafeInteger(pgrp) || !Number.isSafeInteger(session)
+    || !Number.isSafeInteger(ttyNr) || !Number.isSafeInteger(tpgid)) {
     return null;
   }
-  return { pgrp, ttyNr, tpgid };
+  return { session, pgrp, ttyNr, tpgid };
 }
 
 /** The epoll instance `fd` of `pid` watches fd 0 iff its fdinfo lists `tfd: 0`. */
@@ -113,16 +117,40 @@ function waitsOnTtyStdin(pid: number, ttyTarget: string): boolean {
 }
 
 /**
+ * The `/dev/pts/<minor>` path a Linux `tty_nr` names, or null for any other
+ * device kind (or no tty at all). pts devices have major 136; the dev_t minor
+ * is split across the low and high halves of the encoded number.
+ */
+function ptsTarget(ttyNr: number): string | null {
+  const major = (ttyNr >> 8) & 0xfff;
+  const minor = (ttyNr & 0xff) | ((ttyNr >> 12) & 0xfff00);
+  return major === 136 ? `/dev/pts/${minor}` : null;
+}
+
+/**
  * The pts path fd 0 of `pid` resolves to, or null when it is not a pts device
- * (a pipe, a file, a dead process). The caller freezes the returned path while
- * the shell is idle: the proof is about the session's tty, not about whatever
- * a later redirection temporarily puts on fd 0.
+ * (a pipe, a file, a dead process), not the child's own controlling terminal,
+ * or not readable. The caller freezes the returned path while the shell is
+ * idle: the proof is about the session's tty, not about whatever a later
+ * redirection temporarily puts on fd 0.
+ *
+ * `forkpty` returns before the child's `login_tty`, so an immediate read can
+ * still see the spawner's inherited session, ctty and fd 0 — and that pair
+ * agrees with itself, so matching fd 0 against tty_nr alone would freeze the
+ * PARENT's pts. `login_tty` calls `setsid` and then `TIOCSCTTY`: requiring the
+ * pid to lead its own session proves the tty_nr is the freshly acquired slave,
+ * not the inherited one. (Before `setsid` the session is the spawner's; between
+ * `setsid` and `TIOCSCTTY` tty_nr is 0; between `TIOCSCTTY` and the fd dup,
+ * fd 0 still names the inherited tty.)
  */
 export function sessionTtyTarget(pid: number): string | null {
   if (process.platform !== 'linux') return null;
   try {
-    const target = readlinkSync(`/proc/${pid}/fd/0`);
-    return target.startsWith('/dev/pts/') ? target : null;
+    const stat = readStat(pid);
+    if (stat === null || stat.session !== pid) return null;
+    const own = ptsTarget(stat.ttyNr);
+    if (own === null) return null;
+    return readlinkSync(`/proc/${pid}/fd/0`) === own ? own : null;
   } catch {
     return null;
   }

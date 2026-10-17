@@ -63,7 +63,19 @@ describe('sanitizePtyText', () => {
 
   it('strips raw C1 control bytes', () => {
     expect(sanitizePtyText('a\x85b\x9bc')).toBe('abc');
-    expect(sanitizePtyText('x\x90y\x9dz\x9f')).toBe('xyz');
+    expect(sanitizePtyText('x\x84y\x9bz')).toBe('xyz');
+  });
+
+  it('consumes raw 8-bit C1 string-sequence payloads (DCS/SOS/OSC/PM/APC)', () => {
+    // Deleting only the introducer would leave the payload visible.
+    expect(sanitizePtyText('a\x90payload\x1b\\b')).toBe('ab');
+    expect(sanitizePtyText('a\x98payload\x9cb')).toBe('ab');
+    expect(sanitizePtyText('a\x9d0;title\x07b')).toBe('ab');
+    expect(sanitizePtyText('a\x9epayload\x1b\\b')).toBe('ab');
+    expect(sanitizePtyText('a\x9fpayload\x9cb')).toBe('ab');
+    // An unterminated raw sequence drops its tail to the capture end.
+    expect(sanitizePtyText('a\x9dunterminated')).toBe('a');
+    expect(sanitizePtyText(`a\x90line one\n${ESC}[31mred\x9cb`)).toBe('ab');
   });
 
   it('never splits a surrogate pair', () => {

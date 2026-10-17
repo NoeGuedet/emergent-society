@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -335,4 +335,20 @@ describe('PtyTerminalRuntime', () => {
     const outcome = await rt.run('echo x', limits(), new AbortController().signal);
     expect(outcome).toMatchObject({ status: 'spawn-failed', exitCode: null, reset: false });
   }, 10000);
+
+  it('a spawn failure after a stdin wedge reports the reset it performed', async () => {
+    // The wedge reset runs before the respawn; when that respawn then fails,
+    // the outcome must not claim reset:false — the session was killed.
+    const gone = join(dir, 'vanishing');
+    await mkdir(gone);
+    const rt = new PtyTerminalRuntime(gone, DEFAULT_TERMINAL_ENV);
+    runtimes.push(rt);
+    const wedged = await rt.run('read answer', limits(), new AbortController().signal);
+    expect(wedged.status).toBe('stdin_read');
+    await rm(gone, { recursive: true, force: true });
+    const outcome = await rt.run('echo never', limits(), new AbortController().signal);
+    expect(outcome).toMatchObject({
+      status: 'spawn-failed', exitCode: null, reset: true, fresh: 'stdin-wedge',
+    });
+  }, 15000);
 });
