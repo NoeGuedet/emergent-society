@@ -17,6 +17,7 @@ import { defaultAgentConfig } from '../config.js';
 import { ContextFold } from '../fold.js';
 import { SurfacePolicyError } from '../surface.js';
 import { ArtifactMismatchError, loadVerifiedEvents } from '../loader.js';
+import type { VerifiedEvent } from '../loader.js';
 import { canonicalBytes } from '../artifacts.js';
 import type {
   ArtifactRef, AssistantProjection, CompactionStart, CompactionSummary, FunctionCall, RequestId,
@@ -336,7 +337,7 @@ describe('fold: compaction applies only after a verified end', () => {
       const surface = before.snapshot().surface;
       if (surface === null) throw new Error('missing surface');
       const group = surface.nodes.find((node) => node.group.kind === 'perception')!.group;
-      const shadow = Buffer.from(canonicalBytes(group.messages));
+      const shadow = Buffer.from(canonicalMessagesBytes(group.messages));
       const candidate = {
         revision: surface.revision, groupIds: [group.id], sources: group.sources,
         shadowHash: sha256HexOf(shadow), shadowBytes: shadow.length,
@@ -351,7 +352,7 @@ describe('fold: compaction applies only after a verified end', () => {
       const message = { role: 'user' as const, content: 'Older committed context was removed.' };
       const summary = gate.append('compaction/summary', {
         id: start.id, message, sources: start.sources,
-        replacementBytes: canonicalBytes([message]).length,
+        replacementBytes: canonicalMessagesBytes([message]).length,
       });
       await gate.flush();
 
@@ -388,7 +389,7 @@ describe('fold: compaction applies only after a verified end', () => {
       const surface = before.snapshot().surface;
       if (surface === null) throw new Error('missing surface');
       const group = surface.nodes.find((node) => node.group.kind === 'perception')!.group;
-      const shadow = Buffer.from(canonicalBytes(group.messages));
+      const shadow = Buffer.from(canonicalMessagesBytes(group.messages));
       const fields = {
         revision: surface.revision, groupIds: [group.id], sources: group.sources,
         shadowHash: sha256HexOf(shadow), shadowBytes: shadow.length,
@@ -1263,5 +1264,355 @@ describe('fold: an invariant never leaves the cached surface half-changed', () =
     } finally {
       await s.close();
     }
+  });
+});
+
+// --- request sequencing invariants, table-driven (T3 audit M2) -------------------
+
+/**
+ * Every row starts from a real writer, a real config and, where it matters, a
+ * real folded prefix, then appends the one event (or event pair) that violates a
+ * sequencing rule. The gate is bypassed with `rawAppend` only where it would
+ * reject the forged fact before the fold could own the invariant.
+ */
+describe('fold: request-sequencing invariants fail closed', () => {
+  type InvariantCase = {
+    readonly name: string;
+    readonly pattern: RegExp;
+    readonly run: (s: Session, cfg: Source) => Promise<void>;
+  };
+
+  function beginTurn(s: Session, turn = 0): BoundaryGate {
+    s.lifecycle('turn/start', { turn, trigger: 'boot', world: { from: null, to: null } });
+    return s.gate('turn', turn).gate;
+  }
+
+  function rawAppend(s: Session, type: string, data: JsonValue): void {
+    (s.writer.append as unknown as (t: string, d: JsonValue) => EventEnvelope)(type, data);
+  }
+
+  /** Plan, wire, response and assistant, with tool/call receipts controlled by the caller. */
+  async function announced(
+    s: Session, cfg: Source, calls: FunctionCall[], receipts: boolean,
+  ): Promise<{ id: RequestId; gate: BoundaryGate; raw: ArtifactRef }> {
+    const gate = beginTurn(s);
+    gate.append('world/perception', {
+      turn: 0, range: { from: null, to: null },
+      value: { kind: 'inline', value: perception('evidence') },
+    });
+    const id: RequestId = { turn: 0, ordinal: 0 };
+    gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
+    const body = await gate.capture(Buffer.from('{}'), 'utf8');
+    gate.append('request/wire', { id, attempt: 0, body });
+    const raw = await gate.capture(Buffer.from('{"ok":true}'), 'utf8');
+    gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
+    gate.append('assistant/message', {
+      id, value: await gate.store(projection(calls, raw)),
+    });
+    if (receipts) for (const call of calls) gate.append('tool/call', { turn: 0, request: id, call });
+    return { id, gate, raw };
+  }
+
+  const cases: readonly InvariantCase[] = [
+    {
+      name: 'turn/start while a turn is already open',
+      pattern: /turn\/start while a turn is already open/,
+      run: async (s) => {
+        s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+        s.lifecycle('turn/start', { turn: 1, trigger: 'boot', world: { from: null, to: null } });
+      },
+    },
+    {
+      name: 'duplicate request/plan',
+      pattern: /duplicate request\/plan/,
+      run: async (s, cfg) => {
+        const t = await pipeline(s, 0, cfg, {});
+        t.gate.append('request/plan', {
+          id: t.id, value: await t.gate.store(minimalPlan(t.id, cfg)),
+        });
+      },
+    },
+    {
+      name: 'request/plan id does not match its payload',
+      pattern: /request\/plan id does not match its payload/,
+      run: async (s, cfg) => {
+        const gate = beginTurn(s);
+        gate.append('request/plan', {
+          id: { turn: 0, ordinal: 0 },
+          value: await gate.store(minimalPlan({ turn: 0, ordinal: 1 }, cfg)),
+        });
+      },
+    },
+    {
+      name: 'request/plan config differs from the active config',
+      pattern: /request\/plan config does not equal the active config/,
+      run: async (s) => {
+        const gate = beginTurn(s);
+        const foreign = { seq: 999, hash: 'c'.repeat(64) };
+        gate.append('request/plan', {
+          id: { turn: 0, ordinal: 0 },
+          value: await gate.store(minimalPlan({ turn: 0, ordinal: 0 }, foreign)),
+        });
+      },
+    },
+    {
+      name: 'request/wire without a recorded plan',
+      pattern: /request\/wire without a recorded plan/,
+      run: async (s) => {
+        const gate = beginTurn(s);
+        const body = await gate.capture(Buffer.from('{}'), 'utf8');
+        gate.append('request/wire', { id: { turn: 0, ordinal: 0 }, attempt: 0, body });
+      },
+    },
+    {
+      name: 'duplicate first request/wire',
+      pattern: /duplicate first request\/wire/,
+      run: async (s, cfg) => {
+        const gate = beginTurn(s);
+        const id: RequestId = { turn: 0, ordinal: 0 };
+        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
+        const body = await gate.capture(Buffer.from('{}'), 'utf8');
+        gate.append('request/wire', { id, attempt: 0, body });
+        gate.append('request/wire', { id, attempt: 0, body });
+      },
+    },
+    {
+      name: 'retry request/wire with different body bytes',
+      pattern: /retry request\/wire does not reuse the first body/,
+      run: async (s, cfg) => {
+        const gate = beginTurn(s);
+        const id: RequestId = { turn: 0, ordinal: 0 };
+        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
+        const first = await gate.capture(Buffer.from('{}'), 'utf8');
+        const second = await gate.capture(Buffer.from('{"changed":true}'), 'utf8');
+        gate.append('request/wire', { id, attempt: 0, body: first });
+        gate.append('request/wire', { id, attempt: 1, body: second });
+      },
+    },
+    {
+      name: 'duplicate request/wire attempt',
+      pattern: /duplicate request\/wire attempt/,
+      run: async (s, cfg) => {
+        const gate = beginTurn(s);
+        const id: RequestId = { turn: 0, ordinal: 0 };
+        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
+        const body = await gate.capture(Buffer.from('{}'), 'utf8');
+        gate.append('request/wire', { id, attempt: 0, body });
+        gate.append('request/wire', { id, attempt: 1, body });
+        gate.append('request/wire', { id, attempt: 1, body });
+      },
+    },
+    {
+      name: 'response/raw without a preceding wire',
+      pattern: /response\/raw without a preceding wire/,
+      run: async (s, cfg) => {
+        const gate = beginTurn(s);
+        const id: RequestId = { turn: 0, ordinal: 0 };
+        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
+        const raw = await gate.capture(Buffer.from('raw'), 'utf8');
+        gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
+      },
+    },
+    {
+      name: 'duplicate response/raw for an attempt',
+      pattern: /duplicate response\/raw for an attempt/,
+      run: async (s, cfg) => {
+        const gate = beginTurn(s);
+        const id: RequestId = { turn: 0, ordinal: 0 };
+        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
+        const body = await gate.capture(Buffer.from('{}'), 'utf8');
+        gate.append('request/wire', { id, attempt: 0, body });
+        const raw = await gate.capture(Buffer.from('raw'), 'utf8');
+        gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
+        gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
+      },
+    },
+    {
+      name: 'assistant/message without a recorded plan',
+      pattern: /assistant\/message without a recorded plan/,
+      run: async (s) => {
+        const gate = beginTurn(s);
+        const raw = await gate.capture(Buffer.from('raw'), 'utf8');
+        gate.append('assistant/message', {
+          id: { turn: 0, ordinal: 0 },
+          value: await gate.store(projection([], raw)),
+        });
+      },
+    },
+    {
+      name: 'assistant/message without a preceding wire',
+      pattern: /assistant\/message without a preceding wire/,
+      run: async (s, cfg) => {
+        const gate = beginTurn(s);
+        const id: RequestId = { turn: 0, ordinal: 0 };
+        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
+        const raw = await gate.capture(Buffer.from('raw'), 'utf8');
+        gate.append('assistant/message', { id, value: await gate.store(projection([], raw)) });
+      },
+    },
+    {
+      name: 'duplicate assistant/message for a request',
+      pattern: /duplicate assistant\/message for a request/,
+      run: async (s, cfg) => {
+        const t = await announced(s, cfg, [], false);
+        t.gate.append('assistant/message', {
+          id: t.id, value: await t.gate.store(projection([], t.raw)),
+        });
+      },
+    },
+    {
+      name: 'tool/call was not advertised',
+      pattern: /tool\/call c2 was not advertised/,
+      run: async (s, cfg) => {
+        const t = await pipeline(s, 0, cfg, { calls: [call('c1')] });
+        t.gate.append('tool/call', { turn: 0, request: t.id, call: call('c2') });
+      },
+    },
+    {
+      name: 'tool/call arguments disagree with the advertised call',
+      pattern: /tool\/call c1 disagrees with the advertised call/,
+      run: async (s, cfg) => {
+        const t = await pipeline(s, 0, cfg, { calls: [call('c1')] });
+        t.gate.append('tool/call', {
+          turn: 0, request: t.id,
+          call: { id: 'c1', type: 'function', function: { name: 'execute', arguments: '{"cmd":"x"}' } },
+        });
+      },
+    },
+    {
+      name: 'duplicate tool/result for a call',
+      pattern: /duplicate tool\/result for c1/,
+      run: async (s, cfg) => {
+        const t = await pipeline(s, 0, cfg, { calls: [call('c1')] });
+        t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
+        t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
+      },
+    },
+    {
+      name: 'tool/result without a preceding tool/call',
+      pattern: /tool\/result without a preceding tool\/call/,
+      run: async (s, cfg) => {
+        const t = await announced(s, cfg, [call('c1')], false);
+        t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
+      },
+    },
+    {
+      name: 'non-synthetic tool/result outside its turn',
+      pattern: /non-synthetic tool\/result outside its turn/,
+      run: async (s) => {
+        beginTurn(s);
+        rawAppend(s, 'tool/result', result({ turn: 1, ordinal: 0 }, 1, 'c1'));
+      },
+    },
+    {
+      name: 'compaction/end without a matching summary',
+      pattern: /compaction\/end without a matching summary/,
+      run: async (s, cfg) => {
+        const gate = beginTurn(s);
+        const id = 'a'.repeat(64);
+        gate.append('compaction/start', {
+          id, revision: 'b'.repeat(64), groupIds: [cfg], sources: [cfg],
+          shadowHash: 'c'.repeat(64), shadowBytes: 1,
+        });
+        rawAppend(s, 'compaction/end', { id, summary: { seq: 0, hash: cfg.hash } });
+      },
+    },
+    {
+      name: 'compaction/end cites a different summary receipt',
+      pattern: /compaction\/end summary source does not match the recorded summary/,
+      run: async (s, cfg) => {
+        const gate = beginTurn(s);
+        const first = 'a'.repeat(64);
+        const second = 'b'.repeat(64);
+        let secondSummary: Source | null = null;
+        for (const id of [first, second]) {
+          gate.append('compaction/start', {
+            id, revision: 'c'.repeat(64), groupIds: [cfg], sources: [cfg],
+            shadowHash: 'd'.repeat(64), shadowBytes: 1,
+          });
+          const summary = gate.append('compaction/summary', {
+            id, message: { role: 'user', content: 'older context removed' },
+            sources: [cfg], replacementBytes: 1,
+          });
+          if (id === second) secondSummary = summary;
+        }
+        // The fold holds both summaries; ending the first with the second's
+        // receipt is a provenance mismatch, not a missing summary.
+        const other = secondSummary!;
+        gate.append('compaction/end', {
+          id: first, summary: { seq: other.seq, hash: other.hash },
+        });
+      },
+    },
+    {
+      name: 'duplicate world/perception for a turn',
+      pattern: /duplicate world\/perception for the turn/,
+      run: async (s) => {
+        const gate = beginTurn(s);
+        const value = { kind: 'inline' as const, value: perception('evidence') };
+        gate.append('world/perception', {
+          turn: 0, range: { from: null, to: null }, value,
+        });
+        gate.append('world/perception', {
+          turn: 0, range: { from: null, to: null }, value,
+        });
+      },
+    },
+    {
+      name: 'config version regression',
+      pattern: /config version must strictly increase/,
+      run: async (s) => {
+        const ready = s.gate('ready', null).gate;
+        ready.append('system/message', {
+          version: 1,
+          value: { kind: 'inline', value: { ...defaultAgentConfig(), heading: 'A different heading.' } },
+        });
+      },
+    },
+  ];
+
+  it.each(cases)('$name', async ({ pattern, run }) => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      await run(s, cfg);
+      await s.writer.flush();
+      await expect(foldOf(home())).rejects.toThrow(pattern);
+    } finally {
+      await s.close();
+    }
+  }, 15000);
+});
+
+describe('fold: observation identity fails closed', () => {
+  const GENESIS = '0'.repeat(64);
+  const hashFor = (seq: number): string => (seq + 1).toString(16).padStart(64, '0');
+
+  function boot(seq: number): VerifiedEvent {
+    const envelope = {
+      v: 0, seq, time: 1, prev_hash: GENESIS, hash: hashFor(seq), type: 'node/boot', data: {},
+    } as EventEnvelope;
+    return { ...envelope, raw: envelope };
+  }
+
+  it('rejects a changed hash at an already-observed seq', async () => {
+    const fold = new ContextFold();
+    await fold.observe([boot(0)]);
+    const changed = boot(0);
+    const raw = { ...changed.raw, hash: 'f'.repeat(64) };
+    await expect(fold.observe([{ ...raw, raw }])).rejects.toThrow(/changed hash at seq 0/);
+  });
+
+  it('rejects a gap in seq on observation', async () => {
+    const fold = new ContextFold();
+    await expect(fold.observe([boot(1)])).rejects.toThrow(
+      /gap in observation: expected seq 0, received 1/);
+  });
+
+  it('skips an identical (seq,hash) and continues from the observed prefix', async () => {
+    const fold = new ContextFold();
+    await fold.observe([boot(0)]);
+    await fold.observe([boot(0), boot(1)]);
+    expect(fold.verifiedEvents().map((event) => event.raw.seq)).toEqual([0, 1]);
   });
 });

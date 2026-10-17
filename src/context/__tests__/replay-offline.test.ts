@@ -6,7 +6,7 @@ import { C13_EVENT_TYPES, createBoundaryRegistry, validateRequestPlan } from '..
 import { createBoundaryGate } from '../../node/gate.js';
 import { ContextFold } from '../fold.js';
 import { assemble } from '../assembler.js';
-import { serializeWire } from '../../provider/wire.js';
+import { canonicalMessagesBytes, serializeWire } from '../../provider/wire.js';
 import { loadVerifiedEvents } from '../loader.js';
 import { canonicalBytes, resolveArtifact, resolveStored } from '../artifacts.js';
 import { defaultAgentConfig } from '../config.js';
@@ -210,7 +210,7 @@ describe('C1.3 offline reconstruction (writer-backed, no runtime)', () => {
     const groupSources = [...dialogue.group.sources]
       .map((s) => ({ seq: s.seq, hash: s.hash }))
       .sort((a, b) => (a.seq - b.seq) || (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
-    const shadow = Buffer.from(canonicalBytes(dialogue.group.messages));
+    const shadow = Buffer.from(canonicalMessagesBytes(dialogue.group.messages));
     const candidate = { revision: before.surface.revision, groupIds: [dialogue.group.id],
       sources: groupSources, shadowHash: sha256HexOf(shadow), shadowBytes: shadow.length };
     const start: CompactionStart = { id: sha256HexOf(Buffer.from(canonicalBytes(candidate))), ...candidate };
@@ -224,7 +224,7 @@ describe('C1.3 offline reconstruction (writer-backed, no runtime)', () => {
       gate.gate.append('compaction/start', start);
       const message = { role: 'user' as const, content: 'Older committed context was removed.' };
       const summary = gate.gate.append('compaction/summary', { id: start.id, message,
-        sources: groupSources, replacementBytes: canonicalBytes([message]).length });
+        sources: groupSources, replacementBytes: canonicalMessagesBytes([message]).length });
       gate.gate.append('compaction/end', { id: start.id, summary: source(summary) });
       await gate.gate.flush();
       compact.lifecycle('turn/end', { turn: 2, outcome: 'waiting' }, { ignorable: true });

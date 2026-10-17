@@ -6,7 +6,10 @@ import { defaultAgentConfig } from '../config.js';
 import { ArtifactMismatchError, type VerifiedEvent, type VerifiedEvents } from '../loader.js';
 import { canonicalBytes, resolveArtifact } from '../artifacts.js';
 import { assemble, rederivePlans } from '../assembler.js';
+import { ContextFold } from '../fold.js';
+import { presentWorld } from '../diff.js';
 import { serializeWire } from '../../provider/wire.js';
+import { useWorld } from '../../node/__tests__/helpers.js';
 import type { WorldRepo } from '../../node/world.js';
 import type {
   AgentConfig, ArtifactRef, CanonicalUsage, ChatMessage, FunctionCall, OpenTurn, ProjectionState,
@@ -208,6 +211,20 @@ describe('assemble: stateHash scope', () => {
       .toBe(assemble({ id: ID, state: base }).stateHash);
   });
 
+  it('includes the open turn in the state hash', () => {
+    const open: OpenTurn = {
+      start: src(9), turn: 0, world: { from: null, to: null },
+      perception: null, perceptionConsumed: false, messages: [], sources: [],
+    };
+    const closed = assemble({ id: ID, state: makeState() });
+    const opened = assemble({ id: ID, state: makeState({ open }) });
+    expect(opened.stateHash).not.toBe(closed.stateHash);
+    // The open turn is the only difference: config, surface and recovery agree.
+    expect(opened.sections).toEqual(closed.sections);
+    expect(opened.history).toEqual(closed.history);
+    expect(opened.queue).toEqual(closed.queue);
+  });
+
   it('refuses without a config and refuses a nonempty recovery list', () => {
     expect(() => assemble({ id: ID, state: makeState({ config: null, surface: null }) }))
       .toThrow(/config/);
@@ -338,5 +355,123 @@ describe('rederivePlans: the observed prefix is authoritative', () => {
     // read, so reconstruction refuses rather than trusting a later receipt.
     const world = {} as unknown as WorldRepo;
     await expect(rederivePlans(events, world)).rejects.toThrow(ArtifactMismatchError);
+  });
+});
+
+describe('rederivePlans: a divergence is explicit, never a promise of equality', () => {
+  const GENESIS = '0'.repeat(64);
+  const RANGE = { from: null, to: null };
+  // A fresh world (unborn HEAD) makes the recorded perception independently
+  // re-renderable; every case below diverges from it by exactly one field.
+  const fixture = useWorld('c13-replay-divergence-');
+  const hashFor = (seq: number): string => (seq + 1).toString(16).padStart(64, '0');
+
+  function envelope(seq: number, type: string, data: JsonValue): EventEnvelope {
+    return { v: 0, seq, time: 1, prev_hash: GENESIS, hash: hashFor(seq), type, data };
+  }
+
+  const verified = (event: EventEnvelope): VerifiedEvent => ({ ...event, raw: event });
+
+  const configEvent = (): VerifiedEvent => verified(envelope(0, 'system/message', {
+    version: 1, value: { kind: 'inline', value: defaultAgentConfig() },
+  }));
+  const turnEvent = (): VerifiedEvent => verified(envelope(1, 'turn/start', {
+    turn: 0, trigger: 'boot', world: RANGE,
+  }));
+  const id: RequestId = { turn: 0, ordinal: 0 };
+
+  it('rejects a recorded plan rewritten to a different but valid plan', async () => {
+    const { world } = fixture();
+    const config = configEvent();
+    const turn = turnEvent();
+    // The plan genuinely rederivable from these two facts...
+    const prefix = new ContextFold();
+    await prefix.observe([config, turn]);
+    const real = assemble({ id, state: prefix.snapshot() });
+    // ...and a valid plan that differs in one field.
+    const rewritten = JSON.parse(JSON.stringify(real)) as RequestPlan;
+    (rewritten as { model: string }).model = 'another-model';
+
+    const events: VerifiedEvents = [
+      config, turn,
+      verified(envelope(2, 'request/plan', { id, value: { kind: 'inline', value: rewritten } })),
+    ];
+    await expect(rederivePlans(events, world)).rejects.toThrow(
+      /plan recorded at \d+:[0-9a-f]+ does not match the plan rederived/);
+  });
+
+  it('rejects a recorded perception whose inline text differs from the re-render', async () => {
+    const { world } = fixture();
+    const rendered = await presentWorld(world, 'n1', RANGE, 32768, 4096);
+    const recorded = { ...rendered, text: `${rendered.text}tampered` };
+    const events: VerifiedEvents = [
+      configEvent(), turnEvent(),
+      verified(envelope(2, 'world/perception', {
+        turn: 0, range: RANGE, value: { kind: 'inline', value: recorded },
+      })),
+    ];
+    await expect(rederivePlans(events, world)).rejects.toThrow(
+      /does not match the perception rederived from the world/);
+  });
+
+  it('rejects a recorded perception that binds a different Git version', async () => {
+    const { world } = fixture();
+    const rendered = await presentWorld(world, 'n1', RANGE, 32768, 4096);
+    const recorded = {
+      ...rendered,
+      renderer: { ...rendered.renderer, gitVersion: 'git version 9.99.9' },
+    };
+    const events: VerifiedEvents = [
+      configEvent(), turnEvent(),
+      verified(envelope(2, 'world/perception', {
+        turn: 0, range: RANGE, value: { kind: 'inline', value: recorded },
+      })),
+    ];
+    await expect(rederivePlans(events, world)).rejects.toThrow(
+      /recorded Git version .* differs from the host's/);
+  });
+
+  it('re-encodes every recorded wire body from the recorded plan', async () => {
+    const { world } = fixture();
+    const config = configEvent();
+    const turn = turnEvent();
+    const rendered = await presentWorld(world, 'n1', RANGE, 32768, 4096);
+    const perception = verified(envelope(2, 'world/perception', {
+      turn: 0, range: RANGE, value: { kind: 'inline', value: rendered },
+    }));
+
+    // The plan assembled at the recorded moment, then captured as its wire.
+    const atPlan = new ContextFold();
+    await atPlan.observe([config, turn, perception]);
+    const plan = assemble({ id, state: atPlan.snapshot() });
+    const wireBytes = Buffer.from(serializeWire(plan));
+    const sha = sha256HexOf(wireBytes);
+    const chunk = verified(envelope(4, 'artifact/chunk', {
+      artifact: sha, index: 0, base64: wireBytes.toString('base64'),
+    }));
+    const end = verified(envelope(5, 'artifact/end', {
+      artifact: sha, sha256: sha, bytes: wireBytes.length, encoding: 'utf8', complete: true,
+      parts: [{ seq: chunk.raw.seq, hash: chunk.raw.hash }],
+    }));
+    const body: ArtifactRef = {
+      kind: 'c13-artifact', manifest: { seq: end.raw.seq, hash: end.raw.hash },
+      sha256: sha, bytes: wireBytes.length, encoding: 'utf8', complete: true,
+    };
+    const events: VerifiedEvents = [
+      config, turn, perception,
+      verified(envelope(3, 'request/plan', { id, value: { kind: 'inline', value: plan } })),
+      chunk, end,
+      verified(envelope(6, 'request/wire', { id, attempt: 0, body })),
+    ];
+
+    const comparisons = await rederivePlans(events, world);
+    expect(comparisons).toHaveLength(1);
+    const recorded = comparisons[0]!.recorded;
+    // The durable wire is exactly what the recorded plan re-serializes to; the
+    // utility compares plans canonically, this pins the wire side of that promise.
+    expect(Buffer.from(resolveArtifact(events, body)).equals(Buffer.from(serializeWire(recorded))))
+      .toBe(true);
+    expect(Buffer.from(serializeWire(recorded)))
+      .toEqual(Buffer.from(serializeWire(comparisons[0]!.rederived)));
   });
 });
