@@ -32,6 +32,9 @@ import type { SerializedTransport, TransportResult } from './transport.js';
  * keeps the transport's own `body-limit` (non-retryable), lets a gate abort win
  * as a non-retryable `cancelled` with the status preserved, and turns the
  * adapter's own timer into a retryable `timeout` rather than a cancellation.
+ *
+ * Not to be confused with `src/node/tools/providers.ts`: this module is the LLM
+ * request path; that one is the web-tool credential store.
  */
 
 export type ProviderPolicy = {

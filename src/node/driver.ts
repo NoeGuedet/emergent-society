@@ -52,9 +52,6 @@ function checkedKnownTypes(
 // ShutdownReason and a closer takes a TurnEndOutcome.
 export type { ShutdownReason, TurnEndOutcome, TurnTrigger } from './events.js';
 
-/** How a turn ended: chained/waiting are the handler's, error is a recoverable failure. */
-export type TurnOutcome = 'chained' | 'waiting' | 'error';
-
 /**
  * What the handler reports back. The driver decides what the turn *meant*: it
  * is the only one that knows what the world did, and the handler is the only

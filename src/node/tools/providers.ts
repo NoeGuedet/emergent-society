@@ -27,6 +27,9 @@ import { toJson } from '../../context/artifacts.js';
  * assigned `undefined`:
  * `const webTools = webToolsFromProviders(await loadProviders(home));`
  * `createAgentRuntime({ ...options, ...(webTools !== undefined ? { webTools } : {}) });`
+ *
+ * Not to be confused with `src/provider/adapter.ts`: this module stores web-tool
+ * credentials; that one is the LLM request path.
  */
 
 const PROVIDERS_BASENAME = 'providers.json';

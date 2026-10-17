@@ -473,16 +473,18 @@ describe('stop', () => {
       fx, configWith({ policy: { stepsPerTurn: 8, retryDelayMs: 1 } }), transport,
     );
     const driver = await openRuntime(fx, runtime);
-    const started = Date.now();
     const running = driver.run();
     await vi.waitFor(
       async () => { await access(join(fx.world.path, 'started.txt')); },
       { timeout: 15000 },
     );
+    // Measure the abort path, not shell startup: the claim is that stop() kills
+    // the 30 s command promptly, so the clock starts when stop is requested.
+    const stopped = Date.now();
     driver.stop();
     await running;
 
-    expect(Date.now() - started).toBeLessThan(10000);
+    expect(Date.now() - stopped).toBeLessThan(10000);
     expect(transport.sends).toHaveLength(1);
     const events = await eventsOf(fx);
     // The killed call completed the group; no second logical request was attempted.

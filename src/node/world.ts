@@ -100,9 +100,10 @@ const GIT_ENV_STRIP: readonly string[] = [
  * kernel reads physical committed facts rather than a `refs/replace` projection
  * — intentionally, since a projection is not a durable fact of the world. This
  * is the single place that decides a kernel git environment: the process
- * environment is read, never mutated.
+ * environment is read, never mutated. Exported so test fixtures acting as a
+ * second writer use the same controlled environment the kernel does.
  */
-function gitEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
+export function gitEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of GIT_ENV_STRIP) delete env[key];
   for (const key of Object.keys(env)) {

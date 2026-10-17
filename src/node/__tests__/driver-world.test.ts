@@ -19,8 +19,12 @@ const timed = useWorld('node-world-timed-', { pollMs: 25 });
 const wait = (): TurnResult => ({ outcome: 'waiting', toolCalls: false });
 const acted = (): TurnResult => ({ outcome: 'waiting', toolCalls: true });
 
-/** Long enough for a wake evaluation (two git reads) to have finished, or not to. */
-const quiet = (ms = 80): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
+/**
+ * A negative wake assertion needs a window in which a spurious wake would
+ * certainly have landed: two git reads plus scheduler slack. It is a deliberately
+ * generous quiet window, not a settle — a too-short one is a flake by design.
+ */
+const quiet = (ms = 500): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
 
 /** Parks the driver, then waits until its subscription to the world is in place. */
 async function parked(d: NodeDriver, world: WorldRepo, subscribers = 1): Promise<void> {
@@ -359,7 +363,9 @@ describe('the wake predicate', () => {
     // latch of the park that follows, or the node would take a `wakeup` turn on
     // a world that has not moved since it looked.
     await parked(d, world);
-    await quiet(250);
+    // Must outlast the 150 ms stalled evaluation plus both git reads; the
+    // assertion is negative, so the window is the only signal.
+    await quiet(750);
     expect(triggers).toEqual(['boot', 'wakeup']);
     expect(d.state).toBe('waiting');
     d.stop();

@@ -223,7 +223,10 @@ describe('ownership guard failure', () => {
       const err = await guard.run('acquire', await identity()).catch((e: unknown) => e);
       const elapsed = Date.now() - started;
       expect(err).toBeInstanceOf(JournalLockUnavailableError);
-      expect(elapsed).toBeLessThan(1800);
+      // The positive fact is the typed failure; this bound only proves the
+      // shortened 800 ms timeout was honored rather than the 10 s default. It is
+      // deliberately loose so a loaded host's process reaping cannot flip it.
+      expect(elapsed).toBeLessThan(5000);
       expect(await ownerExists(dir)).toBe(false);
       // No orphan still holds the kernel lock: a fresh flock acquires it at once.
       const probe = spawnSync(FLOCK, ['--nonblock', '--exclusive', lockPath(dir), '/bin/true']);

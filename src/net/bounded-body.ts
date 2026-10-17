@@ -12,7 +12,8 @@ import { Buffer } from 'node:buffer';
  * `isCancelled` is evaluated at the moment a read fails, never after, matching
  * each caller's own check at the same point: a caller-cancelled read is
  * `cancelled-by-caller`, anything else is `read-error`. A zero cap therefore
- * still yields an empty, incomplete body rather than reading one chunk.
+ * yields an empty, incomplete body — it still reads one chunk to discover the
+ * overrun, then discards it while cancelling the reader.
  */
 export type BoundedBodyOutcome = 'complete' | 'body-limit' | 'read-error' | 'cancelled-by-caller';
 

@@ -213,7 +213,10 @@ describe('PtyTerminalRuntime', () => {
 
   it('a timeout returns the partial output and resets the session', async () => {
     const rt = terminal();
-    const outcome = await rt.run('echo before; sleep 30', limits({ timeoutMs: 700 }),
+    // 3 s, not a 700 ms race: the assertion is that output written before the
+    // timeout survives it, so the bound must not compete with a loaded shell's
+    // startup. The sleep keeps the command running until the timeout fires.
+    const outcome = await rt.run('echo before; sleep 30', limits({ timeoutMs: 3000 }),
       new AbortController().signal);
     expect(outcome).toMatchObject({ status: 'timeout', exitCode: null, reset: true });
     expect(text(outcome)).toContain('before');
@@ -267,8 +270,15 @@ describe('PtyTerminalRuntime', () => {
   it('an abort mid-command cancels and resets the session', async () => {
     const rt = terminal();
     const controller = new AbortController();
-    const pending = rt.run('sleep 30', limits(), controller.signal);
-    setTimeout(() => { controller.abort(); }, 300);
+    // Abort only after a positive observable proves the command was written and
+    // running: a pre-write abort legitimately answers `reset: false`, so a timer
+    // race would assert the wrong path under load.
+    const started = join(dir, 'abort-started.txt');
+    const pending = rt.run(`touch '${started}' && sleep 30`, limits(), controller.signal);
+    await waitFor(() => {
+      try { readFileSync(started); return true; } catch { return false; }
+    });
+    controller.abort();
     const outcome = await pending;
     expect(outcome).toMatchObject({ status: 'cancelled', reset: true });
   }, 15000);

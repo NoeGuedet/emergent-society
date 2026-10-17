@@ -10,7 +10,6 @@ export {
   type NodeState,
   type TurnContext,
   type TurnHandler,
-  type TurnOutcome,
   type TurnResult,
 } from './driver.js';
 export {

@@ -7,7 +7,7 @@ const NOOP = (): void => {};
  * world. It costs a process spawn, never a token: a node waiting on an
  * unchanged world is silent, and the only price of the wait is this read.
  */
-export const DEFAULT_POLL_MS = 250;
+const DEFAULT_POLL_MS = 250;
 
 /**
  * The kernel's HEAD watcher (kernel.md §5.2): the one source of "the world may

@@ -7,7 +7,7 @@ import { collectEvents } from '../../journal/__tests__/helpers.js';
 import type { EventEnvelope } from '../../journal/index.js';
 import { NODE_EVENT_TYPES } from '../events.js';
 import { HeadWatcher } from '../watcher.js';
-import { WorldRepo } from '../world.js';
+import { WorldRepo, gitEnv } from '../world.js';
 
 /**
  * Scaffolding shared by the node suites: a temp root holding one node home and
@@ -50,10 +50,18 @@ export function useWorld(prefix: string, opts: { pollMs?: number } = {}): () => 
   };
 }
 
-/** Runs a git command in a directory, as a test's own hand rather than a driver's. */
-export async function gitIn(dir: string, args: readonly string[]): Promise<string> {
+/**
+ * Runs a git command in a directory, as a test's own hand rather than a
+ * driver's. The environment is the kernel's controlled one: a fixture must not
+ * inherit a host `GIT_DIR`/global config any more than production may. A test
+ * that deliberately needs a host-ambient read (the replace-ref sanity check)
+ * passes its own environment.
+ */
+export async function gitIn(
+  dir: string, args: readonly string[], env: NodeJS.ProcessEnv = gitEnv(),
+): Promise<string> {
   return new Promise<string>((resolvePromise, reject) => {
-    execFile('git', [...args], { cwd: dir }, (err, stdout, stderr) => {
+    execFile('git', [...args], { cwd: dir, env }, (err, stdout, stderr) => {
       if (err !== null) reject(new Error(`git ${args.join(' ')}: ${stderr}`));
       else resolvePromise(stdout);
     });
@@ -75,11 +83,10 @@ export async function commitAs(
     await writeFile(path, content);
   }
   const email = `${author.replace(/[^A-Za-z0-9._-]/g, '-')}@world.local`;
-  const env = {
-    ...process.env,
+  const env = gitEnv({
     GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: email,
     GIT_COMMITTER_NAME: author, GIT_COMMITTER_EMAIL: email,
-  };
+  });
   // `add --all` then `commit`, not `commit --all`: `-a` stages tracked
   // modifications only, so a newly written file would not be committed.
   await gitIn(world.path, ['add', '--all']);

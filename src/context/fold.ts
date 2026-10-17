@@ -313,6 +313,9 @@ export class ContextFold {
       invariant('system/message version does not equal the resolved config version');
     }
     if (this.config === null) {
+      // Fail-closed defense for a future refactor: validateAgentConfig already
+      // requires version >= 1, so this is unreachable today — but a first config
+      // must never create a surface at an unversioned epoch.
       if (config.version < 1) invariant('the first config version must be at least 1');
       this.surface = new Surface({ text: config.heading, source }, this.lookup);
     } else {
@@ -680,10 +683,6 @@ export class ContextFold {
         recover.push(buffer);
       }
     }
-    if (promote.length > 0 && this.surface === null) {
-      invariant('no heading surface to append a dialogue to');
-    }
-
     // The external perception is promoted first, so it precedes this turn's
     // dialogues in committed history, even when the turn did nothing else.
     if (open.perceptionGroup !== null && this.surface !== null) {

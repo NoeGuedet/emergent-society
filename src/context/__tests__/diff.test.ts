@@ -148,8 +148,8 @@ describe('world reads ignore a refs/replace projection', () => {
     await gitIn(world.path, ['replace', c1, replacement]);
 
     // Sanity: a plain git read without the kernel's env does project the forgery.
-    expect(await gitIn(world.path, ['log', '--format=%an', '-1', c1])).toBe('attacker\n');
-    expect(await gitIn(world.path, ['log', '--format=%s', '-1', c1])).toBe('forged subject\n');
+    expect(await gitIn(world.path, ['log', '--format=%an', '-1', c1], process.env)).toBe('attacker\n');
+    expect(await gitIn(world.path, ['log', '--format=%s', '-1', c1], process.env)).toBe('forged subject\n');
 
     // The kernel's git environment neutralizes the projection: the log and the
     // rev-list traversal report the physical author.

@@ -23,6 +23,10 @@ export function decodeToolText(bytes: Uint8Array): string {
  * U+FFFD replacement of an unpaired surrogate — is never split, and the cut
  * never introduces a replacement of its own. The returned `bytes` is the
  * prefix's encoded length, which is what callers account for.
+ *
+ * Precondition: `text` has no lone surrogate, so the encode/decode round trip is
+ * lossless — callers feed TextDecoder output or `toJson`-validated content;
+ * otherwise the decode would surface the surrogate as U+FFFD.
  */
 export function utf8Prefix(text: string, maxBytes: number): { text: string; bytes: number } {
   const encoded = Buffer.from(text, 'utf8');
