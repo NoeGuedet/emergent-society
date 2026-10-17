@@ -40,6 +40,8 @@ const runtime = createAgentRuntime({
 });
 ```
 
+`RuntimeOptions.terminal` is a required option: the host supplies the environment allowlist, exactly as it used to supply `shellPolicy.env`.
+
 Without a `<home>/providers.json`, the offered web calls resolve as `denied`. Placing `<home>` outside the world and outside the project checkout is a host responsibility: documented, not enforced by any runtime guard.
 
 ## Development

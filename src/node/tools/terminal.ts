@@ -1,6 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
+import { constants as osConstants } from 'node:os';
 import * as pty from '@lydell/node-pty';
 import { stdinWaitPids } from './proc.js';
 
@@ -69,10 +70,13 @@ const STDIN_PROBES = 2;
  */
 const STDIN_PROBE_INTERVAL_MS = 200;
 
-/** pty onExit reports the signal as a number; the renderer wants the name. */
-const SIGNAL_NAMES: Readonly<Record<number, string>> = {
-  1: 'SIGHUP', 2: 'SIGINT', 6: 'SIGABRT', 9: 'SIGKILL', 15: 'SIGTERM',
-};
+/**
+ * A reverse map built once from the platform's signal table: pty onExit reports
+ * the signal as a number, and the renderer wants the name (`SIGSEGV`, not
+ * `SIG11`). Unknown numbers still fall back to `SIG<n>`.
+ */
+const SIGNAL_NAMES: Readonly<Record<number, string>> =
+  Object.fromEntries(Object.entries(osConstants.signals).map(([name, number]) => [number, name]));
 
 /**
  * DSH's exact quoting: the wrapped line stays one physical line, no PS2 ever
@@ -140,6 +144,12 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     return task;
   }
 
+  /**
+   * Kills the session and refuses later runs; safe to call twice. Disposal is
+   * FIFO behind an in-flight command: it runs only after that command settles,
+   * and the wait is bounded only by that command's own timeout. A caller
+   * shutting down must abort in-flight work first (the driver does).
+   */
   async dispose(_reason: string, killGraceMs: number): Promise<void> {
     const task = this.queue.then(async () => {
       this.disposed = true;
@@ -164,8 +174,9 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     });
     const session: Session = { proc, pid: proc.pid, exited: null };
     proc.onExit(({ exitCode, signal }) => {
-      // node-pty reports the signal as a NUMBER: 0 for a clean exit, never
-      // undefined — so only a nonzero signal names a death.
+      // node-pty reports the signal as a NUMBER in practice (the d.ts types it
+      // optional, so the check stays): 0 for a clean exit — only a nonzero
+      // signal names a death.
       session.exited = {
         code: exitCode,
         signal: signal === undefined || signal === 0

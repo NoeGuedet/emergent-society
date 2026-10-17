@@ -81,6 +81,15 @@ describe('PtyTerminalRuntime', () => {
     expect(outcome.reset).toBe(true);
   }, 10000);
 
+  it('a shell killed by a signal is a session_exit by signal and resets the session', async () => {
+    const rt = terminal();
+    const outcome = await rt.run('kill -9 $$', limits(), new AbortController().signal);
+    // node-pty's exit code for a signal death varies: only the signal is asserted.
+    expect(outcome).toMatchObject({ status: 'session_exit', signal: 'SIGKILL', reset: true });
+    const next = await rt.run('echo fresh', limits(), new AbortController().signal);
+    expect(next).toMatchObject({ status: 'completed', exitCode: 0, fresh: null });
+  }, 15000);
+
   it('a plain failing command keeps the session alive', async () => {
     const rt = terminal();
     const bad = await rt.run('false', limits(), new AbortController().signal);

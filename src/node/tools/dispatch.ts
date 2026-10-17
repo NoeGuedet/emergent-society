@@ -9,7 +9,7 @@ import { renderExtract, renderSearch } from './web.js';
 import type { WebOutcome, WebTools } from './web.js';
 
 /**
- * Foreground tool dispatch (T7, kernel.md §4).
+ * Tool dispatch (T7, kernel.md §4).
  *
  * `dispatchCalls` turns an assistant projection's advertised calls into durable
  * `tool/call` + `tool/result` facts. Tool names are recognized exactly: `execute`

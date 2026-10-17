@@ -1,5 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { createServer, type Server } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { loadVerifiedEvents } from '../../context/loader.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
@@ -139,15 +141,17 @@ describe('C1.4b persistent terminal end to end', () => {
       expect(results[0]!.message.content).toContain('/bench');
       expect(results[1]!.message.content).toContain('/bench');
       expect(results[1]!.message.content).toContain('c14b-persisted');
-      // The raw artifacts carry the verbatim spans (CRLF and all).
+      // The raw artifacts carry the verbatim spans: the PTY's own CRLF line
+      // endings survive, and the bytes are not the sanitized render.
       for (const result of results) {
         expect(result.raw).not.toBeNull();
-        expect(Buffer.from(resolveArtifact(events, result.raw!)).toString('utf8'))
-          .toContain('/bench');
+        const raw = Buffer.from(resolveArtifact(events, result.raw!)).toString('utf8');
+        expect(raw).toContain('\r\n');
+        expect(raw).toContain('/bench');
       }
-      // The world commit carries the file the session wrote.
-      const log = events.filter((event) => event.type === 'turn/end');
-      expect(log.length).toBeGreaterThan(0);
+      // The session's write persists in the world.
+      expect(await readFile(join(world.path, 'bench/marker.txt'), 'utf8'))
+        .toBe('c14b-persisted');
     } finally {
       if (running !== null) { driver!.stop(); await running; }
       await model.close();

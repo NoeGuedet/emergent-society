@@ -78,6 +78,8 @@ class Runtime implements AgentRuntime {
   /** The latest scheduled configuration, applied at the next turn start. */
   private pendingConfig: AgentConfig | null = null;
   private terminalSession: TerminalRuntime | null = null;
+  /** Set by the driver's stop: a late run can never respawn a session. */
+  private terminalStopped = false;
   private readonly terminalPort: TerminalPort;
   readonly handler: TurnHandler;
   readonly hooks: DriverHooks;
@@ -101,7 +103,15 @@ class Runtime implements AgentRuntime {
       onStop: async (): Promise<void> => { await this.stopTerminal(); },
     };
     this.terminalPort = {
-      run: (cmd, limits, signal) => this.session().run(cmd, limits, signal),
+      run: (cmd, limits, signal) => {
+        if (this.terminalStopped) {
+          return Promise.resolve({
+            status: 'spawn-failed', exitCode: null, signal: null,
+            output: new Uint8Array(), truncated: false, reset: false, fresh: null,
+          });
+        }
+        return this.session().run(cmd, limits, signal);
+      },
     };
   }
 
@@ -162,10 +172,14 @@ class Runtime implements AgentRuntime {
 
   /** The driver's stop tears the session down before the journal closes. */
   private async stopTerminal(): Promise<void> {
+    this.terminalStopped = true;
     const session = this.terminalSession;
     this.terminalSession = null;
     if (session === null) return;
-    const grace = this.fold.snapshot().config?.value.policy.killGraceMs ?? FALLBACK_KILL_GRACE_MS;
+    let grace = FALLBACK_KILL_GRACE_MS;
+    try {
+      grace = this.fold.snapshot().config?.value.policy.killGraceMs ?? FALLBACK_KILL_GRACE_MS;
+    } catch { /* teardown must run even if the fold cannot be read */ }
     await session.dispose('driver stop', grace);
   }
 

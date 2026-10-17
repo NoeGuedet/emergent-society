@@ -155,8 +155,8 @@ describe('validateAgentConfig', () => {
   });
 
   it('the retired drain knob is refused', () => {
-    const base = defaultAgentConfig();
-    const retired = { ...base, policy: { ...base.policy, shellDrainMs: 500 } };
+    const defaults = defaultAgentConfig();
+    const retired = { ...defaults, policy: { ...defaults.policy, shellDrainMs: 500 } };
     expect(() => validateAgentConfig(retired)).toThrow(/unexpected key/);
   });
 
