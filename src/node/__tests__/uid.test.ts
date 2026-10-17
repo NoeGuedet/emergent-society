@@ -3,6 +3,7 @@ import { readdir } from 'node:fs/promises';
 import { InvalidNodeUidError } from '../../journal/errors.js';
 import { NodeDriver } from '../driver.js';
 import { createAgentRuntime, defaultAgentConfig } from '../loop.js';
+import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import { ProviderAdapter } from '../../provider/adapter.js';
 import type { SerializedTransport, TransportResult } from '../../provider/transport.js';
 import type { TurnHandler } from '../driver.js';
@@ -29,11 +30,7 @@ function runtimeWithUid(fx: WorldFixture, uid: string): unknown {
   const config = defaultAgentConfig();
   return createAgentRuntime({
     home: fx.home, uid, world: fx.world, initialConfig: config,
-    shellPolicy: {
-      timeoutMs: config.policy.shellTimeoutMs, killGraceMs: config.policy.killGraceMs,
-      maxCaptureBytes: config.policy.maxShellCaptureBytes, drainDeadlineMs: config.policy.shellDrainMs,
-      env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', TERM: 'dumb' },
-    },
+    terminal: { env: DEFAULT_TERMINAL_ENV },
     adapter: new ProviderAdapter(new UnusedTransport(), {
       delay,
       schedule: (ms, callback) => { const timer = setTimeout(callback, ms); return () => { clearTimeout(timer); }; },

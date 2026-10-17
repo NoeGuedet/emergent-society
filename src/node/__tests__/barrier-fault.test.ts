@@ -5,6 +5,7 @@ import { withFailingWrite } from '../../journal/__tests__/helpers.js';
 import { useWorld, type WorldFixture } from './helpers.js';
 import { NodeDriver } from '../driver.js';
 import { createAgentRuntime, defaultAgentConfig } from '../loop.js';
+import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
 import { ProviderAdapter } from '../../provider/adapter.js';
@@ -36,9 +37,7 @@ const delay = (ms: number, signal: AbortSignal): Promise<void> => new Promise((r
 function runtimeFor(fx: WorldFixture, transport: CountingTransport, config: AgentConfig) {
   return createAgentRuntime({
     home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
-    shellPolicy: { timeoutMs: config.policy.shellTimeoutMs, killGraceMs: config.policy.killGraceMs,
-      maxCaptureBytes: config.policy.maxShellCaptureBytes, drainDeadlineMs: config.policy.shellDrainMs,
-      env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', TERM: 'dumb' } },
+    terminal: { env: DEFAULT_TERMINAL_ENV },
     adapter: new ProviderAdapter(transport, {
       delay,
       schedule: (ms, callback) => { const timer = setTimeout(callback, ms); return () => { clearTimeout(timer); }; },

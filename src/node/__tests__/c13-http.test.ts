@@ -14,6 +14,7 @@ import { ProviderAdapter } from '../../provider/adapter.js';
 import { OpenAITransport } from '../../provider/transport.js';
 import { NodeDriver } from '../driver.js';
 import { createAgentRuntime, defaultAgentConfig } from '../loop.js';
+import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import { HeadWatcher } from '../watcher.js';
 import { commitAs, useWorld } from './helpers.js';
 import type { ArtifactRef, RequestId, RequestPlan, Stored } from '../../context/contracts.js';
@@ -152,16 +153,11 @@ describe('C1.3 real boundaries', () => {
     const endpoint = `http://127.0.0.1:${address.port}/v1/chat/completions`;
     const defaults = defaultAgentConfig();
     const config = { ...defaults, policy: { ...defaults.policy,
-      shellTimeoutMs: 1000, killGraceMs: 20, retryDelayMs: 1, requestTimeoutMs: 1000,
+      shellTimeoutMs: 5000, killGraceMs: 20, retryDelayMs: 1, requestTimeoutMs: 1000,
     } };
-    const shellPolicy = {
-      timeoutMs: config.policy.shellTimeoutMs, killGraceMs: config.policy.killGraceMs,
-      maxCaptureBytes: config.policy.maxShellCaptureBytes,
-      drainDeadlineMs: config.policy.shellDrainMs,
-      env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', TERM: 'dumb' },
-    };
     const makeRuntime = () => createAgentRuntime({
-      home, uid: 'n1', world, initialConfig: config, shellPolicy,
+      home, uid: 'n1', world, initialConfig: config,
+      terminal: { env: DEFAULT_TERMINAL_ENV },
       adapter: new ProviderAdapter(new OpenAITransport({ endpoint, key: 'test-key-never-log' }), {
         delay,
         schedule: (ms, callback) => {
@@ -298,14 +294,9 @@ describe('C1.3 real boundaries', () => {
     const config = { ...defaults, policy: { ...defaults.policy,
       maxAttempts: 2, retryDelayMs: 0, requestTimeoutMs: 250,
     } };
-    const shellPolicy = {
-      timeoutMs: config.policy.shellTimeoutMs, killGraceMs: config.policy.killGraceMs,
-      maxCaptureBytes: config.policy.maxShellCaptureBytes,
-      drainDeadlineMs: config.policy.shellDrainMs,
-      env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', TERM: 'dumb' },
-    };
     const runtime = createAgentRuntime({
-      home, uid: 'n1', world, initialConfig: config, shellPolicy,
+      home, uid: 'n1', world, initialConfig: config,
+      terminal: { env: DEFAULT_TERMINAL_ENV },
       adapter: new ProviderAdapter(new OpenAITransport({ endpoint, key: 'test-key-never-log' }), {
         delay,
         schedule: (ms, callback) => {

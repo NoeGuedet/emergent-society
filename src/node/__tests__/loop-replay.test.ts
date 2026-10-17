@@ -13,7 +13,8 @@ import { serializeWire } from '../../provider/wire.js';
 import { ProviderAdapter } from '../../provider/adapter.js';
 import type { SerializedTransport, TransportResult } from '../../provider/transport.js';
 import type { AgentConfig, ArtifactRef, FunctionCall } from '../../context/contracts.js';
-import type { ShellPolicy } from '../tools/shell.js';
+import { DEFAULT_TERMINAL_ENV, PtyTerminalRuntime } from '../tools/terminal.js';
+import type { TerminalFactory } from '../tools/terminal.js';
 import { commitAs, useWorld, type WorldFixture } from './helpers.js';
 
 /**
@@ -29,37 +30,16 @@ import { commitAs, useWorld, type WorldFixture } from './helpers.js';
  *    artifact, so the final turn's plan and wire are giants too; version 1's
  *    default charter keeps the earlier turns cheap);
  *  - successive committed compactions;
- *  - an interrupted turn: the shell is armed to throw mid-dispatch, so the turn
- *    closes with a durable error closer that moves its incomplete call group
- *    into recovery.
+ *  - an interrupted turn: the terminal is armed to reject mid-dispatch, so the
+ *    turn closes with a durable error closer that moves its incomplete call
+ *    group into recovery.
  *
- * It then stops, replays offline with a throwing transport and an armed shell
+ * It then stops, replays offline with a throwing transport and an armed terminal
  * (zero calls/effects/commits), restarts a fresh runtime whose `initialConfig`
  * deliberately differs (the journaled config wins), and asserts every rederived
  * plan and serialized wire is canonically equal. Two focused companions cover the
  * oversize-plan refusal and the 429-then-200 retry.
  */
-
-type RunShell = typeof import('../tools/shell.js').runShell;
-
-const shellGuard = vi.hoisted(() => ({
-  real: null as unknown as RunShell,
-  throwsOn: null as string | null,
-  calls: 0,
-}));
-
-vi.mock('../tools/shell.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../tools/shell.js')>();
-  shellGuard.real = actual.runShell;
-  const wrapped: RunShell = (cmd, cwd, signal, policy) => {
-    shellGuard.calls += 1;
-    if (shellGuard.throwsOn !== null && cmd.includes(shellGuard.throwsOn)) {
-      throw new Error('injected shell crash');
-    }
-    return actual.runShell(cmd, cwd, signal, policy);
-  };
-  return { ...actual, runShell: wrapped };
-});
 
 const fixture = useWorld('c13-loop-replay-');
 
@@ -67,10 +47,37 @@ const MiB = 1024 * 1024;
 /** A charter above the 4 MiB artifact threshold, so the final turn's plan/wire are giants. */
 const GIANT_CHARTER = 'c'.repeat(4.5 * MiB);
 
+const terminalGuard = { throwsOn: null as string | null, calls: 0 };
+
 beforeEach(() => {
-  shellGuard.throwsOn = null;
-  shellGuard.calls = 0;
+  terminalGuard.throwsOn = null;
+  terminalGuard.calls = 0;
 });
+
+/**
+ * A real PTY session behind a crash-injection guard: `run` genuinely executes
+ * (the replay assertions read files the commands write); the guard only fakes
+ * the failure — rejecting INSTEAD of delegating, exactly like the retired
+ * wrapper. Disposal rides the runtime's own onStop (even on the crash path:
+ * run() always passes through shutdown()); a runtime whose execute never ran
+ * never spawned a session (lazy spawn), so the never-driven restarted runtime
+ * costs nothing.
+ */
+function guardedTerminalFactory(): TerminalFactory {
+  return (cwd, env) => {
+    const real = new PtyTerminalRuntime(cwd, env);
+    return {
+      run: (cmd, limits, signal) => {
+        terminalGuard.calls += 1;
+        if (terminalGuard.throwsOn !== null && cmd.includes(terminalGuard.throwsOn)) {
+          return Promise.reject(new Error('injected terminal crash'));
+        }
+        return real.run(cmd, limits, signal);
+      },
+      dispose: (reason, grace) => real.dispose(reason, grace),
+    };
+  };
+}
 
 class ScriptedTransport implements SerializedTransport {
   readonly sends: Uint8Array[] = [];
@@ -138,19 +145,10 @@ function waitCall(id: string): FunctionCall {
   return { id, type: 'function', function: { name: 'wait', arguments: '{}' } };
 }
 
-function shellPolicyFor(config: AgentConfig): ShellPolicy {
-  return {
-    timeoutMs: config.policy.shellTimeoutMs, killGraceMs: config.policy.killGraceMs,
-    maxCaptureBytes: config.policy.maxShellCaptureBytes,
-    drainDeadlineMs: config.policy.shellDrainMs,
-    env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', TERM: 'dumb' },
-  };
-}
-
 function runtimeFor(fx: WorldFixture, config: AgentConfig, transport: ScriptedTransport): AgentRuntime {
   return createAgentRuntime({
     home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
-    shellPolicy: shellPolicyFor(config),
+    terminal: { env: DEFAULT_TERMINAL_ENV, create: guardedTerminalFactory() },
     adapter: new ProviderAdapter(transport, providerPolicy),
   });
 }
@@ -244,18 +242,18 @@ describe('C1.3 runtime-seeded replay', () => {
       // (moved into recovery). No turn runs after this one, so no further world render.
       runtime.scheduleConfig(updated);
       const f3 = await commitAs(fx.world, 'peer', { 'peer3.txt': 'third fact\n' });
-      shellGuard.throwsOn = 'boom';
+      terminalGuard.throwsOn = 'boom';
       await HeadWatcher.for(fx.world).check();
-      await expect(running).rejects.toThrow('injected shell crash');
+      await expect(running).rejects.toThrow('injected terminal crash');
       running = null;
       expect(transport.sends).toHaveLength(4);
 
       // --- offline reconstruction with throwing ports: zero calls/effects/commits ---
       const events = await eventsOf(fx);
       const headBefore = await fx.world.headHash();
-      const shellCallsBefore = shellGuard.calls;
+      const terminalCallsBefore = terminalGuard.calls;
       transport.throwIfCalled = true;
-      shellGuard.throwsOn = ''; // any shell call would throw
+      terminalGuard.throwsOn = ''; // any terminal call would reject
 
       const perceptionsRecorded = events.filter((event) => event.type === 'world/perception');
       expect(perceptionsRecorded.some((event) => inlinePerceptionText(event).includes('direction.txt')))
@@ -299,9 +297,9 @@ describe('C1.3 runtime-seeded replay', () => {
       expect(v2Stored.kind).toBe('artifact-json');
       expect(resolveArtifact(events, v2Stored.ref).length).toBeGreaterThan(4 * MiB);
 
-      // The throwing transport and armed shell were never reached.
+      // The throwing transport and armed terminal were never reached.
       expect(transport.sends).toHaveLength(4);
-      expect(shellGuard.calls).toBe(shellCallsBefore);
+      expect(terminalGuard.calls).toBe(terminalCallsBefore);
       expect(await fx.world.headHash()).toBe(headBefore);
 
       // --- restart with a deliberately different initialConfig: journaled config wins ---
@@ -313,17 +311,15 @@ describe('C1.3 runtime-seeded replay', () => {
       restartedTransport.throwIfCalled = true;
       const restarted = createAgentRuntime({
         home: fx.home, uid: 'n1', world: fx.world, initialConfig: differing,
-        // The supplied shell numerics come from the JOURNALED config, not the ignored
-        // differing initialConfig: strict shell-policy validation checks the effective one.
-        shellPolicy: shellPolicyFor(updated),
+        terminal: { env: DEFAULT_TERMINAL_ENV, create: guardedTerminalFactory() },
         adapter: new ProviderAdapter(restartedTransport, providerPolicy),
       });
       driver = await NodeDriver.open(fx.home, 'n1', restarted.handler, fx.world, {
         knownTypes: C13_EVENT_TYPES, hooks: restarted.hooks, worldPollMs: 0,
       });
-      // open() rebuilt offline and reconciled the interrupted call: no send, no shell.
+      // open() rebuilt offline and reconciled the interrupted call: no send, no terminal.
       expect(restartedTransport.sends).toHaveLength(0);
-      expect(shellGuard.calls).toBe(shellCallsBefore);
+      expect(terminalGuard.calls).toBe(terminalCallsBefore);
       expect(restarted.snapshot().config?.value.version).toBe(2);
       expect(restarted.snapshot().config?.value.heading).toBe('New heading, verbatim.');
       expect(restarted.snapshot().recovery).toEqual([]);
@@ -346,7 +342,7 @@ describe('C1.3 runtime-seeded replay', () => {
       // The last foreign commit is still HEAD: no effect or commit was replayed.
       expect(await fx.world.headHash()).toBe(f3);
     } finally {
-      shellGuard.throwsOn = null;
+      terminalGuard.throwsOn = null;
       const current = driver;
       driver = null;
       if (current) {

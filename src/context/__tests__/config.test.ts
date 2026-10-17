@@ -22,7 +22,7 @@ describe('defaultAgentConfig', () => {
       allowedTools: ['execute', 'wait', 'web_search', 'web_fetch'],
       tools: [
         {
-          name: 'execute', description: 'Run a foreground command in the shared world.',
+          name: 'execute', description: 'Run a command in the shared world. The shell session persists across calls: working directory, exports and background jobs survive. A command that times out resets the session.',
           parameters: {
             type: 'object', properties: { cmd: { type: 'string', minLength: 1 } },
             required: ['cmd'], additionalProperties: false,
@@ -57,9 +57,9 @@ describe('defaultAgentConfig', () => {
       policy: {
         stepsPerTurn: 8, compactAfterBytes: 262144, keepRecentGroups: 8,
         maxAttempts: 2, retryDelayMs: 250, requestTimeoutMs: 30000,
-        shellTimeoutMs: 60000, killGraceMs: 200,
+        shellTimeoutMs: 300000, killGraceMs: 200,
         maxCaptureBytes: 33554432, maxRequestBytes: 33554432,
-        maxShellCaptureBytes: 16777216, shellDrainMs: 500,
+        maxShellCaptureBytes: 16777216,
         maxDiffBytes: 32768, maxCommits: 4096, maxAssistantBytes: 32768,
         maxToolResultBytes: 65536, maxToolArgumentBytes: 262144, maxCallsPerResponse: 32,
       },
@@ -152,9 +152,12 @@ describe('validateAgentConfig', () => {
     expect(() => validateAgentConfig(withPolicy({ maxCommits: 0 }))).toThrow();
     expect(() => validateAgentConfig(withPolicy({ maxCommits: 4096 }))).not.toThrow();
     expect(() => validateAgentConfig(withPolicy({ maxCommits: 4097 }))).toThrow();
-    expect(() => validateAgentConfig(withPolicy({ shellDrainMs: 0 }))).toThrow();
-    expect(() => validateAgentConfig(withPolicy({ shellDrainMs: 60000 }))).not.toThrow();
-    expect(() => validateAgentConfig(withPolicy({ shellDrainMs: 60001 }))).toThrow();
+  });
+
+  it('the retired drain knob is refused', () => {
+    const base = defaultAgentConfig();
+    const retired = { ...base, policy: { ...base.policy, shellDrainMs: 500 } };
+    expect(() => validateAgentConfig(retired)).toThrow(/unexpected key/);
   });
 
   it('rejects an oversize configuration before it is accepted', () => {

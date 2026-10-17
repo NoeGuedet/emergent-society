@@ -26,7 +26,7 @@ function plan(over: Partial<RequestPlan> = {}): RequestPlan {
     policy: {
       stepsPerTurn: 8, compactAfterBytes: 1, keepRecentGroups: 0, maxAttempts: 1,
       retryDelayMs: 0, requestTimeoutMs: 1, shellTimeoutMs: 1, killGraceMs: 1,
-      maxCaptureBytes: 1, maxRequestBytes: 1, maxShellCaptureBytes: 1, shellDrainMs: 1,
+      maxCaptureBytes: 1, maxRequestBytes: 1, maxShellCaptureBytes: 1,
       maxDiffBytes: 512, maxCommits: 1, maxAssistantBytes: 256, maxToolResultBytes: 256,
       maxToolArgumentBytes: 1, maxCallsPerResponse: 1,
     },

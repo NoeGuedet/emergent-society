@@ -116,6 +116,12 @@ export interface DriverHooks {
    * watermark simply stands.
    */
   acknowledgedWorld(): WorldAcknowledgement | null;
+  /**
+   * The handler's own teardown at driver stop (the C1.4b terminal session),
+   * called during shutdown after the `node/shutdown` event and before the
+   * writer closes. Optional: a handler holding no host resources omits it.
+   */
+  readonly onStop?: () => Promise<void>;
 }
 
 /** Fixed artifact ingest ceiling (algorithm 2); lower runtime limits apply before capture. */

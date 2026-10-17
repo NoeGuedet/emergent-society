@@ -6,7 +6,8 @@ import { NodeDriver } from '../driver.js';
 import { HeadWatcher } from '../watcher.js';
 import { WorldRepo, type WorldRange } from '../world.js';
 import { BlobStore } from '../../journal/index.js';
-import { DEFAULT_SHELL_ENV, type ShellPolicy } from '../tools/shell.js';
+import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
+import type { TerminalRuntime } from '../tools/terminal.js';
 import { createAgentRuntime, defaultAgentConfig, type AgentRuntime } from '../loop.js';
 import { ContextFold } from '../../context/fold.js';
 import { rederivePlans } from '../../context/assembler.js';
@@ -124,22 +125,12 @@ function configWith(over: {
   };
 }
 
-function shellPolicyFor(config: AgentConfig): ShellPolicy {
-  return {
-    timeoutMs: config.policy.shellTimeoutMs,
-    killGraceMs: config.policy.killGraceMs,
-    maxCaptureBytes: config.policy.maxShellCaptureBytes,
-    drainDeadlineMs: config.policy.shellDrainMs,
-    env: DEFAULT_SHELL_ENV,
-  };
-}
-
 function runtimeFor(
   fx: WorldFixture, config: AgentConfig, transport: ScriptedTransport,
 ): AgentRuntime {
   return createAgentRuntime({
     home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
-    shellPolicy: shellPolicyFor(config),
+    terminal: { env: DEFAULT_TERMINAL_ENV },
     adapter: new ProviderAdapter(transport, providerPolicy),
   });
 }
@@ -227,6 +218,38 @@ describe('turn control', () => {
     const tool = second.messages.find((message) => message['role'] === 'tool');
     expect((assistant?.['tool_calls'] as Array<{ id: string }>)[0]?.id).toBe('c1');
     expect(tool?.['tool_call_id']).toBe('c1');
+  });
+
+  it('stopping the driver disposes the terminal session with the journaled grace', async () => {
+    const fx = fixture();
+    const disposed: string[] = [];
+    const graces: number[] = [];
+    const create = (): TerminalRuntime => ({
+      run: () => Promise.resolve({
+        status: 'completed', exitCode: 0, signal: null,
+        output: new Uint8Array(), truncated: false, reset: false, fresh: null,
+      }),
+      dispose: (reason, grace) => {
+        disposed.push(reason);
+        graces.push(grace);
+        return Promise.resolve();
+      },
+    });
+    const config = configWith({ policy: { retryDelayMs: 1, killGraceMs: 20 } });
+    const transport = new ScriptedTransport([calling([execute('e1', 'true')]), noCalls('done')]);
+    const runtime = createAgentRuntime({
+      home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
+      terminal: { env: DEFAULT_TERMINAL_ENV, create },
+      adapter: new ProviderAdapter(transport, providerPolicy),
+    });
+    const driver = await openRuntime(fx, runtime);
+    const running = driver.run();
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    driver.stop();
+    await running;
+
+    expect(disposed).toEqual(['driver stop']);
+    expect(graces).toEqual([config.policy.killGraceMs]);
   });
 });
 
@@ -351,20 +374,7 @@ describe('world perception identity', () => {
   });
 });
 
-describe('configuration and shell policy', () => {
-  it('refuses supplied shell limits that disagree with the recorded configuration', async () => {
-    const fx = fixture();
-    const config = defaultAgentConfig();
-    const transport = new ScriptedTransport([]);
-    const runtime = createAgentRuntime({
-      home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
-      shellPolicy: { ...shellPolicyFor(config), timeoutMs: config.policy.shellTimeoutMs + 1 },
-      adapter: new ProviderAdapter(transport, providerPolicy),
-    });
-    await expect(openRuntime(fx, runtime)).rejects.toThrow(/shell policy/);
-    expect(transport.sends).toHaveLength(0);
-  });
-
+describe('configuration', () => {
   it('applies a strictly newer scheduled configuration at the next turn start', async () => {
     const fx = fixture();
     const base = configWith({ policy: { retryDelayMs: 1 } });

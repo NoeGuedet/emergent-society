@@ -9,7 +9,7 @@ import type { DurableWatermark } from '../gate.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
 import { readSnapshot } from '../../context/snapshots.js';
-import { DEFAULT_SHELL_ENV, type ShellPolicy } from '../tools/shell.js';
+import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import { ProviderAdapter, type ProviderPolicy } from '../../provider/adapter.js';
 import type { SerializedTransport, TransportResult } from '../../provider/transport.js';
 import type { AgentConfig } from '../../context/contracts.js';
@@ -91,20 +91,10 @@ async function canonicalRows(fx: WorldFixture): Promise<number[]> {
   return seqs.sort((a, b) => a - b);
 }
 
-function shellPolicyFor(config: AgentConfig): ShellPolicy {
-  return {
-    timeoutMs: config.policy.shellTimeoutMs,
-    killGraceMs: config.policy.killGraceMs,
-    maxCaptureBytes: config.policy.maxShellCaptureBytes,
-    drainDeadlineMs: config.policy.shellDrainMs,
-    env: DEFAULT_SHELL_ENV,
-  };
-}
-
 function runtimeFor(fx: WorldFixture, config: AgentConfig, transport: ScriptedTransport): AgentRuntime {
   return createAgentRuntime({
     home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
-    shellPolicy: shellPolicyFor(config),
+    terminal: { env: DEFAULT_TERMINAL_ENV },
     adapter: new ProviderAdapter(transport, providerPolicy),
   });
 }

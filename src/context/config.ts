@@ -21,7 +21,7 @@ export function defaultAgentConfig(): AgentConfig {
     allowedTools: ['execute', 'wait', 'web_search', 'web_fetch'],
     tools: [
       {
-        name: 'execute', description: 'Run a foreground command in the shared world.',
+        name: 'execute', description: 'Run a command in the shared world. The shell session persists across calls: working directory, exports and background jobs survive. A command that times out resets the session.',
         parameters: {
           type: 'object', properties: { cmd: { type: 'string', minLength: 1 } },
           required: ['cmd'], additionalProperties: false,
@@ -56,9 +56,9 @@ export function defaultAgentConfig(): AgentConfig {
     policy: {
       stepsPerTurn: 8, compactAfterBytes: 262144, keepRecentGroups: 8,
       maxAttempts: 2, retryDelayMs: 250, requestTimeoutMs: 30000,
-      shellTimeoutMs: 60000, killGraceMs: 200,
+      shellTimeoutMs: 300000, killGraceMs: 200,
       maxCaptureBytes: 33554432, maxRequestBytes: 33554432,
-      maxShellCaptureBytes: 16777216, shellDrainMs: 500,
+      maxShellCaptureBytes: 16777216,
       maxDiffBytes: 32768, maxCommits: 4096, maxAssistantBytes: 32768,
       maxToolResultBytes: 65536, maxToolArgumentBytes: 262144, maxCallsPerResponse: 32,
     },
@@ -119,7 +119,7 @@ function providerParameters(value: unknown): { readonly [key: string]: JsonValue
 const POLICY_KEYS = [
   'stepsPerTurn', 'compactAfterBytes', 'keepRecentGroups', 'maxAttempts', 'retryDelayMs',
   'requestTimeoutMs', 'shellTimeoutMs', 'killGraceMs', 'maxCaptureBytes', 'maxRequestBytes',
-  'maxShellCaptureBytes', 'shellDrainMs', 'maxDiffBytes', 'maxCommits', 'maxAssistantBytes',
+  'maxShellCaptureBytes', 'maxDiffBytes', 'maxCommits', 'maxAssistantBytes',
   'maxToolResultBytes', 'maxToolArgumentBytes', 'maxCallsPerResponse',
 ] as const;
 
@@ -140,7 +140,6 @@ export function validateSeedPolicy(value: unknown, where = 'policy'): SeedPolicy
     maxRequestBytes: safeInt(value['maxRequestBytes'], 'policy.maxRequestBytes', 1, 32 * MiB),
     maxShellCaptureBytes:
       safeInt(value['maxShellCaptureBytes'], 'policy.maxShellCaptureBytes', 1, 24 * MiB - 4096),
-    shellDrainMs: safeInt(value['shellDrainMs'], 'policy.shellDrainMs', 1, 60000),
     maxDiffBytes: safeInt(value['maxDiffBytes'], 'policy.maxDiffBytes', 512, MiB),
     maxCommits: safeInt(value['maxCommits'], 'policy.maxCommits', 1, 4096),
     maxAssistantBytes: safeInt(value['maxAssistantBytes'], 'policy.maxAssistantBytes', 256, 256 * 1024),

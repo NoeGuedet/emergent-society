@@ -2,11 +2,8 @@ import type {
   AgentConfig, ArtifactRef, AssistantProjection, FunctionCall, RequestId, SafeFailure,
 } from '../../context/contracts.js';
 import type { BoundaryGate } from '../gate.js';
-import type { WorldRepo } from '../world.js';
-import {
-  renderShellText, runShell, shellArtifactBytes, shellFailure, shellIsError,
-} from './shell.js';
-import type { ShellPolicy, ShellResult } from './shell.js';
+import { sanitizePtyText } from './sanitize.js';
+import type { CommandOutcome, TerminalPort } from './terminal.js';
 import { boundToolText, decodeToolText } from './text.js';
 import { renderExtract, renderSearch } from './web.js';
 import type { WebOutcome, WebTools } from './web.js';
@@ -16,7 +13,8 @@ import type { WebOutcome, WebTools } from './web.js';
  *
  * `dispatchCalls` turns an assistant projection's advertised calls into durable
  * `tool/call` + `tool/result` facts. Tool names are recognized exactly: `execute`
- * runs one foreground shell command, `wait` is loop control, `web_search` and
+ * runs one command in the node's persistent shell session (marker-encapsulated,
+ * typed statuses, reset-on-timeout), `wait` is loop control, `web_search` and
  * `web_fetch` run through the injected `WebTools` port (its client is the only
  * place the credential is written, and only into an `Authorization` header), and
  * any other name is an unknown tool that never becomes bash. Arguments stay raw
@@ -135,19 +133,76 @@ function appendWaitResult(gate: BoundaryGate, id: RequestId, callId: string): vo
   });
 }
 
-/** Captures the raw wrapper and appends the bounded shell result. */
-async function appendShellResult(
-  gate: BoundaryGate, id: RequestId, callId: string, result: ShellResult, maxToolResultBytes: number,
+/**
+ * Failure precedence for a session outcome: spawn > cancelled > timeout >
+ * output-limit > signal — the retired shell's order. An ordinary nonzero exit
+ * and a clean session exit carry no SafeFailure (the extract `failed: true`
+ * precedent: content, not transport).
+ */
+function executeFailure(outcome: CommandOutcome): SafeFailure | null {
+  if (outcome.status === 'spawn-failed') return { code: 'spawn', status: null };
+  if (outcome.status === 'cancelled') return { code: 'cancelled', status: null };
+  if (outcome.status === 'timeout') return { code: 'timeout', status: null };
+  if (outcome.truncated) return { code: 'output-limit', status: null };
+  if (outcome.status === 'session_exit' && outcome.signal !== null) {
+    return { code: 'signal', status: null };
+  }
+  return null;
+}
+
+function executeIsError(outcome: CommandOutcome): boolean {
+  return executeFailure(outcome) !== null
+    || (outcome.status === 'completed' && outcome.exitCode !== 0)
+    || (outcome.status === 'session_exit'
+      && (outcome.signal !== null || outcome.exitCode !== 0));
+}
+
+/** The deterministic model-facing render of a session outcome. */
+function renderExecuteText(outcome: CommandOutcome): string {
+  const lines: string[] = [];
+  if (outcome.fresh === 'stdin-wedge') {
+    lines.push('[session: reset after a command left waiting on stdin — previous shell state is gone]');
+  }
+  if (outcome.status === 'completed') {
+    lines.push(`exit: ${outcome.exitCode}`);
+  } else {
+    lines.push(`status: ${outcome.status}`);
+    if (outcome.status === 'session_exit') {
+      lines.push(outcome.signal !== null
+        ? `detail: the shell was killed by signal ${outcome.signal}`
+        : `detail: the shell exited with code ${outcome.exitCode ?? 'unknown'}`);
+    }
+    if (outcome.status === 'stdin_read') {
+      lines.push('[the command is waiting on standard input; the next execute call resets the session first]');
+    }
+  }
+  if (outcome.reset) lines.push('[session: reset — the next command starts fresh]');
+  if (outcome.truncated) lines.push('[output truncated at the capture limit; the command kept running]');
+  const text = sanitizePtyText(decodeToolText(outcome.output));
+  if (text.length > 0) lines.push('output:', text);
+  return lines.join('\n');
+}
+
+/** Captures the raw output span and appends the bounded execute result. */
+async function appendExecuteResult(
+  gate: BoundaryGate, id: RequestId, callId: string,
+  outcome: CommandOutcome, maxToolResultBytes: number,
 ): Promise<void> {
-  const complete = !result.truncated && !result.drainExpired;
-  const raw = await gate.capture(shellArtifactBytes(result), 'utf8', complete);
-  const content = boundToolText(renderShellText(result), maxToolResultBytes, raw);
+  const complete = outcome.status === 'completed' && !outcome.truncated;
+  // A silent command captures nothing: the header alone is the result.
+  const raw = outcome.output.length > 0
+    ? await gate.capture(outcome.output, 'utf8', complete) : null;
+  const rendered = renderExecuteText(outcome);
   gate.append('tool/result', {
     turn: id.turn, request: id, callId,
-    message: { role: 'tool', content, tool_call_id: callId },
-    isError: shellIsError(result),
+    message: {
+      role: 'tool',
+      content: raw === null ? rendered : boundToolText(rendered, maxToolResultBytes, raw),
+      tool_call_id: callId,
+    },
+    isError: executeIsError(outcome),
     raw,
-    failure: shellFailure(result),
+    failure: executeFailure(outcome),
     synthetic: false,
   });
 }
@@ -192,8 +247,8 @@ async function appendWebResult(
 }
 
 export async function dispatchCalls(
-  projection: AssistantProjection, id: RequestId, world: WorldRepo, gate: BoundaryGate,
-  config: AgentConfig, shellPolicy: ShellPolicy, web?: WebTools,
+  projection: AssistantProjection, id: RequestId, gate: BoundaryGate,
+  config: AgentConfig, terminal: TerminalPort, web?: WebTools,
 ): Promise<DispatchResult> {
   const calls = projection.message.tool_calls;
   let called = 0;
@@ -239,10 +294,14 @@ export async function dispatchCalls(
       continue;
     }
 
-    // `runShell` re-checks the signal after the flush above, so an abort that
-    // landed during that await returns cancelled without spawning.
-    const result = await runShell(decision.cmd, world.path, gate.signal, shellPolicy);
-    await appendShellResult(gate, id, call.id, result, config.policy.maxToolResultBytes);
+    // The terminal re-checks the signal after the flush above, so an abort that
+    // landed during that await returns cancelled without writing to the session.
+    const outcome = await terminal.run(decision.cmd, {
+      timeoutMs: config.policy.shellTimeoutMs,
+      killGraceMs: config.policy.killGraceMs,
+      maxCaptureBytes: config.policy.maxShellCaptureBytes,
+    }, gate.signal);
+    await appendExecuteResult(gate, id, call.id, outcome, config.policy.maxToolResultBytes);
     await gate.flush();
   }
 

@@ -74,7 +74,7 @@ export type SeedPolicy = {
   readonly retryDelayMs: number; readonly requestTimeoutMs: number;
   readonly shellTimeoutMs: number; readonly killGraceMs: number;
   readonly maxCaptureBytes: number; readonly maxRequestBytes: number;
-  readonly maxShellCaptureBytes: number; readonly shellDrainMs: number;
+  readonly maxShellCaptureBytes: number;
   readonly maxDiffBytes: number; readonly maxCommits: number;
   readonly maxAssistantBytes: number;
   readonly maxToolResultBytes: number; readonly maxToolArgumentBytes: number;

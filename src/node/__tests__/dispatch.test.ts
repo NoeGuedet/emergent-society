@@ -12,8 +12,8 @@ import { defaultAgentConfig } from '../../context/config.js';
 import { createBoundaryGate } from '../gate.js';
 import type { BoundaryGate, GateCallbacks, GateScope } from '../gate.js';
 import { dispatchCalls } from '../tools/dispatch.js';
-import { DEFAULT_SHELL_ENV, DRAIN_NOTICE } from '../tools/shell.js';
-import type { ShellPolicy } from '../tools/shell.js';
+import { DEFAULT_TERMINAL_ENV, PtyTerminalRuntime } from '../tools/terminal.js';
+import type { CommandLimits, CommandOutcome, TerminalPort } from '../tools/terminal.js';
 import type { WebOutcome, WebTools } from '../tools/web.js';
 import { useWorld } from './helpers.js';
 import type {
@@ -94,10 +94,28 @@ function config(over: Partial<AgentConfig> = {}): AgentConfig {
   return { ...defaultAgentConfig(), ...over };
 }
 
-function shellPolicy(over: Partial<ShellPolicy> = {}): ShellPolicy {
+type ExecCall = { readonly cmd: string; readonly limits: CommandLimits };
+
+function stubTerminal(outcomes: CommandOutcome[], calls: ExecCall[]): TerminalPort {
   return {
-    timeoutMs: 2000, killGraceMs: 100, maxCaptureBytes: 1024 * 1024,
-    drainDeadlineMs: 200, env: DEFAULT_SHELL_ENV, ...over,
+    run: (cmd, limits, _signal) => {
+      calls.push({ cmd, limits });
+      const outcome = outcomes.shift();
+      if (outcome === undefined) throw new Error('stubTerminal: no outcome queued');
+      return Promise.resolve(outcome);
+    },
+  };
+}
+
+/** The never-called terminal for the describes that never reach execute. */
+const neverTerminal: TerminalPort = {
+  run: () => Promise.reject(new Error('terminal not expected')),
+};
+
+function outcome(over: Partial<CommandOutcome> = {}): CommandOutcome {
+  return {
+    status: 'completed', exitCode: 0, signal: null,
+    output: new Uint8Array(), truncated: false, reset: false, fresh: null, ...over,
   };
 }
 
@@ -114,13 +132,6 @@ interface ResultData {
 async function firstResult(home: string): Promise<ResultData> {
   const durable = await events(home);
   return ofType(durable, 'tool/result')[0]!.data as unknown as ResultData;
-}
-
-async function wrapperOf(home: string): Promise<Record<string, unknown>> {
-  const durable = await events(home);
-  const data = ofType(durable, 'tool/result')[0]!.data as unknown as { raw: ArtifactRef | null };
-  const bytes = resolveArtifact(durable, data.raw!);
-  return JSON.parse(Buffer.from(bytes).toString('utf8')) as Record<string, unknown>;
 }
 
 /** The `complete` flag of the first artifact's manifest. */
@@ -149,100 +160,182 @@ function flushFaultGate(gate: BoundaryGate, failOnCall: number): BoundaryGate {
 }
 
 describe('dispatchCalls: execute', () => {
-  it('runs a valid execute call, records call+result, and leaves its effect', async () => {
+  it('runs a valid execute call in the persistent session and leaves its effect', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
     try {
-      const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'printf hello > note.txt' }))]);
-      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config(), shellPolicy());
+      const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: "printf 'hello' > note.txt" }))]);
+      const result = await dispatchCalls(proj, ID, s.gate('turn', 0), config(), terminal);
       expect(result).toEqual({ waited: false, called: 1 });
       expect(await readFile(join(repo.path, 'note.txt'), 'utf8')).toBe('hello');
-
       const durable = await events(home);
       expect(ofType(durable, 'tool/call')).toHaveLength(1);
       const data = await firstResult(home);
-      expect(data.callId).toBe('c1');
       expect(data.isError).toBe(false);
       expect(data.failure).toBeNull();
-      expect(data.raw).not.toBeNull();
-      expect(data.synthetic).toBe(false);
-      expect(data.message.tool_call_id).toBe('c1');
-      const parsed = await wrapperOf(home);
-      expect(parsed['exitCode']).toBe(0);
-      // A normal capture is complete, on the ref and on its manifest.
-      expect(data.raw!.complete).toBe(true);
+      expect(data.message.content).toBe('exit: 0');
+      // A silent command captures no artifact.
+      expect(data.raw).toBeNull();
+      expect(ofType(durable, 'artifact/end')).toHaveLength(0);
+    } finally {
+      await terminal.dispose('test', 100);
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('renders captured output and keeps the verbatim raw artifact', async () => {
+    const { home, world: repo } = world();
+    const s = await openSession(home);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
+    try {
+      const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'echo hello-$((6*7))' }))]);
+      await dispatchCalls(proj, ID, s.gate('turn', 0), config(), terminal);
+      const data = await firstResult(home);
+      expect(data.message.content).toMatch(/^exit: 0\noutput:\nhello-42/);
+      const durable = await events(home);
+      const rawBytes = resolveArtifact(durable, data.raw!);
+      expect(Buffer.from(rawBytes).toString('utf8')).toMatch(/hello-42\r?\n/);
       expect(await artifactComplete(home)).toBe(true);
     } finally {
+      await terminal.dispose('test', 100);
       await s.shutdown();
     }
   }, 15000);
 
   it('records an ordinary nonzero exit as isError with a null failure', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     try {
-      const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'exit 7' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config(), shellPolicy());
+      const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'false' }))]);
+      await dispatchCalls(proj, ID, s.gate('turn', 0), config(),
+        stubTerminal([outcome({ exitCode: 1 })], []));
       const data = await firstResult(home);
       expect(data.isError).toBe(true);
       expect(data.failure).toBeNull();
-      expect(data.message.content).toContain('exitCode 7');
-      expect((await wrapperOf(home))['exitCode']).toBe(7);
+      expect(data.message.content).toBe('exit: 1');
     } finally {
       await s.shutdown();
     }
-  }, 15000);
+  });
 
-  it('bounds the model-visible tool text and marks an over-limit capture incomplete', async () => {
-    const { home, world: repo } = world();
+  const STATUS_ROWS: ReadonlyArray<readonly [string, CommandOutcome, boolean, unknown, string]> = [
+    ['timeout', outcome({ status: 'timeout', exitCode: null, reset: true,
+      output: Buffer.from('partial\n', 'utf8') }), true, { code: 'timeout', status: null },
+      'status: timeout\n[session: reset — the next command starts fresh]\noutput:\npartial\n'],
+    ['session_exit clean', outcome({ status: 'session_exit', exitCode: 0, reset: true }),
+      false, null,
+      'status: session_exit\ndetail: the shell exited with code 0\n[session: reset — the next command starts fresh]'],
+    ['session_exit nonzero', outcome({ status: 'session_exit', exitCode: 1, reset: true }),
+      true, null,
+      'status: session_exit\ndetail: the shell exited with code 1\n[session: reset — the next command starts fresh]'],
+    ['session_exit by signal', outcome({ status: 'session_exit', exitCode: null,
+      signal: 'SIGTERM', reset: true }), true, { code: 'signal', status: null },
+      'status: session_exit\ndetail: the shell was killed by signal SIGTERM\n[session: reset — the next command starts fresh]'],
+    ['stdin_read', outcome({ status: 'stdin_read', exitCode: null,
+      output: Buffer.from('prompt? ', 'utf8') }), false, null,
+      'status: stdin_read\n[the command is waiting on standard input; the next execute call resets the session first]\noutput:\nprompt? '],
+    ['cancelled', outcome({ status: 'cancelled', exitCode: null, reset: true }),
+      true, { code: 'cancelled', status: null },
+      'status: cancelled\n[session: reset — the next command starts fresh]'],
+    ['spawn-failed', outcome({ status: 'spawn-failed', exitCode: null }),
+      true, { code: 'spawn', status: null }, 'status: spawn-failed'],
+  ];
+
+  it.each(STATUS_ROWS)('a %s outcome renders and classifies exactly',
+    async (_name, outcomeValue, isError, failure, content) => {
+      const { home } = world();
+      const s = await openSession(home);
+      try {
+        const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'whatever' }))]);
+        await dispatchCalls(proj, ID, s.gate('turn', 0), config(),
+          stubTerminal([outcomeValue], []));
+        const data = await firstResult(home);
+        expect(data.isError).toBe(isError);
+        expect(data.failure).toEqual(failure);
+        expect(data.message.content).toBe(content);
+      } finally {
+        await s.shutdown();
+      }
+    });
+
+  it('bounds the model-visible text and marks an over-limit capture incomplete', async () => {
+    const { home } = world();
     const s = await openSession(home);
     try {
+      const big = 'x'.repeat(4096);
       const policy = { ...defaultAgentConfig().policy, maxToolResultBytes: 256 };
-      const proj = projection([call('c1', 'execute',
-        JSON.stringify({ cmd: 'head -c 100000 /dev/zero | base64 -w 0' }))]);
-      // A small shell capture cap forces the shell itself to truncate, so the
-      // raw artifact wrapper is an incomplete captured prefix.
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config({ policy }),
-        shellPolicy({ maxCaptureBytes: 1024 }));
+      const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'big' }))]);
+      await dispatchCalls(proj, ID, s.gate('turn', 0), config({ policy }),
+        stubTerminal([outcome({ output: Buffer.from(big, 'utf8'), truncated: true })], []));
       const data = await firstResult(home);
-      expect(Buffer.byteLength(data.message.content, 'utf8')).toBeGreaterThan(256);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'output-limit', status: null });
       const raw = data.raw!;
-      const notice = new RegExp(
-        `\\n\\[output truncated: showing (\\d+) of ${raw.bytes} bytes; raw sha256 ${raw.sha256}\\]$`,
-      );
-      expect(notice.test(data.message.content)).toBe(true);
-      // An over-limit capture is incomplete, on the ref and on its manifest.
-      expect(raw.complete).toBe(false);
+      const notice = /\n\[output truncated: showing (\d+) of (\d+) bytes; raw sha256 ([0-9a-f]{64})\]$/
+        .exec(data.message.content);
+      expect(notice).not.toBeNull();
+      expect(Number(notice![1])).toBe(256);
+      expect(Number(notice![2])).toBe(raw.bytes);
+      expect(notice![3]).toBe(raw.sha256);
+      expect(data.message.content).toContain('[output truncated at the capture limit; the command kept running]');
       expect(await artifactComplete(home)).toBe(false);
     } finally {
       await s.shutdown();
     }
-  }, 15000);
+  });
 
-  it('records complete=false plus the not-killed notice for drain expiry', async () => {
-    const { home, world: repo } = world();
+  it('sanitizes the render but keeps the raw artifact verbatim', async () => {
+    const { home } = world();
     const s = await openSession(home);
-    const pidFile = join(repo.path, 'escaped.pid');
     try {
-      const cmd = "setsid sh -c 'echo $$ > escaped.pid; sleep 30' & "
-        + 'until [ -s escaped.pid ]; do sleep 0.01; done';
-      const proj = projection([call('c1', 'execute', JSON.stringify({ cmd }))]);
-      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config(),
-        shellPolicy({ timeoutMs: 5000, drainDeadlineMs: 100 }));
-      expect(result).toEqual({ waited: false, called: 1 });
-
+      const dirty = Buffer.from('\x1b[31mred\x1b[0m\r\nprogress 10%\rprogress 99%\n', 'utf8');
+      const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'dirty' }))]);
+      await dispatchCalls(proj, ID, s.gate('turn', 0), config(),
+        stubTerminal([outcome({ output: dirty })], []));
       const data = await firstResult(home);
-      expect((await wrapperOf(home))['drainExpired']).toBe(true);
-      expect(data.raw!.complete).toBe(false);
-      expect(await artifactComplete(home)).toBe(false);
-      // The model-visible text states the escaped child was not killed.
-      expect(data.message.content).toContain(DRAIN_NOTICE);
+      expect(data.message.content).toBe('exit: 0\noutput:\nred\nprogress 99%\n');
+      const durable = await events(home);
+      expect(Buffer.from(resolveArtifact(durable, data.raw!)).toString('utf8'))
+        .toBe('\x1b[31mred\x1b[0m\r\nprogress 10%\rprogress 99%\n');
     } finally {
-      const pid = Number((await readFile(pidFile, 'utf8').catch(() => '0')).trim());
-      if (pid > 0) { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
       await s.shutdown();
     }
-  }, 15000);
+  });
+
+  it('a wedged session reset is announced on the next result', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'echo next' }))]);
+      await dispatchCalls(proj, ID, s.gate('turn', 0), config(),
+        stubTerminal([outcome({ fresh: 'stdin-wedge' })], []));
+      const data = await firstResult(home);
+      expect(data.message.content).toBe(
+        '[session: reset after a command left waiting on stdin — previous shell state is gone]\nexit: 0');
+    } finally {
+      await s.shutdown();
+    }
+  });
+
+  it('forwards the journaled policy limits to the terminal port', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    const calls: ExecCall[] = [];
+    try {
+      const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'true' }))]);
+      await dispatchCalls(proj, ID, s.gate('turn', 0), config(),
+        stubTerminal([outcome()], calls));
+      const cfg = config();
+      expect(calls[0]!.limits).toEqual({
+        timeoutMs: cfg.policy.shellTimeoutMs,
+        killGraceMs: cfg.policy.killGraceMs,
+        maxCaptureBytes: cfg.policy.maxShellCaptureBytes,
+      });
+    } finally {
+      await s.shutdown();
+    }
+  });
 });
 
 describe('dispatchCalls: argument validation', () => {
@@ -256,11 +349,11 @@ describe('dispatchCalls: argument validation', () => {
   ];
 
   it.each(INVALID_ARGS)('rejects %s with a durable invalid-tool result and no shell', async (_name, args) => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     try {
       const proj = projection([call('bad', 'execute', args)]);
-      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config(), shellPolicy());
+      const result = await dispatchCalls(proj, ID, s.gate('turn', 0), config(), neverTerminal);
       expect(result).toEqual({ waited: false, called: 1 });
 
       const durable = await events(home);
@@ -283,7 +376,7 @@ describe('dispatchCalls: argument validation', () => {
     const s = await openSession(home);
     try {
       const proj = projection([call('c1', 'not-execute', JSON.stringify({ cmd: 'touch unknown.txt' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config(), shellPolicy());
+      await dispatchCalls(proj, ID, s.gate('turn', 0), config(), neverTerminal);
       const data = await firstResult(home);
       expect(data.failure).toEqual({ code: 'unknown-tool', status: null });
       expect(data.raw).toBeNull();
@@ -300,7 +393,7 @@ describe('dispatchCalls: argument validation', () => {
       const denied = config({ allowedTools: ['wait'] });
       const offeredNames = denied.tools.map((tool) => tool.name);
       const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'touch denied.txt' }))]);
-      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), denied, shellPolicy());
+      const result = await dispatchCalls(proj, ID, s.gate('turn', 0), denied, neverTerminal);
       expect(result).toEqual({ waited: false, called: 1 });
 
       const data = await firstResult(home);
@@ -318,11 +411,11 @@ describe('dispatchCalls: argument validation', () => {
 
 describe('dispatchCalls: wait', () => {
   it('returns the fixed waiting text and no effect', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     try {
       const proj = projection([call('w1', 'wait', '{}')]);
-      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config(), shellPolicy());
+      const result = await dispatchCalls(proj, ID, s.gate('turn', 0), config(), neverTerminal);
       expect(result).toEqual({ waited: true, called: 1 });
       const data = await firstResult(home);
       expect(data.isError).toBe(false);
@@ -339,12 +432,13 @@ describe('dispatchCalls: wait', () => {
   it('completes both a wait and an execute in one group', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
     try {
       const proj = projection([
         call('w1', 'wait', '{}'),
-        call('e1', 'execute', JSON.stringify({ cmd: 'printf hi > both.txt' })),
+        call('e1', 'execute', JSON.stringify({ cmd: 'printf hi > both.txt && echo done' })),
       ]);
-      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config(), shellPolicy());
+      const result = await dispatchCalls(proj, ID, s.gate('turn', 0), config(), terminal);
       expect(result).toEqual({ waited: true, called: 2 });
       expect(await readFile(join(repo.path, 'both.txt'), 'utf8')).toBe('hi');
 
@@ -356,6 +450,7 @@ describe('dispatchCalls: wait', () => {
       expect(results[1]!.callId).toBe('e1');
       expect(results[1]!.raw).not.toBeNull();
     } finally {
+      await terminal.dispose('test', 100);
       await s.shutdown();
     }
   }, 15000);
@@ -365,6 +460,7 @@ describe('dispatchCalls: abort and durability faults', () => {
   it('re-checks the signal after the tool/call flush and cancels without spawning', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
     try {
       let flushes = 0;
       const gate = new Proxy(s.gate('turn', 0), {
@@ -381,15 +477,15 @@ describe('dispatchCalls: abort and durability faults', () => {
         },
       });
       const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'printf x > race.txt' }))]);
-      const result = await dispatchCalls(proj, ID, repo, gate, config(), shellPolicy());
+      const result = await dispatchCalls(proj, ID, gate, config(), terminal);
       expect(result).toEqual({ waited: false, called: 1 });
       expect(await exists(join(repo.path, 'race.txt'))).toBe(false);
 
       const data = await firstResult(home);
       expect(data.failure).toEqual({ code: 'cancelled', status: null });
       expect(data.isError).toBe(true);
-      expect((await wrapperOf(home))['cancelled']).toBe(true);
     } finally {
+      await terminal.dispose('test', 100);
       await s.shutdown();
     }
   }, 15000);
@@ -403,7 +499,7 @@ describe('dispatchCalls: abort and durability faults', () => {
         call('c1', 'execute', JSON.stringify({ cmd: 'touch one.txt' })),
         call('c2', 'execute', JSON.stringify({ cmd: 'touch two.txt' })),
       ]);
-      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config(), shellPolicy());
+      const result = await dispatchCalls(proj, ID, s.gate('turn', 0), config(), neverTerminal);
       expect(result).toEqual({ waited: false, called: 0 });
 
       const durable = await events(home);
@@ -427,13 +523,15 @@ describe('dispatchCalls: abort and durability faults', () => {
   it('leaves the effect absent when the tool/call flush faults', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
     try {
       const gate = flushFaultGate(s.gate('turn', 0), 1);
       const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'printf x > fault1.txt' }))]);
-      await expect(dispatchCalls(proj, ID, repo, gate, config(), shellPolicy()))
+      await expect(dispatchCalls(proj, ID, gate, config(), terminal))
         .rejects.toThrow('injected flush failure');
       expect(await exists(join(repo.path, 'fault1.txt'))).toBe(false);
     } finally {
+      await terminal.dispose('test', 100);
       await s.shutdown();
     }
   }, 15000);
@@ -441,13 +539,15 @@ describe('dispatchCalls: abort and durability faults', () => {
   it('runs the effect but rejects when the result flush faults (no later request)', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
     try {
       const gate = flushFaultGate(s.gate('turn', 0), 2);
       const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'printf x > fault2.txt' }))]);
-      await expect(dispatchCalls(proj, ID, repo, gate, config(), shellPolicy()))
+      await expect(dispatchCalls(proj, ID, gate, config(), terminal))
         .rejects.toThrow('injected flush failure');
       expect(await readFile(join(repo.path, 'fault2.txt'), 'utf8')).toBe('x');
     } finally {
+      await terminal.dispose('test', 100);
       await s.shutdown();
     }
   }, 15000);
@@ -455,17 +555,19 @@ describe('dispatchCalls: abort and durability faults', () => {
   it('completes every listed call in a group', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
     try {
       const proj = projection([
         call('c1', 'execute', JSON.stringify({ cmd: 'printf one > a.txt' })),
         call('c2', 'execute', JSON.stringify({ cmd: 'printf two > b.txt' })),
       ]);
-      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), config(), shellPolicy());
+      const result = await dispatchCalls(proj, ID, s.gate('turn', 0), config(), terminal);
       expect(result).toEqual({ waited: false, called: 2 });
       expect(await readFile(join(repo.path, 'a.txt'), 'utf8')).toBe('one');
       expect(await readFile(join(repo.path, 'b.txt'), 'utf8')).toBe('two');
       expect(ofType(await events(home), 'tool/result')).toHaveLength(2);
     } finally {
+      await terminal.dispose('test', 100);
       await s.shutdown();
     }
   }, 15000);
@@ -537,12 +639,12 @@ describe('dispatchCalls: web tools', () => {
   }
 
   it('journals a bounded web_search result with its raw artifact', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     try {
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
-      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(),
-        shellPolicy(), stubWeb([okSearch()], []));
+      const result = await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(),
+        neverTerminal, stubWeb([okSearch()], []));
       expect(result).toEqual({ waited: false, called: 1 });
       const durable = await events(home);
       expect(ofType(durable, 'tool/call')).toHaveLength(1);
@@ -562,11 +664,11 @@ describe('dispatchCalls: web tools', () => {
   }, 15000);
 
   it('web tools are denied when no provider is configured', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     try {
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy());
+      await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(), neverTerminal);
       const data = await firstResult(home);
       expect(data.isError).toBe(true);
       expect(data.failure).toEqual({ code: 'denied', status: null });
@@ -578,13 +680,13 @@ describe('dispatchCalls: web tools', () => {
   }, 15000);
 
   it('a web tool not in allowedTools is denied', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     const calls: StubCall[] = [];
     try {
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0),
-        webConfig({ allowedTools: ['execute', 'wait'] }), shellPolicy(), stubWeb([], calls));
+      await dispatchCalls(proj, ID, s.gate('turn', 0),
+        webConfig({ allowedTools: ['execute', 'wait'] }), neverTerminal, stubWeb([], calls));
       const data = await firstResult(home);
       expect(data.failure).toEqual({ code: 'denied', status: null });
       expect(calls).toHaveLength(0);
@@ -594,13 +696,13 @@ describe('dispatchCalls: web tools', () => {
   }, 15000);
 
   it('a web tool that is not offered is unknown-tool', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     const calls: StubCall[] = [];
     try {
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), withoutWeb(config()),
-        shellPolicy(), stubWeb([], calls));
+      await dispatchCalls(proj, ID, s.gate('turn', 0), withoutWeb(config()),
+        neverTerminal, stubWeb([], calls));
       const data = await firstResult(home);
       expect(data.failure).toEqual({ code: 'unknown-tool', status: null });
       expect(calls).toHaveLength(0);
@@ -624,13 +726,13 @@ describe('dispatchCalls: web tools', () => {
 
   it.each(INVALID_WEB_ARGS)('rejects invalid %s arguments %s with invalid-tool and no provider call',
     async (name, args) => {
-      const { home, world: repo } = world();
+      const { home } = world();
       const s = await openSession(home);
       const calls: StubCall[] = [];
       try {
         const proj = projection([call('bad', name, args)]);
-        const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(),
-          shellPolicy(), stubWeb([], calls));
+        const result = await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(),
+          neverTerminal, stubWeb([], calls));
         expect(result).toEqual({ waited: false, called: 1 });
         expect(calls).toHaveLength(0);
         const durable = await events(home);
@@ -644,7 +746,7 @@ describe('dispatchCalls: web tools', () => {
     }, 15000);
 
   it('a failed outcome keeps its failure and captured prefix', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     try {
       const outcome: WebOutcome = {
@@ -652,7 +754,7 @@ describe('dispatchCalls: web tools', () => {
         body: Buffer.from('{"detail":"rate limited"}', 'utf8'), complete: true,
       };
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy(),
+      await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(), neverTerminal,
         stubWeb([outcome], []));
       const data = await firstResult(home);
       expect(data.isError).toBe(true);
@@ -665,11 +767,11 @@ describe('dispatchCalls: web tools', () => {
   }, 15000);
 
   it('a malformed success body is a malformed failure with the raw kept', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     try {
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy(),
+      await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(), neverTerminal,
         stubWeb([okSearch('not json')], []));
       const data = await firstResult(home);
       expect(data.isError).toBe(true);
@@ -683,11 +785,11 @@ describe('dispatchCalls: web tools', () => {
   }, 15000);
 
   it('a failed extraction is an error result without a SafeFailure', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     try {
       const proj = projection([call('w1', 'web_fetch', JSON.stringify({ url: 'https://a.example/' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy(),
+      await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(), neverTerminal,
         stubWeb([okSearch(EXTRACT_FAILED_JSON)], []));
       const data = await firstResult(home);
       expect(data.isError).toBe(true);
@@ -700,7 +802,7 @@ describe('dispatchCalls: web tools', () => {
   }, 15000);
 
   it('an empty failure body keeps raw null and writes no artifact', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     try {
       const outcome: WebOutcome = {
@@ -708,7 +810,7 @@ describe('dispatchCalls: web tools', () => {
         body: new Uint8Array(), complete: false,
       };
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy(),
+      await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(), neverTerminal,
         stubWeb([outcome], []));
       const data = await firstResult(home);
       expect(data.isError).toBe(true);
@@ -723,7 +825,7 @@ describe('dispatchCalls: web tools', () => {
   }, 15000);
 
   it('a body-limit outcome captures an incomplete prefix', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     try {
       const outcome: WebOutcome = {
@@ -731,7 +833,7 @@ describe('dispatchCalls: web tools', () => {
         body: Buffer.alloc(2048, 120), complete: false,
       };
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(), shellPolicy(),
+      await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(), neverTerminal,
         stubWeb([outcome], []));
       const data = await firstResult(home);
       expect(data.failure).toEqual({ code: 'body-limit', status: 200 });
@@ -744,7 +846,7 @@ describe('dispatchCalls: web tools', () => {
   }, 15000);
 
   it('bounds a long successful render with the truncation notice', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     try {
       const big = JSON.stringify({
@@ -752,8 +854,8 @@ describe('dispatchCalls: web tools', () => {
       });
       const policy = { ...defaultAgentConfig().policy, maxToolResultBytes: 256 };
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
-      await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig({ policy }),
-        shellPolicy(), stubWeb([okSearch(big)], []));
+      await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig({ policy }),
+        neverTerminal, stubWeb([okSearch(big)], []));
       const data = await firstResult(home);
       const raw = data.raw!;
       // Every byte of the render is ASCII, so the retained prefix is exactly the
@@ -771,7 +873,7 @@ describe('dispatchCalls: web tools', () => {
   }, 15000);
 
   it('forwards the valid max_results bounds to the web port', async () => {
-    const { home, world: repo } = world();
+    const { home } = world();
     const s = await openSession(home);
     const calls: StubCall[] = [];
     try {
@@ -779,8 +881,8 @@ describe('dispatchCalls: web tools', () => {
         call('w1', 'web_search', JSON.stringify({ query: 'q', max_results: 1 })),
         call('w2', 'web_search', JSON.stringify({ query: 'q', max_results: 20 })),
       ]);
-      const result = await dispatchCalls(proj, ID, repo, s.gate('turn', 0), webConfig(),
-        shellPolicy(), stubWeb([okSearch(), okSearch()], calls));
+      const result = await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(),
+        neverTerminal, stubWeb([okSearch(), okSearch()], calls));
       expect(result).toEqual({ waited: false, called: 2 });
       expect(calls.map((entry) => entry.args[1])).toEqual([1, 20]);
     } finally {

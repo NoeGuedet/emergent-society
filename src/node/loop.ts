@@ -13,7 +13,8 @@ import type { ProviderAdapter } from '../provider/adapter.js';
 import type { AgentConfig, ProjectionState, RequestId } from '../context/contracts.js';
 import type { BoundaryGate, DriverHooks, DurableWatermark } from './gate.js';
 import type { TurnContext, TurnHandler, TurnResult } from './driver.js';
-import type { ShellPolicy } from './tools/shell.js';
+import { PtyTerminalRuntime } from './tools/terminal.js';
+import type { TerminalFactory, TerminalPort, TerminalRuntime } from './tools/terminal.js';
 import type { WebTools } from './tools/web.js';
 import type { WorldRepo } from './world.js';
 
@@ -24,12 +25,12 @@ import type { WorldRepo } from './world.js';
  * It owns a `ContextFold`, presents one recorded world perception per turn,
  * assembles exactly one plan per logical request, refuses an oversize plan
  * before storage, delegates the request to the provider adapter and the
- * resulting calls to the foreground dispatcher. It never hands the writer to
+ * resulting calls to the dispatcher. It never hands the writer to
  * the model and never assembles a second message, request, artifact or state
  * shape: every fact it writes goes through the boundary gate.
  *
  * The runtime is not a confinement boundary. Raw bash can still escape the
- * world; C1.4b, C1.4c and C1.5 remain deferred, and `mock-model` is a test
+ * world; C1.4c and C1.5 remain deferred, and `mock-model` is a test
  * fixture, not a certified provider.
  */
 
@@ -37,7 +38,16 @@ import type { WorldRepo } from './world.js';
 export type RuntimeOptions = {
   readonly home: string; readonly uid: string; readonly world: WorldRepo;
   readonly initialConfig: AgentConfig; readonly adapter: ProviderAdapter;
-  readonly shellPolicy: ShellPolicy;
+  /**
+   * The persistent terminal: the trusted environment allowlist (never
+   * `process.env`), plus an optional factory — the test seam that replaces the
+   * retired module mock. Numeric limits are read from the journaled policy at
+   * each call, so a restart cannot resurrect ignored numbers.
+   */
+  readonly terminal: {
+    readonly env: Readonly<Record<string, string>>;
+    readonly create?: TerminalFactory;
+  };
   /** Kernel-mediated web tools; when absent, offered web calls resolve as `denied`. */
   readonly webTools?: WebTools;
 };
@@ -56,6 +66,9 @@ export { defaultAgentConfig, validateAgentConfig };
 /** The fixed artifact ingest ceiling; a plan at or above it is refused before storage. */
 const CAPTURE_CEILING = 32 * 1024 * 1024;
 
+/** Stop-time kill grace when no config was ever journaled (pre-ready stop). */
+const FALLBACK_KILL_GRACE_MS = 200;
+
 /** The one message a reconciled call with no durable result carries (fold algorithm 6). */
 const RECONCILE_NOTICE = 'Outcome unknown after interruption; not re-executed';
 
@@ -64,6 +77,8 @@ class Runtime implements AgentRuntime {
   private readonly initialConfig: AgentConfig;
   /** The latest scheduled configuration, applied at the next turn start. */
   private pendingConfig: AgentConfig | null = null;
+  private terminalSession: TerminalRuntime | null = null;
+  private readonly terminalPort: TerminalPort;
   readonly handler: TurnHandler;
   readonly hooks: DriverHooks;
 
@@ -83,6 +98,10 @@ class Runtime implements AgentRuntime {
       readHistory: (home, uid, knownTypes) => loadVerifiedEvents(home, uid, knownTypes),
       readBlob: (hash) => new BlobStore(this.options.home).get(hash),
       acknowledgedWorld: () => this.fold.acknowledgedWorld(),
+      onStop: async (): Promise<void> => { await this.stopTerminal(); },
+    };
+    this.terminalPort = {
+      run: (cmd, limits, signal) => this.session().run(cmd, limits, signal),
     };
   }
 
@@ -106,11 +125,14 @@ class Runtime implements AgentRuntime {
   /**
    * Ready scope: record the initial configuration when the journal has none,
    * reconcile every interrupted call that has no durable result with a synthetic
-   * unknown-outcome result, abort orphaned compaction transactions, flush, then
-   * validate the supplied shell limits against the now-effective journal config.
+   * unknown-outcome result, abort orphaned compaction transactions, flush.
    * `compaction/abort` is scope-agnostic, so `runCompaction` is only reached here
    * when there is an orphan to abort — it can never select a new transaction in
    * ready scope.
+   *
+   * The shell's numeric limits are read from the journaled policy at each
+   * dispatch, so the journal's numbers win by construction and nothing is left
+   * to compare.
    */
   private async ready(gate: BoundaryGate): Promise<void> {
     if (this.fold.snapshot().config === null) {
@@ -126,38 +148,25 @@ class Runtime implements AgentRuntime {
     }
     if (this.fold.orphanCompactions().length > 0) await runCompaction(this.fold, gate);
     await gate.flush();
-    const effective = this.fold.snapshot().config;
-    if (effective !== null) this.validateShellPolicy(effective.value);
   }
 
-  /**
-   * The shell limits in force are the journal's recorded policy, never the
-   * caller's numbers — `ShellPolicy.env` supplies only the allowlisted
-   * environment. A supplied limit that disagrees with the effective journal
-   * config is refused at ready, so a restart cannot resurrect the ignored
-   * `initialConfig`'s numbers.
-   */
-  private validateShellPolicy(config: AgentConfig): void {
-    const policy = config.policy;
-    const supplied = this.options.shellPolicy;
-    if (supplied.timeoutMs !== policy.shellTimeoutMs
-      || supplied.killGraceMs !== policy.killGraceMs
-      || supplied.maxCaptureBytes !== policy.maxShellCaptureBytes
-      || supplied.drainDeadlineMs !== policy.shellDrainMs) {
-      throw new Error(
-        'runtime: supplied shell policy limits disagree with the effective journal configuration');
+  /** The one session per node, spawned lazily and respawned by its own resets. */
+  private session(): TerminalRuntime {
+    if (this.terminalSession === null) {
+      const create = this.options.terminal.create
+        ?? ((cwd, env) => new PtyTerminalRuntime(cwd, env));
+      this.terminalSession = create(this.options.world.path, this.options.terminal.env);
     }
+    return this.terminalSession;
   }
 
-  /** The dispatch shell policy: recorded numeric limits with the allowlisted environment. */
-  private shellPolicyFor(config: AgentConfig): ShellPolicy {
-    return {
-      timeoutMs: config.policy.shellTimeoutMs,
-      killGraceMs: config.policy.killGraceMs,
-      maxCaptureBytes: config.policy.maxShellCaptureBytes,
-      drainDeadlineMs: config.policy.shellDrainMs,
-      env: this.options.shellPolicy.env,
-    };
+  /** The driver's stop tears the session down before the journal closes. */
+  private async stopTerminal(): Promise<void> {
+    const session = this.terminalSession;
+    this.terminalSession = null;
+    if (session === null) return;
+    const grace = this.fold.snapshot().config?.value.policy.killGraceMs ?? FALLBACK_KILL_GRACE_MS;
+    await session.dispose('driver stop', grace);
   }
 
   /**
@@ -224,8 +233,7 @@ class Runtime implements AgentRuntime {
       }
       const calls = sent.projection.message.tool_calls;
       const dispatched = await dispatchCalls(
-        sent.projection, id, this.options.world, ctx.gate, config, this.shellPolicyFor(config),
-        this.options.webTools,
+        sent.projection, id, ctx.gate, config, this.terminalPort, this.options.webTools,
       );
       accepted += dispatched.called;
       ordinal += 1;

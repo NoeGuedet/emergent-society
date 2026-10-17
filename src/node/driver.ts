@@ -741,6 +741,13 @@ export class NodeDriver {
       failure ??= err;
     }
     try {
+      // The trusted handler's own teardown (the terminal session) runs before
+      // the journal closes; its failure joins the shutdown error channel.
+      await this.hooks?.onStop?.();
+    } catch (err) {
+      failure ??= err;
+    }
+    try {
       await this.writer.close();
     } catch (err) {
       failure ??= err;

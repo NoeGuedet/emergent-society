@@ -13,6 +13,7 @@ import { NodeDriver } from '../driver.js';
 import { HeadWatcher } from '../watcher.js';
 import { createAgentRuntime, defaultAgentConfig } from '../loop.js';
 import { loadProviders } from '../tools/providers.js';
+import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import { webToolsFromProviders } from '../tools/web.js';
 import { commitAs, useWorld } from './helpers.js';
 import type { ArtifactRef } from '../../context/contracts.js';
@@ -116,12 +117,7 @@ describe('C1.4a web tools end to end', () => {
     try {
       const runtime = createAgentRuntime({
         home, uid: 'n1', world, initialConfig: config,
-        shellPolicy: {
-          timeoutMs: config.policy.shellTimeoutMs, killGraceMs: config.policy.killGraceMs,
-          maxCaptureBytes: config.policy.maxShellCaptureBytes,
-          drainDeadlineMs: config.policy.shellDrainMs,
-          env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', TERM: 'dumb' },
-        },
+        terminal: { env: DEFAULT_TERMINAL_ENV },
         adapter: new ProviderAdapter(
           new OpenAITransport({ endpoint: `http://127.0.0.1:${llmAddress.port}/v1/chat/completions`,
             key: 'test-key-never-log' }),
