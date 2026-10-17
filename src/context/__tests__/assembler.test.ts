@@ -431,8 +431,13 @@ describe('rederivePlans: a divergence is explicit, never a promise of equality',
       /recorded Git version .* differs from the host's/);
   });
 
-  it('re-encodes every recorded wire body from the recorded plan', async () => {
-    const { world } = fixture();
+  /**
+   * One recorded turn whose wire artifact carries `wireFor(plan)`, so the same
+   * prefix can prove both the honest and the divergent wire.
+   */
+  async function recordedPipeline(
+    world: WorldRepo, wireFor: (plan: RequestPlan) => Buffer,
+  ): Promise<{ events: VerifiedEvents; body: ArtifactRef; plan: RequestPlan }> {
     const config = configEvent();
     const turn = turnEvent();
     const rendered = await presentWorld(world, 'n1', RANGE, 32768, 4096);
@@ -444,7 +449,7 @@ describe('rederivePlans: a divergence is explicit, never a promise of equality',
     const atPlan = new ContextFold();
     await atPlan.observe([config, turn, perception]);
     const plan = assemble({ id, state: atPlan.snapshot() });
-    const wireBytes = Buffer.from(serializeWire(plan));
+    const wireBytes = wireFor(plan);
     const sha = sha256HexOf(wireBytes);
     const chunk = verified(envelope(4, 'artifact/chunk', {
       artifact: sha, index: 0, base64: wireBytes.toString('base64'),
@@ -457,21 +462,40 @@ describe('rederivePlans: a divergence is explicit, never a promise of equality',
       kind: 'c13-artifact', manifest: { seq: end.raw.seq, hash: end.raw.hash },
       sha256: sha, bytes: wireBytes.length, encoding: 'utf8', complete: true,
     };
-    const events: VerifiedEvents = [
-      config, turn, perception,
-      verified(envelope(3, 'request/plan', { id, value: { kind: 'inline', value: plan } })),
-      chunk, end,
-      verified(envelope(6, 'request/wire', { id, attempt: 0, body })),
-    ];
+    return {
+      plan,
+      body,
+      events: [
+        config, turn, perception,
+        verified(envelope(3, 'request/plan', { id, value: { kind: 'inline', value: plan } })),
+        chunk, end,
+        verified(envelope(6, 'request/wire', { id, attempt: 0, body })),
+      ],
+    };
+  }
+
+  it('re-encodes the recorded wire body from the recorded plan', async () => {
+    const { world } = fixture();
+    const { events, body, plan } = await recordedPipeline(
+      world, (recorded) => Buffer.from(serializeWire(recorded)),
+    );
 
     const comparisons = await rederivePlans(events, world);
     expect(comparisons).toHaveLength(1);
-    const recorded = comparisons[0]!.recorded;
-    // The durable wire is exactly what the recorded plan re-serializes to; the
-    // utility compares plans canonically, this pins the wire side of that promise.
-    expect(Buffer.from(resolveArtifact(events, body)).equals(Buffer.from(serializeWire(recorded))))
+    // The utility itself now verifies the wire; this pins the exact bytes.
+    expect(Buffer.from(resolveArtifact(events, body)).equals(Buffer.from(serializeWire(plan))))
       .toBe(true);
-    expect(Buffer.from(serializeWire(recorded)))
-      .toEqual(Buffer.from(serializeWire(comparisons[0]!.rederived)));
+    expect(Buffer.from(serializeWire(plan)))
+      .toEqual(Buffer.from(serializeWire(comparisons[0]!.recorded)));
+  });
+
+  it('rejects a recorded wire body that differs from the plan it carries', async () => {
+    const { world } = fixture();
+    // A chain-valid artifact, but not the recorded plan's serialized body.
+    const { events } = await recordedPipeline(
+      world, () => Buffer.from('{"tampered":true}'),
+    );
+    await expect(rederivePlans(events, world)).rejects.toThrow(
+      /wire recorded at \d+:[0-9a-f]+ \(attempt 0\) is not the recorded plan's serialized body/);
   });
 });

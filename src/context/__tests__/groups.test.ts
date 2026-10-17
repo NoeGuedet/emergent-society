@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { sha256HexOf } from '../../journal/canon.js';
 import { canonicalBytes } from '../artifacts.js';
 import {
-  candidateIdentity, groupCitations, isBalancedGroup, sameSourceSet, sortUnique,
+  MAX_COMPACTION_SOURCES, candidateIdentity, groupCitations, isBalancedGroup, sameSourceSet,
+  sortUnique,
 } from '../groups.js';
 import type {
   CompactionStart, FunctionCall, Source, SurfaceGroup,
@@ -28,8 +29,7 @@ function group(over: Partial<SurfaceGroup> & Pick<SurfaceGroup, 'kind'>): Surfac
   };
 }
 
-describe('sortUnique: the one canonical receipt ordering', () => {
-  it.each([
+describe('sortUnique: the one canonical receipt ordering', () => {  it.each([
     { name: 'empty', input: [] as Source[], expected: [] as Source[] },
     {
       name: 'sorts by seq then hash',
@@ -231,5 +231,11 @@ describe('candidateIdentity: the five hashed fields and the excluded id', () => 
     { name: 'shadowBytes', change: { shadowBytes: 129 } },
   ])('changes when $name changes', ({ change }) => {
     expect(candidateIdentity({ ...base, ...change })).not.toBe(candidateIdentity(base));
+  });
+});
+
+describe('MAX_COMPACTION_SOURCES: the pinned per-transaction citation bound', () => {
+  it('stays at the documented 4096 receipts', () => {
+    expect(MAX_COMPACTION_SOURCES).toBe(4096);
   });
 });

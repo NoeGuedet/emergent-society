@@ -1569,6 +1569,86 @@ describe('fold: request-sequencing invariants fail closed', () => {
         });
       },
     },
+    {
+      name: 'retry request/wire before the first wire',
+      pattern: /retry request\/wire before the first wire/,
+      run: async (s, cfg) => {
+        const gate = beginTurn(s);
+        const id: RequestId = { turn: 0, ordinal: 0 };
+        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
+        const body = await gate.capture(Buffer.from('{}'), 'utf8');
+        gate.append('request/wire', { id, attempt: 1, body });
+      },
+    },
+    {
+      name: 'request/wire after request/refused',
+      pattern: /request\/wire after request\/refused/,
+      run: async (s) => {
+        const gate = beginTurn(s);
+        const id: RequestId = { turn: 0, ordinal: 0 };
+        gate.append('request/refused', { id, bytes: 5, limit: 10, phase: 'plan' });
+        const body = await gate.capture(Buffer.from('{}'), 'utf8');
+        gate.append('request/wire', { id, attempt: 0, body });
+      },
+    },
+    {
+      name: 'tool/result is not an advertised call in-turn',
+      pattern: /tool\/result c2 is not an advertised call/,
+      run: async (s, cfg) => {
+        const t = await announced(s, cfg, [call('c1')], true);
+        t.gate.append('tool/result', result(t.id, 0, 'c2') as never);
+      },
+    },
+    {
+      name: 'tool/result before its assistant message',
+      pattern: /tool\/result before its assistant message/,
+      run: async (s) => {
+        const gate = beginTurn(s);
+        gate.append('tool/result', result({ turn: 0, ordinal: 0 }, 0, 'c1') as never);
+      },
+    },
+    {
+      name: 'compaction/end without a matching start',
+      pattern: /compaction\/end without a matching start/,
+      run: async (s, cfg) => {
+        beginTurn(s);
+        rawAppend(s, 'compaction/end', {
+          id: 'a'.repeat(64), summary: { seq: 0, hash: cfg.hash },
+        });
+      },
+    },
+    {
+      name: 'duplicate compaction/start',
+      pattern: /duplicate compaction\/start/,
+      run: async (s, cfg) => {
+        const gate = beginTurn(s);
+        const start = {
+          id: 'a'.repeat(64), revision: 'b'.repeat(64), groupIds: [cfg], sources: [cfg],
+          shadowHash: 'c'.repeat(64), shadowBytes: 1,
+        };
+        gate.append('compaction/start', start);
+        gate.append('compaction/start', start);
+      },
+    },
+    {
+      name: 'turn/end turn mismatch',
+      pattern: /turn\/end turn mismatch/,
+      run: async (s) => {
+        beginTurn(s, 0);
+        s.lifecycle('turn/end', { turn: 1, outcome: 'waiting' });
+      },
+    },
+    {
+      name: 'world/perception turn mismatch',
+      pattern: /world\/perception turn mismatch/,
+      run: async (s) => {
+        beginTurn(s, 0);
+        rawAppend(s, 'world/perception', {
+          turn: 1, range: { from: null, to: null },
+          value: { kind: 'inline', value: perception('evidence') },
+        });
+      },
+    },
   ];
 
   it.each(cases)('$name', async ({ pattern, run }) => {

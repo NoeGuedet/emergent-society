@@ -319,6 +319,9 @@ export class ContextFold {
       if (config.version <= this.config.value.version) {
         invariant('config version must strictly increase');
       }
+      // Fail-closed defense for a future refactor: the first config creates the
+      // heading surface and it is never nulled, so this guard is unreachable
+      // today — but a rewrite must never proceed without a heading pin.
       if (this.surface === null) invariant('config rewrite without a heading surface');
       this.surface.replaceHeading(config.heading, source);
     }
@@ -801,6 +804,9 @@ export class ContextFold {
     if (!SAME(offered.source, summary)) {
       invariant('compaction/end summary source does not match the recorded summary');
     }
+    // Fail-closed defense for a future refactor: compaction/start already
+    // requires a surface and it is never nulled, so this is unreachable today —
+    // but an end must never replace committed state without a heading pin.
     if (this.surface === null) invariant('compaction/end without a heading surface');
     const start = this.pendingCompactions[index]!;
     this.surface.replaceCommitted(start, offered.summary, offered.source);

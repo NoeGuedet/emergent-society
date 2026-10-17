@@ -1,17 +1,18 @@
 import { canonicalizeJson } from '../journal/index.js';
 import { sha256HexOf } from '../journal/canon.js';
-import { canonicalBytes, eventKey, resolveStored, toJson } from './artifacts.js';
+import { canonicalBytes, eventKey, resolveArtifact, resolveStored, toJson } from './artifacts.js';
 import type { VerifiedEventIndex } from './artifacts.js';
 import { RENDER_POLICY, presentWorld } from './diff.js';
 import { createBoundaryRegistry, validateRequestPlan } from './events.js';
 import { ContextFold } from './fold.js';
 import { sourceOf } from './loader.js';
+import { serializeWire } from '../provider/wire.js';
 import type { GateScope } from '../node/gate.js';
 import type { WorldRepo, WorldRange } from '../node/world.js';
 import type { VerifiedEvent, VerifiedEvents } from './loader.js';
 import type {
-  ChatMessage, PlanSection, ProjectionState, RequestId, RequestPlan, Source, Stored, ToolSchema,
-  WorldPerception,
+  ArtifactRef, ChatMessage, PlanSection, ProjectionState, RequestId, RequestPlan, Source, Stored,
+  ToolSchema, WorldPerception,
 } from './contracts.js';
 
 /**
@@ -224,17 +225,22 @@ async function verifyPerception(
  *
  * It walks every recorded fact with a real `ContextFold`, assembles the plan
  * immediately before each recorded `request/plan` and compares it canonically,
- * and recomputes each `world/perception` from the recorded Git range, uid and
- * render budgets through `presentWorld`. A divergence — a changed renderer
- * policy, a differing exact Git version or any other canonical difference —
- * throws rather than promising equality. No external effect is executed: the
- * fold, the assembler and the renderer are read-only.
+ * re-encodes every recorded `request/wire` body from that plan's canonical wire
+ * serializer (retries reuse the first body), and recomputes each
+ * `world/perception` from the recorded Git range, uid and render budgets through
+ * `presentWorld`. A divergence — a changed renderer policy, a differing exact
+ * Git version, a wire that is not the plan's serialized body or any other
+ * canonical difference — throws rather than promising equality. No external
+ * effect is executed: the fold, the assembler and the renderer are read-only.
  */
 export async function rederivePlans(
   events: VerifiedEvents, world: WorldRepo,
 ): Promise<readonly ReplayComparison[]> {
   const fold = new ContextFold();
   const comparisons: ReplayComparison[] = [];
+  // The recorded plan per logical request, so each wire body can be re-encoded
+  // from the plan it claims to carry rather than trusted as a valid artifact.
+  const plans = new Map<string, RequestPlan>();
   // The observed prefix only: an event that has not yet been reached cannot
   // resolve a receipt, so a plan can never be verified against a future fact.
   const prefix = new Map<string, VerifiedEvent>();
@@ -253,6 +259,20 @@ export async function rederivePlans(
           + ' does not match the plan rederived from the recorded facts');
       }
       comparisons.push({ source, recorded, rederived });
+      plans.set(`${data.id.turn}:${data.id.ordinal}`, recorded);
+    } else if (event.type === 'request/wire') {
+      const data = event.data as unknown as { id: RequestId; attempt: number; body: ArtifactRef };
+      const recorded = plans.get(`${data.id.turn}:${data.id.ordinal}`);
+      // Without a recorded plan the fold owns the sequencing refusal below.
+      if (recorded !== undefined) {
+        const source = sourceOf(event);
+        const body = resolveArtifact(prefix, data.body);
+        if (!Buffer.from(body).equals(Buffer.from(serializeWire(recorded)))) {
+          throw new Error(
+            `replay: the wire recorded at ${source.seq}:${source.hash}`
+            + ` (attempt ${data.attempt}) is not the recorded plan's serialized body`);
+        }
+      }
     }
     await fold.observe([event]);
   }
