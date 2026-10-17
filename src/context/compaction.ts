@@ -2,7 +2,8 @@ import { sha256HexOf } from '../journal/canon.js';
 import { canonicalMessagesBytes } from '../provider/wire.js';
 import { canonicalBytes, toJson } from './artifacts.js';
 import {
-  MAX_COMPACTION_SOURCES, SAME, candidateIdentity, groupCitations, isBalancedGroup, sortUnique,
+  MAX_COMPACTION_SOURCES, groupCitations, isBalancedGroup, replacementFits, sortUnique,
+  validateCompactionSpan,
 } from './groups.js';
 import type { BoundaryGate } from '../node/gate.js';
 import type { ContextFold } from './fold.js';
@@ -110,48 +111,19 @@ export function selectCompaction(state: ProjectionState): CompactionStart | null
 }
 
 /**
- * Re-derives the candidate from the current state: the revision must still match,
- * the identity must be the hash of its own five fields, the span must still be
- * the same contiguous committed groups with the same receipts, the shadow must
- * re-encode to the recorded bytes, and the replacement must still be strictly
- * smaller. Any drift is stale.
+ * Re-derives the candidate from the current state through the one shared span
+ * validator: the revision, identity, contiguous balanced span, citations and
+ * shadow must all still hold, and the notice must still be strictly smaller
+ * than the real shadow. Any drift is stale.
  */
 function transactionValid(state: ProjectionState, candidate: CompactionStart): boolean {
   const surface = state.surface;
-  if (surface === null || candidate.revision !== surface.revision) return false;
-  if (candidate.id !== candidateIdentity(candidate)) return false;
-  if (candidate.groupIds.length === 0 || candidate.sources.length === 0) return false;
-  if (candidate.sources.length > MAX_COMPACTION_SOURCES) return false;
-
-  const indexes: number[] = [];
-  const groups: SurfaceGroup[] = [];
-  for (const id of candidate.groupIds) {
-    const index = surface.nodes.findIndex((node) => SAME(node.group.id, id));
-    if (index < 1) return false;
-    indexes.push(index);
-    groups.push(surface.nodes[index]!.group);
-  }
-  for (let i = 1; i < indexes.length; i++) {
-    if (indexes[i] !== indexes[i - 1]! + 1) return false;
-  }
-
-  const messages: ChatMessage[] = [];
-  const sources: Source[] = [];
-  for (const group of groups) {
-    if (!isBalancedGroup(group)) return false;
-    for (const message of group.messages) messages.push(message);
-    for (const source of groupCitations(group)) sources.push(source);
-  }
-  const ordered = sortUnique(sources);
-  if (ordered.length !== candidate.sources.length) return false;
-  for (let i = 0; i < ordered.length; i++) {
-    if (!SAME(ordered[i]!, candidate.sources[i]!)) return false;
-  }
-  const shadow = canonicalMessagesBytes(messages);
-  if (shadow.length !== candidate.shadowBytes) return false;
-  if (sha256HexOf(Buffer.from(shadow)) !== candidate.shadowHash) return false;
-  if (canonicalMessagesBytes([noticeMessage()]).length >= candidate.shadowBytes) return false;
-  return true;
+  if (surface === null) return false;
+  const verdict = validateCompactionSpan(
+    surface.nodes.map((node) => node.group), candidate);
+  if (!verdict.ok) return false;
+  return replacementFits(
+    canonicalMessagesBytes([noticeMessage()]).length, verdict.shadow.length);
 }
 
 async function abortStale(gate: BoundaryGate, id: string): Promise<'aborted'> {

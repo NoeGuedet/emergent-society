@@ -1,15 +1,15 @@
 import type { EventEnvelope } from '../journal/index.js';
-import { sha256HexOf } from '../journal/canon.js';
 import { canonicalMessagesBytes } from '../provider/wire.js';
 import type { GateScope } from '../node/gate.js';
 import { canonicalBytes, toJson } from './artifacts.js';
 import { createBoundaryRegistry } from './events.js';
 import {
-  MAX_COMPACTION_SOURCES, SAME, candidateIdentity, groupCitations, isBalancedGroup, sameSourceSet,
-  sortUnique,
+  SAME, replacementFits, sameSourceSet, sortUnique, surfaceHeading, surfaceRevision,
+  validateCompactionSpan,
 } from './groups.js';
+import type { CompactionSpanFailure } from './groups.js';
 import type {
-  ChatMessage, CompactionStart, CompactionSummary, Source, SurfaceGroup, SurfaceNode, SurfaceSnapshot,
+  CompactionStart, CompactionSummary, Source, SurfaceGroup, SurfaceSnapshot,
 } from './contracts.js';
 
 /**
@@ -46,9 +46,40 @@ function groupType(kind: SurfaceGroup['kind']): string | null {
   }
 }
 
-function headingText(group: SurfaceGroup): string {
-  const first = group.messages[0];
-  return first !== undefined && first.role === 'system' ? first.content : '';
+/** The applier's exact message for each rejected span invariant. */
+function spanError(reason: CompactionSpanFailure): SurfacePolicyError {
+  switch (reason.code) {
+    case 'revision':
+      return new SurfacePolicyError('replaceCommitted: candidate revision is stale');
+    case 'identity':
+      return new SurfacePolicyError('replaceCommitted: candidate id does not match its fields');
+    case 'no-group-ids':
+      return new SurfacePolicyError('replaceCommitted: no group ids');
+    case 'no-sources':
+      return new SurfacePolicyError('replaceCommitted: no source receipts');
+    case 'too-many-sources':
+      return new SurfacePolicyError(
+        `replaceCommitted: candidate cites more than ${reason.max} receipts`);
+    case 'unknown-group':
+      return new SurfacePolicyError(
+        `replaceCommitted: group ${reason.id.seq}:${reason.id.hash} is not on the surface`);
+    case 'duplicate-group':
+      return new SurfacePolicyError('replaceCommitted: duplicate group id in candidate');
+    case 'heading-pin':
+      return new SurfacePolicyError('replaceCommitted: a candidate may not span the heading pin');
+    case 'non-contiguous':
+      return new SurfacePolicyError('replaceCommitted: candidate groups are not contiguous');
+    case 'unbalanced':
+      return new SurfacePolicyError('replaceCommitted: a selected group is not a balanced unit');
+    case 'citations':
+      return new SurfacePolicyError('replaceCommitted: candidate sources are not the group citations');
+    case 'shadow-bytes':
+      return new SurfacePolicyError(
+        'replaceCommitted: candidate shadowBytes do not match the real span');
+    case 'shadow-hash':
+      return new SurfacePolicyError(
+        'replaceCommitted: candidate shadowHash does not match the real span');
+  }
 }
 
 export class Surface {
@@ -77,15 +108,12 @@ export class Surface {
   }
 
   private revision(): string {
-    const heading = { text: headingText(this.groups[0]!), source: this.groups[0]!.id };
-    const nodes: SurfaceNode[] = this.groups.map((group, position) => ({ position, group }));
-    return sha256HexOf(Buffer.from(canonicalBytes({ heading, nodes })));
+    return surfaceRevision(this.groups);
   }
 
   snapshot(): SurfaceSnapshot {
-    const head = this.groups[0]!;
-    const heading = { text: headingText(head), source: head.id };
-    const nodes: SurfaceNode[] = this.groups.map((group, position) => ({ position, group }));
+    const heading = surfaceHeading(this.groups);
+    const nodes = this.groups.map((group, position) => ({ position, group }));
     const revision = this.revision();
     return toJson({ heading, nodes, revision }) as unknown as SurfaceSnapshot;
   }
@@ -154,102 +182,36 @@ export class Surface {
 
   /**
    * Applies a completed compaction, verifying the whole transaction at apply time
-   * and *before* any mutation: the candidate's revision must still equal the
-   * surface revision, its id must be the hash of its own five fields, the summary
-   * must name the same id and cite exactly the candidate's sources, the named
-   * groups must be a real, contiguous, balanced span outside the heading pin, the
-   * candidate's sources must be exactly the sorted unique citations of that span
-   * (a prior summary cited by its own receipt, never flattened), the recorded
-   * shadowBytes/shadowHash must equal the real canonical encoding of the span,
-   * `replacementBytes` must equal the encoded summary message and be strictly
-   * smaller than that real shadow, and every claimed receipt must resolve. A false
-   * field is refused even when the id, revision and journal chain are otherwise
-   * coherent; nothing is replaced.
+   * and *before* any mutation. The span itself is the producer's own shared
+   * verdict (`validateCompactionSpan`): revision, identity, a contiguous balanced
+   * span outside the heading pin, exactly that span's sorted unique citations
+   * (a prior summary cited by its own receipt, never flattened), and the real
+   * shadow bytes/hash. The applier then binds the summary: it must name the same
+   * id, cite exactly the candidate's sources, have `replacementBytes` equal the
+   * encoded summary message, and be strictly smaller than the real shadow; every
+   * claimed receipt must resolve. A false field is refused even when the id,
+   * revision and journal chain are otherwise coherent; nothing is replaced.
    */
   replaceCommitted(
     candidate: CompactionStart, summary: CompactionSummary, summarySource: Source,
   ): void {
-    if (candidate.revision !== this.revision()) {
-      throw new SurfacePolicyError('replaceCommitted: candidate revision is stale');
-    }
-    if (candidate.id !== candidateIdentity(candidate)) {
-      throw new SurfacePolicyError('replaceCommitted: candidate id does not match its fields');
-    }
+    // One shared verdict with the producer: every span invariant (revision,
+    // identity, contiguity, balance, citations, shadow) is re-derived from the
+    // durable groups before anything is read from the caller's summary.
+    const verdict = validateCompactionSpan(this.groups, candidate);
+    if (!verdict.ok) throw spanError(verdict.reason);
+
     if (summary.id !== candidate.id) {
       throw new SurfacePolicyError('replaceCommitted: summary id does not match the candidate');
     }
     if (!sameSourceSet(summary.sources, candidate.sources)) {
       throw new SurfacePolicyError('replaceCommitted: summary sources do not match the candidate');
     }
-    if (candidate.groupIds.length === 0) {
-      throw new SurfacePolicyError('replaceCommitted: no group ids');
-    }
-    if (candidate.sources.length === 0) {
-      throw new SurfacePolicyError('replaceCommitted: no source receipts');
-    }
-    if (candidate.sources.length > MAX_COMPACTION_SOURCES) {
-      throw new SurfacePolicyError(
-        `replaceCommitted: candidate cites more than ${MAX_COMPACTION_SOURCES} receipts`);
-    }
-
-    const positions: number[] = [];
-    const seenPositions = new Set<number>();
-    for (const id of candidate.groupIds) {
-      const position = this.groups.findIndex((group) => SAME(group.id, id));
-      if (position < 0) {
-        throw new SurfacePolicyError(`replaceCommitted: group ${id.seq}:${id.hash} is not on the surface`);
-      }
-      if (seenPositions.has(position)) {
-        throw new SurfacePolicyError('replaceCommitted: duplicate group id in candidate');
-      }
-      seenPositions.add(position);
-      positions.push(position);
-    }
-    const first = Math.min(...positions);
-    if (first === 0) {
-      throw new SurfacePolicyError('replaceCommitted: a candidate may not span the heading pin');
-    }
-    const sorted = [...positions].sort((a, b) => a - b);
-    for (let i = 0; i < sorted.length; i++) {
-      if (sorted[i] !== first + i) {
-        throw new SurfacePolicyError('replaceCommitted: candidate groups are not contiguous');
-      }
-    }
-
-    // The real span, in surface order: its balance, its citations and its encoded
-    // shadow are re-derived from the durable groups, never trusted from the record.
-    const messages: ChatMessage[] = [];
-    const citations: Source[] = [];
-    for (const position of sorted) {
-      const group = this.groups[position]!;
-      if (!isBalancedGroup(group)) {
-        throw new SurfacePolicyError('replaceCommitted: a selected group is not a balanced unit');
-      }
-      for (const message of group.messages) messages.push(message);
-      for (const source of groupCitations(group)) citations.push(source);
-    }
-    const derived = sortUnique(citations);
-    if (derived.length !== candidate.sources.length) {
-      throw new SurfacePolicyError('replaceCommitted: candidate sources are not the group citations');
-    }
-    for (let i = 0; i < derived.length; i++) {
-      if (!SAME(derived[i]!, candidate.sources[i]!)) {
-        throw new SurfacePolicyError('replaceCommitted: candidate sources are not the group citations');
-      }
-    }
-    const shadow = canonicalMessagesBytes(messages);
-    if (shadow.length !== candidate.shadowBytes) {
-      throw new SurfacePolicyError(
-        'replaceCommitted: candidate shadowBytes do not match the real span');
-    }
-    if (sha256HexOf(Buffer.from(shadow)) !== candidate.shadowHash) {
-      throw new SurfacePolicyError('replaceCommitted: candidate shadowHash does not match the real span');
-    }
     if (summary.replacementBytes !== canonicalMessagesBytes([summary.message]).length) {
       throw new SurfacePolicyError(
         'replaceCommitted: summary replacementBytes does not match the encoded summary');
     }
-    if (summary.replacementBytes >= shadow.length) {
+    if (!replacementFits(summary.replacementBytes, verdict.shadow.length)) {
       throw new SurfacePolicyError(
         'replaceCommitted: replacement is not strictly smaller than the shadow',
       );
@@ -262,7 +224,7 @@ export class Surface {
     // Bind the applied summary to the durable receipt's own data: the caller's
     // payload is accepted only when it is byte-identical to the recorded
     // `compaction/summary`, and the spliced group is built from that recorded value.
-    const durable = this.durableSummary(summaryReceipt.data, this.groups[first]!.turn);
+    const durable = this.durableSummary(summaryReceipt.data, this.groups[verdict.first]!.turn);
     if (!sameCanonical(durable, summary)) {
       throw new SurfacePolicyError(
         'replaceCommitted: summary does not match its durable compaction/summary receipt');
@@ -270,10 +232,10 @@ export class Surface {
     for (const source of candidate.sources) this.receipt(source, 'replaceCommitted.source');
 
     const summaryGroup: SurfaceGroup = toJson({
-      id: summarySource, kind: 'summary', turn: this.groups[first]!.turn,
+      id: summarySource, kind: 'summary', turn: this.groups[verdict.first]!.turn,
       messages: [durable.message],
       sources: sortUnique([summarySource, ...durable.sources]),
     }) as unknown as SurfaceGroup;
-    this.groups.splice(first, sorted.length, summaryGroup);
+    this.groups.splice(verdict.first, verdict.length, summaryGroup);
   }
 }
