@@ -1,5 +1,5 @@
 import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib';
-import { CorruptionError } from './errors.js';
+import { CorruptionError, JournalError } from './errors.js';
 
 const LEN_BYTES = 4;
 
@@ -7,11 +7,37 @@ const LEN_BYTES = 4;
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
 
 /**
- * Format constant — a durable batch never decompresses to more than this. It
- * bounds the allocation a single frame can force (`maxOutputLength`), so a
- * crafted or corrupt frame cannot expand without limit (zstd bomb).
+ * Format constant — a durable batch decompresses to strictly fewer than this.
+ * It bounds the allocation a single frame can force (`maxOutputLength`), so a
+ * crafted or corrupt frame cannot expand without limit (zstd bomb). The writer
+ * must never emit a frame its own reader would refuse: a burst is split into
+ * consecutive frames below the bound, and a single event that alone reaches it
+ * is refused at append.
  */
 export const MAX_DECOMPRESSED_BATCH_BYTES = 64 * 1024 * 1024;
+
+/**
+ * A batch whose decompressed content reaches the frame bound. The frame would
+ * be minted but every reader and `repair()` would refuse it, so it is refused
+ * before any bytes are written.
+ */
+export class OversizedBatchError extends JournalError {
+  constructor(public readonly bytes: number) {
+    super(`batch decompresses to ${bytes} bytes, at or over the ${MAX_DECOMPRESSED_BATCH_BYTES}-byte frame bound`);
+  }
+}
+
+/**
+ * A single event line that alone reaches the frame bound. No split can make it
+ * fit, so the event can never be committed; `append` refuses it while the
+ * writer is still clean rather than admitting an event that could only poison
+ * the journal.
+ */
+export class OversizedEventError extends JournalError {
+  constructor(public readonly bytes: number) {
+    super(`event is ${bytes} bytes, at or over the ${MAX_DECOMPRESSED_BATCH_BYTES}-byte frame bound`);
+  }
+}
 
 /**
  * Frames carry a zstd content checksum (kernel.md §3: "independent checksummed
@@ -44,7 +70,14 @@ export interface ScannedBatch {
 }
 
 export function encodeBatch(lines: string[]): Buffer {
-  const compressed = zstdCompressSync(Buffer.from(lines.join('\n'), 'utf8'), COMPRESS_OPTIONS);
+  const raw = Buffer.from(lines.join('\n'), 'utf8');
+  // The compressed length is not the durable bound: `decompress` caps the
+  // *output*, so an over-bound frame would be minted here and then refused by
+  // every reader (and by `repair`). Refuse it at the writer instead.
+  if (raw.length >= MAX_DECOMPRESSED_BATCH_BYTES) {
+    throw new OversizedBatchError(raw.length);
+  }
+  const compressed = zstdCompressSync(raw, COMPRESS_OPTIONS);
   if (compressed.length > 0xffffffff) {
     throw new RangeError(`batch compresses to ${compressed.length} bytes, over the u32 frame limit`);
   }

@@ -3,7 +3,9 @@ import type { FileHandle } from 'node:fs/promises';
 import { canonicalizeJson, sha256HexOf, type JsonValue } from './canon.js';
 import { GENESIS_HASH, makeEvent, eventLine, type EventDataFor, type EventEnvelope } from './envelope.js';
 import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from './blobs.js';
-import { encodeBatch, scanBatches } from './framing.js';
+import {
+  encodeBatch, scanBatches, MAX_DECOMPRESSED_BATCH_BYTES, OversizedEventError,
+} from './framing.js';
 import { CorruptionError, JournalError } from './errors.js';
 import { atomicWriteFile, ensureDurableDirectory, readFileOrNull, syncPath, writeAll } from './fsutil.js';
 import { headPath, journalPath, nodeDir, type Head } from './layout.js';
@@ -226,6 +228,8 @@ export class JournalWriter {
    * @throws JournalPoisonedError once a batch has failed to commit twice.
    * @throws the recorded write-behind failure, if a prior flush failed.
    * @throws NonCanonicalizableError when the payload has no JSON form.
+   * @throws OversizedEventError when the event alone reaches the frame bound:
+   * no split can commit it, so it is refused before `seq` advances.
    */
   append<T extends string>(
     type: T, data: EventDataFor<T>, opts?: { ignorable?: boolean },
@@ -239,14 +243,22 @@ export class JournalWriter {
       type, data: this.claimCheck(data), seq: this.seq, time: this.now(),
       prevHash: this.prevHash, ...opts,
     });
+    // The canonical line is captured here, once: `flush` writes these exact
+    // bytes, so a caller mutating `data` afterwards cannot desynchronize the
+    // persisted bytes from the hash that was chained.
+    const line = eventLine(e);
+    // The bound is measured on the line because a frame's decompressed content
+    // is exactly its lines and separators; an event that alone reaches it fits
+    // no split. Refusing *here*, before `seq`/`prevHash` advance, leaves the
+    // writer and the journal usable instead of admitting an event that no
+    // reader could ever accept.
+    const lineBytes = Buffer.byteLength(line, 'utf8');
+    if (lineBytes >= MAX_DECOMPRESSED_BATCH_BYTES) throw new OversizedEventError(lineBytes);
 
     this.seq += 1;
     this.prevHash = e.hash;
     this.firstHash ??= e.hash;
-    // The canonical line is captured here, once: `flush` writes these exact
-    // bytes, so a caller mutating `data` afterwards cannot desynchronize the
-    // persisted bytes from the hash that was chained.
-    this.pending.push({ event: e, line: eventLine(e) });
+    this.pending.push({ event: e, line });
     // No debounce: the window starts with the first event of the burst. The
     // guard makes a timer that outlives `close()` a no-op instead of a
     // synchronous throw from `flush()` inside a callback nothing can catch.
@@ -354,9 +366,19 @@ export class JournalWriter {
       if (this.pendingFailure) throw this.pendingFailure;
       return;
     }
-    const frame = encodeBatch(batch.map((p) => p.line));
+    let frames: Buffer[];
+    let framedBytes: number;
     try {
-      await writeAll(this.log, frame);
+      // A burst is split into consecutive frames, each under the decompressed
+      // bound: concatenated frames are exactly what `scanBatches` walks, and the
+      // chain crosses a frame boundary unchanged because every line carries its
+      // own prev_hash/hash. One fsync still covers the whole burst. Encoding is
+      // inside the `try` so an encode refusal restores the batch like a write
+      // failure; the append-side guard makes that refusal unreachable, but a
+      // captured batch is never dropped.
+      frames = splitIntoFrames(batch);
+      framedBytes = frames.reduce((n, frame) => n + frame.length, 0);
+      for (const frame of frames) await writeAll(this.log, frame);
       await this.log.sync();
     } catch (err) {
       // Restore the batch at the front of `pending` (order preserved) and roll
@@ -373,7 +395,7 @@ export class JournalWriter {
     }
     const last = batch[batch.length - 1]!;
     this.committed = {
-      bytes: this.committed.bytes + frame.length,
+      bytes: this.committed.bytes + framedBytes,
       seq: last.event.seq + 1,
       lastHash: last.event.hash,
     };
@@ -511,6 +533,37 @@ export class JournalWriter {
     }
     if (failure !== undefined) throw failure;
   }
+}
+
+/**
+ * Splits a burst into the fewest consecutive frames whose decompressed content
+ * stays strictly under `MAX_DECOMPRESSED_BATCH_BYTES`. A frame's decompressed
+ * size is its lines joined by `\n`, so the running byte count is exact.
+ *
+ * An event that alone reaches the bound fits no split; `append` refuses it
+ * before it can enter `pending`, and this is the encode-side backstop.
+ */
+function splitIntoFrames(batch: PendingEvent[]): Buffer[] {
+  const frames: Buffer[] = [];
+  let lines: string[] = [];
+  let bytes = 0;
+  const flushGroup = (): void => {
+    if (lines.length === 0) return;
+    frames.push(encodeBatch(lines));
+    lines = [];
+    bytes = 0;
+  };
+  for (const { line } of batch) {
+    const lineBytes = Buffer.byteLength(line, 'utf8');
+    if (lineBytes >= MAX_DECOMPRESSED_BATCH_BYTES) throw new OversizedEventError(lineBytes);
+    // The newline between lines counts toward the decompressed size too.
+    if (lines.length > 0 && bytes + 1 + lineBytes >= MAX_DECOMPRESSED_BATCH_BYTES) flushGroup();
+    if (lines.length > 0) bytes += 1;
+    bytes += lineBytes;
+    lines.push(line);
+  }
+  flushGroup();
+  return frames;
 }
 
 /**

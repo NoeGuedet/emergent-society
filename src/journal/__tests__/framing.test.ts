@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { zstdCompressSync } from 'node:zlib';
 import {
   decodeBatch, encodeBatch, scanBatches, CorruptFrameError, MAX_DECOMPRESSED_BATCH_BYTES,
+  OversizedBatchError,
 } from '../framing.js';
 
 describe('framed zstd batches', () => {
@@ -55,6 +56,17 @@ describe('framed zstd batches', () => {
   it('round-trips content with newlines and unicode', () => {
     const lines = ['a",b\\c', 'é\u2028日'];
     expect(decodeBatch(encodeBatch(lines))).toEqual(lines);
+  });
+  it('accepts a batch just under the decompressed bound', () => {
+    const line = 'a'.repeat(MAX_DECOMPRESSED_BATCH_BYTES - 1);
+    expect(decodeBatch(encodeBatch([line]))).toEqual([line]);
+  });
+  it('refuses a batch at or over the decompressed bound at encode time', () => {
+    const line = 'a'.repeat(MAX_DECOMPRESSED_BATCH_BYTES);
+    expect(() => encodeBatch([line])).toThrow(OversizedBatchError);
+    // The separator counts too: two half-bound lines joined by `\n` reach it.
+    const half = 'a'.repeat(MAX_DECOMPRESSED_BATCH_BYTES / 2);
+    expect(() => encodeBatch([half, half])).toThrow(OversizedBatchError);
   });
   it('bounds decompression to the documented per-batch maximum', () => {
     expect(MAX_DECOMPRESSED_BATCH_BYTES).toBe(64 * 1024 * 1024);

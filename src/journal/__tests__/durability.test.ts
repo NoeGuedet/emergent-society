@@ -4,11 +4,15 @@ import type { FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JournalWriter, JournalPoisonedError, JournalClosedError } from '../writer.js';
-import { BlobStore } from '../blobs.js';
+import { BlobStore, CLAIM_CHECK_THRESHOLD } from '../blobs.js';
 import { JournalReader } from '../reader.js';
+import {
+  MAX_DECOMPRESSED_BATCH_BYTES, OversizedEventError, scanBatches,
+} from '../framing.js';
 import { headPath, nodeDir } from '../layout.js';
 import {
-  BIG_PAYLOAD_CHARS, collectEvents, injectBlobPut, KNOWN_TYPES, logPath, useTempHome, withFailingWrite,
+  BIG_PAYLOAD_CHARS, collectEvents, injectBlobPut, KNOWN_TYPES, logPath, payloadOfCanonicalBytes,
+  useTempHome, withFailingWrite,
 } from './helpers.js';
 
 const home = useTempHome('cell-spine-');
@@ -126,6 +130,44 @@ describe('durability spine', () => {
     await expect(withFailingWrite(home(), () => w.close(), 1)).rejects.toThrow('injected EIO');
     const w2 = await JournalWriter.open(home(), 'n1');
     await w2.close();
+  });
+});
+
+describe('decompressed frame bound', () => {
+  it('splits a burst that would cross the bound into readable chained frames', async () => {
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    // Just under the claim-check threshold, so every event stays inline and the
+    // decompressed burst (not the compressed frames) is what crosses the bound.
+    const inline = payloadOfCanonicalBytes(CLAIM_CHECK_THRESHOLD - 1);
+    const count = 4200;
+    for (let i = 0; i < count; i += 1) w.append('test/ping', inline);
+    await w.flush();
+    await w.close();
+    const { batches } = scanBatches(await readFile(logPath(home())));
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.reduce((n, b) => n + b.lines.length, 0)).toBe(count);
+    for (const batch of batches) {
+      expect(Buffer.byteLength(batch.lines.join('\n'), 'utf8'))
+        .toBeLessThan(MAX_DECOMPRESSED_BATCH_BYTES);
+    }
+    // The reader verifies the chain across the split: frame boundaries are
+    // invisible because every line carries its own prev_hash/hash.
+    const events = await collectEvents(home());
+    expect(events).toHaveLength(count);
+    expect(events[0]!.seq).toBe(0);
+    expect(events.at(-1)!.seq).toBe(count - 1);
+  }, 30_000);
+  it('refuses one event that alone reaches the bound and stays usable', async () => {
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    const hugeType = 'x'.repeat(MAX_DECOMPRESSED_BATCH_BYTES);
+    expect(() => w.append(hugeType, { n: 0 }, { ignorable: true })).toThrow(OversizedEventError);
+    // The refused event consumed no seq and nothing was framed: the journal is
+    // still writable and readable, and the next event is seq 0.
+    expect(w.append('test/ping', { n: 0 }).seq).toBe(0);
+    await w.flush();
+    await w.close();
+    const events = await collectEvents(home());
+    expect(events.map((e) => [e.seq, e.type])).toEqual([[0, 'test/ping']]);
   });
 });
 
