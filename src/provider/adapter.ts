@@ -210,6 +210,18 @@ export class ProviderAdapter {
       if (gate.signal.aborted) {
         return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
       }
+      if (attempt > 0) {
+        // A next-attempt wire is journaled only after this final abort check, so
+        // a stop up to here leaves no durable wire for an attempt that never
+        // runs. One window is inherent: a stop landing during the flush itself
+        // leaves the wire durable with no POST — no attempt left the process,
+        // and the send is terminal, so that wire is inert.
+        gate.append('request/wire', { id, attempt, body: bodyRef });
+        await gate.flush();
+        if (gate.signal.aborted) {
+          return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
+        }
+      }
 
       const posted = await this.post(body, policy, gate);
       const result = posted.result;
@@ -218,7 +230,7 @@ export class ProviderAdapter {
         // No status: journal the attempt only (no raw body was received).
         const failure = this.classifyNoStatus(result, posted.timedOut, gate);
         const retryable = failure.code === 'network' || failure.code === 'timeout';
-        const next = await this.maybeRetry(gate, id, attempt, failure, retryable, policy, bodyRef);
+        const next = await this.maybeRetry(gate, id, attempt, failure, retryable, policy);
         if (next === 'continue') { attempt += 1; continue; }
         if (gate.signal.aborted) return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
         return this.fail(gate, id, attempt, failure);
@@ -258,13 +270,14 @@ export class ProviderAdapter {
         return { kind: 'response', projection };
       }
 
-      const next = await this.maybeRetry(gate, id, attempt, failure, retryable, policy, bodyRef);
+      const next = await this.maybeRetry(gate, id, attempt, failure, retryable, policy);
       if (next === 'continue') { attempt += 1; continue; }
       // A stop observed before headers or during the retry delay is a boundary
       // cancellation; a stop already classified from a status-known body keeps
-      // its own status.
+      // its own status (non-null in this branch), so recording never depends on
+      // whether the stop landed during capture or afterwards.
       if (gate.signal.aborted && failure.code !== 'cancelled') {
-        return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
+        return this.fail(gate, id, attempt, { code: 'cancelled', status: failure.status });
       }
       return this.fail(gate, id, attempt, failure);
     }
@@ -315,11 +328,19 @@ export class ProviderAdapter {
     const controller = new AbortController();
     let timedOut = false;
     const onAbort = (): void => { controller.abort(); };
-    gate.signal.addEventListener('abort', onAbort, { once: true });
-    const clearTimer = this.policy.schedule(policy.requestTimeoutMs, () => {
-      timedOut = true;
-      controller.abort();
-    });
+    let clearTimer: () => void = () => {};
+    // Register the listener and arm the timer as one guarded step: a throwing
+    // injected `schedule` would otherwise leak the listener on the gate signal.
+    try {
+      gate.signal.addEventListener('abort', onAbort, { once: true });
+      clearTimer = this.policy.schedule(policy.requestTimeoutMs, () => {
+        timedOut = true;
+        controller.abort();
+      });
+    } catch (error) {
+      gate.signal.removeEventListener('abort', onAbort);
+      throw error;
+    }
     try {
       const result = await this.transport.post(body, controller.signal, policy.maxCaptureBytes);
       return { result, timedOut };
@@ -350,13 +371,14 @@ export class ProviderAdapter {
 
   /**
    * Journals a non-terminal attempt, waits the fixed cancellable delay, and
-   * appends the next wire (the same retained body artifact and bytes). Returns
-   * 'continue' to retry or 'stop' when no retry is allowed. A cancelled delay
-   * returns 'stop' without a later send; the caller journals the terminal result.
+   * returns 'continue' to retry or 'stop' when no retry is allowed. A cancelled
+   * delay returns 'stop' without a later send; the caller journals the terminal
+   * result. The next attempt's `request/wire` is appended by the send loop,
+   * after its final abort check — never here.
    */
   private async maybeRetry(
     gate: BoundaryGate, id: RequestId, attempt: number, failure: SafeFailure,
-    retryable: boolean, policy: RequestPlan['policy'], bodyRef: ArtifactRef,
+    retryable: boolean, policy: RequestPlan['policy'],
   ): Promise<'continue' | 'stop'> {
     if (!retryable || attempt + 1 >= policy.maxAttempts) return 'stop';
     gate.append('assistant/attempt', { id, attempt, failure, terminal: false });
@@ -367,9 +389,6 @@ export class ProviderAdapter {
     } catch {
       return 'stop';
     }
-    if (gate.signal.aborted) return 'stop';
-    gate.append('request/wire', { id, attempt: attempt + 1, body: bodyRef });
-    await gate.flush();
     return 'continue';
   }
 

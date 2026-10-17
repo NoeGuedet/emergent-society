@@ -963,7 +963,9 @@ describe('ProviderAdapter: transport failures', () => {
       });
       session.controller.abort();
       const result = await sending;
-      expect(result).toEqual({ kind: 'failure', failure: { code: 'cancelled', status: null } });
+      // The 500 was already classified when the stop landed, so the status is
+      // preserved rather than recorded as an unknown cancellation.
+      expect(result).toEqual({ kind: 'failure', failure: { code: 'cancelled', status: 500 } });
       expect(transport.sends).toBe(1);
       expect(ofType(await events(), 'request/wire')).toHaveLength(1);
     } finally {
@@ -1007,9 +1009,117 @@ describe('ProviderAdapter: transport failures', () => {
     try {
       const sending = adapter.send(plan({ policy: seedPolicy({ maxAttempts: 2 }) }), guarded);
       const result = await sending;
-      expect(result).toEqual({ kind: 'failure', failure: { code: 'cancelled', status: null } });
+      expect(result).toEqual({ kind: 'failure', failure: { code: 'cancelled', status: 500 } });
       expect(transport.sends).toBe(1);
       expect(ofType(await events(), 'request/wire')).toHaveLength(1);
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+// --- late stops and policy seams --------------------------------------------------
+
+/** A gate whose flush aborts the session after its `at`-th flush returns. */
+function abortAfterFlush(
+  gate: BoundaryGate, controller: AbortController, at: number,
+): BoundaryGate {
+  let flushes = 0;
+  return {
+    get signal() { return gate.signal; },
+    append: (type, data) => gate.append(type, data),
+    flush: async () => {
+      flushes += 1;
+      await gate.flush();
+      if (flushes === at) controller.abort();
+    },
+    capture: (bytes, encoding, complete) => gate.capture(bytes, encoding, complete),
+    store: (value) => gate.store(value),
+  };
+}
+
+describe('ProviderAdapter: a late stop preserves the classified status', () => {
+  it('journals cancelled with the known status when the stop lands after response/raw', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult('{"error":"bad"}', 400)]);
+    try {
+      const adapter = new ProviderAdapter(transport, policies());
+      // Flush #1 is the wire barrier, #2 the response/raw barrier: the 400 is
+      // classified afterwards but before the terminal attempt is journaled.
+      const guarded = abortAfterFlush(session.gate('turn', 0), session.controller, 2);
+      const result = await adapter.send(plan(), guarded);
+      expect(result).toEqual({
+        kind: 'failure', failure: { code: 'cancelled', status: 400 },
+      });
+
+      const durable = await events();
+      const raw = ofType(durable, 'response/raw');
+      expect(raw).toHaveLength(1);
+      expect((raw[0]!.data as unknown as { status: number }).status).toBe(400);
+      const attempts = ofType(durable, 'assistant/attempt');
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]!.data).toMatchObject({
+        terminal: true, failure: { code: 'cancelled', status: 400 },
+      });
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+describe('ProviderAdapter: the post seam', () => {
+  it('removes the abort listener when the injected schedule throws', async () => {
+    const session = await openSession();
+    const inner = session.gate('turn', 0);
+    const added = vi.spyOn(inner.signal, 'addEventListener');
+    const removed = vi.spyOn(inner.signal, 'removeEventListener');
+    try {
+      const adapter = new ProviderAdapter(
+        new ScriptedTransport([transportResult(validBody())]),
+        policies({ schedule: () => { throw new Error('injected schedule failure'); } }),
+      );
+      await expect(adapter.send(plan(), inner)).rejects.toThrow('injected schedule failure');
+      const addAbort = added.mock.calls.filter((call) => call[0] === 'abort');
+      const removeAbort = removed.mock.calls.filter((call) => call[0] === 'abort');
+      expect(addAbort).toHaveLength(1);
+      expect(removeAbort).toHaveLength(1);
+      // The exact listener registered is the one removed: no leak on throw.
+      expect(removeAbort[0]![1]).toBe(addAbort[0]![1]);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('tolerates a stop during the next-wire flush as a durable wire with no send', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([
+      transportResult('{"error":"retry"}', 500),
+      transportResult(validBody()),
+    ]);
+    try {
+      const adapter = new ProviderAdapter(transport, policies());
+      // Flushes: #1 wire, #2 response/raw, #3 non-terminal attempt, #4 the next
+      // attempt's wire. A stop landing during #4 cannot be observed before the
+      // wire is durable; no POST follows, so the wire is inert.
+      const guarded = abortAfterFlush(session.gate('turn', 0), session.controller, 4);
+      const result = await adapter.send(
+        plan({ policy: seedPolicy({ maxAttempts: 2 }) }), guarded,
+      );
+      expect(result).toEqual({
+        kind: 'failure', failure: { code: 'cancelled', status: null },
+      });
+      expect(transport.sends).toBe(1);
+
+      const durable = await events();
+      const wires = ofType(durable, 'request/wire');
+      expect(wires).toHaveLength(2);
+      const first = wires[0]!.data as unknown as { attempt: number; body: ArtifactRef };
+      const second = wires[1]!.data as unknown as { attempt: number; body: ArtifactRef };
+      expect(first.attempt).toBe(0);
+      expect(second.attempt).toBe(1);
+      expect(second.body).toEqual(first.body);
+      expect(ofType(durable, 'assistant/attempt').map(
+        (event) => (event.data as unknown as { terminal: boolean }).terminal)).toEqual([false, true]);
     } finally {
       await session.shutdown();
     }

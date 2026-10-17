@@ -131,9 +131,11 @@ export function validateSeedPolicy(value: unknown, where = 'policy'): SeedPolicy
     stepsPerTurn: safeInt(value['stepsPerTurn'], 'policy.stepsPerTurn', 1),
     compactAfterBytes: safeInt(value['compactAfterBytes'], 'policy.compactAfterBytes', 1),
     keepRecentGroups: safeInt(value['keepRecentGroups'], 'policy.keepRecentGroups', 0),
-    maxAttempts: safeInt(value['maxAttempts'], 'policy.maxAttempts', 1),
-    retryDelayMs: safeInt(value['retryDelayMs'], 'policy.retryDelayMs', 0),
-    requestTimeoutMs: safeInt(value['requestTimeoutMs'], 'policy.requestTimeoutMs', 1),
+    // Retry/timeout knobs are bounded above as well: a persisted 2^53-scale
+    // attempt count would otherwise make the adapter retry without a deadline.
+    maxAttempts: safeInt(value['maxAttempts'], 'policy.maxAttempts', 1, 32),
+    retryDelayMs: safeInt(value['retryDelayMs'], 'policy.retryDelayMs', 0, 300_000),
+    requestTimeoutMs: safeInt(value['requestTimeoutMs'], 'policy.requestTimeoutMs', 1, 300_000),
     shellTimeoutMs: safeInt(value['shellTimeoutMs'], 'policy.shellTimeoutMs', 1),
     killGraceMs: safeInt(value['killGraceMs'], 'policy.killGraceMs', 1),
     maxCaptureBytes: safeInt(value['maxCaptureBytes'], 'policy.maxCaptureBytes', 1, 32 * MiB),

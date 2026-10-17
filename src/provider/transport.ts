@@ -24,6 +24,12 @@ export type TransportResult = {
 };
 
 export interface SerializedTransport {
+  /**
+   * Sends the exact bytes and settles only on a response or a signal abort:
+   * this method has no timeout of its own. Callers MUST supply a timing signal
+   * (the adapter arms `requestTimeoutMs` on an internal controller and aborts
+   * it); passing an unsignalled or never-aborted signal can hang the caller.
+   */
   post(body: Uint8Array, signal: AbortSignal, maxBytes: number): Promise<TransportResult>;
 }
 

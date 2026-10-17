@@ -125,6 +125,18 @@ describe('validateAgentConfig', () => {
     expect(() => validateAgentConfig(withPolicy({ keepRecentGroups: -1 }))).toThrow();
   });
 
+  it('bounds the retry and timeout knobs above', () => {
+    // Bounds are inclusive; one past is refused, so a persisted policy cannot
+    // approach 2^53 attempts or retry without an overall deadline.
+    expect(() => validateAgentConfig(withPolicy({ maxAttempts: 32 }))).not.toThrow();
+    expect(() => validateAgentConfig(withPolicy({ maxAttempts: 33 }))).toThrow();
+    expect(() => validateAgentConfig(withPolicy({ maxAttempts: 2 ** 53 - 1 }))).toThrow();
+    expect(() => validateAgentConfig(withPolicy({ retryDelayMs: 300_000 }))).not.toThrow();
+    expect(() => validateAgentConfig(withPolicy({ retryDelayMs: 300_001 }))).toThrow();
+    expect(() => validateAgentConfig(withPolicy({ requestTimeoutMs: 300_000 }))).not.toThrow();
+    expect(() => validateAgentConfig(withPolicy({ requestTimeoutMs: 300_001 }))).toThrow();
+  });
+
   it('enforces capture, request and shell capture ceilings', () => {
     const MiB = 1024 * 1024;
     expect(() => validateAgentConfig(withPolicy({ maxCaptureBytes: 32 * MiB }))).not.toThrow();
