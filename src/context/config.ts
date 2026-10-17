@@ -1,6 +1,7 @@
 import type { JsonValue } from '../journal/index.js';
 import { canonicalBytes, toJson } from './artifacts.js';
 import { validateProviderParameters } from './parameters.js';
+import { createValidator } from './validate.js';
 import type { AgentConfig, SeedPolicy, ToolSchema } from './contracts.js';
 
 /**
@@ -74,30 +75,14 @@ function fail(message: string): never {
   throw new Error(`invalid agent configuration: ${message}`);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-/** Rejects any key outside `allowed`, so a boundary payload cannot smuggle extra shape. */
-function onlyKeys(obj: Record<string, unknown>, allowed: readonly string[], where: string): void {
-  for (const key of Object.keys(obj)) {
-    if (!allowed.includes(key)) fail(`${where}: unexpected key ${JSON.stringify(key)}`);
-  }
-}
-
-function safeInt(
-  value: unknown, where: string, min: number, max = Number.MAX_SAFE_INTEGER,
-): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min || value > max) {
-    fail(`${where}: expected a safe integer in [${min}, ${max}]`);
-  }
-  return value as number;
-}
-
-function nonEmptyString(value: unknown, where: string): string {
-  if (typeof value !== 'string' || value.length === 0) fail(`${where}: expected a nonempty string`);
-  return value as string;
-}
+/**
+ * The shared primitives, bound to this module's original vocabulary: the
+ * configuration validator prefixes nothing at the root (`where === ''`) and
+ * spells every other diagnostic as `<where>: <message>`.
+ */
+const v = createValidator((where, message) =>
+  fail(where === '' ? message : `${where}: ${message}`));
+const { record, onlyKeys, text, safeInt, array } = v;
 
 function json(value: unknown, where: string): JsonValue {
   try {
@@ -124,42 +109,40 @@ const POLICY_KEYS = [
 ] as const;
 
 export function validateSeedPolicy(value: unknown, where = 'policy'): SeedPolicy {
-  if (!isRecord(value)) fail(`${where}: expected an object`);
-  onlyKeys(value, POLICY_KEYS, where);
-  for (const key of POLICY_KEYS) if (!(key in value)) fail(`policy.${key}: missing`);
+  const o = record(value, where);
+  onlyKeys(o, POLICY_KEYS, where);
+  for (const key of POLICY_KEYS) if (!(key in o)) fail(`policy.${key}: missing`);
   return {
-    stepsPerTurn: safeInt(value['stepsPerTurn'], 'policy.stepsPerTurn', 1),
-    compactAfterBytes: safeInt(value['compactAfterBytes'], 'policy.compactAfterBytes', 1),
-    keepRecentGroups: safeInt(value['keepRecentGroups'], 'policy.keepRecentGroups', 0),
+    stepsPerTurn: safeInt(o['stepsPerTurn'], 'policy.stepsPerTurn', 1),
+    compactAfterBytes: safeInt(o['compactAfterBytes'], 'policy.compactAfterBytes', 1),
+    keepRecentGroups: safeInt(o['keepRecentGroups'], 'policy.keepRecentGroups', 0),
     // Retry/timeout knobs are bounded above as well: a persisted 2^53-scale
     // attempt count would otherwise make the adapter retry without a deadline.
-    maxAttempts: safeInt(value['maxAttempts'], 'policy.maxAttempts', 1, 32),
-    retryDelayMs: safeInt(value['retryDelayMs'], 'policy.retryDelayMs', 0, 300_000),
-    requestTimeoutMs: safeInt(value['requestTimeoutMs'], 'policy.requestTimeoutMs', 1, 300_000),
-    shellTimeoutMs: safeInt(value['shellTimeoutMs'], 'policy.shellTimeoutMs', 1),
-    killGraceMs: safeInt(value['killGraceMs'], 'policy.killGraceMs', 1),
-    maxCaptureBytes: safeInt(value['maxCaptureBytes'], 'policy.maxCaptureBytes', 1, 32 * MiB),
-    maxRequestBytes: safeInt(value['maxRequestBytes'], 'policy.maxRequestBytes', 1, 32 * MiB),
+    maxAttempts: safeInt(o['maxAttempts'], 'policy.maxAttempts', 1, 32),
+    retryDelayMs: safeInt(o['retryDelayMs'], 'policy.retryDelayMs', 0, 300_000),
+    requestTimeoutMs: safeInt(o['requestTimeoutMs'], 'policy.requestTimeoutMs', 1, 300_000),
+    shellTimeoutMs: safeInt(o['shellTimeoutMs'], 'policy.shellTimeoutMs', 1),
+    killGraceMs: safeInt(o['killGraceMs'], 'policy.killGraceMs', 1),
+    maxCaptureBytes: safeInt(o['maxCaptureBytes'], 'policy.maxCaptureBytes', 1, 32 * MiB),
+    maxRequestBytes: safeInt(o['maxRequestBytes'], 'policy.maxRequestBytes', 1, 32 * MiB),
     maxShellCaptureBytes:
-      safeInt(value['maxShellCaptureBytes'], 'policy.maxShellCaptureBytes', 1, 24 * MiB - 4096),
-    maxDiffBytes: safeInt(value['maxDiffBytes'], 'policy.maxDiffBytes', 512, MiB),
-    maxCommits: safeInt(value['maxCommits'], 'policy.maxCommits', 1, 4096),
-    maxAssistantBytes: safeInt(value['maxAssistantBytes'], 'policy.maxAssistantBytes', 256, 256 * 1024),
-    maxToolResultBytes: safeInt(value['maxToolResultBytes'], 'policy.maxToolResultBytes', 256, 256 * 1024),
-    maxToolArgumentBytes: safeInt(value['maxToolArgumentBytes'], 'policy.maxToolArgumentBytes', 1, 256 * 1024),
-    maxCallsPerResponse: safeInt(value['maxCallsPerResponse'], 'policy.maxCallsPerResponse', 1, 32),
+      safeInt(o['maxShellCaptureBytes'], 'policy.maxShellCaptureBytes', 1, 24 * MiB - 4096),
+    maxDiffBytes: safeInt(o['maxDiffBytes'], 'policy.maxDiffBytes', 512, MiB),
+    maxCommits: safeInt(o['maxCommits'], 'policy.maxCommits', 1, 4096),
+    maxAssistantBytes: safeInt(o['maxAssistantBytes'], 'policy.maxAssistantBytes', 256, 256 * 1024),
+    maxToolResultBytes: safeInt(o['maxToolResultBytes'], 'policy.maxToolResultBytes', 256, 256 * 1024),
+    maxToolArgumentBytes: safeInt(o['maxToolArgumentBytes'], 'policy.maxToolArgumentBytes', 1, 256 * 1024),
+    maxCallsPerResponse: safeInt(o['maxCallsPerResponse'], 'policy.maxCallsPerResponse', 1, 32),
   };
 }
 
 export function validateToolSchema(value: unknown, where: string): ToolSchema {
-  if (!isRecord(value)) fail(`${where}: expected an object`);
-  onlyKeys(value, ['name', 'description', 'parameters'], where);
+  const o = record(value, where);
+  onlyKeys(o, ['name', 'description', 'parameters'], where);
   return {
-    name: nonEmptyString(value['name'], `${where}.name`),
-    description: typeof value['description'] === 'string'
-      ? (value['description'] as string)
-      : fail(`${where}.description: expected a string`),
-    parameters: json(value['parameters'], `${where}.parameters`),
+    name: text(o['name'], `${where}.name`),
+    description: text(o['description'], `${where}.description`, false),
+    parameters: json(o['parameters'], `${where}.parameters`),
   };
 }
 
@@ -172,19 +155,16 @@ export function validateToolSchema(value: unknown, where: string): ToolSchema {
  * is refused before it is accepted (the prior durable config stays in force).
  */
 export function validateAgentConfig(value: unknown): AgentConfig {
-  if (!isRecord(value)) fail('expected an object');
-  onlyKeys(value, [
+  const o = record(value, '');
+  onlyKeys(o, [
     'version', 'charter', 'heading', 'tools', 'allowedTools', 'model', 'parameters', 'policy',
   ], 'config');
-  const version = safeInt(value['version'], 'version', 1);
-  const charter = typeof value['charter'] === 'string'
-    ? (value['charter'] as string) : fail('charter: expected a string');
-  const heading = typeof value['heading'] === 'string'
-    ? (value['heading'] as string) : fail('heading: expected a string');
-  const model = nonEmptyString(value['model'], 'model');
+  const version = safeInt(o['version'], 'version', 1);
+  const charter = text(o['charter'], 'charter', false);
+  const heading = text(o['heading'], 'heading', false);
+  const model = text(o['model'], 'model');
 
-  if (!Array.isArray(value['tools'])) fail('tools: expected an array');
-  const tools = (value['tools'] as unknown[]).map((tool, i) =>
+  const tools = array(o['tools'], 'tools').map((tool, i) =>
     validateToolSchema(tool, `tools[${i}]`));
   const names = new Set<string>();
   for (const tool of tools) {
@@ -192,9 +172,8 @@ export function validateAgentConfig(value: unknown): AgentConfig {
     names.add(tool.name);
   }
 
-  if (!Array.isArray(value['allowedTools'])) fail('allowedTools: expected an array');
-  const allowedTools = (value['allowedTools'] as unknown[]).map((name, i) =>
-    nonEmptyString(name, `allowedTools[${i}]`));
+  const allowedTools = array(o['allowedTools'], 'allowedTools').map((name, i) =>
+    text(name, `allowedTools[${i}]`));
   const seen = new Set<string>();
   for (const name of allowedTools) {
     if (seen.has(name)) fail(`allowedTools: duplicate ${JSON.stringify(name)}`);
@@ -202,8 +181,8 @@ export function validateAgentConfig(value: unknown): AgentConfig {
     if (!names.has(name)) fail(`allowedTools: ${JSON.stringify(name)} is not offered`);
   }
 
-  const parameters = providerParameters(value['parameters']);
-  const policy = validateSeedPolicy(value['policy']);
+  const parameters = providerParameters(o['parameters']);
+  const policy = validateSeedPolicy(o['policy']);
 
   const config = { version, charter, heading, tools, allowedTools, model, parameters, policy };
   const size = canonicalBytes(config).length;

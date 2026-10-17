@@ -1,13 +1,13 @@
 import { readdir, realpath, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { HASH_RE, sha256HexOf } from '../journal/canon.js';
+import { sha256HexOf } from '../journal/canon.js';
 import { atomicWriteFile, ensureDurableDirectory, readFileOrNull, syncPath } from '../journal/fsutil.js';
 import { nodeDir } from '../journal/index.js';
 import { canonicalBytes, toJson } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
+import { SNAPSHOT_DIALECT, createValidator } from './validate.js';
 import type {
-  AgentConfig, ChatMessage, CompactionStart, FunctionCall, OpenTurn, ProjectionState, RecoveryGroup,
-  RequestId, Source, SurfaceGroup, SurfaceSnapshot,
+  AgentConfig, OpenTurn, ProjectionState, RecoveryGroup, Source, SurfaceGroup, SurfaceSnapshot,
 } from './contracts.js';
 import type { VerifiedEvents } from './loader.js';
 
@@ -48,141 +48,25 @@ const NAME_RE = /^(0|[1-9][0-9]*)\.json$/;
 
 const STATE_KEYS = ['config', 'surface', 'open', 'recovery', 'watermark', 'pendingCompactions'] as const;
 
-function fail(where: string, message: string): never {
+/**
+ * The shared schema primitives, bound to the snapshot parser's own prefix. Its
+ * dialect is deliberately stricter than the gate's about empty chat content and
+ * function arguments; see `ShapeDialect` in `validate.ts`.
+ */
+const v = createValidator((where, message): never => {
   throw new Error(`invalid snapshot at ${where}: ${message}`);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function record(value: unknown, where: string): Record<string, unknown> {
-  if (!isRecord(value)) fail(where, 'expected an object');
-  return value;
-}
-
-function onlyKeys(value: Record<string, unknown>, allowed: readonly string[], where: string): void {
-  for (const key of Object.keys(value)) {
-    if (!allowed.includes(key)) fail(where, `unexpected key ${JSON.stringify(key)}`);
-  }
-}
-
-function safeInt(value: unknown, where: string, min: number): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min) {
-    fail(where, `expected a safe integer >= ${min}`);
-  }
-  return value as number;
-}
-
-function text(value: unknown, where: string): string {
-  if (typeof value !== 'string') fail(where, 'expected a string');
-  return value as string;
-}
-
-function bool(value: unknown, where: string): boolean {
-  if (typeof value !== 'boolean') fail(where, 'expected a boolean');
-  return value as boolean;
-}
-
-function hash(value: unknown, where: string): string {
-  const hex = text(value, where);
-  if (!HASH_RE.test(hex)) fail(where, 'expected 64 lowercase hex characters');
-  return hex;
-}
-
-function array(value: unknown, where: string): unknown[] {
-  if (!Array.isArray(value)) fail(where, 'expected an array');
-  return value;
-}
-
-function source(value: unknown, where: string): Source {
-  const o = record(value, where);
-  onlyKeys(o, ['seq', 'hash'], where);
-  return { seq: safeInt(o['seq'], `${where}.seq`, 0), hash: hash(o['hash'], `${where}.hash`) };
-}
-
-function worldRange(value: unknown, where: string): { from: string | null; to: string | null } {
-  const o = record(value, where);
-  onlyKeys(o, ['from', 'to'], where);
-  const edge = (key: string): string | null =>
-    o[key] === null ? null : text(o[key], `${where}.${key}`);
-  return { from: edge('from'), to: edge('to') };
-}
-
-function requestId(value: unknown, where: string): RequestId {
-  const o = record(value, where);
-  onlyKeys(o, ['turn', 'ordinal'], where);
-  return {
-    turn: safeInt(o['turn'], `${where}.turn`, 0),
-    ordinal: safeInt(o['ordinal'], `${where}.ordinal`, 0),
-  };
-}
-
-function functionCall(value: unknown, where: string): FunctionCall {
-  const o = record(value, where);
-  onlyKeys(o, ['id', 'type', 'function'], where);
-  if (o['type'] !== 'function') fail(`${where}.type`, 'expected "function"');
-  const fn = record(o['function'], `${where}.function`);
-  onlyKeys(fn, ['name', 'arguments'], `${where}.function`);
-  return {
-    id: text(o['id'], `${where}.id`),
-    type: 'function',
-    function: {
-      name: text(fn['name'], `${where}.function.name`),
-      arguments: text(fn['arguments'], `${where}.function.arguments`),
-    },
-  };
-}
-
-function chatMessage(value: unknown, where: string): ChatMessage {
-  const o = record(value, where);
-  const role = o['role'];
-  if (role === 'system') {
-    onlyKeys(o, ['role', 'content'], where);
-    return { role: 'system', content: text(o['content'], `${where}.content`) };
-  }
-  if (role === 'user') {
-    onlyKeys(o, ['role', 'content'], where);
-    return { role: 'user', content: text(o['content'], `${where}.content`) };
-  }
-  if (role === 'assistant') {
-    onlyKeys(o, ['role', 'content', 'tool_calls'], where);
-    const content = o['content'] === null ? null : text(o['content'], `${where}.content`);
-    const calls = array(o['tool_calls'], `${where}.tool_calls`)
-      .map((call, i) => functionCall(call, `${where}.tool_calls[${i}]`));
-    return { role: 'assistant', content, tool_calls: calls };
-  }
-  if (role === 'tool') {
-    onlyKeys(o, ['role', 'content', 'tool_call_id'], where);
-    return {
-      role: 'tool',
-      content: text(o['content'], `${where}.content`),
-      tool_call_id: text(o['tool_call_id'], `${where}.tool_call_id`),
-    };
-  }
-  return fail(`${where}.role`, 'unknown chat role');
-}
-
-function assistantMessage(
-  value: unknown, where: string,
-): Extract<ChatMessage, { role: 'assistant' }> {
-  const message = chatMessage(value, where);
-  if (message.role !== 'assistant') fail(where, 'expected an assistant message');
-  return message;
-}
-
-function toolMessage(value: unknown, where: string): Extract<ChatMessage, { role: 'tool' }> {
-  const message = chatMessage(value, where);
-  if (message.role !== 'tool') fail(where, 'expected a tool message');
-  return message;
-}
+}, SNAPSHOT_DIALECT);
+const {
+  fail, record, onlyKeys, text, bool, safeInt, hash, array, source, requestId, worldRange,
+  functionCall, chatMessage, assistantMessage, toolMessage, compactionStart,
+} = v;
 
 function surfaceGroup(value: unknown, where: string): SurfaceGroup {
   const o = record(value, where);
   onlyKeys(o, ['id', 'kind', 'turn', 'messages', 'sources'], where);
   const kind = o['kind'];
   if (kind !== 'heading' && kind !== 'perception' && kind !== 'dialogue' && kind !== 'summary') {
-    fail(`${where}.kind`, 'unknown group kind');
+    return fail(`${where}.kind`, 'unknown group kind');
   }
   return {
     id: source(o['id'], `${where}.id`),
@@ -274,21 +158,6 @@ function recoveryGroup(value: unknown, where: string): RecoveryGroup {
       .map((message, i) => toolMessage(message, `${where}.results[${i}]`)),
     missing: array(o['missing'], `${where}.missing`)
       .map((call, i) => functionCall(call, `${where}.missing[${i}]`)),
-  };
-}
-
-function compactionStart(value: unknown, where: string): CompactionStart {
-  const o = record(value, where);
-  onlyKeys(o, ['id', 'revision', 'groupIds', 'sources', 'shadowHash', 'shadowBytes'], where);
-  return {
-    id: hash(o['id'], `${where}.id`),
-    revision: hash(o['revision'], `${where}.revision`),
-    groupIds: array(o['groupIds'], `${where}.groupIds`)
-      .map((entry, i) => source(entry, `${where}.groupIds[${i}]`)),
-    sources: array(o['sources'], `${where}.sources`)
-      .map((entry, i) => source(entry, `${where}.sources[${i}]`)),
-    shadowHash: hash(o['shadowHash'], `${where}.shadowHash`),
-    shadowBytes: safeInt(o['shadowBytes'], `${where}.shadowBytes`, 0),
   };
 }
 

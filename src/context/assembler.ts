@@ -7,6 +7,7 @@ import { createBoundaryRegistry, validateRequestPlan } from './events.js';
 import { ContextFold } from './fold.js';
 import { sourceOf } from './loader.js';
 import { serializeWire } from '../provider/wire.js';
+import { isRecord } from './validate.js';
 import type { GateScope } from '../node/gate.js';
 import type { WorldRepo, WorldRange } from '../node/world.js';
 import type { VerifiedEvent, VerifiedEvents } from './loader.js';
@@ -155,10 +156,6 @@ type PerceptionPayload = {
 
 const REPLAY_REGISTRY = createBoundaryRegistry();
 const REPLAY_SIGNAL = new AbortController().signal;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 /** The canonical JSON text of a value — the comparison `canonicalBytes` hashes. */
 function canonicalText(value: unknown): string {

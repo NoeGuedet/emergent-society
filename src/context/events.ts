@@ -5,6 +5,7 @@ import type { WorldRange } from '../node/world.js';
 import { toJson } from './artifacts.js';
 import { validateAgentConfig, validateSeedPolicy, validateToolSchema } from './config.js';
 import { validateProviderParameters } from './parameters.js';
+import { GATE_DIALECT, createValidator } from './validate.js';
 import type {
   AgentConfig, ArtifactChunk, ArtifactManifest, ArtifactRef, AssistantProjection, CanonicalUsage,
   ChatMessage, CompactionAbort, CompactionEnd, CompactionStart, CompactionSummary, ErrorCode,
@@ -70,36 +71,29 @@ const REGISTERED: Record<keyof ContextEventDataMap, true> = {
 export const C13_EVENT_TYPES: ReadonlySet<string> =
   new Set([...NODE_EVENT_TYPES, ...Object.keys(REGISTERED)]);
 
-const HASH_RE = /^[0-9a-f]{64}$/;
 const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
-const ERROR_CODES: ReadonlySet<string> = new Set<ErrorCode>([
-  'http', 'network', 'timeout', 'cancelled', 'malformed', 'body-limit', 'invalid-tool',
-  'unknown-tool', 'denied', 'spawn', 'signal', 'output-limit', 'request-limit',
-]);
+
+/**
+ * Every error code the vocabulary admits. `satisfies Record<ErrorCode, true>`
+ * ties the table to the union: adding a code to either side alone fails
+ * typecheck, so the validator and `SafeFailure` can never silently drift.
+ */
+const ERROR_CODES = {
+  http: true, network: true, timeout: true, cancelled: true, malformed: true,
+  'body-limit': true, 'invalid-tool': true, 'unknown-tool': true, denied: true,
+  spawn: true, signal: true, 'output-limit': true, 'request-limit': true,
+} satisfies Record<ErrorCode, true>;
 
 function fail(where: string, message: string): never {
   throw new Error(`invalid ${where}: ${message}`);
 }
 
-function record(value: unknown, where: string): Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    fail(where, 'expected an object');
-  }
-  return value as Record<string, unknown>;
-}
-
-function onlyKeys(obj: Record<string, unknown>, allowed: readonly string[], where: string): void {
-  for (const key of Object.keys(obj)) {
-    if (!allowed.includes(key)) fail(where, `unexpected key ${JSON.stringify(key)}`);
-  }
-}
-
-function text(value: unknown, where: string, nonEmpty = true): string {
-  if (typeof value !== 'string' || (nonEmpty && value.length === 0)) {
-    fail(where, nonEmpty ? 'expected a nonempty string' : 'expected a string');
-  }
-  return value as string;
-}
+/** The shared primitives, bound to the gate's original error vocabulary. */
+const v = createValidator(fail, GATE_DIALECT);
+const {
+  record, onlyKeys, text, bool, safeInt, array, source, requestId, worldRange,
+  functionCall, chatMessage,
+} = v;
 
 function nullableHash(value: unknown, where: string): string | null {
   if (value === null) return null;
@@ -107,31 +101,12 @@ function nullableHash(value: unknown, where: string): string | null {
 }
 
 function hash(value: unknown, where: string): string {
-  const s = text(value, where);
-  if (!HASH_RE.test(s)) fail(where, 'expected 64 lowercase hex characters');
-  return s;
+  return v.hash(value, where);
 }
 
 function encoding(value: unknown, where: string): 'utf8' | 'binary' {
   if (value !== 'utf8' && value !== 'binary') fail(where, "expected 'utf8' or 'binary'");
   return value;
-}
-
-function bool(value: unknown, where: string): boolean {
-  if (typeof value !== 'boolean') fail(where, 'expected a boolean');
-  return value as boolean;
-}
-
-function safeInt(value: unknown, where: string, min: number, max = Number.MAX_SAFE_INTEGER): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min || value > max) {
-    fail(where, `expected a safe integer in [${min}, ${max}]`);
-  }
-  return value as number;
-}
-
-function array(value: unknown, where: string): unknown[] {
-  if (!Array.isArray(value)) fail(where, 'expected an array');
-  return value as unknown[];
 }
 
 function base64(value: unknown, where: string): string {
@@ -141,30 +116,6 @@ function base64(value: unknown, where: string): string {
     fail(where, 'expected canonical base64');
   }
   return s;
-}
-
-function source(value: unknown, where: string): Source {
-  const o = record(value, where);
-  onlyKeys(o, ['seq', 'hash'], where);
-  return { seq: safeInt(o['seq'], `${where}.seq`, 0), hash: hash(o['hash'], `${where}.hash`) };
-}
-
-function requestId(value: unknown, where: string): RequestId {
-  const o = record(value, where);
-  onlyKeys(o, ['turn', 'ordinal'], where);
-  return {
-    turn: safeInt(o['turn'], `${where}.turn`, 0),
-    ordinal: safeInt(o['ordinal'], `${where}.ordinal`, 0),
-  };
-}
-
-function worldRange(value: unknown, where: string): WorldRange {
-  const o = record(value, where);
-  onlyKeys(o, ['from', 'to'], where);
-  return {
-    from: nullableHash(o['from'], `${where}.from`),
-    to: nullableHash(o['to'], `${where}.to`),
-  };
 }
 
 function artifactRef(value: unknown, where: string): ArtifactRef {
@@ -179,51 +130,6 @@ function artifactRef(value: unknown, where: string): ArtifactRef {
     encoding: encoding(o['encoding'], `${where}.encoding`),
     complete: bool(o['complete'], `${where}.complete`),
   };
-}
-
-function functionCall(value: unknown, where: string): FunctionCall {
-  const o = record(value, where);
-  onlyKeys(o, ['id', 'type', 'function'], where);
-  if (o['type'] !== 'function') fail(where, "type must be 'function'");
-  const fn = record(o['function'], `${where}.function`);
-  onlyKeys(fn, ['name', 'arguments'], `${where}.function`);
-  return {
-    id: text(o['id'], `${where}.id`),
-    type: 'function',
-    function: {
-      name: text(fn['name'], `${where}.function.name`),
-      arguments: text(fn['arguments'], `${where}.function.arguments`, false),
-    },
-  };
-}
-
-function chatMessage(value: unknown, where: string): ChatMessage {
-  const o = record(value, where);
-  const role = o['role'];
-  if (role === 'system') {
-    onlyKeys(o, ['role', 'content'], where);
-    return { role: 'system', content: text(o['content'], `${where}.content`, false) };
-  }
-  if (role === 'user') {
-    onlyKeys(o, ['role', 'content'], where);
-    return { role: 'user', content: text(o['content'], `${where}.content`, false) };
-  }
-  if (role === 'assistant') {
-    onlyKeys(o, ['role', 'content', 'tool_calls'], where);
-    const content = o['content'] === null ? null : text(o['content'], `${where}.content`, false);
-    const calls = array(o['tool_calls'], `${where}.tool_calls`).map((call, i) =>
-      functionCall(call, `${where}.tool_calls[${i}]`));
-    return { role: 'assistant', content, tool_calls: calls };
-  }
-  if (role === 'tool') {
-    onlyKeys(o, ['role', 'content', 'tool_call_id'], where);
-    return {
-      role: 'tool',
-      content: text(o['content'], `${where}.content`, false),
-      tool_call_id: text(o['tool_call_id'], `${where}.tool_call_id`),
-    };
-  }
-  return fail(where, 'unknown chat role');
 }
 
 function usage(value: unknown, where: string): CanonicalUsage {
@@ -244,7 +150,9 @@ function safeFailure(value: unknown, where: string): SafeFailure {
   const o = record(value, where);
   onlyKeys(o, ['code', 'status'], where);
   const code = text(o['code'], `${where}.code`);
-  if (!ERROR_CODES.has(code)) fail(`${where}.code`, `unknown error code ${JSON.stringify(code)}`);
+  if (!Object.hasOwn(ERROR_CODES, code)) {
+    fail(`${where}.code`, `unknown error code ${JSON.stringify(code)}`);
+  }
   const status = o['status'] === null ? null : safeInt(o['status'], `${where}.status`, 0);
   return { code: code as ErrorCode, status };
 }
@@ -376,6 +284,45 @@ function receipts(scope: GateScope, list: Source[], where: string, type?: string
   for (const src of list) receipt(scope, src, where, type);
 }
 
+/**
+ * The preamble every request-scoped payload shares: a turn scope, an exact key
+ * set, a request id and the id/scope turn agreement. Payload-specific checks
+ * follow; this is the one place the agreement is spelled.
+ */
+function requestScoped(
+  data: unknown, scope: GateScope, where: string, allowed: readonly string[],
+): { readonly turn: number; readonly o: Record<string, unknown>; readonly id: RequestId } {
+  const turn = turnScope(scope, where);
+  const o = record(data, where);
+  onlyKeys(o, allowed, where);
+  const id = requestId(o['id'], `${where}.id`);
+  if (id.turn !== turn) fail(where, "id.turn does not match the scope's turn");
+  return { turn, o, id };
+}
+
+/**
+ * The one `Stored<T>` branch: inline values are decoded by the caller, artifact
+ * references must resolve to a real `artifact/end` manifest. Every stored
+ * payload in the vocabulary shares this shape, so the branch lives here once.
+ */
+function storedValue<T>(
+  scope: GateScope, value: unknown, where: string,
+  decodeInline: (value: unknown) => T,
+): Stored<T> {
+  const o = record(value, where);
+  if (o['kind'] === 'inline') {
+    onlyKeys(o, ['kind', 'value'], where);
+    return { kind: 'inline', value: decodeInline(o['value']) };
+  }
+  if (o['kind'] === 'artifact-json') {
+    onlyKeys(o, ['kind', 'ref'], where);
+    const ref = artifactRef(o['ref'], `${where}.ref`);
+    receipt(scope, ref.manifest, where, 'artifact/end');
+    return { kind: 'artifact-json', ref };
+  }
+  return fail(where, "kind must be 'inline' or 'artifact-json'");
+}
+
 export function createBoundaryRegistry(): BoundaryRegistry {
   const registry: BoundaryRegistry = {
     'artifact/chunk': (data: unknown, _scope: GateScope): JsonValue => {
@@ -408,24 +355,16 @@ export function createBoundaryRegistry(): BoundaryRegistry {
       const o = record(data, 'system/message');
       onlyKeys(o, ['version', 'value'], 'system/message');
       const version = safeInt(o['version'], 'system/message.version', 1);
-      const value = record(o['value'], 'system/message.value');
-      if (value['kind'] === 'inline') {
-        onlyKeys(value, ['kind', 'value'], 'system/message.value');
-        const config = validateAgentConfig(value['value']);
+      // Inline configs are version-bound here; an artifact's version lives inside
+      // the captured blob, which the fold re-validates during replay.
+      const value = storedValue<AgentConfig>(scope, o['value'], 'system/message.value', (raw) => {
+        const config = validateAgentConfig(raw);
         if (config.version !== version) {
           fail('system/message', `version ${version} does not equal resolved version ${config.version}`);
         }
-        return toJson({ version, value: { kind: 'inline', value: config } });
-      }
-      if (value['kind'] === 'artifact-json') {
-        onlyKeys(value, ['kind', 'ref'], 'system/message.value');
-        const ref = artifactRef(value['ref'], 'system/message.value.ref');
-        // The inner version lives inside the captured blob; the fold re-validates
-        // it during replay. Here the reference must resolve to a real manifest.
-        receipt(scope, ref.manifest, 'system/message.value', 'artifact/end');
-        return toJson({ version, value: { kind: 'artifact-json', ref } });
-      }
-      return fail('system/message.value', "kind must be 'inline' or 'artifact-json'");
+        return config;
+      });
+      return toJson({ version, value });
     },
 
     'world/perception': (data: unknown, scope: GateScope): JsonValue => {
@@ -436,50 +375,28 @@ export function createBoundaryRegistry(): BoundaryRegistry {
         fail('world/perception', "turn does not match the scope's turn");
       }
       const range = worldRange(o['range'], 'world/perception.range');
-      const value = record(o['value'], 'world/perception.value');
-      if (value['kind'] === 'inline') {
-        onlyKeys(value, ['kind', 'value'], 'world/perception.value');
-        const perception = worldPerception(value['value'], 'world/perception.value');
-        if (perception.range.from !== range.from || perception.range.to !== range.to) {
-          fail('world/perception', 'resolved value.range does not equal the wrapper range');
-        }
-        return toJson({ turn, range, value: { kind: 'inline', value: perception } });
-      }
-      if (value['kind'] === 'artifact-json') {
-        onlyKeys(value, ['kind', 'ref'], 'world/perception.value');
-        const ref = artifactRef(value['ref'], 'world/perception.value.ref');
-        receipt(scope, ref.manifest, 'world/perception.value', 'artifact/end');
-        return toJson({ turn, range, value: { kind: 'artifact-json', ref } });
-      }
-      return fail('world/perception.value', "kind must be 'inline' or 'artifact-json'");
+      const value = storedValue<WorldPerception>(
+        scope, o['value'], 'world/perception.value', (raw) => {
+          const perception = worldPerception(raw, 'world/perception.value');
+          if (perception.range.from !== range.from || perception.range.to !== range.to) {
+            fail('world/perception', 'resolved value.range does not equal the wrapper range');
+          }
+          return perception;
+        },
+      );
+      return toJson({ turn, range, value });
     },
 
     'request/plan': (data: unknown, scope: GateScope): JsonValue => {
-      const turn = turnScope(scope, 'request/plan');
-      const o = record(data, 'request/plan');
-      onlyKeys(o, ['id', 'value'], 'request/plan');
-      const id = requestId(o['id'], 'request/plan.id');
-      if (id.turn !== turn) fail('request/plan', "id.turn does not match the scope's turn");
-      const value = record(o['value'], 'request/plan.value');
-      if (value['kind'] === 'inline') {
-        onlyKeys(value, ['kind', 'value'], 'request/plan.value');
-        return toJson({ id, value: { kind: 'inline', value: validateRequestPlan(value['value']) } });
-      }
-      if (value['kind'] === 'artifact-json') {
-        onlyKeys(value, ['kind', 'ref'], 'request/plan.value');
-        const ref = artifactRef(value['ref'], 'request/plan.value.ref');
-        receipt(scope, ref.manifest, 'request/plan.value', 'artifact/end');
-        return toJson({ id, value: { kind: 'artifact-json', ref } });
-      }
-      return fail('request/plan.value', "kind must be 'inline' or 'artifact-json'");
+      const { o, id } = requestScoped(data, scope, 'request/plan', ['id', 'value']);
+      const value = storedValue<RequestPlan>(
+        scope, o['value'], 'request/plan.value', validateRequestPlan);
+      return toJson({ id, value });
     },
 
     'request/refused': (data: unknown, scope: GateScope): JsonValue => {
-      const turn = turnScope(scope, 'request/refused');
-      const o = record(data, 'request/refused');
-      onlyKeys(o, ['id', 'bytes', 'limit', 'phase'], 'request/refused');
-      const id = requestId(o['id'], 'request/refused.id');
-      if (id.turn !== turn) fail('request/refused', "id.turn does not match the scope's turn");
+      const { o, id } = requestScoped(
+        data, scope, 'request/refused', ['id', 'bytes', 'limit', 'phase']);
       if (o['phase'] !== 'plan') fail('request/refused.phase', "must be 'plan'");
       return toJson({
         id, bytes: safeInt(o['bytes'], 'request/refused.bytes', 0),
@@ -488,22 +405,15 @@ export function createBoundaryRegistry(): BoundaryRegistry {
     },
 
     'request/wire': (data: unknown, scope: GateScope): JsonValue => {
-      const turn = turnScope(scope, 'request/wire');
-      const o = record(data, 'request/wire');
-      onlyKeys(o, ['id', 'attempt', 'body'], 'request/wire');
-      const id = requestId(o['id'], 'request/wire.id');
-      if (id.turn !== turn) fail('request/wire', "id.turn does not match the scope's turn");
+      const { o, id } = requestScoped(data, scope, 'request/wire', ['id', 'attempt', 'body']);
       const body = artifactRef(o['body'], 'request/wire.body');
       receipt(scope, body.manifest, 'request/wire.body', 'artifact/end');
       return toJson({ id, attempt: safeInt(o['attempt'], 'request/wire.attempt', 0), body });
     },
 
     'response/raw': (data: unknown, scope: GateScope): JsonValue => {
-      const turn = turnScope(scope, 'response/raw');
-      const o = record(data, 'response/raw');
-      onlyKeys(o, ['id', 'attempt', 'status', 'body', 'complete'], 'response/raw');
-      const id = requestId(o['id'], 'response/raw.id');
-      if (id.turn !== turn) fail('response/raw', "id.turn does not match the scope's turn");
+      const { o, id } = requestScoped(
+        data, scope, 'response/raw', ['id', 'attempt', 'status', 'body', 'complete']);
       const body = artifactRef(o['body'], 'response/raw.body');
       receipt(scope, body.manifest, 'response/raw.body', 'artifact/end');
       const complete = bool(o['complete'], 'response/raw.complete');
@@ -520,11 +430,7 @@ export function createBoundaryRegistry(): BoundaryRegistry {
     },
 
     'request/usage': (data: unknown, scope: GateScope): JsonValue => {
-      const turn = turnScope(scope, 'request/usage');
-      const o = record(data, 'request/usage');
-      onlyKeys(o, ['id', 'attempt', 'value'], 'request/usage');
-      const id = requestId(o['id'], 'request/usage.id');
-      if (id.turn !== turn) fail('request/usage', "id.turn does not match the scope's turn");
+      const { o, id } = requestScoped(data, scope, 'request/usage', ['id', 'attempt', 'value']);
       return toJson({
         id, attempt: safeInt(o['attempt'], 'request/usage.attempt', 0),
         value: usage(o['value'], 'request/usage.value'),
@@ -532,46 +438,31 @@ export function createBoundaryRegistry(): BoundaryRegistry {
     },
 
     'assistant/message': (data: unknown, scope: GateScope): JsonValue => {
-      const turn = turnScope(scope, 'assistant/message');
-      const o = record(data, 'assistant/message');
-      onlyKeys(o, ['id', 'value'], 'assistant/message');
-      const id = requestId(o['id'], 'assistant/message.id');
-      if (id.turn !== turn) fail('assistant/message', "id.turn does not match the scope's turn");
-      const value = record(o['value'], 'assistant/message.value');
-      if (value['kind'] === 'inline') {
-        onlyKeys(value, ['kind', 'value'], 'assistant/message.value');
-        const projection = record(value['value'], 'assistant/message.value.value');
-        onlyKeys(projection, ['message', 'contentTruncated', 'raw'], 'assistant/message.value.value');
-        const message = chatMessage(projection['message'], 'assistant/message.value.value.message');
-        if (message.role !== 'assistant') fail('assistant/message.value.value.message', 'must be assistant');
-        const raw = artifactRef(projection['raw'], 'assistant/message.value.value.raw');
-        receipt(scope, raw.manifest, 'assistant/message.value.value.raw', 'artifact/end');
-        return toJson({
-          id,
-          value: {
-            kind: 'inline',
-            value: {
-              message, raw,
-              contentTruncated: bool(projection['contentTruncated'], 'assistant/message.value.value.contentTruncated'),
-            } satisfies AssistantProjection,
-          },
-        });
-      }
-      if (value['kind'] === 'artifact-json') {
-        onlyKeys(value, ['kind', 'ref'], 'assistant/message.value');
-        const ref = artifactRef(value['ref'], 'assistant/message.value.ref');
-        receipt(scope, ref.manifest, 'assistant/message.value', 'artifact/end');
-        return toJson({ id, value: { kind: 'artifact-json', ref } });
-      }
-      return fail('assistant/message.value', "kind must be 'inline' or 'artifact-json'");
+      const { o, id } = requestScoped(data, scope, 'assistant/message', ['id', 'value']);
+      const value = storedValue<AssistantProjection>(
+        scope, o['value'], 'assistant/message.value', (raw) => {
+          const projection = record(raw, 'assistant/message.value.value');
+          onlyKeys(projection, ['message', 'contentTruncated', 'raw'], 'assistant/message.value.value');
+          const message = chatMessage(
+            projection['message'], 'assistant/message.value.value.message');
+          if (message.role !== 'assistant') {
+            fail('assistant/message.value.value.message', 'must be assistant');
+          }
+          const rawRef = artifactRef(projection['raw'], 'assistant/message.value.value.raw');
+          receipt(scope, rawRef.manifest, 'assistant/message.value.value.raw', 'artifact/end');
+          return {
+            message, raw: rawRef,
+            contentTruncated:
+              bool(projection['contentTruncated'], 'assistant/message.value.value.contentTruncated'),
+          };
+        },
+      );
+      return toJson({ id, value });
     },
 
     'assistant/attempt': (data: unknown, scope: GateScope): JsonValue => {
-      const turn = turnScope(scope, 'assistant/attempt');
-      const o = record(data, 'assistant/attempt');
-      onlyKeys(o, ['id', 'attempt', 'failure', 'terminal'], 'assistant/attempt');
-      const id = requestId(o['id'], 'assistant/attempt.id');
-      if (id.turn !== turn) fail('assistant/attempt', "id.turn does not match the scope's turn");
+      const { o, id } = requestScoped(
+        data, scope, 'assistant/attempt', ['id', 'attempt', 'failure', 'terminal']);
       return toJson({
         id, attempt: safeInt(o['attempt'], 'assistant/attempt.attempt', 0),
         failure: safeFailure(o['failure'], 'assistant/attempt.failure'),
@@ -621,21 +512,10 @@ export function createBoundaryRegistry(): BoundaryRegistry {
 
     'compaction/start': (data: unknown, scope: GateScope): JsonValue => {
       turnScope(scope, 'compaction/start');
-      const o = record(data, 'compaction/start');
-      onlyKeys(o, ['id', 'revision', 'groupIds', 'sources', 'shadowHash', 'shadowBytes'], 'compaction/start');
-      const groupIds = array(o['groupIds'], 'compaction/start.groupIds').map((s, i) =>
-        source(s, `compaction/start.groupIds[${i}]`));
-      const sources = array(o['sources'], 'compaction/start.sources').map((s, i) =>
-        source(s, `compaction/start.sources[${i}]`));
-      receipts(scope, groupIds, 'compaction/start.groupIds');
-      receipts(scope, sources, 'compaction/start.sources');
-      return toJson({
-        id: hash(o['id'], 'compaction/start.id'),
-        revision: hash(o['revision'], 'compaction/start.revision'),
-        groupIds, sources,
-        shadowHash: hash(o['shadowHash'], 'compaction/start.shadowHash'),
-        shadowBytes: safeInt(o['shadowBytes'], 'compaction/start.shadowBytes', 0),
-      });
+      const start = v.compactionStart(data, 'compaction/start');
+      receipts(scope, start.groupIds, 'compaction/start.groupIds');
+      receipts(scope, start.sources, 'compaction/start.sources');
+      return toJson(start);
     },
 
     'compaction/summary': (data: unknown, scope: GateScope): JsonValue => {
