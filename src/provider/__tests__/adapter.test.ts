@@ -441,7 +441,11 @@ describe('ProviderAdapter: retry-status matrix', () => {
       );
       expect(result).toEqual({ kind: 'failure', failure: { code: 'http', status } });
       expect(transport.sends).toBe(1);
-      expect(ofType(await events(), 'assistant/attempt')).toHaveLength(1);
+      const attempts = ofType(await events(), 'assistant/attempt');
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]!.data).toMatchObject({
+        terminal: true, failure: { code: 'http', status },
+      });
     } finally {
       await session.shutdown();
     }
@@ -479,6 +483,11 @@ describe('ProviderAdapter: retry-status matrix', () => {
         kind: 'failure', failure: { code: 'body-limit', status: 200 },
       });
       expect(transport.sends).toBe(1);
+      const attempts = ofType(await events(), 'assistant/attempt');
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]!.data).toMatchObject({
+        terminal: true, failure: { code: 'body-limit', status: 200 },
+      });
     } finally {
       await session.shutdown();
     }

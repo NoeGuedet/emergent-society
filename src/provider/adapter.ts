@@ -211,11 +211,10 @@ export class ProviderAdapter {
         return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
       }
       if (attempt > 0) {
-        // A next-attempt wire is journaled only after this final abort check, so
-        // a stop up to here leaves no durable wire for an attempt that never
-        // runs. One window is inherent: a stop landing during the flush itself
-        // leaves the wire durable with no POST — no attempt left the process,
-        // and the send is terminal, so that wire is inert.
+        // The next-attempt wire is journaled after the loop-top abort check.
+        // The post-append check below catches a stop that lands during the
+        // append/flush: the wire is then durable with no POST — no attempt left
+        // the process, and the send is terminal, so that wire is inert.
         gate.append('request/wire', { id, attempt, body: bodyRef });
         await gate.flush();
         if (gate.signal.aborted) {
@@ -353,8 +352,9 @@ export class ProviderAdapter {
         timedOut,
       };
     } finally {
-      clearTimer();
+      // Remove the listener first: a throwing timer-clear must not leak it.
       gate.signal.removeEventListener('abort', onAbort);
+      clearTimer();
     }
   }
 
