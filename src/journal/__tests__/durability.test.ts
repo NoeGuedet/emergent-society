@@ -38,6 +38,34 @@ async function failSyncsTo(
   return () => spy.mockRestore();
 }
 
+/**
+ * Fails the first `FileHandle#sync` whose real path satisfies `predicate`, and
+ * records every synced path until restored. The fd is resolved through `/proc`,
+ * so the injection lands on the directory the kernel was actually asked to
+ * flush. Later syncs of the same path succeed, which is what lets a retry prove
+ * that it re-synced the entry the first attempt failed to make durable.
+ */
+async function failFirstSyncTo(
+  predicate: (path: string) => boolean, message: string,
+): Promise<{ paths: string[]; restore: () => void }> {
+  const probe = await openFile(join(home(), 'sync-probe'), 'w');
+  const proto = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
+  await probe.close();
+  const real = proto.sync;
+  const paths: string[] = [];
+  let failed = false;
+  const spy = vi.spyOn(proto, 'sync').mockImplementation(async function (this: FileHandle) {
+    const path = await readlink(`/proc/self/fd/${this.fd}`);
+    paths.push(path);
+    if (!failed && predicate(path)) {
+      failed = true;
+      throw Object.assign(new Error(message), { code: 'EIO' });
+    }
+    return real.call(this);
+  });
+  return { paths, restore: () => spy.mockRestore() };
+}
+
 describe('durability spine', () => {
   it('a failed flush loses no event and corrupts no chain (retry semantics)', async () => {
     const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
@@ -206,6 +234,30 @@ describe('durable directory creation', () => {
     await w.flush();
     await w.close();
     expect(await new BlobStore(home()).has(blobHash)).toBe(true);
+    expect((await collectEvents(home())).map((ev) => ev.seq)).toEqual([0]);
+  });
+  it('re-proves the blob shard entry on retry (shard fsync EIO)', async () => {
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    const e = w.append('test/big', { payload: 'a'.repeat(BIG_PAYLOAD_CHARS) });
+    const blobHash = (e.data as { blob: string }).blob;
+    const shard = join(home(), 'blobs', blobHash.slice(0, 2));
+    const { paths, restore } = await failFirstSyncTo(
+      (p) => p === shard, 'injected shard fsync EIO',
+    );
+    try {
+      await expect(w.flush()).rejects.toThrow('injected shard fsync EIO');
+      // The rename is visible but the shard entry is not durable, so no event
+      // may be committed and the blob stays pending for the retry.
+      expect((await readFile(logPath(home()))).length).toBe(0);
+      expect(await new BlobStore(home()).has(blobHash)).toBe(true);
+      await w.flush();
+      await w.close();
+    } finally {
+      restore();
+    }
+    // The retry found the blob through `has()` and still fsynced the shard
+    // entry: the first sync failed, the second proved the entry before commit.
+    expect(paths.filter((p) => p === shard)).toHaveLength(2);
     expect((await collectEvents(home())).map((ev) => ev.seq)).toEqual([0]);
   });
 });

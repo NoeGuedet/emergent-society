@@ -1,5 +1,7 @@
 import { readFile, rm, truncate } from 'node:fs/promises';
-import { BlobStore, assertBlobRefReadable, isBlobRef, parseBlobJson } from './blobs.js';
+import {
+  BlobStore, assertBlobRefReadable, isBlobRef, parseBlobJson, throwBlobReadError,
+} from './blobs.js';
 import { scanBatches } from './framing.js';
 import { readFileOrNull, syncPath } from './fsutil.js';
 import { headPath, journalPath, nodeDir, parseHead, type Head } from './layout.js';
@@ -81,8 +83,8 @@ export class JournalReader {
    * non-v0 envelope or a malformed line; CorruptFrameError on interior damage;
    * UnknownEventTypeError on an unknown non-ignorable type; with
    * `resolveBlobs`, TruncatedBlobError on a truncated reference,
-   * BlobIntegrityError when the blob does not match its reference (digest,
-   * length or a non-JSON body), and the blob store's own errors on a missing or
+   * BlobIntegrityError when the blob is missing or does not match its reference
+   * (digest, length or a non-JSON body), and the blob store's own errors on an
    * unreadable blob.
    */
   async *events(fromSeq = 0): AsyncGenerator<EventEnvelope> {
@@ -109,8 +111,11 @@ export class JournalReader {
     // Refuse a flagged prefix *before* the read: resolution of a truncated
     // reference must stay TruncatedBlobError even if its blob file is gone.
     assertBlobRefReadable(ref);
-    // A missing or unreadable blob keeps the store's own error (ENOENT, EACCES).
-    const bytes = await this.blobs.get(ref.blob);
+    // The boundary's one verified-read mapping: a missing blob is an
+    // unrecoverable integrity failure, not a transient environment error, while
+    // an unreadable one (EACCES, EIO) keeps its own type.
+    const bytes = await this.blobs.get(ref.blob)
+      .catch((err: unknown) => throwBlobReadError(ref, err));
     return { ...e, data: parseBlobJson(ref, bytes) };
   }
 }

@@ -158,8 +158,15 @@ export class BlobStore {
     // trusted root; the chain is re-proved on every call, never cached.
     await ensureDurableDirectory(dir, this.home);
     // Content addressing makes an existing blob byte-identical to what we were
-    // asked to store, so there is nothing to write.
-    if (await this.has(hash)) return hash;
+    // asked to store, so there is nothing to write. The entry is re-proved
+    // anyway: a previous attempt may have renamed the blob into the shard and
+    // then failed to fsync the shard, and a rename that `has()` can see is not
+    // yet a durable directory entry. Skipping the sync on that retry would
+    // leave the journal referencing a blob that a crash can lose.
+    if (await this.has(hash)) {
+      await syncPath(dir);
+      return hash;
+    }
     // Write, fsync and rename a temporary file: a crash mid-write then cannot
     // leave a torn blob under a name that later reads would trust.
     await atomicWriteFile(path, content);

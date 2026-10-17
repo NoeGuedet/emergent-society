@@ -107,10 +107,11 @@ describe('JournalReader blob resolution', () => {
     const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES, resolveBlobs: true });
     await expect(collect(r)).rejects.toThrow(TruncatedBlobError);
   });
-  it('rejects resolving a reference whose blob is gone', async () => {
+  it('classifies a reference whose blob is gone as integrity corruption', async () => {
     // The reference is in the journal but the blob it names was deleted. The
-    // data is unrecoverable, so resolution surfaces the store's own ENOENT
-    // rather than serving the reference as if it were the payload.
+    // data is unrecoverable, so the verified read maps it to BlobIntegrityError
+    // — corruption to inspect, not a retryable environment failure — rather
+    // than serving the reference as if it were the payload.
     const w = await JournalWriter.open(home(), 'n1');
     w.append('test/big', payloadOfCanonicalBytes(CLAIM_CHECK_THRESHOLD));
     await w.close();
@@ -119,7 +120,27 @@ describe('JournalReader blob resolution', () => {
     const { blob } = raw[0]!.data;
     await rm(join(home(), 'blobs', blob.slice(0, 2), blob));
     const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES, resolveBlobs: true });
-    await expect(collect(r)).rejects.toMatchObject({ code: 'ENOENT' });
+    const err = await collectFailure(r);
+    expect(err).toBeInstanceOf(BlobIntegrityError);
+    expect(isCorruption(err)).toBe(true);
+    expect((err as NodeJS.ErrnoException).code).toBeUndefined();
+  });
+  it('keeps the store error for a blob that exists but cannot be read', async () => {
+    // A directory in the blob's place makes the read fail with EISDIR, which is
+    // an environment failure, not corruption: the verified-read boundary keeps
+    // its own type instead of reclassifying it.
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/big', payloadOfCanonicalBytes(CLAIM_CHECK_THRESHOLD));
+    await w.close();
+    const raw = await collect(await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES }));
+    if (!isBlobRef(raw[0]!.data)) throw new Error('expected a claim-check reference');
+    const path = join(home(), 'blobs', raw[0]!.data.blob.slice(0, 2), raw[0]!.data.blob);
+    await rm(path);
+    await mkdir(path);
+    const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES, resolveBlobs: true });
+    const err = await collectFailure(r);
+    expect(err).not.toBeInstanceOf(BlobIntegrityError);
+    expect((err as NodeJS.ErrnoException).code).toBe('EISDIR');
   });
 });
 
