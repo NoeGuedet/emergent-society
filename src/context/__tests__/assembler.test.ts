@@ -380,6 +380,26 @@ describe('rederivePlans: a divergence is explicit, never a promise of equality',
   }));
   const id: RequestId = { turn: 0, ordinal: 0 };
 
+  it.each(['world/perception', 'request/plan', 'request/wire'] as const)(
+    'refuses a chain-valid null %s payload as a typed replay error', async (type) => {
+      const { world } = fixture();
+      // Chain verification proves bytes, not shapes: these events are "verified"
+      // but carry null data. The replay's own guard must classify them before
+      // any id/value dereference, so the model sees a replay error, not a
+      // TypeError from the offline utility.
+      const events = [verified(envelope(0, type, null))];
+      let err: unknown;
+      try {
+        await rederivePlans(events, world);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(TypeError);
+      expect((err as Error).message).toContain(`replay: ${type} data at 0:`);
+      expect((err as Error).message).toContain('is not an object');
+    });
+
   it('rejects a recorded plan rewritten to a different but valid plan', async () => {
     const { world } = fixture();
     const config = configEvent();

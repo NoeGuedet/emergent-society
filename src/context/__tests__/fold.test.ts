@@ -1034,6 +1034,56 @@ describe('fold: forged chain-valid payloads fail as typed invariants', () => {
     }
   });
 
+  it.each([
+    {
+      name: 'a non-string content',
+      message: { role: 'user', content: 7 },
+      pattern: /compaction\/summary\.message\.content is not a string/,
+    },
+    {
+      name: 'an unknown field',
+      message: { role: 'user', content: 'summary', stray: true },
+      pattern: /compaction\/summary\.message has an unknown field "stray"/,
+    },
+  ])('rejects a forged compaction summary message ($name)', async ({ message, pattern }) => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      // The summary handler validates its message before the pending-start check,
+      // so a valid-looking id cannot let a bad message reach the surface.
+      rawAppend(s, 'compaction/summary', {
+        id: 'a'.repeat(64), message, sources: [], replacementBytes: 0,
+      });
+      await s.writer.flush();
+      expectInvariant(await foldError(home()), pattern);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('classifies a malformed receipt citation as unknown, not an artifact mismatch', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      rawAppend(s, 'compaction/start', {
+        id: 'a'.repeat(64), revision: 'b'.repeat(64),
+        groupIds: [{ seq: 0, hash: 'not-a-hash' }], sources: [],
+        shadowHash: 'c'.repeat(64), shadowBytes: 0,
+      });
+      await s.writer.flush();
+      const err = await foldError(home());
+      // A receipt that cannot even be keyed is an unknown citation; the typed
+      // ArtifactMismatchError stays reserved for a real artifact mismatch (the
+      // forged raw-ref digest test above pins that side).
+      expectInvariant(err, /compaction\/start cites an unknown receipt/);
+      expect(err).not.toBeInstanceOf(ArtifactMismatchError);
+    } finally {
+      await s.close();
+    }
+  });
+
   it('rejects an unknown turn/end outcome instead of treating it as failure', async () => {
     const s = await openSession(home());
     try {

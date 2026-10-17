@@ -369,9 +369,11 @@ export class PtyTerminalRuntime implements TerminalRuntime {
    * the inherited socket fd 0: poll until the slave pts appears. The value is
    * kept for the session once frozen. On deadline expiry the target stays null
    * and the stdin proof is disabled for that session — a missed proof costs a
-   * timeout, never a false positive. Off Linux (or after an abort, or a death
-   * before login_tty) there is nothing to wait for: return without burning the
-   * deadline, and let the caller's respawn/abort path decide.
+   * timeout, never a false positive. Off Linux, after an abort, or once the pid
+   * is no longer alive, return without burning the deadline; an unreaped zombie
+   * still satisfies `kill(pid, 0)`, so that window is not detected here and can
+   * poll to the deadline — bounded to one 1 s window, with the same conservative
+   * outcome.
    */
   private async freezeTtyTarget(session: Session, signal: AbortSignal): Promise<void> {
     if (session.ttyTarget !== null || process.platform !== 'linux') return;

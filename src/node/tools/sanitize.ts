@@ -4,8 +4,12 @@
  * A session's output is a tty stream: programs emit ANSI escapes (they see a
  * terminal, unlike the old pipe shell), CRLF endings and carriage-return
  * redraws. The render strips them — OSC, CSI, the DCS/APC/PM string sequences
- * (ESC- or 8-bit-C1-introduced), single-character escapes, and residual
- * C0/C1 controls; the raw artifact keeps the verbatim bytes.
+ * (ESC-introduced, or C1-character-introduced when those bytes survived UTF-8
+ * decoding), single-character escapes, and residual C0/C1 controls; the raw
+ * artifact keeps the verbatim bytes. Display hygiene only: raw 8-bit C1 bytes
+ * never reach this string as controls — node-pty/`decodeToolText` decode
+ * non-fatally, so a bare 0x90 is already U+FFFD upstream. The C1 rule below
+ * therefore covers only the UTF-8-encoded C1 characters (e.g. C2 90 → U+0090).
  * Order is load-bearing: escapes, then newline normalization, then per-line
  * carriage returns, then residual control bytes. No replacement can split a
  * surrogate pair. This is display hygiene, never a security boundary.
@@ -19,10 +23,12 @@ export function sanitizePtyText(text: string): string {
     // Their introducers are in the generic short-escape range, so the payload
     // must be consumed here or it would survive after the introducer is removed.
     .replace(/\x1b[P^_][\s\S]*?(?:\x1b\\|\x07|\x9c|$)/g, '')
-    // Raw 8-bit C1 string introducers (DCS 0x90, SOS 0x98, OSC 0x9D, PM 0x9E,
-    // APC 0x9F) carry the same payloads. Deleting the introducer alone (as the
-    // residual-C1 rule below would) leaves that payload visible, so consume it
-    // to ST/BEL exactly like the ESC forms.
+    // C1 string-sequence introducers as characters. They arrive here only
+    // through their UTF-8 encoding (C2 90/98/9D/9E/9F → U+0090/98/9D/9E/9F); a
+    // raw 0x90 byte decodes non-fatally to U+FFFD upstream and never matches.
+    // They carry the same payloads as the ESC forms: deleting the introducer
+    // alone (as the residual-C1 rule below would) leaves that payload visible,
+    // so consume it to ST/BEL exactly like the ESC forms.
     .replace(/[\x90\x98\x9d\x9e\x9f][\s\S]*?(?:\x1b\\|\x07|\x9c|$)/g, '')
     // CSI: ESC [ params intermediates final.
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')

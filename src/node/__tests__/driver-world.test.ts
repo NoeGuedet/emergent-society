@@ -468,15 +468,20 @@ describe('the wake predicate', () => {
     await commitAs(world, 'n2', { 'n2/earlier.md': 'earlier' });
     const range = vi.spyOn(WorldRepo.prototype, 'commitsSince');
     const bounded = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
-    const running = d.run();
-    await vi.waitFor(() => expect(d.state).toBe('waiting'));
-    // The predicate holds its answer to existence: it streams authors and stops
-    // at the first foreign one, never materializing the range.
-    expect(bounded).toHaveBeenCalled();
-    expect(range).not.toHaveBeenCalled();
-    d.stop();
-    await running;
+    try {
+      const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+      const running = d.run();
+      await vi.waitFor(() => expect(d.state).toBe('waiting'));
+      // The predicate holds its answer to existence: it streams authors and stops
+      // at the first foreign one, never materializing the range.
+      expect(bounded).toHaveBeenCalled();
+      expect(range).not.toHaveBeenCalled();
+      d.stop();
+      await running;
+    } finally {
+      range.mockRestore();
+      bounded.mockRestore();
+    }
   });
 
   it('reports a failing wake predicate instead of parking silently', async () => {
