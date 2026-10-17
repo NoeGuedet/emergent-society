@@ -689,7 +689,9 @@ describe('fold: assistant provenance binds to a recorded complete 200 response',
     gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
     const body = await gate.capture(Buffer.from('{}'), 'utf8');
     gate.append('request/wire', { id, attempt: 0, body });
-    const responseBody = await gate.capture(Buffer.from('{"ok":true}'), 'utf8');
+    const responseBody = await gate.capture(
+      Buffer.from('{"ok":true}'), 'utf8', opts.complete ?? true,
+    );
     if (opts.response !== false) {
       gate.append('response/raw', {
         id, attempt: 0, status: opts.status ?? 200, body: responseBody,
@@ -768,7 +770,14 @@ describe('fold: assistant provenance binds to a recorded complete 200 response',
       const cfg = await startConfig(s);
       const t = await turnWithAssistant(s, cfg, { complete: false });
       await t.gate.flush();
-      await expect(foldOf(home())).rejects.toThrow(/response/);
+      let err: unknown;
+      try {
+        await foldOf(home());
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(ArtifactMismatchError);
+      expect((err as ArtifactMismatchError).field).toBe('complete');
     } finally {
       await s.close();
     }

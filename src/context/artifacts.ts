@@ -1,6 +1,6 @@
 import { canonicalizeJson } from '../journal/index.js';
 import type { JsonValue } from '../journal/index.js';
-import { copyJsonValue, sha256HexOf } from '../journal/canon.js';
+import { HASH_RE, copyJsonValue, sha256HexOf } from '../journal/canon.js';
 import type { ArtifactRef, ArtifactChunk, ArtifactManifest, Source, Stored } from './contracts.js';
 import { ArtifactMismatchError } from './loader.js';
 import type { VerifiedEvent, VerifiedEvents } from './loader.js';
@@ -14,9 +14,21 @@ import type { VerifiedEvent, VerifiedEvents } from './loader.js';
  */
 export type VerifiedEventIndex = ReadonlyMap<string, VerifiedEvent>;
 
-/** The one `(seq, hash)` key: the provenance identity of a verified event. */
+/**
+ * The one `(seq, hash)` key: the provenance identity of a verified event.
+ * The source is untrusted journal data at every replay boundary, so a malformed
+ * receipt is a typed artifact mismatch — never a `TypeError` from dereferencing
+ * a null manifest or part.
+ */
 export function eventKey(source: Source): string {
-  return `${source.seq}:${source.hash}`;
+  if (!isRecord(source)) mismatch('manifest');
+  const seq = source['seq'];
+  const hash = source['hash'];
+  if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0
+    || typeof hash !== 'string' || !HASH_RE.test(hash)) {
+    mismatch('manifest');
+  }
+  return `${seq}:${hash}`;
 }
 
 /** Builds the `(seq, hash)` index from a verified sequence in one pass. */
@@ -72,15 +84,18 @@ function mismatch(field: ArtifactMismatchError['field']): never {
   throw new ArtifactMismatchError(field);
 }
 
+/** The strict UTF-8 decoder: invalid bytes are a corruption, never U+FFFD substitution. */
+const UTF8 = new TextDecoder('utf-8', { fatal: true });
+
 /**
  * Parses the JSON body of a manifest-verified artifact. The bytes already match
- * their digest and length; a body that is not JSON is a typed mismatch rather
- * than a raw `SyntaxError`, so a forged payload is distinguished from a read
- * error and classified as corruption, not a programming fault.
+ * their digest and length; a body that is not valid UTF-8 or not JSON is a typed
+ * mismatch rather than a raw `SyntaxError`, so a forged payload is distinguished
+ * from a read error and classified as corruption, not a programming fault.
  */
 export function parseArtifactJson(bytes: Uint8Array): unknown {
   try {
-    return JSON.parse(Buffer.from(bytes).toString('utf8'));
+    return JSON.parse(UTF8.decode(bytes));
   } catch {
     mismatch('json');
   }
@@ -158,8 +173,19 @@ export function resolveArtifact(
 }
 
 /**
+ * Refuses an incomplete capture where a complete value is required. The bytes of
+ * an incomplete artifact may still resolve, but a truncated capture never
+ * satisfies a `Stored<T>` or an assistant raw body: completeness is part of the
+ * reference's meaning, not a hint.
+ */
+export function requireCompleteArtifact(ref: ArtifactRef): void {
+  if (ref.complete !== true) mismatch('complete');
+}
+
+/**
  * Resolves a `Stored<T>`: an inline value passes straight to `validate`; an
- * `artifact-json` value is decoded from its verified artifact bytes first.
+ * `artifact-json` value is decoded from its verified artifact bytes first. An
+ * artifact-json value must be a complete capture.
  */
 export function resolveStored<T>(
   events: VerifiedEvents | VerifiedEventIndex, value: Stored<T>, validate: (value: unknown) => T,
@@ -168,7 +194,9 @@ export function resolveStored<T>(
   if (value['kind'] === 'inline') return validate(value['value']);
   if (value['kind'] === 'artifact-json') {
     const ref = value['ref'] as ArtifactRef;
-    return validate(parseArtifactJson(resolveArtifact(events, ref)));
+    const bytes = resolveArtifact(events, ref);
+    requireCompleteArtifact(ref);
+    return validate(parseArtifactJson(bytes));
   }
   throw new Error('stored value has an unknown kind');
 }

@@ -1,7 +1,9 @@
 import type { EventEnvelope } from '../journal/index.js';
 import type { GateScope, WorldAcknowledgement } from '../node/gate.js';
 import type { WorldRange } from '../node/world.js';
-import { eventKey, parseArtifactJson, resolveArtifact, resolveStored, toJson } from './artifacts.js';
+import {
+  eventKey, parseArtifactJson, requireCompleteArtifact, resolveArtifact, resolveStored, toJson,
+} from './artifacts.js';
 import { validateAgentConfig } from './config.js';
 import { createBoundaryRegistry, validateRequestPlan } from './events.js';
 import { SAME, sortUnique } from './groups.js';
@@ -287,7 +289,9 @@ export class ContextFold {
       const out = validator(data, scope) as unknown as { value: { value: WorldPerception } };
       return out.value.value;
     }
-    const parsed = parseArtifactJson(resolveArtifact(this.verifiedIndex, data.value.ref));
+    const bytes = resolveArtifact(this.verifiedIndex, data.value.ref);
+    requireCompleteArtifact(data.value.ref);
+    const parsed = parseArtifactJson(bytes);
     const out = validator(
       { turn: data.turn, range: data.range, value: { kind: 'inline', value: parsed } }, scope,
     ) as unknown as { value: { value: WorldPerception } };
@@ -400,7 +404,9 @@ export class ContextFold {
       const out = validator({ id, value }, scope) as unknown as { value: { value: AssistantProjection } };
       return out.value.value;
     }
-    const parsed = parseArtifactJson(resolveArtifact(this.verifiedIndex, value.ref));
+    const bytes = resolveArtifact(this.verifiedIndex, value.ref);
+    requireCompleteArtifact(value.ref);
+    const parsed = parseArtifactJson(bytes);
     const out = validator(
       { id, value: { kind: 'inline', value: parsed } }, scope,
     ) as unknown as { value: { value: AssistantProjection } };
@@ -423,6 +429,7 @@ export class ContextFold {
     // arbitrary valid artifact, nor a shared digest, nor a 429/incomplete body can
     // support an assistant projection.
     resolveArtifact(this.verifiedIndex, projection.raw);
+    requireCompleteArtifact(projection.raw);
     let bound = false;
     for (const response of buffer.responses.values()) {
       if (response.status !== 200 || !response.complete) continue;

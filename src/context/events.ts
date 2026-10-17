@@ -506,10 +506,16 @@ export function createBoundaryRegistry(): BoundaryRegistry {
       if (id.turn !== turn) fail('response/raw', "id.turn does not match the scope's turn");
       const body = artifactRef(o['body'], 'response/raw.body');
       receipt(scope, body.manifest, 'response/raw.body', 'artifact/end');
+      const complete = bool(o['complete'], 'response/raw.complete');
+      // The wrapper's completeness and its body artifact's completeness describe
+      // the same capture; a disagreement is a forged snapshot of the boundary.
+      if (body.complete !== complete) {
+        fail('response/raw', "body.complete does not equal the wrapper's complete");
+      }
       return toJson({
         id, attempt: safeInt(o['attempt'], 'response/raw.attempt', 0),
         status: safeInt(o['status'], 'response/raw.status', 0),
-        body, complete: bool(o['complete'], 'response/raw.complete'),
+        body, complete,
       });
     },
 

@@ -16,7 +16,7 @@ import { useWorld } from '../../node/__tests__/helpers.js';
 import { createBoundaryRegistry } from '../events.js';
 import { C13_EVENT_TYPES } from '../events.js';
 import {
-  buildEventIndex, canonicalBytes, eventKey, resolveArtifact, resolveStored, toJson,
+  buildEventIndex, canonicalBytes, eventKey, parseArtifactJson, resolveArtifact, resolveStored, toJson,
 } from '../artifacts.js';
 import { loadVerifiedEvents, ArtifactMismatchError } from '../loader.js';
 import type { VerifiedEvent, VerifiedEvents } from '../loader.js';
@@ -334,6 +334,64 @@ describe('capture, resolveArtifact and manifest verification', () => {
     };
     expect(() => resolveArtifact([], ref)).toThrow(ArtifactMismatchError);
   });
+
+  it('rejects a null manifest as a typed mismatch, not a TypeError', () => {
+    const ref = {
+      kind: 'c13-artifact', manifest: null,
+      sha256: 'a'.repeat(64), bytes: 0, encoding: 'utf8', complete: true,
+    } as unknown as ArtifactRef;
+    let err: unknown;
+    try {
+      resolveArtifact([], ref);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ArtifactMismatchError);
+    expect((err as ArtifactMismatchError).field).toBe('manifest');
+    expect(err).not.toBeInstanceOf(TypeError);
+  });
+
+  it('rejects a null part receipt as a typed mismatch, not a TypeError', () => {
+    const artifact = 'a'.repeat(64);
+    const manifestEvent = envelope({
+      type: 'artifact/end', seq: 2, hash: 'c'.repeat(64),
+      data: {
+        artifact, sha256: artifact, bytes: 0, encoding: 'utf8', complete: true,
+        parts: [null],
+      },
+    });
+    const ref: ArtifactRef = {
+      kind: 'c13-artifact', manifest: { seq: 2, hash: 'c'.repeat(64) },
+      sha256: artifact, bytes: 0, encoding: 'utf8', complete: true,
+    };
+    let err: unknown;
+    try {
+      resolveArtifact([verified(manifestEvent)], ref);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ArtifactMismatchError);
+    expect((err as ArtifactMismatchError).field).toBe('manifest');
+    expect(err).not.toBeInstanceOf(TypeError);
+  });
+
+  it('refuses response/raw whose wrapper complete flag disagrees with the body', async () => {
+    const h = await openGate();
+    try {
+      const id = { turn: 0, ordinal: 0 };
+      const incomplete = await h.gate.capture(Buffer.from('{}'), 'utf8', false);
+      expect(() => h.gate.append('response/raw', {
+        id, attempt: 0, status: 200, body: incomplete, complete: true,
+      })).toThrow(/body\.complete/);
+      // The agreeing form is accepted.
+      expect(() => h.gate.append('response/raw', {
+        id, attempt: 0, status: 200, body: incomplete, complete: false,
+      })).not.toThrow();
+    } finally {
+      h.close();
+      await h.writer.close();
+    }
+  });
 });
 
 describe('verified event index', () => {
@@ -467,6 +525,52 @@ describe('resolveStored', () => {
     let err: unknown;
     try {
       resolveStored(events, { kind: 'artifact-json', ref }, (v) => v);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ArtifactMismatchError);
+    expect((err as ArtifactMismatchError).field).toBe('json');
+    expect(err).not.toBeInstanceOf(SyntaxError);
+  });
+
+  it('refuses an incomplete artifact-json Stored as a typed complete mismatch', () => {
+    const body = Buffer.from('{"payload":"ok"}');
+    const artifact = sha256HexOf(body);
+    const manifestEvent = envelope({
+      type: 'artifact/end', seq: 1, hash: 'c'.repeat(64),
+      data: {
+        artifact, sha256: artifact, bytes: body.length, encoding: 'utf8', complete: false,
+        parts: [{ seq: 0, hash: 'd'.repeat(64) }],
+      },
+    });
+    const chunkEvent = envelope({
+      type: 'artifact/chunk', seq: 0, hash: 'd'.repeat(64),
+      data: { artifact, index: 0, base64: body.toString('base64') },
+    });
+    const ref: ArtifactRef = {
+      kind: 'c13-artifact', manifest: { seq: 1, hash: 'c'.repeat(64) },
+      sha256: artifact, bytes: body.length, encoding: 'utf8', complete: false,
+    };
+    let err: unknown;
+    try {
+      resolveStored(
+        [verified(manifestEvent), verified(chunkEvent)], { kind: 'artifact-json', ref }, (v) => v,
+      );
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ArtifactMismatchError);
+    expect((err as ArtifactMismatchError).field).toBe('complete');
+    expect(err).not.toBeInstanceOf(TypeError);
+  });
+
+  it('treats invalid UTF-8 inside a JSON string as a typed json mismatch', () => {
+    const bytes = Buffer.concat([
+      Buffer.from('{"a":"'), Buffer.from([0xff]), Buffer.from('"}'),
+    ]);
+    let err: unknown;
+    try {
+      parseArtifactJson(bytes);
     } catch (e) {
       err = e;
     }
