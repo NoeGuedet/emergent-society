@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@lydell/node-pty": "1.2.0-beta.15",
     "canonicalize": "5.0.0"
   },
   "devDependencies": {
