@@ -91,6 +91,26 @@ describe('durability spine', () => {
       expect(await store.has((e.data as { blob: string }).blob)).toBe(true);
     }
   });
+  it('captures the batch before draining, so a microtask append stays pending', async () => {
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    // `flushOnce` is queued one microtask behind `flush`; this awaited
+    // microtask resumes after its `drainBlobs()` has already returned — the
+    // exact window in which an append used to join a batch whose blob set had
+    // been snapshotted before it existed.
+    const flushing = w.flush();
+    await Promise.resolve();
+    const e = w.append('test/big', { payload: 'a'.repeat(BIG_PAYLOAD_CHARS) });
+    const blob = (e.data as { blob: string }).blob;
+    await flushing;
+    // The append belongs to the next batch: nothing was committed, so the log
+    // cannot reference a blob that is still only pending.
+    expect((await readFile(logPath(home()))).length).toBe(0);
+    expect(await new BlobStore(home()).has(blob)).toBe(false);
+    await w.flush();
+    expect(await new BlobStore(home()).has(blob)).toBe(true);
+    await w.close();
+    expect((await collectEvents(home())).map((ev) => ev.seq)).toEqual([0]);
+  });
   it('refuses an append that races close() and still releases the lock', async () => {
     const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
     w.append('test/ping', { n: 0 });

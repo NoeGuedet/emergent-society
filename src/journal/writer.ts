@@ -330,20 +330,30 @@ export class JournalWriter {
   private async flushOnce(): Promise<void> {
     this.throwIfPoisoned();
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-    // A blob must be durable before the events that reference it. An `append`
-    // can land during the await, so drain until nothing is outstanding.
-    await this.drainBlobs();
-    if (this.pending.length === 0) {
+    // Captured synchronously *before* the first await, so the batch and its blob
+    // set are fixed together. Capturing after `drainBlobs` would let an append
+    // that lands between the drain returning and the capture join a batch whose
+    // blob was never drained, committing an event whose blob is not on disk.
+    // Events appended during the drain stay pending for the next flush.
+    const batch = this.pending;
+    this.pending = [];
+    // A blob must be durable before the events that reference it.
+    try {
+      await this.drainBlobs();
+    } catch (err) {
+      // Restore the captured batch at the front (order preserved) so the next
+      // flush retries it. Blobs the drain already made durable have left
+      // `pendingBlobs`, so the retry does not rewrite them.
+      this.pending = batch.concat(this.pending);
+      throw err;
+    }
+    if (batch.length === 0) {
       // Nothing to retry, but a write-behind failure recorded by a prior timer
       // flush must still surface to the caller. A disposable head failure is
       // deliberately not recorded here: its batch is already durable.
       if (this.pendingFailure) throw this.pendingFailure;
       return;
     }
-    // Captured synchronously (no await between the two statements), so the
-    // batch and its blob set are fixed together.
-    const batch = this.pending;
-    this.pending = [];
     const frame = encodeBatch(batch.map((p) => p.line));
     try {
       await writeAll(this.log, frame);
