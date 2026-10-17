@@ -103,9 +103,12 @@ function minimalPlan(id: RequestId, config: Source): RequestPlan {
   };
 }
 
-function projection(calls: FunctionCall[], raw: ArtifactRef): AssistantProjection {
+function projection(
+  calls: FunctionCall[], raw: ArtifactRef,
+  content: string | null = calls.length === 0 ? 'final text' : null,
+): AssistantProjection {
   return {
-    message: { role: 'assistant', content: calls.length === 0 ? 'final text' : null, tool_calls: calls },
+    message: { role: 'assistant', content, tool_calls: calls },
     contentTruncated: false, raw,
   };
 }
@@ -115,7 +118,9 @@ function projection(calls: FunctionCall[], raw: ArtifactRef): AssistantProjectio
  * nonempty history a restart must reconstruct. `closeTurn` false leaves the turn
  * open, which is the checkpoint state that exercises `OpenTurn` validation.
  */
-async function seedJournal(path: string, closeTurn = true): Promise<VerifiedEvents> {
+async function seedJournal(
+  path: string, closeTurn = true, content: string | null = 'final text',
+): Promise<VerifiedEvents> {
   const writer = await JournalWriter.open(path, 'n1', { batchWindowMs: 60000 });
   const controller = new AbortController();
   const receipts = new Map<string, EventEnvelope>();
@@ -156,7 +161,7 @@ async function seedJournal(path: string, closeTurn = true): Promise<VerifiedEven
   turn.append('request/wire', { id, attempt: 0, body: wire });
   const raw = await turn.capture(Buffer.from('raw'), 'utf8');
   turn.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
-  turn.append('assistant/message', { id, value: await turn.store(projection([], raw)) });
+  turn.append('assistant/message', { id, value: await turn.store(projection([], raw, content)) });
   await turn.flush();
   if (closeTurn) {
     lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
@@ -247,6 +252,18 @@ describe('snapshots: round-trip', () => {
     const read = await readSnapshot(path, 'n1', events);
     expect(read).toEqual(snap);
     expect(read?.val.surface?.nodes.map((node) => node.group.kind)).toEqual(['heading', 'dialogue']);
+  });
+
+  it('round-trips a gate-valid empty assistant content promoted into the surface', async () => {
+    const path = home();
+    const events = await seedJournal(path, true, '');
+    const state = await stateOf(events);
+    const dialogue = state.surface?.nodes[1]?.group;
+    expect(dialogue?.messages[0]).toEqual({ role: 'assistant', content: '', tool_calls: [] });
+    const snap = checkpoint(state);
+
+    await expect(writeSnapshot(path, 'n1', snap)).resolves.toBe(true);
+    await expect(readSnapshot(path, 'n1', events)).resolves.toEqual(snap);
   });
 
   it('round-trips a checkpoint of an open turn', async () => {

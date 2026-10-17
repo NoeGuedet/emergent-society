@@ -4,6 +4,7 @@ import { HASH_RE, copyJsonValue, sha256HexOf } from '../journal/canon.js';
 import type { ArtifactRef, ArtifactChunk, ArtifactManifest, Source, Stored } from './contracts.js';
 import { ArtifactMismatchError } from './loader.js';
 import type { VerifiedEvent, VerifiedEvents } from './loader.js';
+import { isRecord } from './validate.js';
 
 /**
  * A resolved `(seq, hash)` index over chain-verified events. The fold keeps one
@@ -74,10 +75,6 @@ export function toJson(value: unknown): JsonValue {
 /** The RFC-8785 canonical UTF-8 bytes of a value — the exact measure the journal hashes. */
 export function canonicalBytes(value: unknown): Uint8Array {
   return Buffer.from(canonicalizeJson(toJson(value)), 'utf8');
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function mismatch(field: ArtifactMismatchError['field']): never {

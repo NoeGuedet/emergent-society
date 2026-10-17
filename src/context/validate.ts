@@ -15,23 +15,28 @@ import type {
  * `invalid snapshot at <where>: <message>`, and the config validator keeps
  * `<where>: <message>`. Extracting them must not silently change any message.
  *
- * One semantic difference predates this module and is *not* unified: the gate
- * accepts empty chat content and empty function-call arguments (a provider may
- * emit `content: ""`), while the snapshot parser refuses them. `ShapeDialect`
- * makes that choice explicit per caller rather than picking a side here.
+ * Empty text is accepted by both old parsers but at different strengths: the
+ * gate deliberately folds `""` chat content and arguments (a provider may emit
+ * them) while still requiring nonempty strings by default elsewhere, and the
+ * snapshot parser's `text` never required one at all. `ShapeDialect` carries
+ * both switches (`allowEmptyText` and `textNonEmpty`) instead of flattening
+ * them, so neither caller's acceptance set changes.
  */
 
 /** Produces a caller's exact error vocabulary. */
 export type Fail = (where: string, message: string) => never;
 
 /**
- * The shape wording a caller already used. `allowEmptyText` is the real
- * divergence: the gate folds `""` content and arguments, the snapshot parser
- * rejects them. `functionTypeError` and `unknownRoleAt` preserve each caller's
- * error location for the two discriminant checks.
+ * The shape wording a caller already used. `allowEmptyText` controls chat
+ * content and function arguments; `textNonEmpty` is the default for generic
+ * `text` fields (the gate requires nonempty, the snapshot parser did not).
+ * `safeIntMessage` preserves each caller's out-of-range wording, and
+ * `functionTypeError`/`unknownRoleAt` preserve the discriminant error location.
  */
 export type ShapeDialect = {
   readonly allowEmptyText: boolean;
+  readonly textNonEmpty: boolean;
+  readonly safeIntMessage: (min: number, max: number) => string;
   readonly functionTypeError: {
     readonly at: (where: string) => string;
     readonly message: string;
@@ -39,16 +44,24 @@ export type ShapeDialect = {
   readonly unknownRoleAt: (where: string) => string;
 };
 
-/** The gate's original vocabulary: empty text allowed, errors point at the value. */
+/** The gate's original vocabulary: nonempty by default, empty content/args allowed. */
 export const GATE_DIALECT: ShapeDialect = {
   allowEmptyText: true,
+  textNonEmpty: true,
+  safeIntMessage: (min, max) => `expected a safe integer in [${min}, ${max}]`,
   functionTypeError: { at: (where) => where, message: "type must be 'function'" },
   unknownRoleAt: (where) => where,
 };
 
-/** The snapshot parser's original, stricter vocabulary. */
+/**
+ * The snapshot parser's original vocabulary: empty strings are accepted
+ * everywhere (its old `text` never required one), and errors point at `.type`
+ * / `.role`.
+ */
 export const SNAPSHOT_DIALECT: ShapeDialect = {
-  allowEmptyText: false,
+  allowEmptyText: true,
+  textNonEmpty: false,
+  safeIntMessage: (min) => `expected a safe integer >= ${min}`,
   functionTypeError: { at: (where) => `${where}.type`, message: 'expected "function"' },
   unknownRoleAt: (where) => `${where}.role`,
 };
@@ -70,7 +83,7 @@ export function createValidator(fail: Fail, dialect: ShapeDialect = GATE_DIALECT
     }
   }
 
-  function text(value: unknown, where: string, nonEmpty = true): string {
+  function text(value: unknown, where: string, nonEmpty = dialect.textNonEmpty): string {
     if (typeof value !== 'string' || (nonEmpty && value.length === 0)) {
       fail(where, nonEmpty ? 'expected a nonempty string' : 'expected a string');
     }
@@ -86,7 +99,7 @@ export function createValidator(fail: Fail, dialect: ShapeDialect = GATE_DIALECT
     value: unknown, where: string, min: number, max = Number.MAX_SAFE_INTEGER,
   ): number {
     if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min || value > max) {
-      fail(where, `expected a safe integer in [${min}, ${max}]`);
+      fail(where, dialect.safeIntMessage(min, max));
     }
     return value as number;
   }
