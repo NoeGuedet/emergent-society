@@ -6,7 +6,7 @@ import type {
 } from './contracts.js';
 
 /**
- * The neutral shared helpers of committed-group handling (kernel.md §4).
+ * The shared helpers of committed-group handling (kernel.md §4).
  *
  * The surface (the consumer that applies a compaction) and the compaction policy
  * (the producer that selects one) must agree, byte for byte, on what a balanced
@@ -14,7 +14,10 @@ import type {
  * which spans are legal (`validateCompactionSpan`).
  * Keeping those in one module that imports neither `surface` nor `compaction`
  * avoids a `surface → compaction → fold` value cycle while still having a single
- * home for the rules.
+ * home for the rules. It is not dependency-free: the shadow encoding is the
+ * provider wire's canonical message bytes, so this module imports `provider/wire`
+ * (as the surface always has) — the neutrality claimed here is only about the
+ * surface/compaction pair.
  */
 
 /**

@@ -87,6 +87,12 @@ export interface TurnContext {
 export type TurnHandler = (ctx: TurnContext) => Promise<TurnResult> | TurnResult;
 
 export interface NodeDriverOptions extends JournalWriterOptions {
+  /**
+   * The inherited write-behind/head diagnostic sink, and also the driver's
+   * wake-predicate diagnostics: a bounded label plus, for git, its exit status —
+   * never an arbitrary message or payload. A throwing reporter is swallowed.
+   */
+  onError?: (err: Error) => void;
   onMaintenance?: () => Promise<void> | void;
   /**
    * The event types this driver's replay understands, defaulting to its own

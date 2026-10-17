@@ -178,9 +178,9 @@ export class ProviderAdapter {
     const policy = plan.policy;
 
     // 1. Store the immutable plan, record `request/plan` once, serialize once.
-    //    The runtime owns the 32 MiB capture-ceiling refusal before `gate.store`;
-    //    here a wire above the persisted `maxRequestBytes` is refused terminally
-    //    with a durable attempt and no send.
+    //    The runtime owns the `MAX_CAPTURE_BYTES` capture-ceiling refusal before
+    //    `gate.store`; here a wire above the persisted `maxRequestBytes` is refused
+    //    terminally with a durable attempt and no send.
     const storedPlan = await gate.store(plan);
     gate.append('request/plan', { id, value: storedPlan });
     const body = serializeWire(plan);

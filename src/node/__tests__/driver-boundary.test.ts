@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+import { existsSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  BlobIntegrityError, BlobStore, JournalWriter, MAX_BLOB_BYTES, TruncatedBlobError,
-  isCorruption, isRetryable,
+  BlobIntegrityError, BlobStore, JournalWriter, LOG_FILE, MAX_BLOB_BYTES, TruncatedBlobError,
+  isCorruption, isRetryable, nodeDir,
 } from '../../journal/index.js';
 import { withFailingWrite } from '../../journal/__tests__/helpers.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../../context/events.js';
@@ -722,15 +723,21 @@ describe('hook contract refusals', () => {
   });
 
   it('refuses a missing lifecycle callback before the writer exists', async () => {
-    for (const port of ['onDurable', 'onReady', 'onTurnStart']) {
-      const { home, world } = fixture();
+    const { home, world } = fixture();
+    for (const [index, port] of ['onDurable', 'onReady', 'onTurnStart'].entries()) {
+      // One uid per port: an earlier iteration's successful open legitimately
+      // creates its own journal, and this assertion is about this one.
+      const uid = `n${index + 1}`;
       const hooks = withoutPort(hooksFor(home), port);
-      await expect(NodeDriver.open(home, 'n1', wait, world,
+      // The refusal is the up-front contract check, not a later failure that
+      // happens to name the port: the message is exact and no journal exists.
+      await expect(NodeDriver.open(home, uid, wait, world,
         { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 }))
-        .rejects.toThrow(new RegExp(port));
+        .rejects.toThrow(new Error(`C1.3 hooks require ${port}`));
+      expect(existsSync(join(nodeDir(home, uid), LOG_FILE))).toBe(false);
       // The refusal happened before the writer was taken: a valid bundle still
       // opens the same node home afterwards.
-      const d = await NodeDriver.open(home, 'n1', wait, world,
+      const d = await NodeDriver.open(home, uid, wait, world,
         { knownTypes: C13_EVENT_TYPES, hooks: hooksFor(home), worldPollMs: 0 });
       d.stop();
       await d.run();

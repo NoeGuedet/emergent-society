@@ -166,22 +166,29 @@ describe('NodeDriver run loop', () => {
     const reached = new Promise<void>((resolve) => { entered = resolve; });
     const real = WorldRepo.prototype.headHash;
     let reads = 0;
-    vi.spyOn(WorldRepo.prototype, 'headHash').mockImplementation(async function (this: WorldRepo) {
-      reads += 1;
-      if (reads === 2) {
-        entered();
-        await held;
-      }
-      return real.call(this);
-    });
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
-    const running = d.run();
-    await reached;
-    d.stop();
-    release();
-    await running;
-    expect(d.state).toBe('stopped');
-    expect((await log(home)).filter((e) => e.type === 'turn/start')).toHaveLength(0);
+    const spy = vi.spyOn(WorldRepo.prototype, 'headHash').mockImplementation(
+      async function (this: WorldRepo) {
+        reads += 1;
+        if (reads === 2) {
+          entered();
+          await held;
+        }
+        return real.call(this);
+      },
+    );
+    try {
+      const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+      const running = d.run();
+      await reached;
+      d.stop();
+      release();
+      await running;
+      expect(d.state).toBe('stopped');
+      expect((await log(home)).filter((e) => e.type === 'turn/start')).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+      release();
+    }
   });
 
   it('shuts down with reason maintenance-error when the maintenance hook throws', async () => {

@@ -6,7 +6,7 @@ import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from '../blobs.js';
 import { JournalReader, repair } from '../reader.js';
 import { canonicalizeJson } from '../canon.js';
 import { eventLine, verifyEvent, type EventEnvelope } from '../envelope.js';
-import { scanBatches } from '../framing.js';
+import { scanBatches, encodeBatch } from '../framing.js';
 import { journalPath, nodeDir } from '../layout.js';
 import {
   appendTear, countSyncs, logPath, payloadOfCanonicalBytes, useTempHome,
@@ -125,5 +125,11 @@ describe('frozen v0 format vectors', () => {
     const events: EventEnvelope[] = [];
     for await (const e of r.events()) events.push(e);
     expect(events).toEqual([JSON.parse(GOLDEN_LINE)]);
+  });
+
+  it('re-encodes the golden line to the pinned frame on the writer side', () => {
+    // Pins COMPRESS_OPTIONS, the checksum flag and the split-free frame layout:
+    // a writer drift must break this literal, not merely a reader's tolerance.
+    expect(encodeBatch([GOLDEN_LINE]).toString('hex')).toBe(GOLDEN_FRAME_HEX);
   });
 });

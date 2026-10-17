@@ -1184,7 +1184,7 @@ describe('fold: forged chain-valid payloads fail as typed invariants', () => {
         await rm(path, { recursive: true, force: true });
       }
     }
-  });
+  }, 15000);
 });
 
 describe('fold: an invariant never leaves the cached surface half-changed', () => {

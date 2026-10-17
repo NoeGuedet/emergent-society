@@ -263,6 +263,16 @@ describe('the world repo', () => {
     expect(await world.hasForeignCommit(head, 'n1')).toBe(false);
   });
 
+  it('classifies an author record past the bound as foreign', async () => {
+    const { world } = fixture();
+    // The stream stops buffering an identity this long: a record over 4096 chars
+    // without its NUL separator cannot be a node uid, so it answers foreign and
+    // kills the scan rather than holding it in memory. git accepts the name.
+    const long = 'x'.repeat(5000);
+    await commitAs(world, long, { 'long/a.md': 'a' });
+    expect(await world.hasForeignCommit(null, 'n1')).toBe(true);
+  });
+
   it('treats a hand-crafted empty author as foreign, never as silence', async () => {
     const { world } = fixture();
     const first = await commitAs(world, 'n2', { 'a.txt': 'one' });
@@ -545,8 +555,8 @@ describe('the world repo', () => {
       const commit = await world.commitAll('n1', 'turn 0');
       expect(commit?.author).toBe('n1');
       // The world moved; the repo the environment pointed at did not. The
-      // assertions go through the kernel's own calls, whose environment is
-      // controlled — the raw test helper would still inherit the stubbed var.
+      // assertions go through the kernel's own calls; `helpers.gitIn` applies the
+      // same controlled environment, so either path ignores the stubbed var.
       expect(await world.headHash()).toBe(commit?.hash);
       expect(await world.commitsSince(null)).toEqual([{ hash: commit?.hash, author: 'n1' }]);
       expect(await other.headHash()).toBeNull();

@@ -51,8 +51,11 @@ const STATE_KEYS = ['config', 'surface', 'open', 'recovery', 'watermark', 'pendi
 
 /**
  * The shared schema primitives, bound to the snapshot parser's own prefix. Its
- * dialect is deliberately stricter than the gate's about empty chat content and
- * function arguments; see `ShapeDialect` in `validate.ts`.
+ * dialect differs from the gate's rather than being stricter: empty text is
+ * accepted everywhere here (the snapshot's original text rule), while the gate
+ * forbids it where its dialect says so; function/role errors point at `.type` /
+ * `.role` here and at the enclosing field there. See `ShapeDialect` in
+ * `validate.ts`.
  */
 const v = createValidator((where, message): never => {
   throw new Error(`invalid snapshot at ${where}: ${message}`);

@@ -233,6 +233,8 @@ export class JournalWriter {
    * @throws JournalPoisonedError once a batch has failed to commit twice.
    * @throws the recorded write-behind failure, if a prior flush failed.
    * @throws NonCanonicalizableError when the payload has no JSON form.
+   * @throws ReservedBlobRefError when the root payload already matches the
+   * reserved claim-check reference shape (the reader would misresolve it).
    * @throws OversizedEventError when the event alone reaches the frame bound:
    * no split can commit it, so it is refused before `seq` advances.
    */

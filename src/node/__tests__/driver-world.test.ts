@@ -339,7 +339,7 @@ describe('the wake predicate', () => {
     // the evaluation that follows it.
     const real = WorldRepo.prototype.hasForeignCommit;
     let stall = true;
-    vi.spyOn(WorldRepo.prototype, 'hasForeignCommit').mockImplementation(
+    const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit').mockImplementation(
       async function (this: WorldRepo, from: string | null, author: string) {
         const stalled = stall;
         stall = false;
@@ -347,29 +347,32 @@ describe('the wake predicate', () => {
         return real.call(this, from, author);
       },
     );
+    try {
+      await commitAs(world, 'n2', { 'n2/a.md': 'a' });
+      await HeadWatcher.for(world).check(); // notification one: the stalled evaluation
+      const head = await commitAs(world, 'n3', { 'n3/b.md': 'b' });
+      await HeadWatcher.for(world).check(); // notification two: the wake that lands
 
-    await commitAs(world, 'n2', { 'n2/a.md': 'a' });
-    await HeadWatcher.for(world).check(); // notification one: the stalled evaluation
-    const head = await commitAs(world, 'n3', { 'n3/b.md': 'b' });
-    await HeadWatcher.for(world).check(); // notification two: the wake that lands
+      await vi.waitFor(() => expect(triggers).toHaveLength(2));
+      expect(triggers[1]).toBe('wakeup');
+      const start = (await readNode(home))
+        .find((e) => e.type === 'turn/start' && (e.data as { turn: number }).turn === 1);
+      expect((start?.data as { world: WorldRange }).world).toEqual({ from: null, to: head });
 
-    await vi.waitFor(() => expect(triggers).toHaveLength(2));
-    expect(triggers[1]).toBe('wakeup');
-    const start = (await readNode(home))
-      .find((e) => e.type === 'turn/start' && (e.data as { turn: number }).turn === 1);
-    expect((start?.data as { world: WorldRange }).world).toEqual({ from: null, to: head });
-
-    // The stalled evaluation resolves after that park ended: it must not arm the
-    // latch of the park that follows, or the node would take a `wakeup` turn on
-    // a world that has not moved since it looked.
-    await parked(d, world);
-    // Must outlast the 150 ms stalled evaluation plus both git reads; the
-    // assertion is negative, so the window is the only signal.
-    await quiet(750);
-    expect(triggers).toEqual(['boot', 'wakeup']);
-    expect(d.state).toBe('waiting');
-    d.stop();
-    await running;
+      // The stalled evaluation resolves after that park ended: it must not arm the
+      // latch of the park that follows, or the node would take a `wakeup` turn on
+      // a world that has not moved since it looked.
+      await parked(d, world);
+      // Must outlast the 150 ms stalled evaluation plus both git reads; the
+      // assertion is negative, so the window is the only signal.
+      await quiet(750);
+      expect(triggers).toEqual(['boot', 'wakeup']);
+      expect(d.state).toBe('waiting');
+      d.stop();
+      await running;
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('parks instead of dying when the check a park opens with fails', async () => {
