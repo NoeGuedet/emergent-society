@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { constants as osConstants } from 'node:os';
 import * as pty from '@lydell/node-pty';
-import { stdinWaitPids } from './proc.js';
+import { stdinWaitPids, sessionTtyTarget } from './proc.js';
 
 /**
  * The persistent PTY shell (C1.4b, kernel.md §4/§7): one bash session per
@@ -109,6 +109,12 @@ type Session = {
   readonly proc: pty.IPty;
   readonly pid: number;
   exited: { readonly code: number; readonly signal: string | null } | null;
+  /**
+   * The pts path the shell's fd 0 resolved to at spawn (or the first pre-write
+   * retry): the stdin proof is bound to this frozen target, so a later
+   * redirection of fd 0 can never make the shell look stdin-blocked.
+   */
+  ttyTarget: string | null;
 };
 
 type CommandState = {
@@ -172,7 +178,9 @@ export class PtyTerminalRuntime implements TerminalRuntime {
       // it also injects PWD=cwd. Neither comes from the parent's environment.
       name: 'dumb', cols: 160, rows: 40, cwd: this.cwd, env,
     });
-    const session: Session = { proc, pid: proc.pid, exited: null };
+    const session: Session = {
+      proc, pid: proc.pid, exited: null, ttyTarget: sessionTtyTarget(proc.pid),
+    };
     proc.onExit(({ exitCode, signal }) => {
       // node-pty reports the signal as a NUMBER in practice (the d.ts types it
       // optional, so the check stays): 0 for a clean exit — only a nonzero
@@ -259,6 +267,11 @@ export class PtyTerminalRuntime implements TerminalRuntime {
         };
       }
     }
+    // Freeze the session's tty target while the shell is idle — before this
+    // command's own redirections can touch fd 0. A spawn-time read can lose a
+    // race with node-pty's setup; retrying here keeps the proof available
+    // without ever freezing a non-pts fd 0.
+    if (session.ttyTarget === null) session.ttyTarget = sessionTtyTarget(session.pid);
 
     const nonce = randomUUID();
     const start = `__ES_EXECUTE_START_${nonce}__`;
@@ -374,7 +387,7 @@ export class PtyTerminalRuntime implements TerminalRuntime {
           && Date.now() >= writeAt + STDIN_GRACE_MS
           && Date.now() >= lastProbeAt + STDIN_PROBE_INTERVAL_MS) {
           lastProbeAt = Date.now();
-          probes = stdinWaitPids(session.pid).length > 0 ? probes + 1 : 0;
+          probes = stdinWaitPids(session.pid, session.ttyTarget).length > 0 ? probes + 1 : 0;
           if (probes >= STDIN_PROBES) {
             // The session stays wedged: the command still waits on stdin, and
             // the next run resets before writing (the `fresh` trailer).

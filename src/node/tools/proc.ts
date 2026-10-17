@@ -10,7 +10,16 @@ import { readFileSync, readdirSync, readlinkSync } from 'node:fs';
  * re-openers (sudo) are unprovable here and return
  * false, so a missed proof costs a timeout, never a false positive. Every
  * read is best-effort: a racing exit or an unexpected shape yields no flag.
- * Off Linux the answer is always "not provable" ([]).
+ *
+ * The syscall table is x86-64's: on any other architecture the numbers mean
+ * different calls, so the proof answers "not provable" rather than guessing
+ * (a wrong `read` number would silently disable detection, and a wrong epoll
+ * number could misread another call). The session's tty target is frozen by
+ * `sessionTtyTarget` while the shell is still at its prompt and every
+ * candidate's fd 0 must resolve to that exact pts path: a builtin with a
+ * redirected stdin (`read x < <(…)`) is NOT waiting on the session's tty, and
+ * calling it a stdin_read would make the next run kill a live command.
+ * Off Linux (or off x86-64) the answer is always "not provable" ([]).
  */
 
 type ProcStat = { readonly pgrp: number; readonly ttyNr: number; readonly tpgid: number };
@@ -59,14 +68,16 @@ function epollWatchesStdin(pid: number, fd: string): boolean {
   return /^tfd:\s+0\s/m.test(info);
 }
 
-function waitsOnTtyStdin(pid: number, shellFd0: string): boolean {
+function waitsOnTtyStdin(pid: number, ttyTarget: string): boolean {
   let fd0: string;
   try {
     fd0 = readlinkSync(`/proc/${pid}/fd/0`);
   } catch {
     return false;
   }
-  if (fd0 !== shellFd0) return false;
+  // The candidate's stdin must be the session's own pts — not merely equal to
+  // whatever the shell's fd 0 is right now (which a redirected builtin changes).
+  if (fd0 !== ttyTarget) return false;
   let tasks: string[];
   try {
     tasks = readdirSync(`/proc/${pid}/task`);
@@ -102,23 +113,35 @@ function waitsOnTtyStdin(pid: number, shellFd0: string): boolean {
 }
 
 /**
+ * The pts path fd 0 of `pid` resolves to, or null when it is not a pts device
+ * (a pipe, a file, a dead process). The caller freezes the returned path while
+ * the shell is idle: the proof is about the session's tty, not about whatever
+ * a later redirection temporarily puts on fd 0.
+ */
+export function sessionTtyTarget(pid: number): string | null {
+  if (process.platform !== 'linux') return null;
+  try {
+    const target = readlinkSync(`/proc/${pid}/fd/0`);
+    return target.startsWith('/dev/pts/') ? target : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The pids of `shellPid`'s foreground process group blocked reading the
- * session's tty, or [] when none — or when anything cannot be read. An idle
- * shell at its prompt is NOT flagged: it waits in `pselect6` (the poll
+ * session's tty, or [] when none — or when anything cannot be read. `ttyTarget`
+ * is the path frozen by `sessionTtyTarget`; without it nothing is provable. An
+ * idle shell at its prompt is NOT flagged: it waits in `pselect6` (the poll
  * family, unprovable by design), which is exactly why no gating is needed
  * against the prompt state — it is invisible to this proof.
  */
-export function stdinWaitPids(shellPid: number): number[] {
-  if (process.platform !== 'linux') return [];
+export function stdinWaitPids(shellPid: number, ttyTarget: string | null): number[] {
+  if (process.platform !== 'linux' || process.arch !== 'x64') return [];
+  if (ttyTarget === null || !ttyTarget.startsWith('/dev/pts/')) return [];
   try {
     const shell = readStat(shellPid);
     if (shell === null || shell.tpgid <= 0 || shell.ttyNr === 0) return [];
-    let shellFd0: string;
-    try {
-      shellFd0 = readlinkSync(`/proc/${shellPid}/fd/0`);
-    } catch {
-      return [];
-    }
     const hits: number[] = [];
     for (const entry of readdirSync('/proc')) {
       if (!/^\d+$/.test(entry)) continue;
@@ -126,7 +149,7 @@ export function stdinWaitPids(shellPid: number): number[] {
       if (pid === 0) continue;
       const stat = readStat(pid);
       if (stat === null || stat.pgrp !== shell.tpgid || stat.ttyNr !== shell.ttyNr) continue;
-      if (waitsOnTtyStdin(pid, shellFd0)) hits.push(pid);
+      if (waitsOnTtyStdin(pid, ttyTarget)) hits.push(pid);
     }
     return hits;
   } catch {
