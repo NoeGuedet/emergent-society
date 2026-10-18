@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
-import { access } from 'node:fs/promises';
+import { access, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { NodeDriver, type TurnHandler } from '../driver.js';
 import { HeadWatcher } from '../watcher.js';
@@ -853,4 +853,119 @@ describe('durable world acknowledgement', () => {
     await ref.d.run();
     expect(seen).toEqual([{ from: h0, to: h1 }]);
   });
+});
+
+/** The durable `tool/result` of one call, with its rendered message. */
+function toolResult(
+  events: Awaited<ReturnType<typeof eventsOf>>, callId: string,
+): { readonly isError: boolean; readonly failure: unknown; readonly content: string } {
+  const found = events.find((event) => event.type === 'tool/result'
+    && (event.data as { callId?: string }).callId === callId);
+  expect(found).toBeDefined();
+  const data = found!.data as {
+    readonly isError: boolean; readonly failure: unknown;
+    readonly message: { readonly content: string };
+  };
+  return { isError: data.isError, failure: data.failure, content: data.message.content };
+}
+
+describe('shell confinement wiring (C1.4c)', () => {
+  it('boots unconfined through the explicit opt-out and reports mode off', async () => {
+    const fx = fixture();
+    const transport = new ScriptedTransport([
+      calling([execute('e1', 'echo unconfined')]),
+      noCalls('done'),
+    ]);
+    const runtime = createAgentRuntime({
+      home: fx.home, uid: 'n1', world: fx.world,
+      initialConfig: configWith({ policy: { retryDelayMs: 1 } }),
+      terminal: { env: DEFAULT_TERMINAL_ENV, sandbox: false },
+      adapter: new ProviderAdapter(transport, providerPolicy),
+    });
+    const driver = await openRuntime(fx, runtime);
+    const running = driver.run();
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    // The escape hatch never probes: the status is `off` from construction.
+    expect(runtime.sandboxStatus()).toEqual({ mode: 'off' });
+    driver.stop();
+    await running;
+
+    const result = toolResult(await eventsOf(fx), 'e1');
+    expect(result.isError).toBe(false);
+    expect(result.content).toContain('unconfined');
+    // A stop keeps the last reported status for the cached surface.
+    expect(runtime.sandboxStatus()).toEqual({ mode: 'off' });
+  }, 20000);
+
+  it('fails every execute closed when the home sits inside the world', async () => {
+    const fx = fixture();
+    const nestedHome = join(fx.world.path, 'inside-home');
+    await mkdir(nestedHome, { recursive: true });
+    const transport = new ScriptedTransport([
+      calling([execute('e1', 'true')]),
+      noCalls('done'),
+    ]);
+    const runtime = createAgentRuntime({
+      home: nestedHome, uid: 'n1', world: fx.world,
+      initialConfig: configWith({ policy: { retryDelayMs: 1 } }),
+      terminal: { env: DEFAULT_TERMINAL_ENV },
+      adapter: new ProviderAdapter(transport, providerPolicy),
+    });
+    // The journal lives outside the world (the driver's home); only the
+    // runtime's own home is nested, which is what the policy refuses.
+    const driver = await openRuntime(fx, runtime);
+    const running = driver.run();
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    driver.stop();
+    await running;
+
+    const result = toolResult(await eventsOf(fx), 'e1');
+    expect(result.isError).toBe(true);
+    expect(result.failure).toEqual({ code: 'spawn', status: null });
+    expect(result.content).toContain('spawn-failed');
+    expect(result.content).toContain('inside the world');
+    expect(runtime.sandboxStatus()).toBeNull();
+    const events = await eventsOf(fx);
+    expect(events.find((event) => event.type === 'node/shutdown')?.data)
+      .toEqual({ reason: 'stop-requested' });
+  }, 20000);
+
+  it('builds a fresh confined session for a second sequential driver', async () => {
+    const fx = fixture();
+    const transport = new ScriptedTransport([
+      calling([execute('e1', 'cd /usr && pwd')]),
+      noCalls('done'),
+      calling([execute('e2', 'pwd')]),
+      noCalls('done'),
+    ]);
+    const runtime = createAgentRuntime({
+      home: fx.home, uid: 'n1', world: fx.world,
+      initialConfig: configWith({ policy: { stepsPerTurn: 1, retryDelayMs: 1 } }),
+      terminal: { env: DEFAULT_TERMINAL_ENV },
+      adapter: new ProviderAdapter(transport, providerPolicy),
+    });
+
+    const first = await openRuntime(fx, runtime);
+    const firstRun = first.run();
+    await vi.waitFor(() => expect(first.state).toBe('waiting'));
+    first.stop();
+    await firstRun;
+
+    const second = await openRuntime(fx, runtime);
+    const secondRun = second.run();
+    await vi.waitFor(() => expect(second.state).toBe('waiting'));
+    second.stop();
+    await secondRun;
+
+    const events = await eventsOf(fx);
+    const e1 = toolResult(events, 'e1');
+    expect(e1.isError).toBe(false);
+    expect(e1.content).toContain('/usr');
+    // The second driver's session is fresh: the first driver's `cd` is gone and
+    // pwd is the world again (the shell was torn down with its driver).
+    const e2 = toolResult(events, 'e2');
+    expect(e2.isError).toBe(false);
+    expect(e2.content).toContain(fx.world.path);
+    expect(e2.content).not.toContain('/usr');
+  }, 30000);
 });

@@ -1,9 +1,13 @@
 import { Buffer } from 'node:buffer';
-import { readFileSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, readFile } from 'node:fs/promises';
+import { existsSync, readFileSync } from 'node:fs';
+import {
+  access, chmod, mkdtemp, mkdir, rm, readFile, writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { buildSandboxSpec, type SandboxSpec } from '../tools/sandbox.js';
 import {
   DEFAULT_TERMINAL_ENV, PtyTerminalRuntime,
 } from '../tools/terminal.js';
@@ -28,7 +32,7 @@ afterEach(async () => {
 });
 
 function terminal(): TerminalRuntime {
-  const rt = new PtyTerminalRuntime(dir, DEFAULT_TERMINAL_ENV);
+  const rt = new PtyTerminalRuntime(dir, DEFAULT_TERMINAL_ENV, 'off');
   runtimes.push(rt);
   return rt;
 }
@@ -330,7 +334,7 @@ describe('PtyTerminalRuntime', () => {
   it('a spawn failure is an outcome, never a throw', async () => {
     // The cwd pre-flight (statSync) refuses a missing directory before node-pty
     // can fork a child that would die in chdir masquerading as a session_exit.
-    const rt = new PtyTerminalRuntime(join(dir, 'no-such-dir'), DEFAULT_TERMINAL_ENV);
+    const rt = new PtyTerminalRuntime(join(dir, 'no-such-dir'), DEFAULT_TERMINAL_ENV, 'off');
     runtimes.push(rt);
     const outcome = await rt.run('echo x', limits(), new AbortController().signal);
     expect(outcome).toMatchObject({ status: 'spawn-failed', exitCode: null, reset: false });
@@ -341,7 +345,7 @@ describe('PtyTerminalRuntime', () => {
     // the outcome must not claim reset:false — the session was killed.
     const gone = join(dir, 'vanishing');
     await mkdir(gone);
-    const rt = new PtyTerminalRuntime(gone, DEFAULT_TERMINAL_ENV);
+    const rt = new PtyTerminalRuntime(gone, DEFAULT_TERMINAL_ENV, 'off');
     runtimes.push(rt);
     const wedged = await rt.run('read answer', limits(), new AbortController().signal);
     expect(wedged.status).toBe('stdin_read');
@@ -351,4 +355,131 @@ describe('PtyTerminalRuntime', () => {
       status: 'spawn-failed', exitCode: null, reset: true, fresh: 'stdin-wedge',
     });
   }, 15000);
+});
+
+/**
+ * The confined spawn (C1.4c): real PTYs behind the real launcher. World and
+ * home are separate leaves of the suite's temp root (the builder refuses a home
+ * inside the world); the launcher suites skip when the binary is absent — the
+ * vitest globalSetup builds it, so a full run always has it.
+ */
+const projectRoot = fileURLToPath(new URL('../../..', import.meta.url));
+const launcherBinary = join(projectRoot, 'native', 'es-landlock', 'es-landlock');
+const launcherPresent = existsSync(launcherBinary);
+
+async function sandboxDirs(): Promise<{ world: string; home: string }> {
+  const world = join(dir, 'sb-world');
+  const home = join(dir, 'sb-home');
+  await mkdir(world);
+  await mkdir(home);
+  return { world, home };
+}
+
+async function realSpec(): Promise<{ spec: SandboxSpec; world: string }> {
+  const { world, home } = await sandboxDirs();
+  return { spec: await buildSandboxSpec({ world, home, uid: 'node-a' }), world };
+}
+
+describe('PtyTerminalRuntime confinement', () => {
+  it.skipIf(!launcherPresent)(
+    'runs a command under the real launcher and reports the probed status',
+    async () => {
+      const { spec, world } = await realSpec();
+      const rt = new PtyTerminalRuntime(world, DEFAULT_TERMINAL_ENV, spec);
+      runtimes.push(rt);
+      // Not probed yet: the status is unknown, never "off".
+      expect(rt.sandboxStatus()).toBeNull();
+      const outcome = await rt.run('echo ok', limits(), new AbortController().signal);
+      expect(outcome).toMatchObject({
+        status: 'completed', exitCode: 0, truncated: false, reset: false, fresh: null,
+      });
+      expect(text(outcome)).toContain('ok');
+      expect(text(outcome)).not.toContain('__ES_EXECUTE_');
+      const status = rt.sandboxStatus();
+      expect(status?.mode).toBe('landlock');
+      if (status?.mode === 'landlock') {
+        expect(status.abi).toBeGreaterThanOrEqual(3);
+        expect(status.enforcement).toBe('full');
+      }
+    },
+    20000,
+  );
+
+  it(
+    'a failed probe settles spawn-failed with its diagnostic and is never re-probed',
+    async () => {
+      const { world, home } = await sandboxDirs();
+      const counter = join(dir, 'probe-count.txt');
+      const launcher = join(dir, 'es-landlock-failing');
+      await writeFile(launcher, '#!/bin/sh\n'
+        + `printf 'x\\n' >> '${counter}'\n`
+        + "printf 'es-landlock: probe-deny: Permission denied\\n' >&2\nexit 125\n");
+      await chmod(launcher, 0o755);
+      const spec = await buildSandboxSpec({ world, home, uid: 'node-a', launcherPath: launcher });
+      const rt = new PtyTerminalRuntime(world, DEFAULT_TERMINAL_ENV, spec);
+      runtimes.push(rt);
+      const first = await rt.run('echo one', limits(), new AbortController().signal);
+      const second = await rt.run('echo two', limits(), new AbortController().signal);
+      for (const outcome of [first, second]) {
+        expect(outcome).toMatchObject({ status: 'spawn-failed', exitCode: null, reset: false });
+        expect(text(outcome)).toContain('es-landlock: probe-deny: Permission denied');
+      }
+      // One probe across two runs: the settled memo, not a per-run retry.
+      expect(await readFile(counter, 'utf8')).toBe('x\n');
+      expect(rt.sandboxStatus()).toBeNull();
+    },
+    20000,
+  );
+
+  it.skipIf(!launcherPresent)(
+    'classifies a pre-start launcher death as spawn-failed carrying its line',
+    async () => {
+      const { spec, world } = await realSpec();
+      const rt = new PtyTerminalRuntime(world, DEFAULT_TERMINAL_ENV, spec);
+      runtimes.push(rt);
+      const signal = new AbortController().signal;
+      const first = await rt.run('echo alive', limits(), signal);
+      expect(first).toMatchObject({ status: 'completed', exitCode: 0 });
+      const exited = await rt.run('exit 0', limits(), signal);
+      expect(exited.status).toBe('session_exit');
+      // Delete a grant that is not the cwd: the launcher's grant open hits
+      // ENOENT before any restriction, so it dies 125 with its `es-landlock:`
+      // line and bash never runs. (Deleting the world would trip the cwd
+      // pre-flight and prove nothing.)
+      await rm(spec.scratchDir, { recursive: true, force: true });
+      let outcome = await rt.run('echo never', limits(), signal);
+      if (outcome.status !== 'spawn-failed') {
+        // The bounded retry covers the `exitedOrUnknown` unknown-code window on
+        // a loaded machine: the conjunction fails on a null code by design, so
+        // one more deterministic pre-start death is asked for.
+        outcome = await rt.run('echo never', limits(), signal);
+      }
+      expect(outcome.status).toBe('spawn-failed');
+      expect(text(outcome)).toContain('es-landlock:');
+      expect(outcome.reset).toBe(true);
+    },
+    30000,
+  );
+
+  it.skipIf(!launcherPresent)(
+    'owns HOME, TMPDIR and HISTFILE, and leaves no history in the world',
+    async () => {
+      const { spec, world } = await realSpec();
+      const rt = new PtyTerminalRuntime(world, DEFAULT_TERMINAL_ENV, spec);
+      runtimes.push(rt);
+      const signal = new AbortController().signal;
+      const outcome = await rt.run(
+        'printf "%s|%s|%s\\n" "$HOME" "$TMPDIR" "$HISTFILE"', limits(), signal);
+      expect(outcome.status).toBe('completed');
+      expect(text(outcome)).toContain(
+        `${spec.env.HOME}|${spec.env.TMPDIR}|/dev/null`);
+      // An interactive bash commits `.bash_history` into $HOME at exit unless
+      // HISTFILE is /dev/null — and $HOME is the (writable) world.
+      const exited = await rt.run('exit 0', limits(), signal);
+      expect(exited.status).toBe('session_exit');
+      await expect(access(join(world, '.bash_history')))
+        .rejects.toMatchObject({ code: 'ENOENT' });
+    },
+    20000,
+  );
 });

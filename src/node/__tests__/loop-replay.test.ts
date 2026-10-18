@@ -65,7 +65,7 @@ beforeEach(() => {
  */
 function guardedTerminalFactory(): TerminalFactory {
   return (cwd, env) => {
-    const real = new PtyTerminalRuntime(cwd, env);
+    const real = new PtyTerminalRuntime(cwd, env, 'off');
     return {
       run: (cmd, limits, signal) => {
         terminalGuard.calls += 1;

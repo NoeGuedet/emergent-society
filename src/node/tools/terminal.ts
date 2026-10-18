@@ -4,6 +4,8 @@ import { statSync } from 'node:fs';
 import { constants as osConstants } from 'node:os';
 import * as pty from '@lydell/node-pty';
 import { stdinWaitPids, sessionTtyTarget } from './proc.js';
+import { probeSandbox } from './sandbox.js';
+import type { SandboxSpec, SandboxStatus } from './sandbox.js';
 
 /**
  * The persistent PTY shell (C1.4b, kernel.md §7): one bash session per
@@ -12,10 +14,20 @@ import { stdinWaitPids, sessionTtyTarget } from './proc.js';
  * are deliberate and documented in docs/plans/2026-10-15-c1-4b (arbitrations):
  * a stdin-wedged session is reset before the next command rather than fed,
  * completion wins over a same-tick abort, and a capture overflow never kills
- * the command. This module owns processes, not confinement: a reset kills the
- * shell and lets the pty teardown SIGHUP the foreground group — a backgrounded
- * or SIGHUP-ignoring process can survive, and the journal never claims
- * otherwise. The session does not survive a kernel restart (kernel.md §7).
+ * the command.
+ *
+ * Confinement (C1.4c): constructed with a `SandboxSpec`, the session is the
+ * vendored Landlock launcher's, not bash's — the launcher restricts itself and
+ * `execve`s bash in place, so the pid, session and controlling tty the `/proc`
+ * stdin proof keys off are preserved. A failed probe or a pre-start launcher
+ * death (exit 125 carrying its `es-landlock:` stderr line) settles
+ * `spawn-failed` with that diagnostic as the output — never a silent
+ * unconfined shell; `sandboxStatus()` reports the probed ABI. `'off'` is the
+ * explicit unconfined choice. This module still owns processes, not the whole
+ * containment story: a reset kills the shell and lets the pty teardown SIGHUP
+ * the foreground group — a backgrounded or SIGHUP-ignoring process can
+ * survive, and the journal never claims otherwise. The session does not
+ * survive a kernel restart (kernel.md §7).
  */
 
 export type CommandLimits = {
@@ -39,13 +51,16 @@ export type CommandOutcome = {
  * The empty outcome of a run that never touches the session: a disposed or
  * spawn-failed runtime, or a pre-write cancellation. `reset` is true only when
  * the wedge reset already ran before the abort, and `fresh` still carries it.
+ * `output` carries a diagnostic (the bounded launcher stderr); it never
+ * reaches this shape on a normal path.
  */
 export function failedOutcome(
   status: CommandStatus, fresh: 'stdin-wedge' | null, reset = false,
+  output: Uint8Array = new Uint8Array(),
 ): CommandOutcome {
   return {
     status, exitCode: null, signal: null,
-    output: new Uint8Array(), truncated: false, reset, fresh,
+    output, truncated: false, reset, fresh,
   };
 }
 
@@ -57,6 +72,8 @@ export type TerminalPort = {
 export interface TerminalRuntime extends TerminalPort {
   /** Kills the session and refuses later runs; safe to call twice. */
   dispose(killGraceMs: number): Promise<void>;
+  /** Optional so factory-supplied runtimes (test seams) stay two-method. */
+  sandboxStatus?(): SandboxStatus | null;
 }
 
 export type TerminalFactory =
@@ -99,6 +116,12 @@ const STDIN_PROBES = 2;
  * settle a stdin_read in well under a second.
  */
 const STDIN_PROBE_INTERVAL_MS = 200;
+/**
+ * The bounded diagnostic retained from before the start marker: the launcher's
+ * failure line lands there (it never runs the command), and a pre-start death
+ * is classified from it. A fixed 4096 bytes is the plan's bound.
+ */
+const PRE_START_DIAGNOSTIC_BYTES = 4096;
 
 /**
  * A reverse map built once from the platform's signal table: pty onExit reports
@@ -163,6 +186,19 @@ type Session = {
 };
 
 /**
+ * One run's live stream capture: the nonce markers this command was written
+ * with, the capture that frames it, and the subscription that feeds it. The
+ * slot is replaced on a silent respawn; a settle and the run's `finally` read
+ * the current slot, never a stale copy.
+ */
+type CaptureSlot = {
+  readonly start: string;
+  readonly end: string;
+  readonly capture: CommandCapture;
+  readonly subscription: { dispose(): void };
+};
+
+/**
  * One command's stream-level capture: start/end marker framing, the held-back
  * suffix that may be the beginning of a marker split across chunks, and the
  * bounded payload. Timeout/abort/reset policy stays in `runExclusive`.
@@ -177,6 +213,8 @@ class CommandCapture {
   private readonly chunks: Buffer[] = [];
   private captured = 0;
   private truncatedFlag = false;
+  /** The last `PRE_START_DIAGNOSTIC_BYTES` of pre-start-marker output, never in `output()`. */
+  private preStartText = '';
   /** Set when the end marker names the command's exit status. */
   exitCode: number | null = null;
 
@@ -196,10 +234,27 @@ class CommandCapture {
   /** When the start marker was seen; the stdin grace is anchored here, not at the write. */
   get startedAt(): number | null { return this.startedAtMs; }
 
+  /** The retained pre-start bytes: a launcher's failure diagnostic, never a payload. */
+  get preStart(): string { return this.preStartText; }
+
   get truncated(): boolean { return this.truncatedFlag; }
 
   /** The captured payload; a held-back marker prefix is never included. */
   output(): Uint8Array { return Buffer.concat(this.chunks); }
+
+  /**
+   * Retains pre-start bytes for the diagnostic, capped on bytes so a chatty
+   * child cannot grow the string without bound. Only bytes the caller has
+   * already ruled out as a marker prefix arrive here, so each byte is appended
+   * exactly once.
+   */
+  private retainPreStart(text: string): void {
+    if (text.length === 0) return;
+    this.preStartText += text;
+    if (Buffer.byteLength(this.preStartText) <= PRE_START_DIAGNOSTIC_BYTES) return;
+    const bytes = Buffer.from(this.preStartText, 'utf8');
+    this.preStartText = bytes.subarray(bytes.length - PRE_START_DIAGNOSTIC_BYTES).toString('utf8');
+  }
 
   private capture(text: string): void {
     if (text.length === 0 || this.truncatedFlag) return;
@@ -225,9 +280,12 @@ class CommandCapture {
     if (!this.startSeen) {
       const m = this.startRe.exec(text);
       if (m === null) {
-        this.carry = text.slice(text.length - suffixOverlap(text, `${this.start}\r\n`));
+        const hold = suffixOverlap(text, `${this.start}\r\n`);
+        this.retainPreStart(text.slice(0, text.length - hold));
+        this.carry = text.slice(text.length - hold);
         return;
       }
+      this.retainPreStart(text.slice(0, m.index));
       this.startSeen = true;
       this.startedAtMs = Date.now();
       text = text.slice(m.index + m[0].length);
@@ -251,6 +309,13 @@ class CommandCapture {
   }
 }
 
+/**
+ * The probe, memoized as a settled union: a failure is data, never a rejection.
+ */
+type ProbeResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly diagnostic: Uint8Array };
+
 export class PtyTerminalRuntime implements TerminalRuntime {
   private session: Session | null = null;
   /** A command left waiting on stdin; the next run resets before writing. */
@@ -260,11 +325,30 @@ export class PtyTerminalRuntime implements TerminalRuntime {
   private disposed = false;
   /** The FIFO that serializes writes on the one session. */
   private queue: Promise<unknown> = Promise.resolve();
+  /** The built policy, or null for the explicit unconfined choice. */
+  private readonly spec: SandboxSpec | null;
+  /**
+   * The probe, assigned synchronously on first use: a failure never re-probes
+   * within this runtime and never rejects an await. A stop discards the whole
+   * runtime (the loop builds a fresh session per driver), so the next driver's
+   * fresh runtime probes again — the deliberate asymmetry with the loop's
+   * persistent build-failure memo.
+   */
+  private probeMemo: Promise<ProbeResult> | null = null;
+  /** `{mode:'off'}` from construction, null until a probe succeeds, then the probed status. */
+  private status: SandboxStatus | null;
 
   constructor(
     private readonly cwd: string,
     private readonly env: Readonly<Record<string, string>>,
-  ) {}
+    sandbox: SandboxSpec | 'off',
+  ) {
+    this.spec = sandbox === 'off' ? null : sandbox;
+    this.status = this.spec === null ? { mode: 'off' } : null;
+  }
+
+  /** The shell sandbox status: 'off' when unconfined, the probed ABI after a success, else null. */
+  sandboxStatus(): SandboxStatus | null { return this.status; }
 
   run(cmd: string, limits: CommandLimits, signal: AbortSignal): Promise<CommandOutcome> {
     const task = this.queue.then(() => this.runExclusive(cmd, limits, signal));
@@ -287,6 +371,27 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     await task;
   }
 
+  /**
+   * Runs the memoized functional probe. The union is assigned synchronously
+   * before the first await, so two runs never probe twice, and a rejection
+   * never escapes: a probe failure is data.
+   */
+  private probeOnce(spec: SandboxSpec): Promise<ProbeResult> {
+    this.probeMemo ??= (async () => {
+      try {
+        const probed = await probeSandbox(spec);
+        this.status = { mode: 'landlock', abi: probed.abi, enforcement: probed.enforcement };
+        return { ok: true } as const;
+      } catch (err) {
+        // T3 attaches the launcher's bounded stderr to the message: it becomes
+        // the run's output, which `renderExecuteText` renders on any status.
+        const message = err instanceof Error ? err.message : String(err);
+        return { ok: false, diagnostic: Buffer.from(message) } as const;
+      }
+    })();
+    return this.probeMemo;
+  }
+
   private spawnFresh(): Session {
     // Pre-flight the cwd: node-pty never throws for a bad one (the child dies
     // in chdir with exit 1), which would masquerade as a session_exit.
@@ -295,11 +400,19 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     }
     const env: Record<string, string> = {};
     for (const [key, value] of Object.entries(this.env)) env[key] = value;
-    const proc = pty.spawn('/bin/bash', ['--noprofile', '--norc', '-i'], {
-      // node-pty forces the child's TERM to `name`, so the name IS the TERM;
-      // it also injects PWD=cwd. Neither comes from the parent's environment.
-      name: 'dumb', cols: 160, rows: 40, cwd: this.cwd, env,
-    });
+    const spec = this.spec;
+    const proc = spec === null
+      ? pty.spawn('/bin/bash', ['--noprofile', '--norc', '-i'], {
+          // node-pty forces the child's TERM to `name`, so the name IS the TERM;
+          // it also injects PWD=cwd. Neither comes from the parent's environment.
+          name: 'dumb', cols: 160, rows: 40, cwd: this.cwd, env,
+        })
+      : pty.spawn(spec.launcherPath, [...spec.spawnArgv], {
+          // The sandbox's own env (HOME/TMPDIR/HISTFILE) is applied last and
+          // wins over the allowlist; node-pty's forced PWD/TERM run after the
+          // merge and cannot clash with those keys.
+          name: 'dumb', cols: 160, rows: 40, cwd: this.cwd, env: { ...env, ...spec.env },
+        });
     const session: Session = {
       proc, pid: proc.pid, exited: null, ttyTarget: sessionTtyTarget(proc.pid),
     };
@@ -409,6 +522,16 @@ export class PtyTerminalRuntime implements TerminalRuntime {
       // though this call itself writes nothing.
       return failedOutcome('cancelled', fresh, wedgeReset);
     }
+    if (this.spec !== null) {
+      // The functional probe gates the first run (and is reused afterwards).
+      // Re-checking the abort after it settles — success or failure — keeps a
+      // clean stop during the probe from journaling a spurious spawn failure.
+      const probed = await this.probeOnce(this.spec);
+      if (signal.aborted) return failedOutcome('cancelled', fresh, wedgeReset);
+      if (!probed.ok) {
+        return failedOutcome('spawn-failed', fresh, wedgeReset, probed.diagnostic);
+      }
+    }
     let session = this.session;
     if (session !== null && (session.exited !== null || !alive(session.pid))) {
       // The shell died while IDLE (a stray SIGHUP, a background job's signal),
@@ -425,52 +548,86 @@ export class PtyTerminalRuntime implements TerminalRuntime {
         return failedOutcome('spawn-failed', fresh, wedgeReset);
       }
     }
-    await this.freezeTtyTarget(session, signal);
-    // A freshly forked shell can still die before this command is written;
-    // that is still an idle death (nothing was written), so respawn once and
-    // proceed silently.
-    if (!alive(session.pid)) {
-      this.session = null;
-      try {
-        session = this.spawnFresh();
-      } catch {
-        return failedOutcome('spawn-failed', fresh, wedgeReset);
-      }
-      await this.freezeTtyTarget(session, signal);
-    }
-    if (signal.aborted) return failedOutcome('cancelled', fresh, wedgeReset);
 
-    const nonce = randomUUID();
-    const start = `__ES_EXECUTE_START_${nonce}__`;
-    const end = `__ES_EXECUTE_END_${nonce}:`;
-    const capture = new CommandCapture(start, end, limits.maxCaptureBytes);
-    const subscription = session.proc.onData((raw) => { capture.feed(raw); });
-
-    const settle = async (
-      status: CommandStatus, exitCode: number | null, signalName: string | null,
-      reset: boolean,
-    ): Promise<CommandOutcome> => {
-      subscription.dispose();
-      // The held-back carry is never captured on a non-completed path: it was
-      // held back BECAUSE it is a prefix of the end marker (or the marker plus
-      // partial digits) — protocol bytes, or output indistinguishable from
-      // them. On the completed path the same bytes DO join the capture: the
-      // end match slices the stream before itself, so CommandCapture.output()
-      // is exactly the payload either way.
-      const outcome: CommandOutcome = {
-        status, exitCode, signal: signalName,
-        output: capture.output(), truncated: capture.truncated, reset, fresh,
+    /**
+     * A command's capture and its data subscription. `attach` disposes the
+     * previous slot and subscribes to the new session in the spawn's own
+     * synchronous stack: node-pty's `spawn` returns before the child's
+     * `login_tty`, and a launcher's pre-start stderr lands in that window — a
+     * subscription created one timer tick later already loses it.
+     */
+    const attach = (target: Session, previous: CaptureSlot | null): CaptureSlot => {
+      previous?.subscription.dispose();
+      const nonce = randomUUID();
+      const start = `__ES_EXECUTE_START_${nonce}__`;
+      const end = `__ES_EXECUTE_END_${nonce}:`;
+      const capture = new CommandCapture(start, end, limits.maxCaptureBytes);
+      return {
+        start, end, capture,
+        subscription: target.proc.onData((raw) => { capture.feed(raw); }),
       };
-      // A timeout, a cancellation and a session death all reset the session;
-      // stdin_read deliberately leaves it wedged.
-      if (reset) await this.reset(limits.killGraceMs);
-      return outcome;
     };
+    // The slot is mutable and every closure reads it: after a respawn a settle
+    // must dispose the live subscription, never the retired one.
+    let slot = attach(session, null);
 
     try {
+      await this.freezeTtyTarget(session, signal);
+      // A freshly forked shell can still die before this command is written;
+      // that is still an idle death (nothing was written), so respawn once and
+      // proceed silently.
+      if (!alive(session.pid)) {
+        this.session = null;
+        try {
+          session = this.spawnFresh();
+        } catch {
+          return failedOutcome('spawn-failed', fresh, wedgeReset);
+        }
+        slot = attach(session, slot);
+        await this.freezeTtyTarget(session, signal);
+      }
+      if (signal.aborted) return failedOutcome('cancelled', fresh, wedgeReset);
+
+      const settle = async (
+        status: CommandStatus, exitCode: number | null, signalName: string | null,
+        reset: boolean, diagnostic?: Uint8Array,
+      ): Promise<CommandOutcome> => {
+        slot.subscription.dispose();
+        // The held-back carry is never captured on a non-completed path: it was
+        // held back BECAUSE it is a prefix of the end marker (or the marker plus
+        // partial digits) — protocol bytes, or output indistinguishable from
+        // them. On the completed path the same bytes DO join the capture: the
+        // end match slices the stream before itself, so CommandCapture.output()
+        // is exactly the payload either way.
+        const outcome: CommandOutcome = {
+          status, exitCode, signal: signalName,
+          output: diagnostic ?? slot.capture.output(),
+          truncated: slot.capture.truncated, reset, fresh,
+        };
+        // A timeout, a cancellation and a session death all reset the session;
+        // stdin_read deliberately leaves it wedged.
+        if (reset) await this.reset(limits.killGraceMs);
+        return outcome;
+      };
+
+      /**
+       * The documented 125 conjunction (arbitration 8): a confined session
+       * that died before the start marker, with exit code exactly 125 and the
+       * launcher's `es-landlock:` line retained. An unknown (null) code fails
+       * deliberately — the diagnostic is what makes the classification, and a
+       * shell that never ran is a spawn failure either way.
+       */
+      const launcherDiagnostic = (exit: { readonly code: number | null }): Uint8Array | null => {
+        if (this.spec === null) return null;
+        if (slot.capture.startedAt !== null) return null;
+        if (exit.code !== 125) return null;
+        if (!slot.capture.preStart.includes('es-landlock:')) return null;
+        return Buffer.from(slot.capture.preStart, 'utf8');
+      };
+
       session.proc.write(
-        `printf '%s\\n' ${quoteForBash(start)}; eval -- ${quoteForBash(cmd)}; `
-        + `__es_status=$?; printf '%s%s\\n' ${quoteForBash(end)} "$__es_status"\n`,
+        `printf '%s\\n' ${quoteForBash(slot.start)}; eval -- ${quoteForBash(cmd)}; `
+        + `__es_status=$?; printf '%s%s\\n' ${quoteForBash(slot.end)} "$__es_status"\n`,
       );
       const writeAt = Date.now();
       const deadline = writeAt + limits.timeoutMs;
@@ -478,10 +635,12 @@ export class PtyTerminalRuntime implements TerminalRuntime {
       let lastProbeAt = 0;
       for (;;) {
         await pause(POLL_MS);
-        if (capture.exitCode !== null) {
-          return settle('completed', capture.exitCode, null, false);
+        if (slot.capture.exitCode !== null) {
+          return settle('completed', slot.capture.exitCode, null, false);
         }
         if (session.exited !== null) {
+          const diagnostic = launcherDiagnostic(session.exited);
+          if (diagnostic !== null) return settle('spawn-failed', null, null, true, diagnostic);
           return settle('session_exit', session.exited.code, session.exited.signal, true);
         }
         // The exit event can lag a killed pid (or the pty can swallow the
@@ -490,6 +649,8 @@ export class PtyTerminalRuntime implements TerminalRuntime {
         // command whose end marker already landed still wins.
         if (!alive(session.pid)) {
           const exit = await this.exitedOrUnknown(session);
+          const diagnostic = launcherDiagnostic(exit);
+          if (diagnostic !== null) return settle('spawn-failed', null, null, true, diagnostic);
           return settle('session_exit', exit.code, exit.signal, true);
         }
         if (signal.aborted) {
@@ -498,8 +659,8 @@ export class PtyTerminalRuntime implements TerminalRuntime {
         if (Date.now() >= deadline) {
           return settle('timeout', null, null, true);
         }
-        if (capture.startedAt !== null
-          && Date.now() >= capture.startedAt + STDIN_GRACE_MS
+        if (slot.capture.startedAt !== null
+          && Date.now() >= slot.capture.startedAt + STDIN_GRACE_MS
           && Date.now() >= lastProbeAt + STDIN_PROBE_INTERVAL_MS) {
           lastProbeAt = Date.now();
           probes = stdinWaitPids(session.pid, session.ttyTarget).length > 0 ? probes + 1 : 0;
@@ -512,7 +673,7 @@ export class PtyTerminalRuntime implements TerminalRuntime {
         }
       }
     } finally {
-      subscription.dispose();
+      slot.subscription.dispose();
     }
   }
 }

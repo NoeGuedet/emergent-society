@@ -163,7 +163,7 @@ describe('dispatchCalls: execute', () => {
   it('runs a valid execute call in the persistent session and leaves its effect', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
-    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV, 'off');
     try {
       const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: "printf 'hello' > note.txt" }))]);
       const result = await dispatchCalls(proj, ID, s.gate('turn', 0), config(), terminal);
@@ -187,7 +187,7 @@ describe('dispatchCalls: execute', () => {
   it('renders captured output and keeps the verbatim raw artifact', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
-    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV, 'off');
     try {
       const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'echo hello-$((6*7))' }))]);
       await dispatchCalls(proj, ID, s.gate('turn', 0), config(), terminal);
@@ -434,7 +434,7 @@ describe('dispatchCalls: wait', () => {
   it('completes both a wait and an execute in one group', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
-    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV, 'off');
     try {
       const proj = projection([
         call('w1', 'wait', '{}'),
@@ -462,7 +462,7 @@ describe('dispatchCalls: abort and durability faults', () => {
   it('re-checks the signal after the tool/call flush and cancels without spawning', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
-    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV, 'off');
     try {
       let flushes = 0;
       const gate = new Proxy(s.gate('turn', 0), {
@@ -525,7 +525,7 @@ describe('dispatchCalls: abort and durability faults', () => {
   it('leaves the effect absent when the tool/call flush faults', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
-    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV, 'off');
     try {
       const gate = flushFaultGate(s.gate('turn', 0), 1);
       const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'printf x > fault1.txt' }))]);
@@ -541,7 +541,7 @@ describe('dispatchCalls: abort and durability faults', () => {
   it('runs the effect but rejects when the result flush faults (no later request)', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
-    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV, 'off');
     try {
       const gate = flushFaultGate(s.gate('turn', 0), 2);
       const proj = projection([call('c1', 'execute', JSON.stringify({ cmd: 'printf x > fault2.txt' }))]);
@@ -557,7 +557,7 @@ describe('dispatchCalls: abort and durability faults', () => {
   it('completes every listed call in a group', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
-    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV);
+    const terminal = new PtyTerminalRuntime(repo.path, DEFAULT_TERMINAL_ENV, 'off');
     try {
       const proj = projection([
         call('c1', 'execute', JSON.stringify({ cmd: 'printf one > a.txt' })),
