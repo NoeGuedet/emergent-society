@@ -1089,6 +1089,27 @@ describe('the world git trust layers', () => {
       .rejects.toThrow(/includeif.* redirects to another config file/i);
   });
 
+  it('refuses a git dir inside the world (the containment guard)', async () => {
+    const { world } = fixture();
+    const inside = join(world.path, 'inside.git');
+    await mkdir(inside, { recursive: true });
+    // A world-contained git dir is writable by the confined shell, which
+    // reopens every execution channel the external dir closes.
+    await expect(WorldRepo.open(world.path, { gitDir: inside }))
+      .rejects.toThrow(/overlaps the world/);
+  });
+
+  it('refuses to re-initialize a legacy world and names the migration', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'node-legacy-init-'));
+    try {
+      await mkdir(join(root, 'world', '.git'), { recursive: true });
+      await expect(WorldRepo.init(join(root, 'world'), { gitDir: join(root, 'world.git') }))
+        .rejects.toThrow(/already contains a \.git entry.*must be migrated/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('refuses a mismatched pair, a relative worktree and a failing scan', async () => {
     const a = await freshWorld('node-pair-a-');
     const b = await freshWorld('node-pair-b-');

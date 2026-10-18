@@ -218,7 +218,8 @@ describe('turn control', () => {
     );
     const driver = await openRuntime(fx, runtime);
     const running = driver.run();
-    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    // The confined path: spec build + launcher probe + PTY + bash before `waiting`.
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'), { timeout: 15000 });
     driver.stop();
     await running;
 
@@ -821,7 +822,8 @@ describe('durable world acknowledgement', () => {
     const runtime = runtimeFor(fx, config, transport);
     const driver = await openRuntime(fx, runtime);
     const running = driver.run();
-    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    // The confined path: spec build + launcher probe + PTY + bash before `waiting`.
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'), { timeout: 15000 });
     driver.stop();
     await running;
 

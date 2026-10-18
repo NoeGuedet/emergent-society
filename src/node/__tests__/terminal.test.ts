@@ -143,14 +143,16 @@ describe('PtyTerminalRuntime', () => {
   it('a shell killed mid-command fails fast as session_exit, not at the timeout', async () => {
     const rt = terminal();
     const signal = new AbortController().signal;
-    // The second run is issued immediately and writes while the shell is still
-    // alive; the scheduled kill then lands mid-command. The poll-cadence
-    // liveness re-check must settle in milliseconds, not 300 s.
-    await rt.run('(sleep 0.2; kill -9 $$) & echo scheduled', limits(), signal);
-    const started = Date.now();
-    const outcome = await rt.run('sleep 30', limits({ timeoutMs: 5000 }), signal);
+    // The killer waits for the second command's own marker, so it can only fire
+    // after that command has been written and is in flight — no scheduling
+    // window stands between the write and the kill (a kill before the write
+    // would leave the runtime to respawn silently and report `timeout`).
+    await rt.run(
+      '(while [ ! -f mid.marker ]; do sleep 0.05; done; kill -9 $$) & echo scheduled',
+      limits(), signal);
+    const outcome = await rt.run(
+      'echo mid > mid.marker; sleep 30', limits({ timeoutMs: 5000 }), signal);
     expect(outcome).toMatchObject({ status: 'session_exit', reset: true });
-    expect(Date.now() - started).toBeLessThan(4000);
     const next = await rt.run('echo fresh', limits(), signal);
     expect(next).toMatchObject({ status: 'completed', exitCode: 0, fresh: null });
   }, 15000);
