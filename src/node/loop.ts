@@ -285,9 +285,15 @@ class Runtime implements AgentRuntime {
     } catch { return FALLBACK_KILL_GRACE_MS; }
   }
 
-  /** The shell's status: the live runtime's, the last probed one across a stop, else null. */
+  /**
+   * The shell's status: a live runtime reports its own — `null` until it has
+   * probed, and `null` again when its probe failed — so a stale success never
+   * describes a live shell. `lastStatus` serves only with no live runtime, the
+   * cached read that survives a stop.
+   */
   sandboxStatus(): SandboxStatus | null {
-    return this.liveRuntime?.sandboxStatus?.() ?? this.lastStatus;
+    if (this.liveRuntime !== null) return this.liveRuntime.sandboxStatus?.() ?? null;
+    return this.lastStatus;
   }
 
   /** The driver's stop tears the session down before the journal closes. */

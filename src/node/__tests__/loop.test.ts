@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
-import { access, mkdir } from 'node:fs/promises';
+import { access, chmod, copyFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { NodeDriver, type TurnHandler } from '../driver.js';
 import { HeadWatcher } from '../watcher.js';
 import { WorldRepo, type WorldRange } from '../world.js';
@@ -1082,5 +1083,50 @@ describe('shell confinement wiring (C1.4c)', () => {
       expect(status.abi).toBeGreaterThanOrEqual(3);
       expect(status.enforcement).toBe('full');
     }
+  }, 30000);
+
+  it('reports a live runtime\'s own null status, never a previous healthy one', async () => {
+    const fx = fixture();
+    const launcher = fileURLToPath(new URL('../../../native/es-landlock/es-landlock', import.meta.url));
+    const copy = join(fx.home, 'launcher-copy');
+    await copyFile(launcher, copy);
+    await chmod(copy, 0o755);
+    const transport = new ScriptedTransport([
+      calling([execute('e1', 'true')]),
+      noCalls('done'),
+      calling([execute('e2', 'true')]),
+      noCalls('done'),
+    ]);
+    const runtime = createAgentRuntime({
+      home: fx.home, uid: 'n1', world: fx.world,
+      initialConfig: configWith({ policy: { retryDelayMs: 1 } }),
+      terminal: { env: DEFAULT_TERMINAL_ENV, sandbox: { launcherPath: copy } },
+      adapter: new ProviderAdapter(transport, providerPolicy),
+    });
+
+    const first = await openRuntime(fx, runtime);
+    const firstRun = first.run();
+    await vi.waitFor(() => expect(first.state).toBe('waiting'), { timeout: 15000 });
+    expect(runtime.sandboxStatus()?.mode).toBe('landlock');
+    first.stop();
+    await firstRun;
+    // Across the stop the probed status survives — there is no live runtime.
+    expect(runtime.sandboxStatus()?.mode).toBe('landlock');
+
+    // A launcher that cannot probe: the second driver's runtime is live but
+    // reports null (unprobed/failed), and its executors settle spawn-failed.
+    // The previous driver's success must not describe this shell.
+    await writeFile(copy, '#!/bin/sh\nexit 125\n');
+    const second = await openRuntime(fx, runtime);
+    const secondRun = second.run();
+    await vi.waitFor(() => expect(second.state).toBe('waiting'), { timeout: 15000 });
+    expect(runtime.sandboxStatus()).toBeNull();
+    second.stop();
+    await secondRun;
+
+    const e2 = toolResult(await eventsOf(fx), 'e2');
+    expect(e2.isError).toBe(true);
+    expect(e2.failure).toEqual({ code: 'spawn', status: null });
+    expect(e2.content).toContain('spawn-failed');
   }, 30000);
 });
