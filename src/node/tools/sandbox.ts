@@ -235,7 +235,13 @@ export async function buildSandboxSpec(opts: {
       `refusing node uid ${JSON.stringify(opts.uid)} as a scratch path segment: ${describe(err)}`);
   }
 
-  const home = await realpathOrSelf(resolve(opts.home));
+  let home: string;
+  try {
+    home = await realpathOrSelf(resolve(opts.home));
+  } catch (err) {
+    throw new SandboxUnavailableError(
+      `the cell home ${opts.home} is not usable: ${describe(err)}`);
+  }
 
   let world: string;
   try {

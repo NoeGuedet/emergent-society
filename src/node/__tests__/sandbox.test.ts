@@ -66,6 +66,15 @@ async function refusal(promise: Promise<unknown>): Promise<SandboxUnavailableErr
   throw new Error('expected the sandbox builder to refuse');
 }
 
+/** `realpath`, or `null` when the entry is absent: the builder skips missing optionals. */
+async function realpathOrNull(path: string): Promise<string | null> {
+  try {
+    return await realpath(path);
+  } catch {
+    return null;
+  }
+}
+
 type Grant = { readonly flag: string; readonly path: string };
 
 /** Splits a flat `--flag path` list into grant pairs (the argv tail is excluded by the caller). */
@@ -92,6 +101,7 @@ describe('buildSandboxSpec', () => {
       const uid = 'node-a';
       const spec = await buildSandboxSpec({ world, home, uid, launcherPath: launcher });
       const homeReal = await realpath(home);
+      const worldReal = await realpath(world);
 
       expect(spec.launcherPath).toBe(await realpath(launcher));
       expect(spec.scratchDir).toBe(join(homeReal, 'tmp', uid));
@@ -113,17 +123,21 @@ describe('buildSandboxSpec', () => {
       for (const name of [
         'ld.so.cache', 'passwd', 'group', 'nsswitch.conf', 'hosts', 'resolv.conf', 'bash.bashrc',
       ]) {
-        const real = await realpath(join('/etc', name));
+        const real = await realpathOrNull(join('/etc', name));
+        if (real === null) continue;
         expect(flagsFor(grants, real), name).toEqual(['--ro']);
       }
       // /etc/localtime resolves into the already-granted /usr on this host.
-      const zone = await realpath('/etc/localtime');
-      if (zone === '/usr' || zone.startsWith('/usr/')) {
-        expect(grants.some((grant) => grant.path === zone)).toBe(false);
-      } else {
-        expect(flagsFor(grants, zone)).toEqual(['--ro']);
+      const zone = await realpathOrNull('/etc/localtime');
+      if (zone !== null) {
+        if (zone === '/usr' || zone.startsWith('/usr/')) {
+          expect(grants.some((grant) => grant.path === zone)).toBe(false);
+        } else {
+          expect(flagsFor(grants, zone)).toEqual(['--ro']);
+        }
       }
-      expect(flagsFor(grants, await realpath('/etc/ssl/certs'))).toEqual(['--ro']);
+      const certs = await realpathOrNull('/etc/ssl/certs');
+      if (certs !== null) expect(flagsFor(grants, certs)).toEqual(['--ro']);
       expect(flagsFor(grants, '/proc')).toEqual(['--ro']);
 
       expect(flagsFor(grants, '/dev/null')).toEqual(['--rw']);
@@ -133,7 +147,7 @@ describe('buildSandboxSpec', () => {
       expect(flagsFor(grants, '/dev/urandom')).toEqual(['--ro']);
 
       expect(spec.env).toEqual({
-        HOME: world, TMPDIR: spec.scratchDir, HISTFILE: '/dev/null',
+        HOME: worldReal, TMPDIR: spec.scratchDir, HISTFILE: '/dev/null',
       });
       expect(spec.probeArgv.slice(0, 7)).toEqual([
         '--probe',
@@ -175,6 +189,19 @@ describe('buildSandboxSpec', () => {
         world, home: nestedHome, uid: 'node-a', launcherPath: await launcherStub(),
       }));
       expect(err.message).toMatch(/inside the world/);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'refuses a home whose realpath fails (a symlink loop)',
+    async () => {
+      const loop = join(root, 'loop');
+      await symlink('loop', loop);
+      const err = await refusal(buildSandboxSpec({
+        world, home: loop, uid: 'node-a', launcherPath: await launcherStub(),
+      }));
+      expect(err.message).toMatch(/not usable/);
     },
     TEST_TIMEOUT_MS,
   );
