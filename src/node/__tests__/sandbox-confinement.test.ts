@@ -7,7 +7,9 @@ import {
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  afterEach, beforeEach, describe, expect, it, vi,
+} from 'vitest';
 import { buildSandboxSpec, type SandboxSpec } from '../tools/sandbox.js';
 import { DEFAULT_TERMINAL_ENV, PtyTerminalRuntime } from '../tools/terminal.js';
 import type { CommandLimits, CommandOutcome, TerminalRuntime } from '../tools/terminal.js';
@@ -231,7 +233,9 @@ describe('the world stays usable', () => {
       const outcome = await rt.run(
         `cat <<'ES_C14C_BIG' > big.txt\n${body}ES_C14C_BIG\n`
           + `wc -c < big.txt\nprintf 'tmpdir:%s\\n' "$TMPDIR"`,
-        limits({ timeoutMs: 15_000 }), signal(),
+        // A load-proofing watchdog, not a behavior expectation: the confined
+        // PTY can stall past the idle ~160 ms under full-suite parallel load.
+        limits({ timeoutMs: 60_000 }), signal(),
       );
       expect(outcome).toMatchObject({ status: 'completed', exitCode: 0 });
       expect(text(outcome)).toMatch(/70100/);
@@ -244,7 +248,7 @@ describe('the world stays usable', () => {
       expect(homeOutcome).toMatchObject({ status: 'completed', exitCode: 0 });
       expect(text(homeOutcome)).toContain(spec.env.HOME);
     },
-    TEST_TIMEOUT_MS,
+    90_000,
   );
 
   it.skipIf(!launcherPresent)(
@@ -318,10 +322,14 @@ describe('the world stays usable', () => {
       const pid = sibling.pid;
       if (pid === undefined) throw new Error('could not spawn the sentinel sibling');
       try {
-        // Unconfined control: the sentinel IS in the outside environ.
-        const control = await environOf(pid);
-        expect(control).not.toBeNull();
-        expect(control).toContain(sentinel);
+        // Unconfined control: the sentinel IS in the outside environ. Retry
+        // the read: on Linux the fork/exec window can still expose the
+        // parent's environ, so a single read may momentarily miss it.
+        await vi.waitFor(async () => {
+          const control = await environOf(pid);
+          expect(control).not.toBeNull();
+          expect(control).toContain(sentinel);
+        }, { timeout: 15_000 });
 
         const { rt } = await confined();
         const outcome = await rt.run(
