@@ -455,7 +455,7 @@ describe('the wake predicate', () => {
     // A force-reset to the root leaves HEAD !== watermark and an empty
     // `watermark..HEAD` range: the shape that must not read as "no movement".
     expect(triggers).toEqual(['wakeup']);
-    await gitIn(world.path, ['reset', '--hard', root]);
+    await gitIn(world, ['reset', '--hard', root]);
     await HeadWatcher.for(world).check();
     await vi.waitFor(() => expect(triggers).toHaveLength(2));
     expect(triggers[1]).toBe('wakeup');

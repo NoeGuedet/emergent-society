@@ -18,8 +18,8 @@ export class UnsafeWorldPathError extends NodeError {
 
 /** The configured world directory is not the root of a git repository. */
 export class WorldNotARepoError extends NodeError {
-  constructor(public readonly path: string) {
-    super(`${path} is not the root of a git repository`);
+  constructor(public readonly path: string, detail?: string) {
+    super(`${path} is not the root of a git repository${detail === undefined ? '' : `: ${detail}`}`);
   }
 }
 

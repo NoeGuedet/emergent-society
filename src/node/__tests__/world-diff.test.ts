@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { GitCommandError } from '../errors.js';
 import { WorldRepo } from '../world.js';
-import { commitAs, gitIn, useWorld } from './helpers.js';
+import { commitAs, gitRaw, useWorld } from './helpers.js';
 
 /**
  * The bounded, pinned history primitives (T4): `commitsIn` traversal and the
@@ -168,10 +168,14 @@ describe('WorldRepo.diff', () => {
   it('renders on a SHA-256 world: empty-tree first commit and a subsequent range', async () => {
     const root = await mkdtemp(join(tmpdir(), 'node-diff-sha256-'));
     const dir = join(root, 'world');
+    const gitDir = join(root, 'world.git');
     await mkdir(dir, { recursive: true });
-    await gitIn(dir, ['init', '--quiet', '--object-format=sha256', '--initial-branch=main']);
+    await gitRaw(dir, [
+      '--git-dir', gitDir, '--work-tree', dir,
+      'init', '--quiet', '--object-format=sha256', '--initial-branch=main',
+    ]);
     try {
-      const world = await WorldRepo.open(dir);
+      const world = await WorldRepo.open(dir, { gitDir });
       const c1 = await commitAs(world, 'n1', { 'a.txt': 'one\n' });
       expect(c1).toMatch(/^[0-9a-f]{64}$/);
       const first = await world.diff({ from: null, to: c1 }, 4096);
@@ -188,7 +192,7 @@ describe('WorldRepo.diff', () => {
   });
 
   it('runs on a host Git at or above the documented 2.42 floor for GIT_ATTR_SOURCE', async () => {
-    const out = (await gitIn(process.cwd(), ['--version'])).trim();
+    const out = (await gitRaw(process.cwd(), ['--version'])).trim();
     const match = /^git version (\d+)\.(\d+)/.exec(out);
     expect(match).not.toBeNull();
     const major = Number(match![1]);
@@ -198,9 +202,10 @@ describe('WorldRepo.diff', () => {
 
   it('renders the world range even when the environment points GIT_DIR elsewhere', async () => {
     const { world } = fixture();
-    const other = await WorldRepo.init(join(dirname(world.path), 'world-b'));
+    const other = await WorldRepo.init(
+      join(dirname(world.path), 'world-b'), { gitDir: join(dirname(world.path), 'world-b.git') });
     const c1 = await commitAs(world, 'n1', { 'a.txt': 'one\n' });
-    vi.stubEnv('GIT_DIR', join(other.path, '.git'));
+    vi.stubEnv('GIT_DIR', other.gitDir);
     try {
       // The renderer addresses the world explicitly and runs under the controlled
       // environment, so an inherited GIT_DIR is not an input to the bytes.

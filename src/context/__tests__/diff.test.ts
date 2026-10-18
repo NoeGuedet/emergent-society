@@ -1,9 +1,9 @@
-import { execFile, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { access, chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { commitAs, gitIn, useWorld, writeWorldFile } from '../../node/__tests__/helpers.js';
+import { commitAs, gitIn, gitRaw, useWorld, writeWorldFile } from '../../node/__tests__/helpers.js';
 import { WorldRepo, gitEnv } from '../../node/world.js';
 import { presentWorld } from '../diff.js';
 
@@ -19,22 +19,17 @@ const MISSING = 'a'.repeat(40);
 const AGGREGATE = 'rendering truncated; remaining selected commits not shown';
 
 /** Writes a byte payload and commits it, returning the commit hash. */
-async function commitBytes(worldPath: string, author: string, rel: string, bytes: Buffer): Promise<string> {
-  const path = join(worldPath, rel);
+async function commitBytes(world: WorldRepo, author: string, rel: string, bytes: Buffer): Promise<string> {
+  const path = join(world.path, rel);
   await mkdir(join(path, '..'), { recursive: true });
   await writeFile(path, bytes);
-  await gitIn(worldPath, ['add', '-A']);
+  await gitIn(world, ['add', '-A']);
   const email = `${author.replace(/[^A-Za-z0-9._-]/g, '-')}@world.local`;
-  await new Promise<void>((resolve, reject) => {
-    execFile('git', ['commit', '--quiet', '-m', 'bytes'], {
-      cwd: worldPath,
-      env: gitEnv({
-        GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: email,
-        GIT_COMMITTER_NAME: author, GIT_COMMITTER_EMAIL: email,
-      }),
-    }, (err, _out, stderr) => { if (err) reject(new Error(stderr)); else resolve(); });
-  });
-  return (await gitIn(worldPath, ['rev-parse', 'HEAD'])).trim();
+  await gitIn(world, ['commit', '--quiet', '-m', 'bytes'], gitEnv({
+    GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: email,
+    GIT_COMMITTER_NAME: author, GIT_COMMITTER_EMAIL: email,
+  }));
+  return (await gitIn(world, ['rev-parse', 'HEAD'])).trim();
 }
 
 describe('presentWorld concrete rendering', () => {
@@ -112,43 +107,41 @@ describe('presentWorld concrete rendering', () => {
     // Committed attributes point every text file at a driver whose config is
     // repo-local; the hermetic view has no such config and passes --no-textconv.
     await commitAs(world, 'n2', { '.gitattributes': '*.txt diff=evil\n', 'a.txt': 'content\n' });
-    await gitIn(world.path, ['config', 'diff.evil.textconv', script]);
-    await gitIn(world.path, ['config', 'diff.external', script]);
-    const head = (await gitIn(world.path, ['rev-parse', 'HEAD'])).trim();
+    // This writes into the now-trusted git dir *after* `open` and never
+    // re-opens: the trust scan is an open-time gate, not a per-command one, and
+    // the hermetic renderer is what neutralizes the driver here.
+    await gitIn(world, ['config', 'diff.evil.textconv', script]);
+    await gitIn(world, ['config', 'diff.external', script]);
+    const head = (await gitIn(world, ['rev-parse', 'HEAD'])).trim();
     const p = await presentWorld(world, 'n1', { from: null, to: head }, 8192, 4096);
     expect(p.text).toContain('+content');
     // The marker file must not exist: no external diff/textconv process ran.
     await expect(access(marker)).rejects.toMatchObject({ code: 'ENOENT' });
-    expect(await gitIn(world.path, ['--version'])).toMatch(/^git version \d+\./);
+    expect(await gitIn(world, ['--version'])).toMatch(/^git version \d+\./);
   });
 });
 
 describe('world reads ignore a refs/replace projection', () => {
   /** Creates a commit object with `author` and `message` over an existing tree. */
-  async function commitTreeAs(worldPath: string, tree: string, message: string, author: string): Promise<string> {
+  async function commitTreeAs(world: WorldRepo, tree: string, message: string, author: string): Promise<string> {
     const email = `${author}@world.local`;
-    return new Promise<string>((resolve, reject) => {
-      execFile('git', ['commit-tree', tree, '-m', message], {
-        cwd: worldPath,
-        env: gitEnv({
-          GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: email,
-          GIT_COMMITTER_NAME: author, GIT_COMMITTER_EMAIL: email,
-        }),
-      }, (err, stdout, stderr) => { if (err) reject(new Error(stderr)); else resolve(stdout.trim()); });
-    });
+    return (await gitIn(world, ['commit-tree', tree, '-m', message], gitEnv({
+      GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: email,
+      GIT_COMMITTER_NAME: author, GIT_COMMITTER_EMAIL: email,
+    }))).trim();
   }
 
   it('reads the physical commit author and subject, not the replacement', async () => {
     const { world } = fixture();
     const c1 = await commitAs(world, 'n1', { 'a.txt': 'one\n' });
-    const tree = (await gitIn(world.path, ['rev-parse', `${c1}^{tree}`])).trim();
-    const replacement = await commitTreeAs(world.path, tree, 'forged subject', 'attacker');
-    await gitIn(world.path, ['replace', c1, replacement]);
+    const tree = (await gitIn(world, ['rev-parse', `${c1}^{tree}`])).trim();
+    const replacement = await commitTreeAs(world, tree, 'forged subject', 'attacker');
+    await gitIn(world, ['replace', c1, replacement]);
 
     // Deliberately the host env, not gitEnv: only an uncontrolled read projects
     // the forgery, so this proves the kernel's env is what neutralizes it below.
-    expect(await gitIn(world.path, ['log', '--format=%an', '-1', c1], process.env)).toBe('attacker\n');
-    expect(await gitIn(world.path, ['log', '--format=%s', '-1', c1], process.env)).toBe('forged subject\n');
+    expect(await gitIn(world, ['log', '--format=%an', '-1', c1], process.env)).toBe('attacker\n');
+    expect(await gitIn(world, ['log', '--format=%s', '-1', c1], process.env)).toBe('forged subject\n');
 
     // The kernel's git environment neutralizes the projection: the log and the
     // rev-list traversal report the physical author.
@@ -168,10 +161,14 @@ describe('presentWorld on a SHA-256 world', () => {
   it('renders a foreign first commit patch and a subsequent commit', async () => {
     const root = await mkdtemp(join(tmpdir(), 'context-diff-sha256-'));
     const dir = join(root, 'world');
+    const gitDir = join(root, 'world.git');
     await mkdir(dir, { recursive: true });
-    await gitIn(dir, ['init', '--quiet', '--object-format=sha256', '--initial-branch=main']);
+    await gitRaw(dir, [
+      '--git-dir', gitDir, '--work-tree', dir,
+      'init', '--quiet', '--object-format=sha256', '--initial-branch=main',
+    ]);
     try {
-      const world = await WorldRepo.open(dir);
+      const world = await WorldRepo.open(dir, { gitDir });
       const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
       const p1 = await presentWorld(world, 'n1', { from: null, to: c1 }, 4096, 4096);
       expect(p1.included).toEqual([c1]);
@@ -194,7 +191,7 @@ describe('presentWorld renderer metadata', () => {
     const p = await presentWorld(world, 'n1', { from: null, to: c1 }, 4096, 4096);
     expect(p.renderer).toEqual({
       policy: 'commit-patches-v1',
-      gitVersion: (await gitIn(world.path, ['--version'])).replace(/\r?\n$/, ''),
+      gitVersion: (await gitIn(world, ['--version'])).replace(/\r?\n$/, ''),
       attrSource: 'to',
     });
     expect(p.renderer.gitVersion).toMatch(/^git version \d+/);
@@ -217,7 +214,7 @@ describe('presentWorld negative and bounded fixtures', () => {
   it.skipIf(process.getuid?.() === 0)('rejects rather than falling back when the repository is unreadable', async () => {
     const { world } = fixture();
     const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
-    const objects = join(world.path, '.git', 'objects');
+    const objects = join(world.gitDir, 'objects');
     await chmod(objects, 0o000);
     try {
       await expect(presentWorld(world, 'n1', { from: c1, to: c1 }, 4096, 4096)).rejects.toThrow();
@@ -230,7 +227,7 @@ describe('presentWorld negative and bounded fixtures', () => {
     const { world } = fixture();
     const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
     const c2 = await commitAs(world, 'n2', { 'b.txt': 'two\n' });
-    await rm(join(world.path, '.git', 'objects'), { recursive: true, force: true });
+    await rm(join(world.gitDir, 'objects'), { recursive: true, force: true });
     // The object database the view would share is gone: the renderer rejects
     // instead of silently rendering from the working tree.
     await expect(world.diff({ from: c1, to: c2 }, 4096)).rejects.toThrow();
@@ -251,7 +248,7 @@ describe('presentWorld negative and bounded fixtures', () => {
   it('replaces invalid bytes deterministically and keeps emitted bytes == bytesRetained <= maxBytes', async () => {
     const { world } = fixture();
     const invalid = Buffer.concat([Buffer.from('ok '), Buffer.from([0xff, 0xfe, 0x80]), Buffer.from(' end\n')]);
-    const c1 = await commitBytes(world.path, 'n2', 'bad.bin', invalid);
+    const c1 = await commitBytes(world, 'n2', 'bad.bin', invalid);
     const capture = await world.diff({ from: null, to: c1 }, 4096);
     expect(capture.text).toContain('\uFFFD');
     expect(capture.bytesRetained).toBe(Buffer.byteLength(capture.text, 'utf8'));
@@ -299,9 +296,11 @@ describe('presentWorld hermetic rendering policy', () => {
     const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
     // Repo metadata that outranks tree attributes and a driver that would break
     // rendering: both live outside the isolated bare view.
-    await writeFile(join(world.path, '.git', 'info', 'attributes'), '*.txt -diff\n');
-    await gitIn(world.path, ['config', 'diff.evil.xfuncname', '^evil-func']);
-    await gitIn(world.path, ['config', 'diff.evil.command', 'false']);
+    await writeFile(join(world.gitDir, 'info', 'attributes'), '*.txt -diff\n');
+    // Written into the trusted git dir after `open`, deliberately: the scan is
+    // an open-time gate and the hermetic view is what neutralizes these.
+    await gitIn(world, ['config', 'diff.evil.xfuncname', '^evil-func']);
+    await gitIn(world, ['config', 'diff.evil.command', 'false']);
     const p = await presentWorld(world, 'n1', { from: null, to: c1 }, 8192, 4096);
     expect(p.text).toContain('+one');
     expect(p.text).not.toContain('Binary files');
@@ -313,7 +312,7 @@ describe('presentWorld hermetic rendering policy', () => {
     const orderFile = join(world.path, 'order.txt');
     // Request z before a; the default git order is alphabetical, so a must stay first.
     await writeFile(orderFile, 'z.txt\na.txt\n');
-    await gitIn(world.path, ['config', 'diff.orderFile', orderFile]);
+    await gitIn(world, ['config', 'diff.orderFile', orderFile]);
     const p = await presentWorld(world, 'n1', { from: null, to: c1 }, 8192, 4096);
     const ai = p.text.indexOf('a/a.txt');
     const zi = p.text.indexOf('b/z.txt');
@@ -324,7 +323,7 @@ describe('presentWorld hermetic rendering policy', () => {
   it('fails closed when the world object database the view points at is absent', async () => {
     const { world } = fixture();
     const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
-    await rm(join(world.path, '.git', 'objects'), { recursive: true, force: true });
+    await rm(join(world.gitDir, 'objects'), { recursive: true, force: true });
     await expect(world.diff({ from: null, to: c1 }, 4096)).rejects.toThrow();
   });
 });
@@ -332,8 +331,8 @@ describe('presentWorld hermetic rendering policy', () => {
 describe('presentWorld list truncation', () => {
   it('reports list truncation for a 4097-commit history at maxCommits 4096', { timeout: 120_000 }, async () => {
     const { world } = fixture();
-    await fastImportCommits(world.path, 4097);
-    const head = (await gitIn(world.path, ['rev-parse', 'HEAD'])).trim();
+    await fastImportCommits(world, 4097);
+    const head = (await gitIn(world, ['rev-parse', 'HEAD'])).trim();
 
     const range = await world.commitsIn({ from: null, to: head }, 4096);
     expect(range.listTruncated).toBe(true);
@@ -349,7 +348,7 @@ describe('presentWorld list truncation', () => {
 });
 
 /** Builds `count` commits through one `git fast-import` stream, cheaply. */
-async function fastImportCommits(worldPath: string, count: number): Promise<void> {
+async function fastImportCommits(world: WorldRepo, count: number): Promise<void> {
   const chunks: string[] = [];
   for (let i = 1; i <= count; i += 1) {
     const content = `line ${i}`;
@@ -365,7 +364,9 @@ async function fastImportCommits(worldPath: string, count: number): Promise<void
   }
   chunks.push('done\n');
   await new Promise<void>((resolve, reject) => {
-    const child = spawn('git', ['fast-import', '--quiet'], { cwd: worldPath, env: gitEnv() });
+    const child = spawn('git', [...world.gitBaseArgs(), 'fast-import', '--quiet'], {
+      cwd: world.path, env: gitEnv(),
+    });
     child.on('error', reject);
     child.stderr.setEncoding('utf8');
     let stderr = '';

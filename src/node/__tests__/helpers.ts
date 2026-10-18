@@ -32,7 +32,7 @@ export function useWorld(prefix: string, opts: { pollMs?: number } = {}): () => 
   let fixture: WorldFixture | null = null;
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), prefix));
-    const world = await WorldRepo.init(join(root, 'world'));
+    const world = await WorldRepo.init(join(root, 'world'), { gitDir: join(root, 'world.git') });
     // The cadence is fixed before any driver can subscribe: the watcher is one
     // per repo and its first caller sets it.
     HeadWatcher.for(world, opts.pollMs ?? 0);
@@ -51,13 +51,15 @@ export function useWorld(prefix: string, opts: { pollMs?: number } = {}): () => 
 }
 
 /**
- * Runs a git command in a directory, as a test's own hand rather than a
+ * Runs a git command in a raw directory, as a test's own hand rather than a
  * driver's. The environment is the kernel's controlled one: a fixture must not
  * inherit a host `GIT_DIR`/global config any more than production may. A test
  * that deliberately needs a host-ambient read (the replace-ref sanity check)
- * passes its own environment.
+ * passes its own environment. No pair is prepended: this is for repo creation,
+ * `--version`, and other calls that address a directory rather than an opened
+ * world.
  */
-export async function gitIn(
+export async function gitRaw(
   dir: string, args: readonly string[], env: NodeJS.ProcessEnv = gitEnv(),
 ): Promise<string> {
   return new Promise<string>((resolvePromise, reject) => {
@@ -66,6 +68,17 @@ export async function gitIn(
       else resolvePromise(stdout);
     });
   });
+}
+
+/**
+ * Runs a git command against an opened world: the same controlled environment
+ * and the world's own pair plus defense-in-depth overrides, exactly as the
+ * kernel addresses the repository.
+ */
+export async function gitIn(
+  world: WorldRepo, args: readonly string[], env: NodeJS.ProcessEnv = gitEnv(),
+): Promise<string> {
+  return gitRaw(world.path, [...world.gitBaseArgs(), ...args], env);
 }
 
 /**
@@ -89,11 +102,8 @@ export async function commitAs(
   });
   // `add --all` then `commit`, not `commit --all`: `-a` stages tracked
   // modifications only, so a newly written file would not be committed.
-  await gitIn(world.path, ['add', '--all']);
-  await new Promise<void>((resolvePromise, reject) => {
-    execFile('git', ['commit', '--quiet', '--message', message], { cwd: world.path, env },
-      (err, _stdout, stderr) => { if (err !== null) reject(new Error(stderr)); else resolvePromise(); });
-  });
+  await gitIn(world, ['add', '--all']);
+  await gitIn(world, ['commit', '--quiet', '--message', message], env);
   const head = await world.headHash();
   if (head === null) throw new Error('commitAs left an unborn HEAD');
   return head;
@@ -108,20 +118,20 @@ export async function writeWorldFile(world: WorldRepo, rel: string, content: str
 
 /** The world's history, oldest first, as `hash author` pairs. */
 export async function worldLog(world: WorldRepo): Promise<string[]> {
-  const out = await gitIn(world.path, ['log', '--format=%H %an']);
+  const out = await gitIn(world, ['log', '--format=%H %an']);
   return out.split('\n').filter((line) => line !== '').reverse();
 }
 
 /** The paths HEAD's commit touched. */
 export async function committedPaths(world: WorldRepo): Promise<string[]> {
-  const out = await gitIn(world.path, ['show', '--pretty=format:', '--name-only', 'HEAD']);
+  const out = await gitIn(world, ['show', '--pretty=format:', '--name-only', 'HEAD']);
   return out.split('\n').filter((line) => line !== '');
 }
 
 /** The commit's blob content, or null when the commit does not carry the path. */
 export async function committedContent(world: WorldRepo, rel: string): Promise<string | null> {
   try {
-    return await gitIn(world.path, ['show', `HEAD:${rel}`]);
+    return await gitIn(world, ['show', `HEAD:${rel}`]);
   } catch {
     return null;
   }

@@ -138,7 +138,7 @@ describe('the HEAD watcher', () => {
     watcher.subscribe(listener);
     await world.commitAll('n1', 'turn 0');
     const { rm } = await import('node:fs/promises');
-    await rm(`${world.path}/.git`, { recursive: true, force: true });
+    await rm(world.gitDir, { recursive: true, force: true });
     // A transient git failure must not reject into a timer callback; the next
     // read retries, so a wake is delayed rather than lost. Spy on the read to
     // prove the failure was actually seen: without it this test would also pass

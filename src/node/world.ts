@@ -1,8 +1,8 @@
 import { execFile, spawn } from 'node:child_process';
 import type { Stats } from 'node:fs';
-import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { assertNodeUid } from '../journal/index.js';
 import { utf8Prefix } from '../text.js';
 import {
@@ -24,6 +24,12 @@ import {
  * The git CLI is driven through `child_process` rather than a library: the
  * commit is a mechanism the kernel must be able to audit byte for byte, and
  * `git` is the only implementation of git whose behavior is a fact.
+ *
+ * The git directory lives *outside* the world (`<home>/world.git` in
+ * production): confinement makes the world agent-writable, and a writable git
+ * configuration, hook set or ref store would let the shell execute code as the
+ * kernel through the kernel's own git calls. `open` therefore verifies the
+ * external pair and the git dir's trust inputs on every start.
  */
 
 /** Git's field separator inside a `--format` line: a control character no uid or hash carries. */
@@ -98,10 +104,14 @@ const GIT_ENV_STRIP: readonly string[] = [
  * is inherited. A caller with an explicit policy (the hermetic diff renderer)
  * passes overrides, which win. Replace refs are neutralized as well, so the
  * kernel reads physical committed facts rather than a `refs/replace` projection
- * — intentionally, since a projection is not a durable fact of the world. This
- * is the single place that decides a kernel git environment: the process
- * environment is read, never mutated. Exported so test fixtures acting as a
- * second writer use the same controlled environment the kernel does.
+ * — intentionally, since a projection is not a durable fact of the world.
+ * Lazy fetching is disabled outright: a promisor configuration plus one missing
+ * object is enough to make ordinary plumbing run a configured transport helper,
+ * i.e. arbitrary code as the kernel; with this variable git fails closed
+ * ("bad tree object") instead of fetching. This is the single place that
+ * decides a kernel git environment: the process environment is read, never
+ * mutated. Exported so test fixtures acting as a second writer use the same
+ * controlled environment the kernel does.
  */
 export function gitEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
@@ -119,6 +129,9 @@ export function gitEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEn
     // is a projection, and every read command (log, rev-list, first-parent,
     // reconciliation, diff) must see the real author and subject.
     GIT_NO_REPLACE_OBJECTS: '1',
+    // Defense in depth under the open-time refusal of promisor/partial-clone
+    // configuration: a missing object must fail closed, never fetch.
+    GIT_NO_LAZY_FETCH: '1',
     ...overrides,
   };
 }
@@ -129,13 +142,214 @@ export function gitEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEn
  * other failure (EACCES, EIO) is an environment fact and propagates: silently
  * comparing raw strings would weaken a safeguard rather than report it.
  */
-async function realpathOrSelf(path: string): Promise<string> {
+export async function realpathOrSelf(path: string): Promise<string> {
   try {
     return await realpath(path);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return path;
     throw err;
   }
+}
+
+/** The sanitizing migration recipe for a legacy world whose git dir is in the world. */
+function migrationNote(root: string, gitDir: string): string {
+  const legacy = join(root, '.git');
+  return [
+    'a legacy world whose .git lives inside the world must be migrated:',
+    'stop the host;',
+    `record the pre-migration HEAD (git --git-dir=${legacy} rev-parse HEAD);`,
+    `mv ${legacy} ${gitDir};`,
+    `sanitize the moved git dir: rm -f ${gitDir}/config.worktree ${gitDir}/info/grafts `
+      + `${gitDir}/shallow ${gitDir}/objects/info/alternates ${gitDir}/commondir; `
+      + `rm -rf ${gitDir}/hooks;`,
+    `materialize every symlink under ${gitDir} (replace each link with a copy of its target, `
+      + `repeating until 'find ${gitDir} -type l' is empty — or cp -aL) and replace every `
+      + `multi-linked file with a fresh copy ('find ${gitDir} -type f -links +1');`,
+    `rewrite ${gitDir}/config to the allowlisted keys only: repositoryformatversion (keep 1 for a `
+      + 'sha-256 repo), filemode, bare=false, logallrefupdates, untrackedCache, '
+      + 'extensions.objectFormat when sha-256;',
+    `re-seed the hooks with 'git --git-dir=${gitDir} --work-tree=${root} init' (keeps bare=false `
+      + 'and the 14 .sample files);',
+    `record the pairing with 'git --git-dir=${gitDir} config core.worktree ${root}';`,
+    `postcondition: 'git --git-dir=${gitDir} rev-parse HEAD' equals the recorded HEAD`,
+  ].join(' ');
+}
+
+/** Component-wise containment: `child` is `parent` or lives under it. */
+function within(parent: string, child: string): boolean {
+  return child === parent || child.startsWith(parent + sep);
+}
+
+/**
+ * Refuses a git dir that overlaps the world. The external location is the
+ * guarantee: a world-contained git dir is writable (and, under confinement,
+ * writable *by the confined shell*), which reopens every execution channel this
+ * contract exists to close.
+ */
+function assertExternalGitDir(root: string, gitDir: string): void {
+  if (!within(root, gitDir) && !within(gitDir, root)) return;
+  throw new WorldNotARepoError(
+    root,
+    `the git directory ${gitDir} overlaps the world; it must live outside the world. `
+      + migrationNote(root, gitDir));
+}
+
+/** `lstat` the path, or null when it is absent entirely (a dangling symlink is present). */
+async function lstatOrNull(path: string): Promise<Stats | null> {
+  try {
+    return await lstat(path);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    throw err;
+  }
+}
+
+/** One `git config --list --show-origin -z` record, which is `origin\0key\nvalue\0`. */
+interface ConfigEntry {
+  readonly origin: string;
+  readonly key: string;
+  readonly value: string;
+}
+
+/**
+ * Parses the `-z` scan. The `-z` form is used because the plain form lets a
+ * multi-line value forge an origin line; here an origin or a key can never be
+ * forged. A valueless key emits `origin\0key\0` and is parsed as an empty value.
+ */
+function parseConfigScan(out: string): ConfigEntry[] {
+  const tokens = out.split('\0');
+  const entries: ConfigEntry[] = [];
+  for (let i = 0; i + 1 < tokens.length; i += 2) {
+    const origin = tokens[i] ?? '';
+    const record = tokens[i + 1] ?? '';
+    if (origin === '' && record === '') continue;
+    const newline = record.indexOf('\n');
+    entries.push({
+      origin,
+      key: newline === -1 ? record : record.slice(0, newline),
+      value: newline === -1 ? '' : record.slice(newline + 1),
+    });
+  }
+  return entries;
+}
+
+/**
+ * The keys a git dir's own `config` may never carry (layer 1). Matching is
+ * prefix/suffix on git's normalized (lowercased) output, never camelCase
+ * equality: a subsection keeps its case. Deliberately absent, with reasons:
+ * `alias.*` cannot override a builtin (verified), `core.pager`/`pager.*` never
+ * run on a pipe (verified), and `credential.helper`, `http.*`, `url.*`,
+ * `protocol.*`, `submodule.*` and `uploadpack.*` are transports the kernel's
+ * plumbing never reaches once lazy fetching is refused and disabled.
+ */
+const CONFIG_REFUSE_KEYS: ReadonlySet<string> = new Set([
+  'core.fsmonitor', 'core.hookspath', 'core.sshcommand', 'core.attributesfile',
+  'core.excludesfile', 'diff.external', 'log.showsignature', 'gpg.program',
+  'gpg.ssh.program', 'extensions.worktreeconfig', 'extensions.partialclone',
+  'extensions.refstorage',
+]);
+
+/** The layer-1 refusal for one config scan, or null when every entry is trusted. */
+function configRefusal(entries: readonly ConfigEntry[], gitDir: string): string | null {
+  const own = `file:${gitDir}/config`;
+  for (const entry of entries) {
+    if (entry.origin !== own) {
+      return `config entry ${entry.key} comes from ${entry.origin}, not ${own} `
+        + '(includes, config.worktree and commondir redirects are not trusted)';
+    }
+    if (entry.value.includes('\n')) {
+      return `config entry ${entry.key} carries a multi-line value`;
+    }
+    const key = entry.key.toLowerCase();
+    if (key.startsWith('filter.')) return `config entry ${entry.key} configures a filter`;
+    if (CONFIG_REFUSE_KEYS.has(key)) return `config entry ${entry.key} is execution-capable`;
+    if (key.startsWith('diff.') && (key.endsWith('.command') || key.endsWith('.textconv'))) {
+      return `config entry ${entry.key} names an external diff driver`;
+    }
+    if (key.startsWith('merge.') && key.endsWith('.driver')) {
+      return `config entry ${entry.key} names a merge driver`;
+    }
+    if (key.startsWith('remote.') && key.endsWith('.promisor')) {
+      return `config entry ${entry.key} enables lazy fetching`;
+    }
+  }
+  return null;
+}
+
+/**
+ * How many metadata entries the layer-2 walk will visit. The budget excludes
+ * loose-object payload files: `objects/<2 hex>/` legitimately accumulates a few
+ * files per turn forever, and is payload rather than metadata.
+ */
+const MAX_METADATA_ENTRIES = 10_000;
+
+/** Whether `rel` is a loose-object payload file (`objects/<2 hex>/<name>`). */
+function isLooseObjectPayload(rel: string): boolean {
+  const parts = rel.split('/');
+  return parts.length === 3 && parts[0] === 'objects' && /^[0-9a-f]{2}$/.test(parts[1] ?? '');
+}
+
+/**
+ * The layer-2 walk: any symlink anywhere under the git dir, and any
+ * non-directory entry with more than one hard link, is a refusal. A symlinked
+ * `refs/heads`, `objects`, `logs`, `info` or `reftable` redirects refs and
+ * object reads into the world while every entry-level check still passes; a
+ * hardlinked `HEAD` or branch ref stays agent-writable through its world alias.
+ */
+async function treeRefusal(gitDir: string): Promise<string | null> {
+  let counted = 0;
+  const visit = async (abs: string, rel: string): Promise<string | null> => {
+    const entries = await readdir(abs, { withFileTypes: true });
+    for (const entry of entries) {
+      const childRel = rel === '' ? entry.name : `${rel}/${entry.name}`;
+      const childAbs = join(abs, entry.name);
+      const info = await lstat(childAbs);
+      if (info.isSymbolicLink()) return `${childRel} is a symlink`;
+      if (!info.isDirectory() && info.nlink > 1) {
+        return `${childRel} has ${info.nlink} hard links`;
+      }
+      if (!isLooseObjectPayload(childRel)) {
+        counted += 1;
+        if (counted > MAX_METADATA_ENTRIES) {
+          return `the metadata tree exceeds ${MAX_METADATA_ENTRIES} entries`;
+        }
+      }
+      if (info.isDirectory()) {
+        const nested = await visit(childAbs, childRel);
+        if (nested !== null) return nested;
+      }
+    }
+    return null;
+  };
+  return visit(gitDir, '');
+}
+
+/** The layer-2 metadata battery, or null when the git dir's shape is trusted. */
+async function metadataRefusal(gitDir: string): Promise<string | null> {
+  const config = await lstatOrNull(join(gitDir, 'config'));
+  if (config === null || !config.isFile()) return 'config is not a regular file';
+  for (const rel of [
+    'config.worktree', 'objects/info/alternates', 'info/grafts', 'shallow',
+  ]) {
+    if (await lstatOrNull(join(gitDir, rel)) !== null) return `${rel} is present`;
+  }
+  const hooks = await lstatOrNull(join(gitDir, 'hooks'));
+  if (hooks !== null) {
+    if (!hooks.isDirectory()) return 'hooks is not a real directory';
+    for (const entry of await readdir(join(gitDir, 'hooks'), { withFileTypes: true })) {
+      if (!entry.name.endsWith('.sample')) return `hooks/${entry.name} is not a sample hook`;
+      const info = await lstat(join(gitDir, 'hooks', entry.name));
+      if (!info.isFile()) return `hooks/${entry.name} is not a regular file`;
+    }
+  }
+  const head = await lstatOrNull(join(gitDir, 'HEAD'));
+  if (head === null || !head.isFile()) return 'HEAD is not a regular file';
+  const refs = await lstatOrNull(join(gitDir, 'refs'));
+  if (refs !== null && !refs.isDirectory()) return 'refs is not a real directory';
+  const packed = await lstatOrNull(join(gitDir, 'packed-refs'));
+  if (packed !== null && !packed.isFile()) return 'packed-refs is not a regular file';
+  return treeRefusal(gitDir);
 }
 
 /**
@@ -238,13 +452,13 @@ export type CommitRange = {
 };
 
 /**
- * Runs one git command in the world and returns its stdout.
+ * Runs one git command with `dir` as its working directory and returns stdout.
  *
  * @throws GitCommandError on any non-zero exit or spawn failure, carrying the
  * exit code and stderr so a caller can tell a policy failure (an unborn branch,
  * a staged-nothing index) from an environment one.
  */
-async function git(dir: string, args: readonly string[], env?: Record<string, string>): Promise<string> {
+async function runGit(dir: string, args: readonly string[], env?: Record<string, string>): Promise<string> {
   return new Promise<string>((resolvePromise, reject) => {
     execFile(
       'git', [...args],
@@ -267,7 +481,7 @@ async function git(dir: string, args: readonly string[], env?: Record<string, st
 }
 
 /** Runs one git command feeding `input` on stdin and returns stdout (T4 empty-tree hash). */
-async function gitWithStdin(dir: string, args: readonly string[], input: Buffer): Promise<string> {
+async function runGitWithStdin(dir: string, args: readonly string[], input: Buffer): Promise<string> {
   return new Promise<string>((resolvePromise, reject) => {
     const child = spawn('git', [...args], { cwd: dir, env: gitEnv(), windowsHide: true });
     let stdout = '';
@@ -376,59 +590,120 @@ export class WorldRepo {
   /** The repo's object format, read once: hash validity depends on it (T4 step 1). */
   private objectFormat: ObjectFormat | null = null;
 
-  private constructor(readonly path: string) {}
+  private constructor(readonly path: string, readonly gitDir: string) {}
 
   /**
-   * Opens the world repository rooted at `dir`.
+   * Opens the world repository rooted at `dir`, with its kernel-owned git dir.
    *
-   * @throws UnsafeWorldPathError when `dir` resolves to `$HOME` or a broad root.
-   * @throws WorldNotARepoError when `dir` does not exist, or is not the root of
-   * a git repository — including the case where it is a *subdirectory* of one,
-   * which would make every turn-end commit the surrounding repository's tree,
-   * and the cases where its git dir is not a real, owned directory: a linked
-   * worktree (a gitfile), a separated git dir (a gitfile), and a `.git` that is
-   * a *symlink* to another repository (which shares and writes that repository's
-   * objects and refs — a realpath comparison cannot see it, `lstat` can).
+   * The pair is verified on every open (arbitration 11): the git dir must live
+   * outside the world, its configuration must come wholly from its own
+   * `config`, its metadata tree must be free of symlinks and multi-linked
+   * files, and git itself must confirm that `core.worktree` names this root and
+   * that the pair resolves to the given git dir. An in-world `.git` entry is
+   * ignored: the kernel addresses its git dir explicitly, and refusing the
+   * stray entry would hand the shell a permanent boot-denial via `mkdir .git`.
+   *
+   * @throws UnsafeWorldPathError when `dir` resolves to `$HOME` or a broad root,
+   * or when the git dir does.
+   * @throws WorldNotARepoError when the world is not a directory, the git dir
+   * is absent or overlaps the world, or any trust layer refuses — always with
+   * the offending key/file and the sanitizing migration in the message.
    */
-  static async open(dir: string): Promise<WorldRepo> {
+  static async open(dir: string, opts: { readonly gitDir: string }): Promise<WorldRepo> {
     const root = await canonicalWorldPath(dir);
-    // The dedicated-repo contract is about the entry itself, not only what it
-    // resolves to: `.git` must be a real directory of this world. `lstat` sees
-    // the entry, so a symlink, a gitfile or a plain file is refused before any
-    // git call runs against it.
-    let gitEntry: Stats | null = null;
-    try {
-      gitEntry = await lstat(join(root, '.git'));
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      // ENOENT/ENOTDIR: there is no `.git` entry here. Anything else (EACCES,
-      // EIO) is an environment failure and propagates rather than being reported
-      // as "not a repository".
-      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw err;
+    const rootEntry = await lstat(root);
+    if (!rootEntry.isDirectory()) {
+      throw new WorldNotARepoError(root, 'the world root is not a directory');
     }
-    if (gitEntry === null || !gitEntry.isDirectory()) throw new WorldNotARepoError(root);
-    let toplevel: string;
-    try {
-      toplevel = (await git(root, ['rev-parse', '--show-toplevel'])).trim();
-    } catch {
-      throw new WorldNotARepoError(root);
-    }
-    if (resolve(toplevel) !== root) throw new WorldNotARepoError(root);
+    const given = resolve(opts.gitDir);
     let gitDir: string;
     try {
-      gitDir = (await git(root, ['rev-parse', '--absolute-git-dir'])).trim();
+      gitDir = await realpath(given);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw err;
+      throw new WorldNotARepoError(
+        root, `the git directory ${given} does not exist. ${migrationNote(root, given)}`);
+    }
+    if (!(await lstat(gitDir)).isDirectory()) {
+      throw new WorldNotARepoError(root, `the git directory ${gitDir} is not a directory`);
+    }
+    assertExternalGitDir(root, gitDir);
+    await assertDedicated(gitDir);
+
+    // Layer 1 — the config scan. No `-c` flags on this call: a command-line
+    // config would surface with a `command line` origin and trip the origin rule
+    // below. A nonzero exit (a cyclic include, an unreadable config) is a
+    // refusal, never an empty config.
+    let scan: string;
+    try {
+      scan = await runGit(root, ['--git-dir', gitDir, 'config', '--list', '--show-origin', '-z']);
     } catch {
-      throw new WorldNotARepoError(root);
+      throw new WorldNotARepoError(
+        root, `git could not read the configuration of ${gitDir}. ${migrationNote(root, gitDir)}`);
     }
-    if (await realpathOrSelf(gitDir) !== await realpathOrSelf(join(root, '.git'))) {
-      throw new WorldNotARepoError(root);
+    const entries = parseConfigScan(scan);
+    const configFault = configRefusal(entries, gitDir);
+    if (configFault !== null) {
+      throw new WorldNotARepoError(root, `${configFault}. ${migrationNote(root, gitDir)}`);
     }
-    return new WorldRepo(root);
+
+    // Layer 2 — the metadata battery.
+    const metadataFault = await metadataRefusal(gitDir);
+    if (metadataFault !== null) {
+      throw new WorldNotARepoError(root, `${metadataFault}. ${migrationNote(root, gitDir)}`);
+    }
+
+    // Layer 3 — the pair check. `core.worktree` must be absolute: a relative
+    // value resolves against the git dir, so it would false-accept or
+    // false-reject depending on where the pair happens to be. A duplicated key
+    // takes its last value, which is the one git itself would use.
+    const worktree = entries
+      .filter((entry) => entry.key.toLowerCase() === 'core.worktree')
+      .at(-1)?.value;
+    if (worktree === undefined || worktree === '') {
+      throw new WorldNotARepoError(
+        root, `core.worktree is not set in ${gitDir}/config. ${migrationNote(root, gitDir)}`);
+    }
+    if (!isAbsolute(worktree)) {
+      throw new WorldNotARepoError(
+        root, `core.worktree ${worktree} is relative; it must be absolute. `
+          + migrationNote(root, gitDir));
+    }
+    let recordedWorktree: string;
+    try {
+      recordedWorktree = await realpath(worktree);
+    } catch {
+      throw new WorldNotARepoError(
+        root, `core.worktree ${worktree} does not resolve to a directory. `
+          + migrationNote(root, gitDir));
+    }
+    if (recordedWorktree !== root) {
+      throw new WorldNotARepoError(
+        root, `core.worktree resolves to ${recordedWorktree}, not the world root. `
+          + migrationNote(root, gitDir));
+    }
+    let absoluteGitDir: string;
+    try {
+      absoluteGitDir = (await runGit(
+        root, ['--git-dir', gitDir, '--work-tree', root, 'rev-parse', '--absolute-git-dir'],
+      )).trim();
+    } catch {
+      throw new WorldNotARepoError(
+        root, `git could not confirm the git directory for ${gitDir}. `
+          + migrationNote(root, gitDir));
+    }
+    if (await realpathOrSelf(absoluteGitDir) !== gitDir) {
+      throw new WorldNotARepoError(
+        root, `git resolves the pair to ${absoluteGitDir}, not ${gitDir}. `
+          + migrationNote(root, gitDir));
+    }
+    return new WorldRepo(root, gitDir);
   }
 
   /**
-   * Creates the world repository. The kernel owns this, not a node: the world
-   * exists before the first node boots.
+   * Creates the world repository with an external git dir. The kernel owns
+   * this, not a node: the world exists before the first node boots.
    *
    * The initial branch is pinned rather than left to `init.defaultBranch`: the
    * kernel runs git under a controlled environment (see `gitEnv`), so a host
@@ -436,16 +711,64 @@ export class WorldRepo {
    * kernel's identity. The untracked cache is enabled because it is the one
    * index extension that is a pure win here; the FSMonitor is not (unavailable
    * on Linux, §7).
+   *
+   * @throws UnsafeWorldPathError when the world or the git dir is `$HOME` or a
+   * broad root.
+   * @throws WorldNotARepoError when the git dir overlaps the world or the world
+   * already carries a `.git` entry.
    */
-  static async init(dir: string): Promise<WorldRepo> {
+  static async init(dir: string, opts: { readonly gitDir: string }): Promise<WorldRepo> {
     // The directory is created first, then resolved and checked: `mkdir` on a
     // symlink to `$HOME` is a no-op, so nothing is written before the refusal.
     const given = resolve(dir);
     await mkdir(given, { recursive: true });
     const path = await canonicalWorldPath(given);
-    await git(path, ['init', '--quiet', '--initial-branch=main']);
-    await git(path, ['config', 'core.untrackedCache', 'true']);
-    return WorldRepo.open(path);
+    // The git dir's parent is created first; the leaf is created only after the
+    // containment check, so a refused init leaves no git dir behind. The
+    // lexical check runs before the parent exists; the canonical one after.
+    const requested = resolve(opts.gitDir);
+    assertExternalGitDir(path, requested);
+    await mkdir(dirname(requested), { recursive: true });
+    const gitDir = join(await realpath(dirname(requested)), basename(requested));
+    assertExternalGitDir(path, gitDir);
+    await assertDedicated(gitDir);
+    await mkdir(gitDir);
+    if (await lstatOrNull(join(path, '.git')) !== null) {
+      throw new WorldNotARepoError(
+        path,
+        `the world already contains a .git entry and cannot be re-initialized in place. `
+          + migrationNote(path, gitDir));
+    }
+    await runGit(path, ['--git-dir', gitDir, '--work-tree', path, 'init', '--quiet', '--initial-branch=main']);
+    await runGit(path, ['--git-dir', gitDir, '--work-tree', path, 'config', 'core.untrackedCache', 'true']);
+    return WorldRepo.open(path, { gitDir });
+  }
+
+  /**
+   * The pair and defense-in-depth `-c`s prepended to every kernel git call on
+   * the opened repo (layer 4): the explicit pair keeps git off the worktree's
+   * `.git`, the signature override stops `log`/`show` from running a configured
+   * `gpg.program` over a signed commit, and the hooks override covers the
+   * `reference-transaction` hook `update-ref` runs.
+   */
+  gitBaseArgs(): readonly string[] {
+    return [
+      '--git-dir', this.gitDir, '--work-tree', this.path,
+      '-c', 'log.showSignature=false', '-c', 'core.hooksPath=/dev/null',
+    ];
+  }
+
+  /**
+   * Runs one git command against the opened repo with the pair and the
+   * defense-in-depth overrides prepended.
+   */
+  private async git(args: readonly string[], env?: Record<string, string>): Promise<string> {
+    return runGit(this.path, [...this.gitBaseArgs(), ...args], env);
+  }
+
+  /** Runs one git command feeding `input` on stdin, with the same prefix. */
+  private async gitWithStdin(args: readonly string[], input: Buffer): Promise<string> {
+    return runGitWithStdin(this.path, [...this.gitBaseArgs(), ...args], input);
   }
 
   /**
@@ -456,7 +779,7 @@ export class WorldRepo {
    */
   async headHash(): Promise<string | null> {
     try {
-      return (await git(this.path, ['rev-parse', '--verify', '--quiet', 'HEAD'])).trim();
+      return (await this.git(['rev-parse', '--verify', '--quiet', 'HEAD'])).trim();
     } catch (err) {
       // `--quiet` makes the unborn-branch failure an exit 1 with no message:
       // the one git failure here that is a fact about the world, not a fault.
@@ -483,7 +806,7 @@ export class WorldRepo {
     // No HEAD, or HEAD unmoved: the range is empty without asking git for it.
     if (head === null || head === from) return [];
     try {
-      const out = await git(this.path, ['log', LOG_FORMAT, from === null ? 'HEAD' : `${from}..HEAD`]);
+      const out = await this.git(['log', LOG_FORMAT, from === null ? 'HEAD' : `${from}..HEAD`]);
       const commits = out.split('\n').filter((line) => line !== '').map(parseCommit).reverse();
       if (commits.length === 0 && from !== null && (await this.isAncestor(head, from))) {
         return this.commitsSince(null);
@@ -553,7 +876,7 @@ export class WorldRepo {
   private foreignAuthorIn(
     spec: readonly string[], author: string,
   ): Promise<'foreign' | 'empty' | 'self-only'> {
-    const args = ['log', '--format=format:%an%x00', ...spec];
+    const args = [...this.gitBaseArgs(), 'log', '--format=format:%an%x00', ...spec];
     return new Promise<'foreign' | 'empty' | 'self-only'>((resolvePromise, reject) => {
       const child = spawn('git', args, { cwd: this.path, env: gitEnv(), windowsHide: true });
       child.stdout.setEncoding('utf8');
@@ -620,15 +943,10 @@ export class WorldRepo {
     });
   }
 
-  /** The visible git directory of the world (a normal non-worktree repository). */
-  private gitDir(): string {
-    return join(this.path, '.git');
-  }
-
   /** The repository's object format, read from git once and cached. */
   private async format(): Promise<ObjectFormat> {
     if (this.objectFormat === null) {
-      const out = (await git(this.path, ['rev-parse', '--show-object-format'])).trim();
+      const out = (await this.git(['rev-parse', '--show-object-format'])).trim();
       this.objectFormat = out === 'sha256' ? 'sha256' : 'sha1';
     }
     return this.objectFormat;
@@ -640,12 +958,12 @@ export class WorldRepo {
    * than promising byte equality across arbitrary versions (T4 step 2).
    */
   async gitVersion(): Promise<string> {
-    return (await git(this.path, ['--version'])).replace(/\r?\n$/, '');
+    return (await this.git(['--version'])).replace(/\r?\n$/, '');
   }
 
   /** The first parent of `commit`, or null for a root. Merge patches use it (T4 step 3). */
   async firstParent(commit: string): Promise<string | null> {
-    const out = (await git(this.path, ['show', '-s', '--format=%P', commit])).trim();
+    const out = (await this.git(['show', '-s', '--format=%P', commit])).trim();
     const first = out.split(' ')[0] ?? '';
     return first === '' ? null : first;
   }
@@ -659,7 +977,7 @@ export class WorldRepo {
 
   /** Verifies `commit` names a commit; a missing object propagates the git failure (T4 step 1). */
   private async verifyCommit(commit: string): Promise<void> {
-    await git(this.path, ['rev-parse', '--verify', '--quiet', `${commit}^{commit}`]);
+    await this.git(['rev-parse', '--verify', '--quiet', `${commit}^{commit}`]);
   }
 
   /** Whether `commit` exists as a commit: the only "missing" signal is git's exit 1. */
@@ -678,7 +996,7 @@ export class WorldRepo {
   /** Whether `from` is an ancestor of `to`; exits 0/1 carry the answer, else fail. */
   private async isAncestor(from: string, to: string): Promise<boolean> {
     try {
-      await git(this.path, ['merge-base', '--is-ancestor', from, to]);
+      await this.git(['merge-base', '--is-ancestor', from, to]);
       return true;
     } catch (err) {
       if (err instanceof GitCommandError && err.exitCode === 1) return false;
@@ -688,19 +1006,19 @@ export class WorldRepo {
 
   /** The empty-tree object hash, generated from empty stdin; never a hardcoded SHA-1. */
   private async emptyTree(): Promise<string> {
-    return (await gitWithStdin(this.path, ['hash-object', '-t', 'tree', '--stdin'], Buffer.alloc(0))).trim();
+    return (await this.gitWithStdin(['hash-object', '-t', 'tree', '--stdin'], Buffer.alloc(0))).trim();
   }
 
   /** The tree object of a commit; a missing object propagates the git failure. */
   private async treeOf(commit: string): Promise<string> {
-    return (await git(this.path, ['rev-parse', '--verify', '--quiet', `${commit}^{tree}`])).trim();
+    return (await this.git(['rev-parse', '--verify', '--quiet', `${commit}^{tree}`])).trim();
   }
 
   /** Author names for a batch of hashes, keyed by full hash. */
   private async authorsOf(hashes: readonly string[]): Promise<Map<string, string>> {
     const map = new Map<string, string>();
     if (hashes.length === 0) return map;
-    const out = await git(this.path, ['log', '--no-walk=unsorted', LOG_FORMAT, ...hashes]);
+    const out = await this.git(['log', '--no-walk=unsorted', LOG_FORMAT, ...hashes]);
     for (const line of out.split('\n')) {
       if (line === '') continue;
       const commit = parseCommit(line);
@@ -741,7 +1059,7 @@ export class WorldRepo {
     }
 
     const spec = base === null ? range.to : `${base}..${range.to}`;
-    const out = await git(this.path, ['rev-list', '--topo-order', `--max-count=${maxCommits + 1}`, spec]);
+    const out = await this.git(['rev-list', '--topo-order', `--max-count=${maxCommits + 1}`, spec]);
     const newest = out.split('\n').filter((line) => line !== '');
     const listTruncated = newest.length > maxCommits;
     // rev-list is newest-first; the extra oldest commit is dropped and the rest
@@ -823,7 +1141,7 @@ export class WorldRepo {
     const scratch = await mkdtemp(join(tmpdir(), 'c13-render-'));
     await mkdir(join(scratch, 'objects', 'info'), { recursive: true });
     await mkdir(join(scratch, 'refs'), { recursive: true });
-    await writeFile(join(scratch, 'objects', 'info', 'alternates'), `${join(this.gitDir(), 'objects')}\n`);
+    await writeFile(join(scratch, 'objects', 'info', 'alternates'), `${join(this.gitDir, 'objects')}\n`);
     // The scratch git dir is explicit (`--git-dir=`), so git derives the object
     // format from *its* config, not the world's. An empty config means "sha1"
     // and rejects a sha256 world's 64-hex ids, so the scratch view declares the
@@ -841,12 +1159,19 @@ export class WorldRepo {
    * bytes become deterministic U+FFFD; hitting the cap kills the child and is
    * the only accepted truncation, while any other nonzero exit or signal is an
    * error. stderr is bounded and never the payload.
+   *
+   * The scratch view is this call's sole git dir (`--git-dir=`), so the pair is
+   * deliberately absent here: git's last-wins rule would let a `--git-dir` after
+   * the scratch one mask it. Only the two defense-in-depth overrides are
+   * prepended.
    */
   private streamDiff(
     args: readonly string[], env: Record<string, string>, maxBytes: number,
   ): Promise<BoundedText> {
     return new Promise<BoundedText>((resolvePromise, rejectPromise) => {
-      const child = spawn('git', [...args], {
+      const child = spawn('git', [
+        '-c', 'log.showSignature=false', '-c', 'core.hooksPath=/dev/null', ...args,
+      ], {
         cwd: this.path, env: gitEnv(env), windowsHide: true,
       });
       const decoder = new TextDecoder('utf-8');
@@ -973,7 +1298,7 @@ export class WorldRepo {
       }
     }
     const spec = base === null ? head : `${base}..${head}`;
-    const out = await git(this.path, [
+    const out = await this.git([
       'log', `--max-count=${MAX_RECONCILE_SCAN + 1}`, RECONCILE_FORMAT, spec,
     ]);
     const lines = out.split('\n').filter((line) => line !== '');
@@ -1030,9 +1355,27 @@ export class WorldRepo {
   private async commitOnce(author: string, message: string): Promise<WorldCommitInfo | null> {
     const headRef = await this.headRef();
     const before = await this.headHash();
-    await git(this.path, ['add', '--all']);
+    // A world subdirectory the agent ran `git init` in is a *nested* repository,
+    // and staging it would break the turn twice: an unborn one makes the whole
+    // `add --all` fail ("does not have a commit checked out"), and a committed
+    // one stages a `160000 commit <hash>` gitlink whose object lives only in the
+    // agent's repo — a durable tree that references an unresolvable object and
+    // whose subtree content is never committed. The pathspec exclusion is the
+    // load-bearing half; the index sweep below is the belt.
+    const nested = await this.nestedRepoDirs();
+    await this.git([
+      'add', '--all', '--', '.',
+      ...nested.map((rel) => `:(exclude,literal)${rel}`),
+    ]);
+    // The belt: remove any gitlink that survived staging. `ls-files --stage -z`
+    // is NUL-separated because a whitespace split would mangle a `my sub` path
+    // and silently keep the gitlink; `--` before the path is required because a
+    // `-`-prefixed path otherwise makes `update-index` no-op or error.
+    for (const rel of await this.stagedGitlinks()) {
+      await this.git(['update-index', '--force-remove', '--', rel]);
+    }
     if (await this.nothingStaged()) return null;
-    const tree = (await git(this.path, ['write-tree'])).trim();
+    const tree = (await this.git(['write-tree'])).trim();
     // The net-change guard: a tree identical to the parent's would be an empty
     // commit — a wake for every other node with no fact behind it (§5.4). The
     // empty tree stands in for an unborn branch's parent.
@@ -1043,8 +1386,7 @@ export class WorldRepo {
     // one. `-c commit.gpgsign=false -c core.hooksPath=/dev/null` keep the commit
     // independent of host configuration and of any hook — `commit-tree` runs no
     // hooks, and the explicit empty path also protects a future regression.
-    const commit = (await git(
-      this.path,
+    const commit = (await this.git(
       [
         '-c', 'commit.gpgsign=false',
         '-c', 'core.hooksPath=/dev/null',
@@ -1056,6 +1398,53 @@ export class WorldRepo {
     )).trim();
     await this.publish(headRef, before, commit);
     return { hash: commit, author };
+  }
+
+  /**
+   * The world's directories that carry a `.git` entry (directory, file or
+   * symlink), relative to the world root — the nested repositories an agent
+   * created. The world root itself is skipped: a stray root-level `.git` is
+   * never read by the explicit pair and is never staged by git.
+   */
+  private async nestedRepoDirs(): Promise<string[]> {
+    const found: string[] = [];
+    const visit = async (rel: string): Promise<void> => {
+      const dir = rel === '' ? this.path : join(this.path, rel);
+      let entries;
+      try {
+        entries = await readdir(dir, { withFileTypes: true });
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        // A directory a peer removed between the readdir and the descent.
+        if (code === 'ENOENT' || code === 'ENOTDIR') return;
+        throw err;
+      }
+      if (rel !== '' && entries.some((entry) => entry.name === '.git')) {
+        found.push(rel);
+        return;
+      }
+      for (const entry of entries) {
+        // Git's own metadata is not world content, and a symlink is not
+        // descended by `add` either.
+        if (entry.name === '.git' || !entry.isDirectory()) continue;
+        await visit(rel === '' ? entry.name : `${rel}/${entry.name}`);
+      }
+    };
+    await visit('');
+    return found;
+  }
+
+  /** The staged paths whose index entry is a `160000` gitlink. */
+  private async stagedGitlinks(): Promise<string[]> {
+    const links: string[] = [];
+    for (const record of (await this.git(['ls-files', '--stage', '-z'])).split('\0')) {
+      if (record === '') continue;
+      const tab = record.indexOf('\t');
+      const space = record.indexOf(' ');
+      if (tab === -1 || space === -1) continue;
+      if (record.slice(0, space) === '160000') links.push(record.slice(tab + 1));
+    }
+    return links;
   }
 
   /**
@@ -1073,7 +1462,7 @@ export class WorldRepo {
   private async headRef(): Promise<string> {
     let ref: string;
     try {
-      ref = (await git(this.path, ['symbolic-ref', '--quiet', 'HEAD'])).trim();
+      ref = (await this.git(['symbolic-ref', '--quiet', 'HEAD'])).trim();
     } catch (err) {
       if (err instanceof GitCommandError && err.exitCode === 1) {
         throw new WorldHeadError('HEAD is detached, not a branch');
@@ -1102,13 +1491,13 @@ export class WorldRepo {
       throw new WorldHeadError(`HEAD switched from ${headRef} to ${current} during a commit`);
     }
     const expected = before ?? '0'.repeat(hashLength(await this.format()));
-    await git(this.path, ['update-ref', headRef, commit, expected]);
+    await this.git(['update-ref', headRef, commit, expected]);
   }
 
   /** Whether the index matches HEAD, so a commit would have nothing to record. */
   private async nothingStaged(): Promise<boolean> {
     try {
-      await git(this.path, ['diff', '--cached', '--quiet']);
+      await this.git(['diff', '--cached', '--quiet']);
       return true;
     } catch (err) {
       // Exit 1 is git's "there are differences", not a failure.

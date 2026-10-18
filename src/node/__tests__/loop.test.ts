@@ -678,7 +678,9 @@ describe('offline reconstruction', () => {
   it('fails reconstruction explicitly when the world cannot re-render the perception', async () => {
     const fx = await journalWithOneTurn();
     const events = await eventsOf(fx);
-    const elsewhere = await WorldRepo.init(join(dirname(fx.home), 'elsewhere-world'));
+    const elsewhere = await WorldRepo.init(
+      join(dirname(fx.home), 'elsewhere-world'),
+      { gitDir: join(dirname(fx.home), 'elsewhere-world.git') });
     await expect(rederivePlans(events, elsewhere)).rejects.toThrow();
   });
 });

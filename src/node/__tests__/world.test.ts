@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod, link, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile,
+} from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { InvalidNodeUidError } from '../../journal/index.js';
@@ -10,17 +12,17 @@ import {
 } from '../errors.js';
 import { WorldRepo, gitEnv, type WorldCommitInfo } from '../world.js';
 import {
-  commitAs, committedContent, committedPaths, gitIn, useWorld, worldLog, writeWorldFile,
+  commitAs, committedContent, committedPaths, gitIn, gitRaw, useWorld, worldLog, writeWorldFile,
 } from './helpers.js';
 
 const fixture = useWorld('node-world-');
 
 const delay = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
 
-/** Runs git with stdin and returns stdout — for hand-crafted objects only. */
-function gitWithInput(dir: string, args: readonly string[], input: string): Promise<string> {
+/** Runs git against the opened world with stdin — for hand-crafted objects only. */
+function gitWithInput(world: WorldRepo, args: readonly string[], input: string): Promise<string> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn('git', [...args], { cwd: dir, env: gitEnv() });
+    const child = spawn('git', [...world.gitBaseArgs(), ...args], { cwd: world.path, env: gitEnv() });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
@@ -36,7 +38,7 @@ function gitWithInput(dir: string, args: readonly string[], input: string): Prom
 
 /** The index lock path of a world repo. */
 function indexLock(world: WorldRepo): string {
-  return join(world.path, '.git', 'index.lock');
+  return join(world.gitDir, 'index.lock');
 }
 
 /** The number of live entries in the per-repo commit queue (a white-box probe). */
@@ -112,7 +114,7 @@ import { execFile } from 'node:child_process';
 import { appendFile, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-const [dir, uid, rounds] = process.argv.slice(2);
+const [dir, gitDir, uid, rounds] = process.argv.slice(2);
 const email = uid + '@world.local';
 const env = { ...process.env,
   GIT_AUTHOR_NAME: uid, GIT_AUTHOR_EMAIL: email,
@@ -120,8 +122,9 @@ const env = { ...process.env,
 const TOLERATED_STDERR = /index\\.lock|cannot lock ref|Another git process seems to be running|nothing to commit/i;
 const report = join(dir, 'peer-unexpected.txt');
 let unexpected = 0;
+const PAIR = ['--git-dir', gitDir, '--work-tree', dir];
 const run = (args, options = {}) => new Promise((resolve) => {
-  execFile('git', args, { cwd: dir, ...options }, (err, _out, stderr) => {
+  execFile('git', [...PAIR, ...args], { cwd: dir, ...options }, (err, _out, stderr) => {
     // The tolerated outcomes are exactly the non-cooperative facts of a shared
     // working tree: git's index/ref lock, the kernel's branch compare-and-swap
     // losing to this peer, and "nothing to commit" — which --quiet signals as
@@ -230,7 +233,7 @@ describe('the world repo', () => {
     // A peer's force-reset to an ancestor leaves HEAD !== watermark but an empty
     // `watermark..HEAD` range. That is not "no movement": the node cannot prove
     // it has seen this history, so it is given the whole of it.
-    await gitIn(world.path, ['reset', '--hard', first?.hash ?? '']);
+    await gitIn(world, ['reset', '--hard', first?.hash ?? '']);
     expect((await world.commitsSince(second)).map((c) => c.hash)).toEqual([first?.hash]);
   });
 
@@ -276,16 +279,16 @@ describe('the world repo', () => {
   it('treats a hand-crafted empty author as foreign, never as silence', async () => {
     const { world } = fixture();
     const first = await commitAs(world, 'n2', { 'a.txt': 'one' });
-    const tree = (await gitIn(world.path, ['rev-parse', `${first}^{tree}`])).trim();
+    const tree = (await gitIn(world, ['rev-parse', `${first}^{tree}`])).trim();
     // A raw commit object outside the kernel's writer: `author <>` has no name,
     // so `%an` is the empty string. `--literally` is required because fsck would
     // otherwise refuse to write the deliberately malformed object.
     const raw = `tree ${tree}\nparent ${first}\nauthor <> 1700000000 +0000\n`
       + 'committer n2 <n2@world.local> 1700000000 +0000\n\nempty author\n';
     const crafted = (await gitWithInput(
-      world.path, ['hash-object', '--literally', '-t', 'commit', '-w', '--stdin'], raw,
+      world, ['hash-object', '--literally', '-t', 'commit', '-w', '--stdin'], raw,
     )).trim();
-    await gitIn(world.path, ['update-ref', 'refs/heads/main', crafted]);
+    await gitIn(world, ['update-ref', 'refs/heads/main', crafted]);
     // commitsSince reports the empty author as ''; the wake predicate refuses an
     // unprovable author, so the two agree instead of the latter missing a wake.
     expect((await world.commitsSince(first)).map((c) => c.author)).toEqual(['']);
@@ -307,7 +310,7 @@ describe('the world repo', () => {
 
   it('serializes the commits of two instances over the same repo', async () => {
     const { world } = fixture();
-    const second = await WorldRepo.open(world.path);
+    const second = await WorldRepo.open(world.path, { gitDir: world.gitDir });
     await writeWorldFile(world, 'a.txt', 'one');
     const results = await Promise.all([
       world.commitAll('n1', 'turn 0'), second.commitAll('n2', 'turn 0'),
@@ -349,7 +352,7 @@ describe('the world repo', () => {
     expect(await world.headHash()).toBe(peer);
     expect(commit?.hash).not.toBe(peer);
     expect(await worldLog(world)).toEqual([`${commit?.hash} n1`, `${peer} n2`]);
-    expect((await gitIn(world.path, ['log', '-1', '--format=%an', commit?.hash ?? 'nope'])).trim()).toBe('n1');
+    expect((await gitIn(world, ['log', '-1', '--format=%an', commit?.hash ?? 'nope'])).trim()).toBe('n1');
   });
 
   it('records no commit when a peer takes the staged tree first', async () => {
@@ -387,7 +390,8 @@ describe('the world repo', () => {
     await writeFile(script, PEER_SCRIPT);
     // The peer inherits the controlled git environment, so its own `process.env`
     // (spread into the commit env below) cannot carry a host GIT_DIR or config.
-    const peer: ChildProcess = spawn(process.execPath, [script, world.path, 'peer', '30'],
+    const peer: ChildProcess = spawn(
+      process.execPath, [script, world.path, world.gitDir, 'peer', '30'],
       { stdio: ['ignore', 'ignore', 'pipe'], env: gitEnv() });
     let peerStderr = '';
     peer.stderr?.on('data', (chunk: Buffer) => { peerStderr += chunk.toString('utf8'); });
@@ -439,7 +443,7 @@ describe('the world repo', () => {
       expect(history.every((line) => line.endsWith(' n1') || line.endsWith(' peer'))).toBe(true);
 
       // No lost commit: every file either writer produced is in HEAD's tree.
-      const tree = new Set((await gitIn(world.path, ['ls-tree', '-r', '--name-only', 'HEAD']))
+      const tree = new Set((await gitIn(world, ['ls-tree', '-r', '--name-only', 'HEAD']))
         .split('\n').filter((line) => line !== ''));
       for (let i = 0; i < 10; i += 1) expect(tree.has(`n1/${i}.md`)).toBe(true);
       for (let i = 0; i < 30; i += 1) expect(tree.has(`peer-${i}.md`)).toBe(true);
@@ -458,33 +462,43 @@ describe('the world repo', () => {
     const { world } = fixture();
     await writeWorldFile(world, 'a.txt', 'one');
     await world.commitAll('n1', 'turn 0');
-    await rm(join(world.path, '.git'), { recursive: true, force: true });
+    await rm(world.gitDir, { recursive: true, force: true });
     await expect(world.headHash()).rejects.toBeInstanceOf(GitCommandError);
   });
 
   it('refuses a directory that is not a git repository root', async () => {
     const { world } = fixture();
     const plain = await mkdtemp(join(tmpdir(), 'node-plain-'));
-    await expect(WorldRepo.open(plain)).rejects.toBeInstanceOf(WorldNotARepoError);
+    // There is no git directory at all: a legacy world, refused with the
+    // sanitizing migration in the message.
+    await expect(WorldRepo.open(plain, { gitDir: join(plain, 'absent.git') }))
+      .rejects.toBeInstanceOf(WorldNotARepoError);
     // A world that is a subdirectory of another repository would commit the
-    // tree above it at every turn-end (kernel.md §7).
+    // tree above it at every turn-end (kernel.md §7); the pair check refuses it
+    // because the external git dir records the surrounding root as its worktree.
     await mkdir(join(world.path, 'nested'), { recursive: true });
-    await expect(WorldRepo.open(join(world.path, 'nested')))
+    await expect(WorldRepo.open(join(world.path, 'nested'), { gitDir: world.gitDir }))
       .rejects.toBeInstanceOf(WorldNotARepoError);
     await rm(plain, { recursive: true, force: true });
   });
 
   it('reports a missing world directory in the node error family', async () => {
     const absent = join(tmpdir(), `node-absent-${process.pid}-${Date.now()}`);
-    await expect(WorldRepo.open(absent)).rejects.toBeInstanceOf(WorldNotARepoError);
-    await expect(WorldRepo.init(absent)).resolves.toBeInstanceOf(WorldRepo);
+    const gitDir = `${absent}-git`;
+    await expect(WorldRepo.open(absent, { gitDir })).rejects.toBeInstanceOf(WorldNotARepoError);
+    const world = await WorldRepo.init(absent, { gitDir });
+    expect(world.gitDir).toBe(await realpath(gitDir));
     await rm(absent, { recursive: true, force: true });
+    await rm(gitDir, { recursive: true, force: true });
   });
 
   it('refuses $HOME and a broad root as the world', async () => {
-    await expect(WorldRepo.open(homedir())).rejects.toBeInstanceOf(UnsafeWorldPathError);
-    await expect(WorldRepo.open('/')).rejects.toBeInstanceOf(UnsafeWorldPathError);
-    await expect(WorldRepo.open(tmpdir())).rejects.toBeInstanceOf(UnsafeWorldPathError);
+    // The world guard runs before the git dir is touched, so the dummy value
+    // only has to exist as a path.
+    const gitDir = join(tmpdir(), 'node-dummy.git');
+    await expect(WorldRepo.open(homedir(), { gitDir })).rejects.toBeInstanceOf(UnsafeWorldPathError);
+    await expect(WorldRepo.open('/', { gitDir })).rejects.toBeInstanceOf(UnsafeWorldPathError);
+    await expect(WorldRepo.open(tmpdir(), { gitDir })).rejects.toBeInstanceOf(UnsafeWorldPathError);
   });
 
   it('refuses a symlink that resolves to $HOME, before anything is written', async () => {
@@ -493,18 +507,20 @@ describe('the world repo', () => {
     await symlink(homedir(), link);
     // The safeguard is about the directory the kernel would really commit, not
     // about the string it was handed: `init` must refuse before `git init`.
-    await expect(WorldRepo.open(link)).rejects.toBeInstanceOf(UnsafeWorldPathError);
-    await expect(WorldRepo.init(link)).rejects.toBeInstanceOf(UnsafeWorldPathError);
+    const gitDir = join(root, 'world.git');
+    await expect(WorldRepo.open(link, { gitDir })).rejects.toBeInstanceOf(UnsafeWorldPathError);
+    await expect(WorldRepo.init(link, { gitDir })).rejects.toBeInstanceOf(UnsafeWorldPathError);
     await rm(root, { recursive: true, force: true });
   });
 
   it('follows a symlink to a dedicated directory', async () => {
     const root = await mkdtemp(join(tmpdir(), 'node-link-'));
     const target = join(root, 'real-world');
-    await WorldRepo.init(target);
+    const gitDir = join(root, 'real-world.git');
+    await WorldRepo.init(target, { gitDir });
     const link = join(root, 'linked-world');
     await symlink(target, link);
-    const world = await WorldRepo.open(link);
+    const world = await WorldRepo.open(link, { gitDir });
     // The repo is addressed by its canonical path, which is also the key the
     // commit queue and the watcher are shared by.
     expect(world.path).toBe(await realpath(target));
@@ -513,7 +529,7 @@ describe('the world repo', () => {
 
   it('initializes a repo with the untracked cache enabled', async () => {
     const { world } = fixture();
-    expect((await gitIn(world.path, ['config', 'core.untrackedCache'])).trim()).toBe('true');
+    expect((await gitIn(world, ['config', 'core.untrackedCache'])).trim()).toBe('true');
   });
 
   it('refuses an invalid uid as the commit author before any effect', async () => {
@@ -532,7 +548,7 @@ describe('the world repo', () => {
     await writeWorldFile(world, 'a.txt', 'one');
     const commit = await world.commitAll('a.b-c_1', 'turn 0');
     expect(commit?.author).toBe('a.b-c_1');
-    expect((await gitIn(world.path, ['log', '--format=%an <%ae>'])).trim())
+    expect((await gitIn(world, ['log', '--format=%an <%ae>'])).trim())
       .toBe('a.b-c_1 <a.b-c_1@world.local>');
   });
 
@@ -546,11 +562,12 @@ describe('the world repo', () => {
       .toEqual([{ hash: human, author: 'Ada Human' }]);
   });
 
-  it('ignores an inherited GIT_DIR and commits the world it was opened on', async () => {
+  it('ignores an inherited GIT_DIR pointing at another repository\'s git dir', async () => {
     const { world } = fixture();
-    const other = await WorldRepo.init(join(dirname(world.path), 'world-b'));
+    const other = await WorldRepo.init(
+      join(dirname(world.path), 'world-b'), { gitDir: join(dirname(world.path), 'world-b.git') });
     await writeWorldFile(world, 'a.txt', 'one');
-    vi.stubEnv('GIT_DIR', join(other.path, '.git'));
+    vi.stubEnv('GIT_DIR', other.gitDir);
     try {
       const commit = await world.commitAll('n1', 'turn 0');
       expect(commit?.author).toBe('n1');
@@ -635,14 +652,14 @@ describe('the world repo', () => {
     // git writes the message to `.git/COMMIT_EDITMSG` and reads it back, so any
     // writer of that file can hijack the message.
     const { world } = fixture();
-    const hooks = join(world.path, '.git', 'hooks');
+    const hooks = join(world.gitDir, 'hooks');
     await mkdir(hooks, { recursive: true });
     await writeFile(join(hooks, 'prepare-commit-msg'), '#!/bin/sh\nprintf "hijacked\\n" > "$1"\n');
     await chmod(join(hooks, 'prepare-commit-msg'), 0o755);
     await writeWorldFile(world, 'a.txt', 'one');
     const commit = await world.commitAll('n1', 'turn 0');
     expect(commit).not.toBeNull();
-    expect((await gitIn(world.path, ['log', '--format=%s'])).trim()).toBe('turn 0');
+    expect((await gitIn(world, ['log', '--format=%s'])).trim()).toBe('turn 0');
   });
 
   it('refuses a world that is the real path of a symlinked HOME', async () => {
@@ -652,12 +669,13 @@ describe('the world repo', () => {
     await mkdir(realHome, { recursive: true });
     await symlink(realHome, link);
     vi.stubEnv('HOME', link);
+    const gitDir = join(root, 'dummy.git');
     try {
       // HOME itself is a symlink: `homedir()` returns the link, so the guard must
       // resolve it before comparing, or the 200 GB safeguard is bypassed.
-      await expect(WorldRepo.open(realHome)).rejects.toBeInstanceOf(UnsafeWorldPathError);
-      await expect(WorldRepo.init(realHome)).rejects.toBeInstanceOf(UnsafeWorldPathError);
-      await expect(WorldRepo.open(link)).rejects.toBeInstanceOf(UnsafeWorldPathError);
+      await expect(WorldRepo.open(realHome, { gitDir })).rejects.toBeInstanceOf(UnsafeWorldPathError);
+      await expect(WorldRepo.init(realHome, { gitDir })).rejects.toBeInstanceOf(UnsafeWorldPathError);
+      await expect(WorldRepo.open(link, { gitDir })).rejects.toBeInstanceOf(UnsafeWorldPathError);
     } finally {
       vi.unstubAllEnvs();
       await rm(root, { recursive: true, force: true });
@@ -668,35 +686,51 @@ describe('the world repo', () => {
     const { world } = fixture();
     await commitAs(world, 'n2', { 'a.txt': 'one' });
     const linked = join(dirname(world.path), 'linked-worktree');
-    await gitIn(world.path, ['worktree', 'add', '--detach', linked]);
-    // A linked worktree shares the world's object database and refs but has its
-    // own git dir; accepting it would make the wake predicate and the diff read
-    // a tree the kernel does not own.
-    await expect(WorldRepo.open(linked)).rejects.toBeInstanceOf(WorldNotARepoError);
+    await gitIn(world, ['worktree', 'add', '--detach', linked]);
+    // A linked worktree carries a `.git` gitfile, not a git dir of its own, and
+    // the real external git dir records the world root as its worktree: the pair
+    // check refuses the linked path.
+    await expect(WorldRepo.open(linked, { gitDir: world.gitDir }))
+      .rejects.toBeInstanceOf(WorldNotARepoError);
   });
 
   it('refuses a repository with a separated git dir', async () => {
     const root = await mkdtemp(join(tmpdir(), 'node-sep-'));
     const repo = join(root, 'repo');
+    const gitDir = join(root, 'gitdir');
     await mkdir(repo, { recursive: true });
-    await gitIn(repo, ['init', '--separate-git-dir', join(root, 'gitdir')]);
-    await expect(WorldRepo.open(repo)).rejects.toBeInstanceOf(WorldNotARepoError);
+    await gitRaw(repo, ['init', '--separate-git-dir', gitDir]);
+    // The separated git dir carries no absolute `core.worktree`, so the pair
+    // cannot be verified.
+    await expect(WorldRepo.open(repo, { gitDir })).rejects.toBeInstanceOf(WorldNotARepoError);
     await rm(root, { recursive: true, force: true });
   });
 
-  it('refuses a world whose .git is a symlink to another repository', async () => {
-    // A symlinked `.git` resolves to a real git dir elsewhere, so a realpath
-    // comparison cannot see it: the world would share and write another
-    // repository's objects and refs. The dedicated-repo contract needs the
-    // entry itself to be a real directory, checked with lstat.
+  it('ignores an in-world .git entry (directory, file or symlink)', async () => {
+    // The kernel addresses its external git dir explicitly, so a root-level
+    // `.git` the agent creates - or one carried over from a legacy world - is
+    // never read. Refusing it would hand the shell a permanent boot denial via
+    // `mkdir .git`; the git dir's trust is what is checked, not the worktree.
     const root = await mkdtemp(join(tmpdir(), 'node-gitlink-'));
-    const real = join(root, 'real');
     const world = join(root, 'world');
-    await mkdir(world, { recursive: true });
-    await WorldRepo.init(real);
-    await symlink(join(real, '.git'), join(world, '.git'));
+    const gitDir = join(root, 'world.git');
+    await WorldRepo.init(world, { gitDir });
+    const entry = join(world, '.git');
+    const expectOpens = async (): Promise<void> => {
+      const reopened = await WorldRepo.open(world, { gitDir });
+      expect(reopened.gitDir).toBe(await realpath(gitDir));
+    };
     try {
-      await expect(WorldRepo.open(world)).rejects.toBeInstanceOf(WorldNotARepoError);
+      await mkdir(entry, { recursive: true });
+      await expectOpens();
+      await rm(entry, { recursive: true, force: true });
+      await writeFile(entry, 'gitdir: /nonexistent\n');
+      await expectOpens();
+      await rm(entry);
+      const other = join(root, 'other.git');
+      await mkdir(other, { recursive: true });
+      await symlink(other, entry);
+      await expectOpens();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -712,11 +746,12 @@ describe('the world repo', () => {
       const secret = join(root, 'secret');
       const world = join(root, 'world');
       await mkdir(secret, { recursive: true });
-      await WorldRepo.init(world);
+      const gitDir = join(root, 'world.git');
+      await WorldRepo.init(world, { gitDir });
       await chmod(secret, 0o000);
       vi.stubEnv('HOME', join(secret, 'home'));
       try {
-        await expect(WorldRepo.open(world)).rejects.toMatchObject({ code: 'EACCES' });
+        await expect(WorldRepo.open(world, { gitDir })).rejects.toMatchObject({ code: 'EACCES' });
       } finally {
         vi.unstubAllEnvs();
         await chmod(secret, 0o700);
@@ -745,7 +780,7 @@ describe('the world repo', () => {
     await writeWorldFile(world, 'a.txt', 'one');
     const first = await world.commitAll('n1', 'turn 0');
     expect(first).not.toBeNull();
-    await gitIn(world.path, ['checkout', '--detach', '--quiet', 'HEAD']);
+    await gitIn(world, ['checkout', '--detach', '--quiet', 'HEAD']);
     await writeWorldFile(world, 'b.txt', 'two');
     // The kernel publishes to one named branch; a detached HEAD has none, so it
     // fails closed rather than guessing which ref to move.
@@ -759,13 +794,13 @@ describe('the world repo', () => {
     // A kernel that commits through it fails; one that uses plumbing does not
     // look at it.
     const { world } = fixture();
-    const commitMessageFile = join(world.path, '.git', 'COMMIT_EDITMSG');
+    const commitMessageFile = join(world.gitDir, 'COMMIT_EDITMSG');
     await rm(commitMessageFile, { force: true });
     await mkdir(commitMessageFile, { recursive: true });
     await writeWorldFile(world, 'a.txt', 'one');
     const commit = await world.commitAll('n1', 'turn 0');
     expect(commit?.author).toBe('n1');
-    expect((await gitIn(world.path, ['log', '--format=%s', '-1'])).trim()).toBe('turn 0');
+    expect((await gitIn(world, ['log', '--format=%s', '-1'])).trim()).toBe('turn 0');
   });
 
   it('keeps PATH and commits the exact message under a collider at the git boundary', async () => {
@@ -783,7 +818,7 @@ describe('the world repo', () => {
       'case " $* " in',
       `  *" commit "*) exec '${real}' -c commit.gpgsign=false commit --quiet --no-verify --file '${collider}' ;;`,
       'esac',
-      `printf 'COLLIDER\\n' > '${world.path}/.git/COMMIT_EDITMSG' 2>/dev/null`,
+      `printf 'COLLIDER\\n' > '${world.gitDir}/COMMIT_EDITMSG' 2>/dev/null`,
       `exec '${real}' "$@"`,
     ].join('\n');
     const shimDir = await installGitShim(root, 'shim-bin', body);
@@ -798,7 +833,7 @@ describe('the world repo', () => {
       vi.unstubAllEnvs();
     }
     expect(commit?.author).toBe('n1');
-    expect((await gitIn(world.path, ['log', '--format=%s', '-1'])).trim()).toBe('turn 0');
+    expect((await gitIn(world, ['log', '--format=%s', '-1'])).trim()).toBe('turn 0');
   });
 
   it('retries a compare-and-swap conflict and keeps both histories', async () => {
@@ -815,6 +850,7 @@ describe('the world repo', () => {
     // After the kernel builds its commit object, an external kernel advances the
     // branch with a plumbing commit of the same tree (an empty change), exactly
     // once: the CAS must lose, and the retry must keep both histories.
+    const pair = `'${real}' --git-dir '${world.gitDir}' --work-tree '${world.path}'`;
     const body = [
       `if [ ! -f '${once}' ]; then`,
       '  case " $* " in',
@@ -822,11 +858,11 @@ describe('the world repo', () => {
       `      '${real}' "$@"`,
       '      out=$?',
       `      : > '${once}'`,
-      `      ref=$('${real}' symbolic-ref -q HEAD)`,
-      `      old=$('${real}' rev-parse --verify "$ref")`,
-      `      tree=$('${real}' rev-parse --verify "$ref^{tree}")`,
-      `      p=$(${peer} '${real}' -c commit.gpgsign=false commit-tree "$tree" -p "$old" -m 'peer advance')`,
-      `      ${peer} '${real}' update-ref "$ref" "$p" "$old"`,
+      `      ref=$(${pair} symbolic-ref -q HEAD)`,
+      `      old=$(${pair} rev-parse --verify "$ref")`,
+      `      tree=$(${pair} rev-parse --verify "$ref^{tree}")`,
+      `      p=$(${peer} ${pair} -c commit.gpgsign=false commit-tree "$tree" -p "$old" -m 'peer advance')`,
+      `      ${peer} ${pair} update-ref "$ref" "$p" "$old"`,
       '      exit $out ;;',
       '  esac',
       'fi',
@@ -850,7 +886,7 @@ describe('the world repo', () => {
     // The returned hash is ours and is in history — never the peer's.
     expect(log.some((line) => line.startsWith(commit?.hash ?? 'nope'))).toBe(true);
     // No file is lost: HEAD holds the base and both writers' files.
-    const tree = new Set((await gitIn(world.path, ['ls-tree', '-r', '--name-only', 'HEAD']))
+    const tree = new Set((await gitIn(world, ['ls-tree', '-r', '--name-only', 'HEAD']))
       .split('\n').filter((line) => line !== ''));
     expect(tree.has('base.txt')).toBe(true);
     expect(tree.has('ours.txt')).toBe(true);
@@ -866,7 +902,7 @@ describe('the world repo', () => {
     const body = [
       `if [ ! -f '${once}' ]; then`,
       '  case " $* " in',
-      `    *" commit-tree "*) : > '${once}'; '${real}' symbolic-ref HEAD refs/heads/other ;;`,
+      `    *" commit-tree "*) : > '${once}'; '${real}' --git-dir '${world.gitDir}' --work-tree '${world.path}' symbolic-ref HEAD refs/heads/other ;;`,
       '  esac',
       'fi',
       `exec '${real}' "$@"`,
@@ -882,7 +918,7 @@ describe('the world repo', () => {
       vi.unstubAllEnvs();
     }
     // The branch the kernel snapshotted did not move to its commit.
-    expect((await gitIn(world.path, ['rev-parse', '--verify', 'refs/heads/main'])).trim())
+    expect((await gitIn(world, ['rev-parse', '--verify', 'refs/heads/main'])).trim())
       .toBe(base?.hash);
   });
 
@@ -891,7 +927,7 @@ describe('the world repo', () => {
     // A fresh world: HEAD is a symbolic ref to an unborn branch, so the CAS
     // expects the all-zero object id of the repository's SHA-1 format.
     expect(await world.headHash()).toBeNull();
-    expect((await gitIn(world.path, ['rev-parse', '--show-object-format'])).trim()).toBe('sha1');
+    expect((await gitIn(world, ['rev-parse', '--show-object-format'])).trim()).toBe('sha1');
     await writeWorldFile(world, 'a.txt', 'one');
     const commit = await world.commitAll('n1', 'turn 0');
     expect(commit?.author).toBe('n1');
@@ -902,10 +938,14 @@ describe('the world repo', () => {
   it('sizes the zero object id from a SHA-256 repository format', async () => {
     const root = await mkdtemp(join(tmpdir(), 'node-sha256-'));
     const dir = join(root, 'world');
+    const gitDir = join(root, 'world.git');
     await mkdir(dir, { recursive: true });
-    await gitIn(dir, ['init', '--quiet', '--object-format=sha256', '--initial-branch=main']);
+    await gitRaw(dir, [
+      '--git-dir', gitDir, '--work-tree', dir,
+      'init', '--quiet', '--object-format=sha256', '--initial-branch=main',
+    ]);
     try {
-      const world = await WorldRepo.open(dir);
+      const world = await WorldRepo.open(dir, { gitDir });
       await writeWorldFile(world, 'a.txt', 'one');
       const first = await world.commitAll('n1', 'turn 0');
       expect(first?.hash).toMatch(/^[0-9a-f]{64}$/);
@@ -917,5 +957,305 @@ describe('the world repo', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * The attack and migration battery for the external git dir (arbitration 11).
+ * Each test reproduces an escape the in-world git dir allowed, or the migration
+ * a legacy world needs, against a real git repository.
+ */
+describe('the world git trust layers', () => {
+  /** Creates a world and its external git dir under a fresh temp root. */
+  async function freshWorld(prefix: string): Promise<{ root: string; world: WorldRepo }> {
+    const root = await mkdtemp(join(tmpdir(), prefix));
+    const world = await WorldRepo.init(join(root, 'world'), { gitDir: join(root, 'world.git') });
+    return { root, world };
+  }
+
+  it('keeps the clean-filter escape closed', async () => {
+    const { world } = fixture();
+    const root = dirname(world.path);
+    const marker = join(root, 'clean-canary');
+    const script = join(root, 'clean.sh');
+    await writeFile(script, `#!/bin/sh\ntouch '${marker}'\nprintf 'FILTERED\\n'\n`);
+    await chmod(script, 0o755);
+    // The attack the in-world git dir made possible: the agent writes the
+    // repository config and a selecting attribute, and the kernel's `add`
+    // would run the filter as the kernel. The kernel's explicit --git-dir never
+    // reads this entry, so the filter has no configuration at all.
+    const stray = join(world.path, '.git');
+    await mkdir(stray, { recursive: true });
+    await writeFile(join(stray, 'config'), `[filter "x"]\n\tclean = ${script}\n`);
+    await writeFile(join(world.path, '.gitattributes'), '*.payload filter=x\n');
+    await writeFile(join(world.path, 'data.payload'), 'raw\n');
+
+    const commit = await world.commitAll('n1', 'turn 0');
+    expect(commit?.author).toBe('n1');
+    await expect(stat(marker)).rejects.toThrow();
+    expect(await committedContent(world, 'data.payload')).toBe('raw\n');
+  });
+
+  it('keeps a worktree .git and nested repos out of history', async () => {
+    const { world } = fixture();
+    const stray = join(world.path, '.git');
+    await mkdir(stray, { recursive: true });
+    await writeFile(join(stray, 'config'), '[filter "x"]\n\tclean = /bin/true\n');
+
+    // A committed nested repository is staged as a 160000 gitlink by a plain
+    // `add --all`; its object lives only in the agent's repo, so the durable
+    // tree would reference an unresolvable object.
+    const nested = join(world.path, 'my sub');
+    await mkdir(nested, { recursive: true });
+    await gitRaw(nested, ['init', '--quiet', '--initial-branch=main']);
+    await writeFile(join(nested, 'inside.txt'), 'nested\n');
+    await gitRaw(nested, ['add', '--all']);
+    const inner = gitEnv({
+      GIT_AUTHOR_NAME: 'agent', GIT_AUTHOR_EMAIL: 'agent@world.local',
+      GIT_COMMITTER_NAME: 'agent', GIT_COMMITTER_EMAIL: 'agent@world.local',
+    });
+    await gitRaw(nested, ['commit', '--quiet', '-m', 'nested commit'], inner);
+    await writeWorldFile(world, 'note.txt', 'note\n');
+
+    const commit = await world.commitAll('n1', 'turn 0');
+    expect(commit).not.toBeNull();
+    const paths = await committedPaths(world);
+    expect(paths).toContain('note.txt');
+    expect(paths.filter((rel) => rel === '.git' || rel.startsWith('.git/'))).toEqual([]);
+    expect(paths.filter((rel) => rel === 'my sub' || rel.startsWith('my sub/'))).toEqual([]);
+    const listing = await gitIn(world, ['ls-tree', '-r', 'HEAD']);
+    expect(listing).not.toContain('160000');
+    expect(await committedContent(world, 'my sub/inside.txt')).toBeNull();
+    // The stray root `.git` must not deny a later boot.
+    await expect(WorldRepo.open(world.path, { gitDir: world.gitDir }))
+      .resolves.toBeInstanceOf(WorldRepo);
+  });
+
+  it('refuses a mismatched pair, a relative worktree and a failing scan', async () => {
+    const a = await freshWorld('node-pair-a-');
+    const b = await freshWorld('node-pair-b-');
+    try {
+      // B's root with A's git dir: A's config names A's root as its worktree.
+      await expect(WorldRepo.open(b.world.path, { gitDir: a.world.gitDir }))
+        .rejects.toBeInstanceOf(WorldNotARepoError);
+      // A relative `core.worktree` resolves against the git dir: refused rather
+      // than guessed in either direction.
+      await gitIn(a.world, ['config', 'core.worktree', '../relative']);
+      await expect(WorldRepo.open(a.world.path, { gitDir: a.world.gitDir }))
+        .rejects.toBeInstanceOf(WorldNotARepoError);
+      // A cyclic include makes the scan exit nonzero: a refusal, never "empty".
+      await gitIn(a.world, ['config', 'core.worktree', a.world.path]);
+      await gitIn(a.world, ['config', 'include.path', join(a.world.gitDir, 'config')]);
+      await expect(WorldRepo.open(a.world.path, { gitDir: a.world.gitDir }))
+        .rejects.toBeInstanceOf(WorldNotARepoError);
+    } finally {
+      await rm(a.root, { recursive: true, force: true });
+      await rm(b.root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses every untrusted git-dir shape, and opens past the loose-object budget', async () => {
+    const commitOnce = async (world: WorldRepo): Promise<void> => {
+      await writeWorldFile(world, 'a.txt', 'one');
+      await world.commitAll('n1', 'turn 0');
+    };
+    const variants: ReadonlyArray<{
+      readonly name: string;
+      readonly sabotage: (world: WorldRepo) => Promise<void>;
+    }> = [
+      {
+        name: 'a filter key',
+        sabotage: async (world) => { await gitIn(world, ['config', 'filter.x.clean', '/bin/true']); },
+      },
+      {
+        name: 'config.worktree content',
+        sabotage: async (world) => {
+          await gitIn(world, ['config', 'extensions.worktreeConfig', 'true']);
+          await writeFile(join(world.gitDir, 'config.worktree'),
+            '[filter "y"]\n\tclean = /bin/true\n');
+        },
+      },
+      {
+        name: 'extensions.worktreeConfig',
+        sabotage: async (world) => {
+          await gitIn(world, ['config', 'extensions.worktreeConfig', 'true']);
+        },
+      },
+      {
+        name: 'an include.path',
+        sabotage: async (world) => {
+          const extra = join(world.path, 'extra.cfg');
+          await writeFile(extra, '[filter "z"]\n\tclean = /bin/true\n');
+          await gitIn(world, ['config', 'include.path', extra]);
+        },
+      },
+      {
+        name: 'a symlinked config',
+        sabotage: async (world) => {
+          const config = join(world.gitDir, 'config');
+          await rename(config, join(world.gitDir, 'config.real'));
+          await symlink('config.real', config);
+        },
+      },
+      {
+        name: 'a symlinked hooks directory',
+        sabotage: async (world) => {
+          await rename(join(world.gitDir, 'hooks'), join(world.gitDir, 'hooks.real'));
+          await symlink('hooks.real', join(world.gitDir, 'hooks'));
+        },
+      },
+      {
+        name: 'a symlinked refs/heads',
+        sabotage: async (world) => {
+          await rename(join(world.gitDir, 'refs', 'heads'), join(world.gitDir, 'heads.real'));
+          await symlink('heads.real', join(world.gitDir, 'refs', 'heads'));
+        },
+      },
+      {
+        name: 'a hardlinked branch ref',
+        sabotage: async (world) => {
+          await commitOnce(world);
+          await link(join(world.gitDir, 'refs', 'heads', 'main'),
+            join(world.gitDir, 'heads-alias'));
+        },
+      },
+      {
+        name: 'info/grafts',
+        sabotage: async (world) => {
+          await writeFile(join(world.gitDir, 'info', 'grafts'), '');
+        },
+      },
+      {
+        name: 'shallow',
+        sabotage: async (world) => {
+          await writeFile(join(world.gitDir, 'shallow'), '');
+        },
+      },
+      {
+        name: 'objects/info/alternates',
+        sabotage: async (world) => {
+          await writeFile(join(world.gitDir, 'objects', 'info', 'alternates'), '/tmp\n');
+        },
+      },
+      {
+        name: 'log.showSignature',
+        sabotage: async (world) => { await gitIn(world, ['config', 'log.showSignature', 'true']); },
+      },
+      {
+        name: 'remote.*.promisor',
+        sabotage: async (world) => {
+          await gitIn(world, ['config', 'remote.origin.promisor', 'true']);
+        },
+      },
+    ];
+
+    for (const variant of variants) {
+      const { root, world } = await freshWorld('node-trust-');
+      try {
+        await variant.sabotage(world);
+        await expect(
+          WorldRepo.open(world.path, { gitDir: world.gitDir }), variant.name,
+        ).rejects.toBeInstanceOf(WorldNotARepoError);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+
+    // The budget counts metadata, not loose-object payload: ten thousand and
+    // one payload files is an ordinary long-lived world, not an attack.
+    const { root, world } = await freshWorld('node-budget-');
+    try {
+      const dir = join(world.gitDir, 'objects', 'aa');
+      await mkdir(dir, { recursive: true });
+      const names = Array.from({ length: 10_001 }, (_, i) => i.toString(16).padStart(38, '0'));
+      for (let at = 0; at < names.length; at += 256) {
+        await Promise.all(names.slice(at, at + 256).map(
+          (name) => writeFile(join(dir, name), '')));
+      }
+      await expect(WorldRepo.open(world.path, { gitDir: world.gitDir }))
+        .resolves.toBeInstanceOf(WorldRepo);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('kills the lazy-fetch escape at the scan and at the belt', async () => {
+    // Layer 1: a promisor or partial-clone configuration never gets as far as
+    // a missing object.
+    for (const [key, value] of [
+      ['remote.origin.promisor', 'true'],
+      ['extensions.partialClone', 'origin'],
+    ] as const) {
+      const { root, world } = await freshWorld('node-lazy-scan-');
+      try {
+        await gitIn(world, ['config', key, value]);
+        await expect(WorldRepo.open(world.path, { gitDir: world.gitDir }))
+          .rejects.toBeInstanceOf(WorldNotARepoError);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+
+    // Layer 4: even a configuration written after open must fail closed. The
+    // fixture is live — without the belt the transport helper really runs.
+    const { world } = fixture();
+    const root = dirname(world.path);
+    const canary = join(root, 'lazy-canary');
+    const helper = join(root, 'lazy-helper.sh');
+    await writeFile(helper, `#!/bin/sh\ntouch '${canary}'\n`);
+    await chmod(helper, 0o755);
+    await writeWorldFile(world, 'a.txt', 'hello\n');
+    await world.commitAll('n1', 'turn 0');
+    // `protocol.ext.allow=always` is required: git's own default refuses `ext`,
+    // and without it the test would prove nothing.
+    await gitIn(world, ['config', 'protocol.ext.allow', 'always']);
+    await gitIn(world, ['config', 'remote.origin.url', `ext::${helper}`]);
+    await gitIn(world, ['config', 'remote.origin.promisor', 'true']);
+    await gitIn(world, ['config', 'extensions.partialClone', 'origin']);
+    const tree = (await gitIn(world, ['rev-parse', 'HEAD^{tree}'])).trim();
+    await rm(join(world.gitDir, 'objects', tree.slice(0, 2), tree.slice(2)), { force: true });
+
+    // Positive control: an empty GIT_NO_LAZY_FETCH disables the belt.
+    await expect(gitIn(world, ['diff', '--cached', '--quiet'],
+      gitEnv({ GIT_NO_LAZY_FETCH: '' }))).rejects.toThrow();
+    expect((await stat(canary)).isFile()).toBe(true);
+    await rm(canary, { force: true });
+
+    // The belt: `gitEnv` carries GIT_NO_LAZY_FETCH, so git fails closed rather
+    // than fetching — and the helper never runs.
+    await expect(gitIn(world, ['diff', '--cached', '--quiet'])).rejects.toThrow();
+    await expect(stat(canary)).rejects.toThrow();
+  }, 30_000);
+
+  it('makes a planted git-dir hook inert at publish', async () => {
+    const { world } = fixture();
+    const canary = join(dirname(world.path), 'hook-canary');
+    const hooks = join(world.gitDir, 'hooks');
+    await mkdir(hooks, { recursive: true });
+    const hook = join(hooks, 'reference-transaction');
+    await writeFile(hook, `#!/bin/sh\ntouch '${canary}'\n`);
+    await chmod(hook, 0o755);
+
+    await writeWorldFile(world, 'a.txt', 'one');
+    const commit = await world.commitAll('n1', 'turn 0');
+    expect(commit?.author).toBe('n1');
+    // The blanket `-c core.hooksPath=/dev/null` covers `update-ref`'s hook.
+    await expect(stat(canary)).rejects.toThrow();
+  });
+
+  it('commits past an unborn nested repository', async () => {
+    const { world } = fixture();
+    const sub = join(world.path, 'sub');
+    await mkdir(sub, { recursive: true });
+    await gitRaw(sub, ['init', '--quiet', '--initial-branch=main']);
+    await writeWorldFile(world, 'note.txt', 'note\n');
+
+    // A plain `add --all` fails the whole turn with "does not have a commit
+    // checked out"; the pathspec exclusion is what keeps the turn committable.
+    const commit = await world.commitAll('n1', 'turn 0');
+    expect(commit).not.toBeNull();
+    const paths = await committedPaths(world);
+    expect(paths).toContain('note.txt');
+    expect(paths.filter((rel) => rel === 'sub' || rel.startsWith('sub/'))).toEqual([]);
   });
 });
