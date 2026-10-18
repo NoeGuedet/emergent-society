@@ -237,11 +237,15 @@ function parseConfigScan(out: string): ConfigEntry[] {
 /**
  * The keys a git dir's own `config` may never carry (layer 1). Matching is
  * prefix/suffix on git's normalized (lowercased) output, never camelCase
- * equality: a subsection keeps its case. Deliberately absent, with reasons:
- * `alias.*` cannot override a builtin (verified), `core.pager`/`pager.*` never
- * run on a pipe (verified), and `credential.helper`, `http.*`, `url.*`,
- * `protocol.*`, `submodule.*` and `uploadpack.*` are transports the kernel's
- * plumbing never reaches once lazy fetching is refused and disabled.
+ * equality: a subsection keeps its case. The include directives are refused as
+ * keys, not only by their targets' origins: a target absent at open is
+ * silently skipped by git, so the origin rule never sees it — and an
+ * agent-written target later would load `filter.*` into the kernel's own git.
+ * Deliberately absent, with reasons: `alias.*` cannot override a builtin
+ * (verified), `core.pager`/`pager.*` never run on a pipe (verified), and
+ * `credential.helper`, `http.*`, `url.*`, `protocol.*`, `submodule.*` and
+ * `uploadpack.*` are transports the kernel's plumbing never reaches once lazy
+ * fetching is refused and disabled.
  */
 const CONFIG_REFUSE_KEYS: ReadonlySet<string> = new Set([
   'core.fsmonitor', 'core.hookspath', 'core.sshcommand', 'core.attributesfile',
@@ -262,6 +266,9 @@ function configRefusal(entries: readonly ConfigEntry[], gitDir: string): string 
       return `config entry ${entry.key} carries a multi-line value`;
     }
     const key = entry.key.toLowerCase();
+    if (key === 'include.path' || key.startsWith('includeif.')) {
+      return `config entry ${entry.key} redirects to another config file`;
+    }
     if (key.startsWith('filter.')) return `config entry ${entry.key} configures a filter`;
     if (CONFIG_REFUSE_KEYS.has(key)) return `config entry ${entry.key} is execution-capable`;
     if (key.startsWith('diff.') && (key.endsWith('.command') || key.endsWith('.textconv'))) {
@@ -1370,7 +1377,10 @@ export class WorldRepo {
     // The belt: remove any gitlink that survived staging. `ls-files --stage -z`
     // is NUL-separated because a whitespace split would mangle a `my sub` path
     // and silently keep the gitlink; `--` before the path is required because a
-    // `-`-prefixed path otherwise makes `update-index` no-op or error.
+    // `-`-prefixed path otherwise makes `update-index` no-op or error. The path
+    // is passed verbatim: `update-index` takes literal file names, not
+    // pathspecs, so a `*`/`?`/`[` in the path removes only that entry (adding
+    // `:(literal)` here would name a nonexistent file and remove nothing).
     for (const rel of await this.stagedGitlinks()) {
       await this.git(['update-index', '--force-remove', '--', rel]);
     }

@@ -1031,6 +1031,64 @@ describe('the world git trust layers', () => {
       .resolves.toBeInstanceOf(WorldRepo);
   });
 
+  it('strips a gitlink at a path carrying a glob metacharacter', async () => {
+    const { world } = fixture();
+    const nested = join(world.path, 'my*sub');
+    await mkdir(nested, { recursive: true });
+    await gitRaw(nested, ['init', '--quiet', '--initial-branch=main']);
+    await writeFile(join(nested, 'inside.txt'), 'nested\n');
+    await gitRaw(nested, ['add', '--all']);
+    const inner = gitEnv({
+      GIT_AUTHOR_NAME: 'agent', GIT_AUTHOR_EMAIL: 'agent@world.local',
+      GIT_COMMITTER_NAME: 'agent', GIT_COMMITTER_EMAIL: 'agent@world.local',
+    });
+    await gitRaw(nested, ['commit', '--quiet', '-m', 'nested commit'], inner);
+    // Stage the gitlink by hand: the belt must remove it even when it is
+    // already in the index, and the `*` must not be read as a pattern (the
+    // sibling file below matches the glob `my*sub` and must survive).
+    await gitIn(world, ['add', '--', ':(literal)my*sub']);
+    expect(await gitIn(world, ['ls-files', '--stage'])).toContain('160000');
+    await writeWorldFile(world, 'my-long-sub', 'sibling\n');
+
+    const commit = await world.commitAll('n1', 'turn 0');
+    expect(commit).not.toBeNull();
+    expect(await committedContent(world, 'my-long-sub')).toBe('sibling\n');
+    // `show HEAD:<glob path>` globs the tree, so the tree listing is the pin.
+    const listing = await gitIn(world, ['ls-tree', '-r', 'HEAD']);
+    expect(listing).not.toContain('160000');
+    expect(listing).not.toContain('my*sub');
+    const names = await gitIn(world, ['ls-tree', '-r', '--name-only', 'HEAD']);
+    expect(names.split('\n').filter((line) => line !== '')).toEqual(['my-long-sub']);
+  });
+
+  it('refuses an include redirection whose target is absent', async () => {
+    const { world } = fixture();
+    // The target does not exist yet, so git's scan skips it and the origin
+    // rule never sees the injected file; the key itself must be refused. The
+    // agent can write the target after open, and the kernel's `add` would then
+    // run the configured filter as itself.
+    await gitIn(world, ['config', 'include.path', join(world.path, 'payload.cfg')]);
+    await expect(WorldRepo.open(world.path, { gitDir: world.gitDir }))
+      .rejects.toThrow(/include\.path redirects to another config file/);
+    await writeFile(join(world.path, 'payload.cfg'), '[filter "z"]\n\tclean = /bin/true\n');
+    await expect(WorldRepo.open(world.path, { gitDir: world.gitDir }))
+      .rejects.toThrow(/include\.path redirects to another config file/);
+  });
+
+  it('refuses an include whose target loads a filter key', async () => {
+    const { world } = fixture();
+    const extra = join(world.path, 'extra.cfg');
+    await writeFile(extra, '[filter "z"]\n\tclean = /bin/true\n');
+    await gitIn(world, ['config', 'include.path', extra]);
+    await expect(WorldRepo.open(world.path, { gitDir: world.gitDir }))
+      .rejects.toBeInstanceOf(WorldNotARepoError);
+    // The includeIf family is refused as a key too, whatever its condition.
+    await gitIn(world, ['config', '--unset', 'include.path']);
+    await gitIn(world, ['config', 'includeIf.gitdir:nowhere/.path', extra]);
+    await expect(WorldRepo.open(world.path, { gitDir: world.gitDir }))
+      .rejects.toThrow(/includeif.* redirects to another config file/i);
+  });
+
   it('refuses a mismatched pair, a relative worktree and a failing scan', async () => {
     const a = await freshWorld('node-pair-a-');
     const b = await freshWorld('node-pair-b-');
