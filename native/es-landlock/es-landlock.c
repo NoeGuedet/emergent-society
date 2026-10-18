@@ -89,6 +89,9 @@
 #ifndef LANDLOCK_CREATE_RULESET_VERSION
 #define LANDLOCK_CREATE_RULESET_VERSION (1U << 0)
 #endif
+#ifndef LANDLOCK_RULE_PATH_BENEATH
+#define LANDLOCK_RULE_PATH_BENEATH 1
+#endif
 
 /* The launcher's own FS right set: bits 0-14, IOCTL_DEV (bit 15) excluded. */
 #define ES_FS_RIGHTS ((1ULL << 15) - 1)
@@ -233,13 +236,13 @@ static void close_extra_fds(void)
 	}
 }
 
-static void precheck_parent_environ(void)
+static void precheck_parent_environ(pid_t parent)
 {
 	char path[64];
 	int fd;
 	int n;
 
-	n = snprintf(path, sizeof(path), "/proc/%d/environ", (int)getppid());
+	n = snprintf(path, sizeof(path), "/proc/%d/environ", (int)parent);
 	if (n < 0 || (size_t)n >= sizeof(path))
 		die_msg("probe", "parent path too long");
 	fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -302,13 +305,13 @@ static void probe_deny(const char *path)
 		die_errno("probe-deny");
 }
 
-static void probe_parent_ptrace(void)
+static void probe_parent_ptrace(pid_t parent)
 {
 	char path[64];
 	int fd;
 	int n;
 
-	n = snprintf(path, sizeof(path), "/proc/%d/stat", (int)getppid());
+	n = snprintf(path, sizeof(path), "/proc/%d/stat", (int)parent);
 	if (n < 0 || (size_t)n >= sizeof(path))
 		die_msg("probe-parent-stat", "parent path too long");
 	fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -316,7 +319,7 @@ static void probe_parent_ptrace(void)
 		die_errno("probe-parent-stat");
 	close(fd);
 
-	n = snprintf(path, sizeof(path), "/proc/%d/environ", (int)getppid());
+	n = snprintf(path, sizeof(path), "/proc/%d/environ", (int)parent);
 	if (n < 0 || (size_t)n >= sizeof(path))
 		die_msg("probe-parent-environ", "parent path too long");
 	fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -330,14 +333,14 @@ static void probe_parent_ptrace(void)
 }
 
 static void run_probe(const char *deny_path, const char **rw_dirs,
-		      size_t rw_count, int abi)
+		      size_t rw_count, int abi, pid_t parent)
 {
 	size_t i;
 
 	for (i = 0; i < rw_count; i++)
 		probe_rw_dir(rw_dirs[i]);
 	probe_deny(deny_path);
-	probe_parent_ptrace();
+	probe_parent_ptrace(parent);
 
 	if (dprintf(STDOUT_FILENO, "abi=%d\nenforcement=%s\n", abi,
 		    abi >= 6 ? "full" : "partial") < 0)
@@ -354,6 +357,7 @@ int main(int argc, char **argv)
 	const char *probe_deny_path = NULL;
 	int probe = 0;
 	int prog_index = -1;
+	pid_t parent = 0;
 	long abi_raw;
 	__u64 supported;
 	long ruleset_fd;
@@ -443,9 +447,15 @@ int main(int argc, char **argv)
 	}
 
 	if (probe) {
+		/*
+		 * Read the parent pid once: the pre-restriction open and the
+		 * post-restriction pair must attribute to the same process, so a
+		 * parent death in between cannot silently retarget the proof.
+		 */
+		parent = getppid();
 		if (access(probe_deny_path, R_OK) != 0)
 			die_errno("probe-deny");
-		precheck_parent_environ();
+		precheck_parent_environ(parent);
 	}
 
 	/*
@@ -497,7 +507,7 @@ int main(int argc, char **argv)
 	close_extra_fds();
 
 	if (probe) {
-		run_probe(probe_deny_path, probe_rw, probe_rw_count, abi);
+		run_probe(probe_deny_path, probe_rw, probe_rw_count, abi, parent);
 		return 0;
 	}
 

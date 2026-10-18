@@ -9,11 +9,19 @@ import { buildNative, needsBuild } from './build-native.mjs';
 export default async function setup() {
   if (process.env.ES_SKIP_NATIVE_BUILD === '1') return;
   if (!needsBuild()) return;
-  if (!buildNative()) {
+
+  const outcome = buildNative();
+  if (outcome === 'ok') return;
+  if (outcome === 'compiler') {
     throw new Error(
-      'es-landlock launcher is missing or stale and could not be built. ' +
-        'Install a C compiler (Debian/Ubuntu: sudo apt install build-essential) ' +
+      'es-landlock launcher is missing or stale and no usable C compiler is available. ' +
+        'Install one (Debian/Ubuntu: sudo apt install build-essential) ' +
         'and run `npm run build:native` before running the suite.',
     );
   }
+  throw new Error(
+    'es-landlock launcher is missing or stale and failed to compile. ' +
+      'The compiler output above is authoritative; fix the build and run ' +
+      '`npm run build:native` before running the suite.',
+  );
 }

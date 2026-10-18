@@ -27,7 +27,7 @@ export function buildNative() {
   if (version.error || version.status !== 0) {
     console.error(`es-landlock: C compiler ${JSON.stringify(cc)} is not usable.`);
     console.error(CC_HINT);
-    return false;
+    return 'compiler';
   }
 
   const result = spawnSync(
@@ -45,14 +45,16 @@ export function buildNative() {
     { cwd: root, stdio: 'inherit' },
   );
   if (result.error || result.status !== 0) {
-    console.error(`es-landlock: compilation failed (${result.error?.message ?? `exit ${result.status}`}).`);
-    console.error(CC_HINT);
-    return false;
+    console.error(
+      `es-landlock: compilation failed (${result.error?.message ?? `exit ${result.status}`}); the compiler output above is authoritative.`,
+    );
+    return 'compile';
   }
 
-  // The probe's deny path must be DAC-readable by the confined child.
+  // Normalize the launcher to 0755 regardless of the caller's umask: the
+  // kernel-side launcher and the tests exec this path directly.
   chmodSync(binaryPath, 0o755);
-  return true;
+  return 'ok';
 }
 
 const invokedDirectly =
@@ -60,6 +62,6 @@ const invokedDirectly =
   path.resolve(process.argv[1]) === path.resolve(scriptPath);
 
 if (invokedDirectly) {
-  if (!buildNative()) process.exit(1);
+  if (buildNative() !== 'ok') process.exit(1);
   console.log(`es-landlock: built ${path.relative(root, binaryPath)}`);
 }
