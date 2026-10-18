@@ -20,6 +20,8 @@ The instrument is arranged in three layers, and the society sits in the middle o
 
 **The precise boundary, stated honestly.** The world's own git history *is* inside the world: an agent can run `git log` and read who wrote what, and that is deliberate — authorship is how the society perceives itself, and the masks of `kernel.md` §7 protect the trace from erasure, not from reading. What is outside is everything above the filesystem (the journal) and everything derived from either record (the graph, the sensors, the readings). The observed may see each other's acts; they cannot see the instrument that reads them.
 
+**Addendum (2026-10-18).** C1.4c delivered after this note was written: the persistent `execute` shell is filesystem-confined by default (Landlock, through a vendored launcher), and the world's git dir now lives outside the worktree (`<home>/world.git`) — the shell has no path to the world's history at all, and perception reads it kernel-side through the explicit `--git-dir`/`--work-tree` pair. For §1 this makes the "outside" boundary physical with respect to filesystem content: the confined shell cannot read the journal, the credential store, or host files outside its explicit system read set. It is not a total boundary — egress remains open by explicit decision, and pathname UNIX sockets, metadata mutations and `/proc` stat surfaces remain unmediated (`kernel.md` §7) — and the kill switch is still C1.7. The body above stays as written; this addendum records delivery.
+
 ## 2. Two raw truths, one disposable projection
 
 - **Raw truth 1 — the kernel event journal.** Append-only, hash-chained, per node (`kernel.md` §3). The wire side of every turn, including the commit hash that closed it.

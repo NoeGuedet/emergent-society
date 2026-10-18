@@ -34,7 +34,7 @@ The state of the art ([research/sota-autonomous-agents.md](research/sota-autonom
 - **The journal is the only truth.** Everything else — dashboards, metrics, agent memory — is a disposable projection.
 - **Metrics are invisible to the agents** (anti-Goodhart). Instrumentation lives outside the graph.
 - **Fidelity is measured on acts, never on declarations.**
-- **Autonomy is not a kernel concept.** The kernel provides bare physics only: kill switch + budget ceiling. Graduation, if it is to exist, emerges as a request from agent zero to the human through the chat.
+- **Autonomy is not a kernel concept.** The kernel provides bare physics only: kill switch + budget ceiling + the filesystem-confinement boundary (which constrains where agent effects can land, not what the kernel records). Graduation, if it is to exist, emerges as a request from agent zero to the human through the chat.
 - **Operating live is the concept.** The Cordis kernel exists for it; the mirror/fork/benchmark is a methodology for developing the engine by an instance, not a law of the kernel.
 
 ## 4. What is measured: viability, not performance

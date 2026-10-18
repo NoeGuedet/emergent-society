@@ -8,21 +8,24 @@ import { toJson } from '../../context/artifacts.js';
  * `<home>/providers.json` holds named credential bundles outside the world and
  * outside the project checkout; a missing file is an empty registry, never an
  * error, and a malformed file is refused loudly. Keeping `<home>` outside the
- * world and outside the project checkout is a host responsibility — documented,
- * not enforced by a runtime guard. Validation errors name positions (never
- * file-controlled text) and never quote values, so a credential mistakenly
- * written as a field or provider name cannot leak through an exception.
- * Honesty bound: until Landlock containment (C1.4c) the unconfined raw shell
- * runs as the same OS user with `cwd = <home>/world`, so this file IS both
- * readable (`cat ../providers.json`) and writable by an agent — an overwrite
- * (`echo ... > ../providers.json`) can replace `baseUrl`, so the next load
- * would send the key wherever that rewrite points. The guarantee bought here is
- * narrower: the kernel interpolates the key into no event, artifact, world write
- * or model request, not that the key is unreadable or this store is reserved;
- * and a provider response body is captured verbatim, so a hostile provider could
- * still reflect the key into the journal. Library-only composition (no host
- * exists yet): load the store, build the port, and pass it as the optional
- * `webTools` field — under
+ * project checkout is a host responsibility — documented, not enforced; a home
+ * inside the world is refused when the shell sandbox is built (C1.4c).
+ * Validation errors name positions (never file-controlled text) and never quote
+ * values, so a credential mistakenly written as a field or provider name cannot
+ * leak through an exception.
+ *
+ * Confinement (C1.4c): the file stays plaintext at rest, but its content is
+ * unreadable and unwritable from the confined `execute` shell — the shell is
+ * granted only its world, its per-node scratch leaf and the explicit system
+ * read set. A host-supplied escape hatch (`terminal.sandbox: false`) hands the
+ * shell back its ambient authority, and the guarantee is scoped to filesystem
+ * content: pathname UNIX sockets, metadata mutations and `/proc` stat surfaces
+ * remain unmediated (the residual list is kernel.md §7). The guarantee bought
+ * here is precise: the kernel interpolates the key into no event, artifact,
+ * world write or model request; a provider response body is captured verbatim,
+ * so a hostile provider can still reflect the key into the journal.
+ * Library-only composition (no host exists yet): load the store, build the
+ * port, and pass it as the optional `webTools` field — under
  * `exactOptionalPropertyTypes` that property is spread conditionally, never
  * assigned `undefined`:
  * `const webTools = webToolsFromProviders(await loadProviders(home));`

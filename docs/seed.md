@@ -48,7 +48,7 @@ Cut order if reducing: I5, I2, I1, I4, never I3. Each instinct has a known **cou
 - **The Hole** — the context is compacted periodically; whatever is not externalized is lost. The kernel's compaction is deliberately **naive and visible** (a journal event); any memory strategy beyond that is an **agent production**. The seed makes the agent self-aware of its own machine (finite context, compaction, loss) so that it sets up its own context and memory management: the Hole is announced as a fact, with no solution provided.
 - **Cost is measured, never injected.** The agent has neither visibility into its budget nor responsibility for it: a parasitic frugality objective would divert it from the heading. Cost is journaled on the human side only, as an observation instrument (consistent with the anti-Goodhart rule).
 - **No artificial friction on frontier crossings.** The world is not undone, and that is a fact, not a rule; no barrier is imposed, so that the system's evolution can be observed as it happens. The reversible/irreversible frontier of `extend` is not guarded — it is *stated* (in the heading) and *observed* (in the journal).
-- **The only hard physics: kill switch + budget ceiling + journal.** The budget ceiling is a simple hard limit upstream on the API key — impossible to exceed, invisible to the agent, which never thinks about it. Accepted consequence: the Hole (compaction) is the only physical pressure of Necessity, and the residual risk (spending, publication) is bounded by the ceiling and the kill switch. The earliest drift signal to watch is **capability-creep** (breadth of rights requested vs demonstrated competence).
+- **The only hard physics: kill switch + budget ceiling + journal + the filesystem-confinement boundary.** The budget ceiling is a simple hard limit upstream on the API key — impossible to exceed, invisible to the agent, which never thinks about it. The confinement boundary is a kept physical bound, like the gate: it constrains where agent effects can land, not what the kernel records. Accepted consequence: the Hole (compaction) is the only physical pressure of Necessity, and the residual risk (spending, publication) is bounded by the ceiling and the kill switch. The earliest drift signal to watch is **capability-creep** (breadth of rights requested vs demonstrated competence).
 
 ## 4. The seed's tools (raw paradigm)
 
@@ -57,7 +57,7 @@ Cut order if reducing: I5, I2, I1, I4, never I3. Each instinct has a known **cou
 | Tool | Semantics | Frontier |
 |---|---|---|
 | `speak` | speech channel toward the human — agent zero alone (`direction.md` §1) | — |
-| `execute` | current: **persistent PTY shell** (C1.4b), unconfined — target: sandbox confined to the world (C1.4c); the kernel commits the world at the end of each turn, author = node uid (→ practical `undo` = revert) | inside |
+| `execute` | current: **persistent PTY shell** (C1.4b) **confined to the world by Landlock** (C1.4c) — it reads and writes only its world, its per-node scratch leaf and an explicit system read set, with egress open by decision; the kernel commits the world at the end of each turn, author = node uid (→ practical `undo` = a files-only revert, kernel-side: the shell cannot read the world's git history) | inside |
 | `web_search` / `web_fetch` | read-only web access (no world write): the transport is a POST to the **kernel-mediated provider** (Tavily) — **delivered, C1.4a** | almost inside (stateless emission), journaled |
 | `extend` | **the Cordis gate in a single tool**: `inspect` (read-only catalogue of the runtime, generated from the source) / `define` (immutable Package, no effect) / `run` / `stop` (reversible) / `undefine` (irreversible) | the gate |
 
@@ -129,7 +129,7 @@ Falsification experiments for the experimental protocol: free arm vs complete se
 
 ## 9. Open points
 
-- **Kernel design**: TS/Cordis vs Python stack; minimal event schema; the context assembler and the pinning mechanism; write serialization; persistence of Packages; real FS sandbox — specified in `kernel.md`.
+- **Kernel design**: TS/Cordis vs Python stack; minimal event schema; the context assembler and the pinning mechanism; write serialization; persistence of Packages; real FS sandbox — delivered in C1.4c (`kernel.md` §7).
 - **Fallback**: a two-phase heading (meta-heading then heading) if the seed proves too thin for sub-threshold models.
 
 ## References
