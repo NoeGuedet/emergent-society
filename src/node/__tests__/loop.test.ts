@@ -47,6 +47,24 @@ vi.mock('../../context/diff.js', async (importOriginal) => {
   return { ...actual, presentWorld: wrapped };
 });
 
+/**
+ * Counts spec builds so a test can prove the persistent build-failure memo
+ * short-circuits without re-running the builder. The wrapper delegates; every
+ * other path in this file is unaffected.
+ */
+const sandboxBuilder = vi.hoisted(() => ({ calls: 0 }));
+
+vi.mock('../tools/sandbox.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../tools/sandbox.js')>();
+  return {
+    ...actual,
+    buildSandboxSpec: (...args: Parameters<typeof actual.buildSandboxSpec>) => {
+      sandboxBuilder.calls += 1;
+      return actual.buildSandboxSpec(...args);
+    },
+  };
+});
+
 const fixture = useWorld('c13-loop-');
 
 const providerPolicy: ProviderPolicy = {
@@ -884,7 +902,7 @@ describe('shell confinement wiring (C1.4c)', () => {
     });
     const driver = await openRuntime(fx, runtime);
     const running = driver.run();
-    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'), { timeout: 15000 });
     // The escape hatch never probes: the status is `off` from construction.
     expect(runtime.sandboxStatus()).toEqual({ mode: 'off' });
     driver.stop();
@@ -899,10 +917,13 @@ describe('shell confinement wiring (C1.4c)', () => {
 
   it('fails every execute closed when the home sits inside the world', async () => {
     const fx = fixture();
+    sandboxBuilder.calls = 0;
     const nestedHome = join(fx.world.path, 'inside-home');
     await mkdir(nestedHome, { recursive: true });
     const transport = new ScriptedTransport([
       calling([execute('e1', 'true')]),
+      noCalls('done'),
+      calling([execute('e2', 'true')]),
       noCalls('done'),
     ]);
     const runtime = createAgentRuntime({
@@ -915,20 +936,106 @@ describe('shell confinement wiring (C1.4c)', () => {
     // runtime's own home is nested, which is what the policy refuses.
     const driver = await openRuntime(fx, runtime);
     const running = driver.run();
-    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'), { timeout: 15000 });
     driver.stop();
     await running;
 
-    const result = toolResult(await eventsOf(fx), 'e1');
-    expect(result.isError).toBe(true);
-    expect(result.failure).toEqual({ code: 'spawn', status: null });
-    expect(result.content).toContain('spawn-failed');
-    expect(result.content).toContain('inside the world');
-    expect(runtime.sandboxStatus()).toBeNull();
     const events = await eventsOf(fx);
+    const e1 = toolResult(events, 'e1');
+    expect(e1.isError).toBe(true);
+    expect(e1.failure).toEqual({ code: 'spawn', status: null });
+    expect(e1.content).toContain('spawn-failed');
+    expect(e1.content).toContain('inside the world');
+    expect(sandboxBuilder.calls).toBe(1);
+    expect(runtime.sandboxStatus()).toBeNull();
     expect(events.find((event) => event.type === 'node/shutdown')?.data)
       .toEqual({ reason: 'stop-requested' });
-  }, 20000);
+
+    // The failure is recorded for the runtime's lifetime: a stop → ready cycle
+    // (a fresh sequential driver) must not re-run the builder, and its execute
+    // fails closed the same way rather than spawning anything.
+    const second = await openRuntime(fx, runtime);
+    const secondRun = second.run();
+    await vi.waitFor(() => expect(second.state).toBe('waiting'), { timeout: 15000 });
+    second.stop();
+    await secondRun;
+
+    const e2 = toolResult(await eventsOf(fx), 'e2');
+    expect(e2.isError).toBe(true);
+    expect(e2.failure).toEqual({ code: 'spawn', status: null });
+    expect(e2.content).toContain('spawn-failed');
+    expect(e2.content).toContain('inside the world');
+    expect(sandboxBuilder.calls).toBe(1);
+    expect(runtime.sandboxStatus()).toBeNull();
+  }, 30000);
+
+  it('disposes a session build superseded by a stop and never memoizes the late result', async () => {
+    const fx = fixture();
+    const created: Array<{ readonly flag: { disposed: number } }> = [];
+    let stopHook: (() => Promise<void>) | null = null;
+    let stopOnBuild = true;
+    const create = (): TerminalRuntime => {
+      const flag = { disposed: 0 };
+      created.push({ flag });
+      // The factory seam is synchronous, so a build's only pending window is
+      // the await hop in `buildSession`; a microtask queued from the factory
+      // lands inside it. The runtime's own stop hook IS `stopTerminal`, so it
+      // supersedes the build deterministically — no timer, no race.
+      const superseding = stopOnBuild;
+      stopOnBuild = false;
+      if (superseding) queueMicrotask(() => { void stopHook?.(); });
+      return {
+        run: () => Promise.resolve({
+          status: 'completed', exitCode: 0, signal: null,
+          output: new Uint8Array(), truncated: false, reset: false, fresh: null,
+        }),
+        dispose: () => { flag.disposed += 1; return Promise.resolve(); },
+      };
+    };
+    const transport = new ScriptedTransport([
+      calling([execute('e1', 'true')]),
+      noCalls('done'),
+      calling([execute('e2', 'true')]),
+      noCalls('done'),
+    ]);
+    const runtime = createAgentRuntime({
+      home: fx.home, uid: 'n1', world: fx.world,
+      initialConfig: configWith({ policy: { retryDelayMs: 1 } }),
+      terminal: { env: DEFAULT_TERMINAL_ENV, create },
+      adapter: new ProviderAdapter(transport, providerPolicy),
+    });
+    stopHook = runtime.hooks.onStop ?? null;
+
+    const first = await openRuntime(fx, runtime);
+    const running = first.run();
+    await vi.waitFor(() => expect(first.state).toBe('waiting'), { timeout: 15000 });
+    first.stop();
+    // Nothing rejects: the settled union is what the stop awaits.
+    await expect(running).resolves.toBeUndefined();
+
+    // The superseded build disposed its own runtime, and the stop's awaited
+    // memo disposed it a second time (idempotent). A build that had been
+    // adopted instead would be disposed exactly once, by the stop — so the
+    // count is what proves the late-build branch ran.
+    expect(created).toHaveLength(1);
+    expect(created[0]!.flag.disposed).toBe(2);
+    const e1 = toolResult(await eventsOf(fx), 'e1');
+    expect(e1.isError).toBe(true);
+    expect(e1.content).toContain('spawn-failed');
+
+    // The late build recorded no failure: the next driver on this runtime
+    // builds a fresh session (the factory runs a second time).
+    const second = await openRuntime(fx, runtime);
+    const secondRun = second.run();
+    await vi.waitFor(() => expect(second.state).toBe('waiting'), { timeout: 15000 });
+    second.stop();
+    await secondRun;
+
+    expect(created).toHaveLength(2);
+    expect(created[1]!.flag.disposed).toBe(1);
+    const e2 = toolResult(await eventsOf(fx), 'e2');
+    expect(e2.isError).toBe(false);
+  }, 30000);
 
   it('builds a fresh confined session for a second sequential driver', async () => {
     const fx = fixture();
@@ -947,13 +1054,13 @@ describe('shell confinement wiring (C1.4c)', () => {
 
     const first = await openRuntime(fx, runtime);
     const firstRun = first.run();
-    await vi.waitFor(() => expect(first.state).toBe('waiting'));
+    await vi.waitFor(() => expect(first.state).toBe('waiting'), { timeout: 15000 });
     first.stop();
     await firstRun;
 
     const second = await openRuntime(fx, runtime);
     const secondRun = second.run();
-    await vi.waitFor(() => expect(second.state).toBe('waiting'));
+    await vi.waitFor(() => expect(second.state).toBe('waiting'), { timeout: 15000 });
     second.stop();
     await secondRun;
 
@@ -967,5 +1074,13 @@ describe('shell confinement wiring (C1.4c)', () => {
     expect(e2.isError).toBe(false);
     expect(e2.content).toContain(fx.world.path);
     expect(e2.content).not.toContain('/usr');
+    // The loop-level surface reports the probed status of the live runtime
+    // (and keeps it across the stop that just ran).
+    const status = runtime.sandboxStatus();
+    expect(status?.mode).toBe('landlock');
+    if (status?.mode === 'landlock') {
+      expect(status.abi).toBeGreaterThanOrEqual(3);
+      expect(status.enforcement).toBe('full');
+    }
   }, 30000);
 });
