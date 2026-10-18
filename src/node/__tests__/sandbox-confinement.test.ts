@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import {
   chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile,
@@ -61,6 +62,9 @@ beforeEach(async () => {
   await mkdir(world);
   canaryPath = join(home, 'providers.json');
   await writeFile(canaryPath, `${CANARY}\n`, { mode: 0o644 });
+  // The umask can only clear bits from `writeFile`'s mode; pin the literal mode
+  // the residual test asserts, independent of the caller's environment.
+  await chmod(canaryPath, 0o644);
   runtimes = [];
 });
 
@@ -82,6 +86,15 @@ function text(outcome: CommandOutcome): string {
 
 function signal(): AbortSignal {
   return new AbortController().signal;
+}
+
+/** A process's exec-time environ (NUL-separated), or null when it is gone. */
+async function environOf(pid: number): Promise<string | null> {
+  try {
+    return await readFile(`/proc/${pid}/environ`, 'utf8');
+  } catch {
+    return null;
+  }
 }
 
 /** The real policy (default launcher), a runtime whose cwd is the world. */
@@ -146,11 +159,13 @@ describe('the credential guarantee', () => {
       const outcome = await rt.run(
         'cat canary-link; echo "symlink-status:$?"; '
           + `cat /proc/self/root${canaryPath}; echo "procroot-status:$?"; `
-          + `bash -c "cat '${canaryPath}'"; echo "nested-status:$?"`,
+          + `bash -c "echo nested-ran; cat '${canaryPath}'"; echo "nested-status:$?"`,
         limits(), signal(),
       );
       expect(outcome.status).toBe('completed');
       const out = text(outcome);
+      // The nested bash really executed: its denial is not a dead command.
+      expect(out).toContain('nested-ran');
       expect(out.match(/Permission denied/g)?.length).toBe(3);
       expect(out).toMatch(/symlink-status:[1-9]\d*/);
       expect(out).toMatch(/procroot-status:[1-9]\d*/);
@@ -214,11 +229,14 @@ describe('the world stays usable', () => {
       // bash's pipe buffer, so the heredoc is spilled to a file in $TMPDIR.
       const body = `${'a'.repeat(700)}\n`.repeat(100);
       const outcome = await rt.run(
-        `cat <<'ES_C14C_BIG' > big.txt\n${body}ES_C14C_BIG\nwc -c < big.txt`,
+        `cat <<'ES_C14C_BIG' > big.txt\n${body}ES_C14C_BIG\n`
+          + `wc -c < big.txt\nprintf 'tmpdir:%s\\n' "$TMPDIR"`,
         limits({ timeoutMs: 15_000 }), signal(),
       );
       expect(outcome).toMatchObject({ status: 'completed', exitCode: 0 });
       expect(text(outcome)).toMatch(/70100/);
+      // The spill landed in the scratch leaf, not in an inherited TMPDIR.
+      expect(text(outcome)).toContain(`tmpdir:${spec.env.TMPDIR}`);
       // The bytes are really on disk in the world, not silently dropped.
       const info = await stat(join(world, 'big.txt'));
       expect(info.size).toBe(70_100);
@@ -271,9 +289,9 @@ describe('the world stays usable', () => {
       expect(outcome).toMatchObject({ status: 'completed', exitCode: 0 });
       const out = text(outcome);
       const self = /self:(\d+)/.exec(out);
-      expect(self).not.toBeNull();
+      if (self === null) throw new Error('the shell pid marker is missing');
       // `ps` reads its own domain's /proc freely and names the shell.
-      expect(out).toContain(` ${self?.[1] ?? ''}`);
+      expect(out).toContain(` ${self[1]}`);
       expect(out).toMatch(/bash/);
       // Another process's cmdline/stat stay world-readable (the documented
       // residual); the pid is listed even though its environ is not.
@@ -287,31 +305,57 @@ describe('the world stays usable', () => {
   it.skipIf(!launcherPresent)(
     'denies /proc/<outside>/environ and fd/0 but keeps /proc/<outside>/stat readable',
     async () => {
-      const sentinel = `ES_C14C_ENV_SENTINEL_${process.pid}`;
-      process.env['ES_C14C_ENV_SENTINEL'] = sentinel;
+      // /proc/<pid>/environ is fixed at exec time, so a runtime `process.env`
+      // write never appears there. The sentinel instead rides the exec
+      // environment of a plainly spawned sibling — outside the shell's
+      // Landlock domain, and readable by this unconfined test process, which
+      // is the control proving the bytes are there to leak.
+      const sentinel = 'ES_C14C_ENV_SENTINEL_4f1c9a';
+      const sibling = spawn('sleep', ['30'], {
+        env: { ...process.env, ES_C14C_ENV_SENTINEL: sentinel },
+        stdio: 'ignore',
+      });
+      const pid = sibling.pid;
+      if (pid === undefined) throw new Error('could not spawn the sentinel sibling');
       try {
+        // Unconfined control: the sentinel IS in the outside environ.
+        const control = await environOf(pid);
+        expect(control).not.toBeNull();
+        expect(control).toContain(sentinel);
+
         const { rt } = await confined();
-        const pid = process.pid;
         const outcome = await rt.run(
-          `cat /proc/${pid}/environ; echo "environ-status:$?"; `
-            + `r=$(readlink /proc/${pid}/fd/0); s=$?; `
+          `test -L /proc/${pid}/fd/0 && echo fd0-present; `
+            + `cat /proc/${pid}/environ; echo "environ-status:$?"; `
+            + `r=$(readlink -v /proc/${pid}/fd/0 2>&1); s=$?; `
             + `printf 'readlink:[%s] readlink-status:%s\\n' "$r" "$s"; `
             + `printf 'stat-first:%s\\n' "$(cut -d' ' -f1 /proc/${pid}/stat)"`,
           limits(), signal(),
         );
         expect(outcome.status).toBe('completed');
         const out = text(outcome);
-        expect(out).toContain('Permission denied');
+        // Metadata is unmediated: the fd link exists, so the denial below
+        // cannot be ENOENT (a closed/absent fd 0 would fail this control).
+        expect(out).toContain('fd0-present');
         expect(out).toMatch(/environ-status:[1-9]\d*/);
-        // Ubuntu's uutils readlink is silent on EACCES: the proof is the empty
-        // value plus the failed status — a readable link would name its target.
-        expect(out).toMatch(/readlink:\[\] readlink-status:[1-9]\d*/);
-        // Non-vacuous: the denied environ would have carried this sentinel.
+        // The environ denial itself is EACCES on the environ path.
+        expect(out).toMatch(new RegExp(`cat: /proc/${pid}/environ: Permission denied`));
+        // uutils readlink is silent by default; -v names the errno, proving
+        // EACCES rather than any other readlink failure.
+        expect(out).toMatch(
+          /readlink:\[readlink: \/proc\/\d+\/fd\/0: Permission denied\] readlink-status:[1-9]\d*/,
+        );
+        // Non-vacuous: the denied environ demonstrably carries this sentinel.
         expect(out).not.toContain(sentinel);
         // The residual: stat is world-readable across domains.
         expect(out).toContain(`stat-first:${pid}`);
       } finally {
-        delete process.env['ES_C14C_ENV_SENTINEL'];
+        sibling.kill('SIGKILL');
+        if (sibling.exitCode === null && sibling.signalCode === null) {
+          await new Promise<void>((resolve) => {
+            sibling.once('exit', () => resolve());
+          });
+        }
       }
     },
     TEST_TIMEOUT_MS,
