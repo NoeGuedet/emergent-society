@@ -146,9 +146,13 @@ describe('PtyTerminalRuntime', () => {
     // The killer waits for the second command's own marker, so it can only fire
     // after that command has been written and is in flight — no scheduling
     // window stands between the write and the kill (a kill before the write
-    // would leave the runtime to respawn silently and report `timeout`).
+    // would leave the runtime to respawn silently and report `timeout`). The
+    // poll is bounded (~10 s) so a regression that never writes the marker
+    // leaves no orphaned loop behind, and it kills only when the marker exists,
+    // so a missing marker fails as `timeout` instead of a false `session_exit`.
     await rt.run(
-      '(while [ ! -f mid.marker ]; do sleep 0.05; done; kill -9 $$) & echo scheduled',
+      '(i=0; while [ ! -f mid.marker ] && [ "$i" -lt 200 ]; do sleep 0.05; i=$((i+1)); done; '
+        + 'if [ -f mid.marker ]; then kill -9 $$; fi) & echo scheduled',
       limits(), signal);
     const outcome = await rt.run(
       'echo mid > mid.marker; sleep 30', limits({ timeoutMs: 5000 }), signal);

@@ -16,8 +16,11 @@ import { toJson } from '../../context/artifacts.js';
  *
  * Confinement (C1.4c): the file stays plaintext at rest, but its content is
  * unreadable and unwritable from the confined `execute` shell — the shell is
- * granted only its world, its per-node scratch leaf and the explicit system
- * read set. A host-supplied escape hatch (`terminal.sandbox: false`) hands the
+ * granted its world and its per-node scratch leaf writable, the explicit system
+ * read set read-only (the merged-usr dirs, a narrow `/etc` file list plus
+ * `/etc/ssl/certs`, `/proc`), and five device files individually (`/dev/null`
+ * and `/dev/tty` writable, `/dev/zero`, `/dev/random`, `/dev/urandom` read-only).
+ * A host-supplied escape hatch (`terminal.sandbox: false`) hands the
  * shell back its ambient authority, and the guarantee is scoped to filesystem
  * content: pathname UNIX sockets, metadata mutations and `/proc` stat surfaces
  * remain unmediated (the residual list is kernel.md §7). The guarantee bought
