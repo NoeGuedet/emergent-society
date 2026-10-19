@@ -569,11 +569,20 @@ describe('repair error precedence', () => {
 describe('JournalReader strict envelope validation', () => {
   const ZERO = '0'.repeat(64);
   // A v0-shaped line whose hash fields are well-formed hex, so validation must
-  // decide on structure before any hash recomputation can run.
-  const line = (over: Record<string, unknown> = {}): string =>
-    JSON.stringify({
+  // decide on structure before any hash recomputation can run. Emitted in
+  // canonical form: the cases below pin a post-parse refusal, and an
+  // insertion-order line would be refused for canonicality first.
+  const line = (over: Record<string, unknown> = {}): string => {
+    const fields: Record<string, unknown> = {
       v: 0, type: 'test/ping', seq: 0, time: EPOCH, prev_hash: ZERO, hash: ZERO, data: {}, ...over,
-    });
+    };
+    // JSON.stringify's convention: an `undefined` member is absent, which the
+    // missing-field cases rely on to build a genuinely missing key.
+    for (const key of Object.keys(fields)) {
+      if (fields[key] === undefined) delete fields[key];
+    }
+    return canonicalizeJson(fields as never);
+  };
 
   // Each case pins the specific validation message, so these cannot pass on an
   // incidental hash/linkage failure instead of the missing or malformed field.
@@ -633,8 +642,11 @@ describe('JournalReader strict envelope validation', () => {
     await expectChainBreak(line({ v: '0' }), 'v is not a number');
   });
   it('classifies non-canonicalizable data as a chain break, not a canonicalization error', async () => {
-    // A lone surrogate survives JSON.parse but has no RFC 8785 form.
-    const err = await collectFailure(await readerOverRawLine(line({ data: { text: '\ud800' } })));
+    // A lone surrogate survives JSON.parse but has no RFC 8785 form. Built as
+    // raw JSON because the `line` helper canonicalizes (and would refuse it).
+    const raw = '{"v":0,"type":"test/ping","seq":0,"time":' + EPOCH
+      + `,"prev_hash":"${ZERO}","hash":"${ZERO}","data":{"text":"\\ud800"}}`;
+    const err = await collectFailure(await readerOverRawLine(raw));
     expect(err).toBeInstanceOf(ChainBreakError);
     expect(isCorruption(err)).toBe(true);
     expect(err).not.toBeInstanceOf(NonCanonicalizableError);
