@@ -176,8 +176,9 @@ export class JournalWriter {
     let log: FileHandle;
     try {
       // 'a' both creates the log and makes every write an append: no code path
-      // can seek backwards into journaled history.
-      log = await openFile(journalPath(dir), 'a');
+      // can seek backwards into journaled history. The mode applies only when
+      // the file is created; an existing log keeps its permissions.
+      log = await openFile(journalPath(dir), 'a', 0o600);
     } catch (err) {
       // Same-token cleanup; the open failure stays the surfaced cause.
       await ownership.release().catch(() => {});

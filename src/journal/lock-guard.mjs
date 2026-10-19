@@ -157,7 +157,9 @@ function writeAllSync(fd, buf) {
 // record, which the next acquire reclaims under the guard — never corruption.
 function writeOwnerAtomic(owner, record) {
   const tmp = `${owner}.${process.pid}.${Date.now()}.${tempCounter++}.tmp`;
-  const fd = openSync(tmp, 'wx');
+  // Owner-only, like every other journal file; the mode applies at creation and
+  // the rename preserves it.
+  const fd = openSync(tmp, 'wx', 0o600);
   try {
     writeAllSync(fd, Buffer.from(JSON.stringify(record)));
     fsyncSync(fd);

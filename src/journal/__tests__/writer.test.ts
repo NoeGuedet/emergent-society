@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { JournalWriter, SessionAlreadyOwnedError, JournalClosedError, TornTailError } from '../writer.js';
 import { repair, JournalReader } from '../reader.js';
@@ -10,7 +10,7 @@ import {
   CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, BlobStore, ReservedBlobRefError, isBlobRef,
 } from '../blobs.js';
 import { canonicalizeJson, NonCanonicalizableError } from '../canon.js';
-import { journalPath, lockPath, nodeDir } from '../layout.js';
+import { headPath, journalPath, lockPath, nodeDir, ownerPath } from '../layout.js';
 import {
   appendTear, BIG_PAYLOAD_CHARS, collectEvents, EPOCH, forgedEnvelope, logPath, rewriteLog,
   useTempHome, withFailingWrite,
@@ -182,6 +182,20 @@ describe('JournalWriter', () => {
     expect(w.append('test/ping', { n: 0 }).seq).toBe(0);
     await w.close();
     expect((await collectEvents(home())).map((e) => e.seq)).toEqual([0]);
+  });
+  it('creates journal directories 0700 and files 0600', async () => {
+    const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
+    w.append('test/ping', { n: 0 });
+    await w.flush();
+    const dir = nodeDir(home(), 'n1');
+    // The journal's own tree and every file in it are owner-only, regardless of
+    // the process umask. The owner record is written by the lock guard process.
+    expect((await stat(join(home(), 'nodes'))).mode & 0o777).toBe(0o700);
+    expect((await stat(dir)).mode & 0o777).toBe(0o700);
+    expect((await stat(journalPath(dir))).mode & 0o777).toBe(0o600);
+    expect((await stat(headPath(dir))).mode & 0o777).toBe(0o600);
+    expect((await stat(ownerPath(dir))).mode & 0o777).toBe(0o600);
+    await w.close();
   });
 });
 

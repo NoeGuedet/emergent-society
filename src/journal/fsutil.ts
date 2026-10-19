@@ -46,7 +46,9 @@ export async function syncPath(path: string): Promise<void> {
  */
 export async function atomicWriteFile(path: string, data: string | Uint8Array): Promise<void> {
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  const handle = await open(tmp, 'wx');
+  // The journal's files are owner-only from the moment they exist; an existing
+  // target is replaced by a rename, so this mode is what the result carries.
+  const handle = await open(tmp, 'wx', 0o600);
   try {
     // `writeAll` loops until every byte is written, so a short `pwrite` cannot
     // leave a torn temp that the rename would then make durable under the
@@ -153,7 +155,10 @@ export async function ensureDurableDirectory(dir: string, root?: string): Promis
   const levels = await levelsToProve(target, trusted);
   for (let i = levels.length - 1; i >= 0; i--) {
     const level = levels[i]!;
-    await mkdir(level).catch(ignoreExisting);
+    // Creation-only mode: the journal's directories are owner-only. `mkdir`
+    // applies the mode only when it creates the level, so an existing
+    // directory is never re-moded.
+    await mkdir(level, { mode: 0o700 }).catch(ignoreExisting);
     await syncPath(dirname(level));
   }
   // `mkdir` reports EEXIST for a file just as for a directory; only the leaf is

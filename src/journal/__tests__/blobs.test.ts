@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readlink, writeFile, open as openFile } from 'node:fs/promises';
+import { readlink, stat, writeFile, open as openFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -66,6 +66,17 @@ describe('BlobStore', () => {
     const hash = await store.put(Buffer.from('stable'));
     await store.put(Buffer.from('stable'));
     expect((await store.get(hash)).toString('utf8')).toBe('stable');
+  });
+  it('creates shard directories 0700 and blob files 0600', async () => {
+    const store = new BlobStore(home());
+    const content = Buffer.from('permissions');
+    const hash = await store.put(content);
+    const shard = join(home(), 'blobs', hash.slice(0, 2));
+    // Journal payloads are private to the cell: the store's directories are
+    // owner-only and so is every blob, regardless of the process umask.
+    expect((await stat(join(home(), 'blobs'))).mode & 0o777).toBe(0o700);
+    expect((await stat(shard)).mode & 0o777).toBe(0o700);
+    expect((await stat(join(shard, hash))).mode & 0o777).toBe(0o600);
   });
   it('rejects a hash that is not 64 lowercase hex characters', async () => {
     const store = new BlobStore(home());
