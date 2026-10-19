@@ -301,7 +301,10 @@ describe('JournalWriter durability and ownership', () => {
     w.append('test/ping', { n: 0 });
     await w.close();
     await rewriteLog(journalPath(nodeDir(home(), 'n1')), (lines) => [...lines, forgedEnvelope()]);
-    await expect(JournalWriter.open(home(), 'n1')).rejects.toThrow(ChainBreakError);
+    const err = await JournalWriter.open(home(), 'n1').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ChainBreakError);
+    // Canonically encoded, so the linkage is what refuses the resume.
+    expect((err as ChainBreakError).message).toContain('prev_hash mismatch');
   });
   it.skipIf(process.getuid?.() === 0)(
     'refuses to resume when the log is unreadable instead of forking from genesis',

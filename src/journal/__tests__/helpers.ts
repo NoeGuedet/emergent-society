@@ -3,7 +3,7 @@ import { appendFile, mkdir, mkdtemp, rm, open as openFile, readFile, writeFile }
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BlobStore, CLAIM_CHECK_THRESHOLD } from '../blobs.js';
-import { canonicalizeJson, sha256HexOf } from '../canon.js';
+import { canonicalizeJson, sha256HexOf, type JsonValue } from '../canon.js';
 import { encodeBatch, scanBatches } from '../framing.js';
 import { journalPath, nodeDir } from '../layout.js';
 import { JournalReader } from '../reader.js';
@@ -73,12 +73,18 @@ export async function appendTear(home: string, bytes = 9): Promise<void> {
   await appendFile(logPath(home), tearFragment(bytes));
 }
 
-/** A self-consistent-looking but forged v0 envelope, for chain tampering tests. */
+/**
+ * A self-consistent-looking but forged v0 envelope, for chain tampering tests.
+ *
+ * Emitted in canonical form so it clears the reader's canonical-line check and
+ * the test reaches the rule it names (linkage/hash), instead of being refused
+ * for a serialization difference alone.
+ */
 export function forgedEnvelope(over: Record<string, unknown> = {}): string {
-  return JSON.stringify({
+  return canonicalizeJson({
     v: 0, type: 'test/ping', seq: 1, time: 1,
     prev_hash: FAKE_HASH, hash: FAKE_HASH, data: {}, ...over,
-  });
+  } as JsonValue);
 }
 
 /** Rebuilds a log from its decoded lines, optionally rewriting one of them. */

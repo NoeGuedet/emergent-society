@@ -51,7 +51,11 @@ describe('JournalReader', () => {
     await w.close();
     await appendFile(logPath(home()), encodeBatch([forgedEnvelope()]));
     const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN });
-    await expect(collect(r)).rejects.toThrow(ChainBreakError);
+    const err = await collectFailure(r);
+    expect(err).toBeInstanceOf(ChainBreakError);
+    // The forged tail is canonically encoded, so it must be refused for the
+    // linkage it breaks — not for a serialization difference.
+    expect(err.message).toContain('prev_hash mismatch');
   });
   it('refuses an unknown non-ignorable type', async () => {
     const w = await JournalWriter.open(home(), 'n1');
