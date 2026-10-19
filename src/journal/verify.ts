@@ -1,15 +1,18 @@
 import { HASH_RE, NonCanonicalizableError } from './canon.js';
-import { FORMAT_VERSION, GENESIS_HASH, assertKnownType, verifyEvent, type EventEnvelope } from './envelope.js';
+import {
+  FORMAT_VERSION, GENESIS_HASH, assertKnownType, eventLine, verifyEvent, type EventEnvelope,
+} from './envelope.js';
 import type { ScannedBatch } from './framing.js';
 import { CorruptionError } from './errors.js';
 
 /**
  * Chain verification, shared by the reader and the writer's `resume`.
  *
- * One iterator enforces every rule of the chain — format version, seq
- * contiguity, `prev_hash` linkage, hash recomputation, known-type refusal — so
- * a log that verifies for one of them verifies identically for the other. Any
- * violation is a typed `ChainBreakError` naming the seq.
+ * One iterator enforces every rule of the chain — format version, canonical
+ * line encoding, seq contiguity, `prev_hash` linkage, hash recomputation,
+ * known-type refusal — so a log that verifies for one of them verifies
+ * identically for the other. Any violation is a typed `ChainBreakError` naming
+ * the seq.
  */
 export class ChainBreakError extends CorruptionError {
   constructor(public readonly seq: number, reason: string) {
@@ -98,6 +101,23 @@ export function* verifyChain(
   for (const batch of batches) {
     for (const line of batch.lines) {
       const e = parseEnvelope(line, state.seq);
+      // The hash authenticates the parsed value, not the bytes on disk: a
+      // re-indented, duplicate-key or alternate-escape line parses to the same
+      // event while storing different bytes. The writer only ever writes
+      // `eventLine(e)`, so a line that is not that exact encoding was not
+      // produced by the journal and must be refused rather than reinterpreted.
+      let canonicalLine: string;
+      try {
+        canonicalLine = eventLine(e);
+      } catch (err) {
+        if (err instanceof NonCanonicalizableError) {
+          throw new ChainBreakError(e.seq, 'data is not canonicalizable JSON');
+        }
+        throw err;
+      }
+      if (canonicalLine !== line) {
+        throw new ChainBreakError(e.seq, 'line is not the canonical encoding');
+      }
       // A format change (v: 1) is a different file, never an in-place
       // mutation, so a v-mismatch means the reader must refuse to rebuild.
       if (e.v !== FORMAT_VERSION) {

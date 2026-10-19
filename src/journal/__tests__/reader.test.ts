@@ -6,7 +6,7 @@ import { JournalWriter } from '../writer.js';
 import { JournalReader, repair } from '../reader.js';
 import { acquireLock, guardLauncher, JournalLockUnavailableError } from '../lock.js';
 import { ChainBreakError } from '../verify.js';
-import { UnknownEventTypeError, computeHash } from '../envelope.js';
+import { UnknownEventTypeError, computeHash, verifyEvent, type EventEnvelope } from '../envelope.js';
 import { canonicalizeJson, NonCanonicalizableError, sha256HexOf } from '../canon.js';
 import { isCorruption } from '../errors.js';
 import { encodeBatch, scanBatches, CorruptFrameError } from '../framing.js';
@@ -631,6 +631,57 @@ describe('JournalReader strict envelope validation', () => {
     expect(err).toBeInstanceOf(ChainBreakError);
     expect((err as ChainBreakError).seq).toBe(1);
     expect(err.message).toContain('data is missing');
+  });
+});
+
+describe('JournalReader canonical line enforcement', () => {
+  // A log holding one event, returned as its single canonical line. The payload
+  // carries a non-ASCII character so an alternate escape form is available.
+  async function singleLine(): Promise<string> {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/ping', { text: 'é', n: 0 });
+    await w.close();
+    const { batches } = scanBatches(await readFile(logPath(home())));
+    return batches.flatMap((b) => b.lines)[0]!;
+  }
+
+  // Replaces the log with exactly `line` and asserts the reader refuses it for
+  // canonicality — not incidentally for a parse, hash or linkage failure.
+  async function expectNonCanonical(line: string): Promise<void> {
+    await rewriteLog(logPath(home()), () => [line]);
+    const err = await collectFailure(await JournalReader.open(home(), 'n1', { knownTypes: KNOWN }));
+    expect(err).toBeInstanceOf(ChainBreakError);
+    expect(isCorruption(err)).toBe(true);
+    expect(err.message).toContain('line is not the canonical encoding');
+  }
+
+  it('refuses a re-indented line that parses and hashes identically', async () => {
+    const line = await singleLine();
+    const parsed: unknown = JSON.parse(line);
+    // Same value, only whitespace changed: the hash is recomputed from the
+    // parsed value, so nothing but the canonicality check can refuse it.
+    const reindented = JSON.stringify(parsed, null, 1).replace(/\n\s*/g, ' ');
+    expect(reindented).not.toBe(line);
+    expect(JSON.parse(reindented)).toEqual(parsed);
+    await expectNonCanonical(reindented);
+  });
+
+  it('refuses a duplicate-key line whose surviving value still verifies', async () => {
+    const line = await singleLine();
+    // JSON.parse keeps the last `data`, so the duplicate is invisible to the
+    // structure, linkage and hash checks: only the stored bytes reveal it.
+    const duplicate = `{"data":{"dup":true},${line.slice(1)}`;
+    expect(verifyEvent(JSON.parse(duplicate) as EventEnvelope)).toBe(true);
+    await expectNonCanonical(duplicate);
+  });
+
+  it('refuses an alternate-escape line that parses to the same value', async () => {
+    const line = await singleLine();
+    expect(line).toContain('é');
+    const alternate = line.replace('é', '\\u00e9');
+    expect(alternate).not.toBe(line);
+    expect(JSON.parse(alternate)).toEqual(JSON.parse(line));
+    await expectNonCanonical(alternate);
   });
 });
 
