@@ -247,6 +247,10 @@ describe('the out-of-worktree paths', () => {
       const outcome = await rt.run(
         'cat ../world.git/HEAD; echo "git-relative-read:$?"; '
           + `cat '${headPath}'; echo "git-absolute-read:$?"; `
+          // The canary-bearing config is read too: the read must fail, and the
+          // marker's absence below is then a real statement about the denial
+          // rather than about a file nothing tried to read.
+          + `cat '${configPath}'; echo "git-config-read:$?"; `
           // Metadata is unmediated (arbitration 13): the stat succeeding on the
           // very file the read could not open is what proves EACCES, not ENOENT.
           + `stat -c 'git-head-size:%s' '${headPath}'; echo "git-stat:$?"; `
@@ -260,8 +264,10 @@ describe('the out-of-worktree paths', () => {
       // Reads: both path shapes are refused with EACCES.
       expect(out).toContain('cat: ../world.git/HEAD: Permission denied');
       expect(out).toContain(`cat: ${headPath}: Permission denied`);
+      expect(out).toContain(`cat: ${configPath}: Permission denied`);
       expect(out).toMatch(/git-relative-read:[1-9]\d*/);
       expect(out).toMatch(/git-absolute-read:[1-9]\d*/);
+      expect(out).toMatch(/git-config-read:[1-9]\d*/);
       expect(out).toMatch(/git-head-size:\d+/);
       expect(out).toMatch(/git-stat:0/);
       // Writes: appending to a config, creating an entry, and listing the dir.
@@ -269,10 +275,37 @@ describe('the out-of-worktree paths', () => {
       expect(out).toMatch(/git-append:[1-9]\d*/);
       expect(out).toMatch(/git-create:[1-9]\d*/);
       expect(out).toMatch(/git-ls:[1-9]\d*/);
-      expect(out.match(/Permission denied/g)?.length).toBe(5);
+      expect(out.match(/Permission denied/g)?.length).toBe(6);
       // Non-vacuous: nothing landed, and no config byte reached the shell.
       await expect(stat(join(worldGit, 'planted'))).rejects.toMatchObject({ code: 'ENOENT' });
       expect((await readFile(configPath)).equals(configBefore)).toBe(true);
+      expect(out).not.toContain(GIT_CANARY);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it.skipIf(!launcherPresent)(
+    'denies a world symlink that names the git dir, for reads and writes',
+    async () => {
+      // The link itself lives inside the granted world, but the rule binds to
+      // the resolved object: following it must be EACCES, not permission
+      // inherited from the link's location.
+      await symlink(worldGit, join(world, 'git-link'));
+      const configBefore = await readFile(join(worldGit, 'config'));
+      const { rt } = await confined();
+      const outcome = await rt.run(
+        'cat git-link/config; echo "git-link-read:$?"; '
+          + 'echo x >> git-link/config; echo "git-link-append:$?"',
+        limits(), signal(),
+      );
+      expect(outcome.status).toBe('completed');
+      const out = text(outcome);
+      expect(out).toContain('cat: git-link/config: Permission denied');
+      expect(out.match(/Permission denied/g)?.length).toBe(2);
+      expect(out).toMatch(/git-link-read:[1-9]\d*/);
+      expect(out).toMatch(/git-link-append:[1-9]\d*/);
+      // Non-vacuous: the append never landed and no config byte leaked.
+      expect((await readFile(join(worldGit, 'config'))).equals(configBefore)).toBe(true);
       expect(out).not.toContain(GIT_CANARY);
     },
     TEST_TIMEOUT_MS,
