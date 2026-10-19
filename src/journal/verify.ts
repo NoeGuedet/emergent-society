@@ -52,6 +52,10 @@ function parseEnvelope(line: string, seq: number): EventEnvelope {
     if (!ENVELOPE_KEYS.has(key)) throw new ChainBreakError(seq, `unknown envelope field "${key}"`);
   }
   if (typeof e['v'] !== 'number') throw new ChainBreakError(seq, 'v is not a number');
+  // JSON.parse('1e999') is Infinity: `typeof === 'number'` alone would let it
+  // through to a canonicality refusal, which would misdescribe a malformed
+  // version as an uncanonicalizable payload.
+  if (!Number.isFinite(e['v'])) throw new ChainBreakError(seq, 'v is not a finite number');
   if (typeof e['type'] !== 'string') throw new ChainBreakError(seq, 'type is not a string');
   const eventSeq = e['seq'];
   if (typeof eventSeq !== 'number' || !Number.isSafeInteger(eventSeq) || eventSeq < 0) {
@@ -102,44 +106,37 @@ export function* verifyChain(
   for (const batch of batches) {
     for (const line of batch.lines) {
       const e = parseEnvelope(line, state.seq);
+      // A format change (v: 1) is a different file, never an in-place
+      // mutation, so a v-mismatch means the reader must refuse to rebuild.
+      // Checked before canonicality: the version is the primary diagnosis for
+      // a line this reader was never meant to understand.
+      if (e.v !== FORMAT_VERSION) {
+        throw new ChainBreakError(state.seq, `unsupported format version ${e.v}`);
+      }
       // The hash authenticates the parsed value, not the bytes on disk: a
       // re-indented, duplicate-key or alternate-escape line parses to the same
       // event while storing different bytes. The writer only ever writes
       // `eventLine(e)`, so a line that is not that exact encoding was not
       // produced by the journal and must be refused rather than reinterpreted.
+      //
+      // This is also where an uncanonicalizable payload (a lone surrogate, a
+      // non-finite number) is refused: `eventLine` canonicalizes the whole
+      // envelope, so a value with no RFC 8785 form cannot reach `verifyEvent`.
       let canonicalLine: string;
       try {
         canonicalLine = eventLine(e);
       } catch (err) {
         if (err instanceof NonCanonicalizableError) {
-          throw new ChainBreakError(e.seq, 'data is not canonicalizable JSON');
+          throw new ChainBreakError(state.seq, 'data is not canonicalizable JSON');
         }
         throw err;
       }
       if (canonicalLine !== line) {
-        throw new ChainBreakError(e.seq, 'line is not the canonical encoding');
-      }
-      // A format change (v: 1) is a different file, never an in-place
-      // mutation, so a v-mismatch means the reader must refuse to rebuild.
-      if (e.v !== FORMAT_VERSION) {
-        throw new ChainBreakError(e.seq, `unsupported format version ${e.v}`);
+        throw new ChainBreakError(state.seq, 'line is not the canonical encoding');
       }
       if (e.seq !== state.seq) throw new ChainBreakError(e.seq, `expected seq ${state.seq}`);
       if (e.prev_hash !== state.prevHash) throw new ChainBreakError(e.seq, 'prev_hash mismatch');
-      // A payload read from disk that has no RFC 8785 form (a lone surrogate, a
-      // non-finite number) is damaged bytes, not a caller handing us an
-      // uncanonicalizable value: classify it as a chain break, not as the
-      // `NonCanonicalizableError` the writer's validation path uses.
-      let verified: boolean;
-      try {
-        verified = verifyEvent(e);
-      } catch (err) {
-        if (err instanceof NonCanonicalizableError) {
-          throw new ChainBreakError(e.seq, 'data is not canonicalizable JSON');
-        }
-        throw err;
-      }
-      if (!verified) throw new ChainBreakError(e.seq, 'hash recomputation failed');
+      if (!verifyEvent(e)) throw new ChainBreakError(e.seq, 'hash recomputation failed');
       if (known !== null) assertKnownType(e.type, e.ignorable ?? false, known);
       state.firstHash ??= e.hash;
       state.prevHash = e.hash;

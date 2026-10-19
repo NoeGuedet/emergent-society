@@ -604,6 +604,21 @@ describe('JournalReader strict envelope validation', () => {
       + `"prev_hash":"${ZERO}","hash":"${ZERO}","data":{}}`;
     await expectChainBreak(raw, 'time is not a finite number');
   });
+  it('refuses a JSON 1e999 format version that parses as Infinity', async () => {
+    // The same `typeof === 'number'` trap as `time`: Infinity must be refused
+    // as a malformed version, not reported as an uncanonicalizable payload.
+    const raw = '{"v":1e999,"type":"test/ping","seq":0,"time":1,'
+      + `"prev_hash":"${ZERO}","hash":"${ZERO}","data":{}}`;
+    await expectChainBreak(raw, 'v is not a finite number');
+  });
+  it('reports the version refusal before the canonicality refusal', async () => {
+    // A v1 line with a lone surrogate is both a format change and
+    // uncanonicalizable; the version is the primary diagnosis, so the reader
+    // must not answer with a serialization detail.
+    const raw = '{"v":1,"type":"test/ping","seq":0,"time":1,'
+      + `"prev_hash":"${ZERO}","hash":"${ZERO}","data":{"text":"\\ud800"}}`;
+    await expectChainBreak(raw, 'unsupported format version 1');
+  });
   it('refuses a truthy non-boolean ignorable as corruption', async () => {
     await expectChainBreak(line({ ignorable: {} }), 'ignorable is not a boolean');
     await expectChainBreak(line({ ignorable: 'false' }), 'ignorable is not a boolean');
