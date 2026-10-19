@@ -2,6 +2,20 @@ import { describe, it, expect, vi } from 'vitest';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, readlink, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+
+// A seam on the journal's `truncate` import: the mock reports the instant the
+// call happens, so the test can assert the stale head is already gone by then.
+const truncateSeam = vi.hoisted(() => ({ onTruncate: null as (() => void) | null }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    truncate: async (path: string, len?: number) => {
+      truncateSeam.onTruncate?.();
+      return actual.truncate(path, len);
+    },
+  };
+});
 import { JournalWriter } from '../writer.js';
 import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from '../blobs.js';
 import { JournalReader, repair } from '../reader.js';
@@ -43,23 +57,34 @@ describe('fsync discipline', () => {
     const { syncs } = await countSyncs(home(), () => repair(home(), 'n1'));
     expect(syncs).toBe(0);
   });
-  it('fsyncs the directory again after unlinking the stale head', async () => {
+  it('unlinks the stale head before truncating the log', async () => {
     const w = await JournalWriter.open(home(), 'n1');
     w.append('test/ping', { n: 0 });
     await w.flush();
     await w.close();
     await appendTear(home());
     const dir = nodeDir(home(), 'n1');
-    // Record whether the head still exists each time the node's directory is
-    // fsynced: the unlink is itself a directory metadata change, so the last
-    // sync of `dir` must happen after it, or a crash can resurrect a head
-    // whose count points past the truncation.
+    const log = logPath(home());
+    const before = (await readFile(log)).length;
+    // The invariant: a crash may leave a torn tail for a later repair to
+    // re-truncate, but never a durable log shorter than a durable head claims.
+    // So the head's unlink (and its directory fsync) must precede the
+    // truncation. Capture the head's presence at the truncate call itself, and
+    // what each fsync saw, so the order cannot silently regress.
+    let headAtTruncate: boolean | null = null;
+    truncateSeam.onTruncate = () => { headAtTruncate = existsSync(headPath(dir)); };
     const headAtDirSync: boolean[] = [];
+    const logAtDirSync: number[] = [];
+    const logAtFileSync: number[] = [];
     const proto = await fileHandleProto(home());
     const real = proto.sync;
     const spy = vi.spyOn(proto, 'sync').mockImplementation(async function (this: { fd: number }) {
-      if ((await readlink(`/proc/self/fd/${this.fd}`)) === dir) {
+      const target = await readlink(`/proc/self/fd/${this.fd}`);
+      if (target === dir) {
         headAtDirSync.push(existsSync(headPath(dir)));
+        logAtDirSync.push((await readFile(log)).length);
+      } else if (target === log) {
+        logAtFileSync.push((await readFile(log)).length);
       }
       return real.call(this);
     });
@@ -67,9 +92,14 @@ describe('fsync discipline', () => {
       expect(await repair(home(), 'n1')).toEqual({ tornBytes: 9 });
     } finally {
       spy.mockRestore();
+      truncateSeam.onTruncate = null;
     }
-    expect(headAtDirSync[0]).toBe(true);
-    expect(headAtDirSync.at(-1)).toBe(false);
+    // Gone before the truncate: the unlink was durable first.
+    expect(headAtTruncate).toBe(false);
+    expect(headAtDirSync).toEqual([false]);
+    expect(logAtDirSync).toEqual([before]);
+    // The log's own fsync carries the shortened length.
+    expect(logAtFileSync).toEqual([before - 9]);
   });
 });
 

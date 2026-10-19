@@ -175,18 +175,19 @@ export async function repair(home: string, nodeUid: string): Promise<{ tornBytes
       // and nothing is deleted.
       const { tornBytes } = scanBatches(raw);
       if (tornBytes > 0) {
-        await truncate(path, raw.length - tornBytes);
-        // The truncation and its directory entry are both metadata changes, so
-        // both are fsynced before the caller trusts the new length.
-        await syncPath(path);
-        await syncPath(dir);
-        // The head checkpoint may now point past the truncation point; it is
-        // disposable, so it is removed and rebuilt from the log on the next flush.
+        // Order matters: the stale head is removed and its unlink made durable
+        // BEFORE the log is shortened. A crash at any point then leaves at
+        // worst a torn tail that a later repair re-truncates — never a durable
+        // head whose count points past a shorter, durable log. (Truncating
+        // first would open a window where a crash resurrects the old head over
+        // already-shortened bytes.)
         await rm(headPath(dir), { force: true });
-        // The unlink is a directory metadata change too: without this second
-        // sync a crash can resurrect a head whose count points past the
-        // truncation, while the log itself is already short.
+        // The unlink is a directory metadata change: without this sync a crash
+        // can resurrect the removed head.
         await syncPath(dir);
+        await truncate(path, raw.length - tornBytes);
+        // The new length is file metadata, fsynced before the caller trusts it.
+        await syncPath(path);
       }
       result = { tornBytes };
     }
