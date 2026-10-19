@@ -248,10 +248,12 @@ export class JournalWriter {
     this.throwIfUnusable();
     if (this.closed) throw new JournalClosedError();
     const claimed = this.claimCheck(data);
-    // Everything between `claimCheck` and a successful `pending.push` must roll
-    // back the blob it may have registered: an event that never enters the
-    // batch would otherwise leave an orphan for the next flush to write, with
-    // nothing in the log referencing it.
+    // The try covers every fallible step between `claimCheck` and the state
+    // advance: an event that throws before entering the batch must roll back
+    // the blob it may have registered, or the orphan would be written by the
+    // next flush with nothing in the log referencing it. The tail below
+    // (`seq++`, `prevHash`, `firstHash`, `push`) is infallible, so once it is
+    // reached no rollback is needed.
     let prepared: PendingEvent;
     try {
       const e = makeEvent({
