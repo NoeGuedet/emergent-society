@@ -95,7 +95,8 @@ export class JournalReader {
    * prefix is served; a torn tail is where iteration stops.
    *
    * @throws ChainBreakError on a broken link, a seq gap, a hash mismatch, a
-   * non-v0 envelope or a malformed line; CorruptFrameError on interior damage;
+   * non-v0 envelope, a non-canonical line or a malformed line; CorruptFrameError
+   * on interior damage;
    * UnknownEventTypeError on an unknown non-ignorable type; with
    * `resolveBlobs`, TruncatedBlobError on a truncated reference,
    * BlobIntegrityError when the blob is missing or does not match its reference

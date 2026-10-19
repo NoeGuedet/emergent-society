@@ -224,7 +224,7 @@ flowchart LR
 
 Why tampering cannot hide: modify one byte of an old event and its recomputed hash changes (avalanche); the next event's `prev_hash` no longer matches; fixing that requires rewriting the event, which breaks the next link, and so on to the tip. **Append-only by construction**: rewriting the past requires rewriting the whole future — and the tip hash cited anywhere else will not match.
 
-Verification (`verify.ts`) replays from genesis and applies five rules to every event: frozen field set and well-formed hashes; `v === 0`; **contiguous `seq`** (a deletion leaves no broken hash but a visible hole — completeness is checked by numbering, not by hashing); `prev_hash` linkage; hash recomputation. The walk never skips the beginning, even when the caller only wants a suffix.
+Verification (`verify.ts`) replays from genesis and applies six rules to every event: frozen field set and well-formed hashes; **canonical line encoding** — the stored line must be exactly the canonical serialization of the event it parses to, so a re-indented, duplicate-key or alternate-escape line is refused rather than reinterpreted; `v === 0`; **contiguous `seq`** (a deletion leaves no broken hash but a visible hole — completeness is checked by numbering, not by hashing); `prev_hash` linkage; hash recomputation. The walk never skips the beginning, even when the caller only wants a suffix.
 
 This is closer to **git than to a blockchain**: one writer per journal (enforced by the lock), a chain per node (a global chain would serialize all writers), and detection rather than economic prevention.
 

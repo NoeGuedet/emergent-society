@@ -88,10 +88,11 @@ export interface ChainState {
 }
 
 /**
- * Walks decoded batches, enforcing format version, seq contiguity, `prev_hash`
- * linkage and hash recomputation, and mutating `state` as it goes. The reader
- * and the writer's `resume` share it, so both apply identical rules; `known` is
- * null on the resume path, which only needs the chain itself to be intact.
+ * Walks decoded batches, enforcing format version, canonical line encoding,
+ * seq contiguity, `prev_hash` linkage and hash recomputation, and mutating
+ * `state` as it goes. The reader and the writer's `resume` share it, so both
+ * apply identical rules; `known` is null on the resume path, which only needs
+ * the chain itself to be intact.
  */
 export function* verifyChain(
   batches: ScannedBatch[],
