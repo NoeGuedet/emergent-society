@@ -183,6 +183,10 @@ export async function repair(home: string, nodeUid: string): Promise<{ tornBytes
         // The head checkpoint may now point past the truncation point; it is
         // disposable, so it is removed and rebuilt from the log on the next flush.
         await rm(headPath(dir), { force: true });
+        // The unlink is a directory metadata change too: without this second
+        // sync a crash can resurrect a head whose count points past the
+        // truncation, while the log itself is already short.
+        await syncPath(dir);
       }
       result = { tornBytes };
     }

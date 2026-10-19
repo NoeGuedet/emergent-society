@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { describe, it, expect, vi } from 'vitest';
+import { existsSync } from 'node:fs';
+import { mkdir, readFile, readlink, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { JournalWriter } from '../writer.js';
 import { BlobStore, CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES } from '../blobs.js';
@@ -7,9 +8,9 @@ import { JournalReader, repair } from '../reader.js';
 import { canonicalizeJson } from '../canon.js';
 import { eventLine, verifyEvent, type EventEnvelope } from '../envelope.js';
 import { scanBatches, encodeBatch } from '../framing.js';
-import { journalPath, nodeDir } from '../layout.js';
+import { headPath, journalPath, nodeDir } from '../layout.js';
 import {
-  appendTear, countSyncs, logPath, payloadOfCanonicalBytes, useTempHome,
+  appendTear, countSyncs, fileHandleProto, logPath, payloadOfCanonicalBytes, useTempHome,
 } from './helpers.js';
 
 const home = useTempHome('cell-pin-');
@@ -41,6 +42,34 @@ describe('fsync discipline', () => {
     await w.close();
     const { syncs } = await countSyncs(home(), () => repair(home(), 'n1'));
     expect(syncs).toBe(0);
+  });
+  it('fsyncs the directory again after unlinking the stale head', async () => {
+    const w = await JournalWriter.open(home(), 'n1');
+    w.append('test/ping', { n: 0 });
+    await w.flush();
+    await w.close();
+    await appendTear(home());
+    const dir = nodeDir(home(), 'n1');
+    // Record whether the head still exists each time the node's directory is
+    // fsynced: the unlink is itself a directory metadata change, so the last
+    // sync of `dir` must happen after it, or a crash can resurrect a head
+    // whose count points past the truncation.
+    const headAtDirSync: boolean[] = [];
+    const proto = await fileHandleProto(home());
+    const real = proto.sync;
+    const spy = vi.spyOn(proto, 'sync').mockImplementation(async function (this: { fd: number }) {
+      if ((await readlink(`/proc/self/fd/${this.fd}`)) === dir) {
+        headAtDirSync.push(existsSync(headPath(dir)));
+      }
+      return real.call(this);
+    });
+    try {
+      expect(await repair(home(), 'n1')).toEqual({ tornBytes: 9 });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(headAtDirSync[0]).toBe(true);
+    expect(headAtDirSync.at(-1)).toBe(false);
   });
 });
 
