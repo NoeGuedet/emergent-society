@@ -20,10 +20,11 @@ import type { SandboxSpec, SandboxStatus } from './sandbox.js';
  * vendored Landlock launcher's, not bash's — the launcher restricts itself and
  * `execve`s bash in place, so the pid, session and controlling tty the `/proc`
  * stdin proof keys off are preserved. A failed probe, a pre-start launcher
- * death (exit 125 carrying its `es-landlock:` stderr line), or a pre-flight
- * spawn refusal (a cwd that vanished, a launcher that cannot fork) settles
- * `spawn-failed` with its own diagnostic as the output — never a silent
- * unconfined shell; `sandboxStatus()` reports the probed ABI. `'off'` is the
+ * death (exit 125 carrying its `es-landlock:` stderr line), or a spawn that
+ * throws — the cwd vanished between the pre-flight check and the fork, or the
+ * launcher cannot fork, so `pty.spawn` itself fails — settles `spawn-failed`
+ * with its own diagnostic as the output — never a silent unconfined shell;
+ * `sandboxStatus()` reports the probed ABI. `'off'` is the
  * explicit unconfined choice. This module still owns processes, not the whole
  * containment story: a reset kills the shell and lets the pty teardown SIGHUP
  * the foreground group — a backgrounded or SIGHUP-ignoring process can
@@ -52,8 +53,8 @@ export type CommandOutcome = {
  * The empty outcome of a run that never touches the session: a disposed or
  * spawn-failed runtime, or a pre-write cancellation. `reset` is true only when
  * the wedge reset already ran before the abort, and `fresh` still carries it.
- * `output` carries a diagnostic (the bounded launcher stderr); it never
- * reaches this shape on a normal path.
+ * `output` carries a diagnostic — the bounded launcher/probe stderr, or the
+ * bounded spawn error message; it never reaches this shape on a normal path.
  */
 export function failedOutcome(
   status: CommandStatus, fresh: 'stdin-wedge' | null, reset = false,
@@ -159,10 +160,15 @@ function pause(ms: number): Promise<void> {
 /**
  * A thrown error's message as the bounded diagnostic a `spawn-failed` outcome
  * carries — the same form the probe's own failure uses, so a refused spawn is
- * never indistinguishable from a refused probe.
+ * never indistinguishable from a refused probe. Capped at
+ * `PRE_START_DIAGNOSTIC_BYTES`, like the pre-start stderr: a pathological path
+ * or message must not grow the outcome without bound.
  */
 function spawnDiagnostic(err: unknown): Uint8Array {
-  return Buffer.from(err instanceof Error ? err.message : String(err));
+  const bytes = Buffer.from(err instanceof Error ? err.message : String(err));
+  return bytes.length <= PRE_START_DIAGNOSTIC_BYTES
+    ? bytes
+    : bytes.subarray(0, PRE_START_DIAGNOSTIC_BYTES);
 }
 
 /**

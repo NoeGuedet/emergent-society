@@ -352,6 +352,19 @@ describe('PtyTerminalRuntime', () => {
     expect(text(outcome)).toContain(missing);
   }, 10000);
 
+  it('bounds the spawn diagnostic instead of carrying a raw error message', async () => {
+    // A cwd longer than PATH_MAX makes the pre-flight's `statSync` throw with
+    // the attempted path in its message. That message must not become the
+    // outcome verbatim: the diagnostic shares the pre-start stderr's bound.
+    const longCwd = join(dir, 'x'.repeat(10_000));
+    const rt = new PtyTerminalRuntime(longCwd, DEFAULT_TERMINAL_ENV, 'off');
+    runtimes.push(rt);
+    const outcome = await rt.run('echo x', limits(), new AbortController().signal);
+    expect(outcome).toMatchObject({ status: 'spawn-failed', exitCode: null, reset: false });
+    expect(outcome.output.length).toBe(4096);
+    expect(text(outcome)).toContain('ENAMETOOLONG');
+  }, 10000);
+
   it('surfaces the exact pre-flight message when the cwd is not a directory', async () => {
     const notADirectory = join(dir, 'cwd-is-a-file');
     await writeFile(notADirectory, 'this is not a directory\n');
