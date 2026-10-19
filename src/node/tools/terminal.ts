@@ -19,9 +19,10 @@ import type { SandboxSpec, SandboxStatus } from './sandbox.js';
  * Confinement (C1.4c): constructed with a `SandboxSpec`, the session is the
  * vendored Landlock launcher's, not bash's — the launcher restricts itself and
  * `execve`s bash in place, so the pid, session and controlling tty the `/proc`
- * stdin proof keys off are preserved. A failed probe or a pre-start launcher
- * death (exit 125 carrying its `es-landlock:` stderr line) settles
- * `spawn-failed` with that diagnostic as the output — never a silent
+ * stdin proof keys off are preserved. A failed probe, a pre-start launcher
+ * death (exit 125 carrying its `es-landlock:` stderr line), or a pre-flight
+ * spawn refusal (a cwd that vanished, a launcher that cannot fork) settles
+ * `spawn-failed` with its own diagnostic as the output — never a silent
  * unconfined shell; `sandboxStatus()` reports the probed ABI. `'off'` is the
  * explicit unconfined choice. This module still owns processes, not the whole
  * containment story: a reset kills the shell and lets the pty teardown SIGHUP
@@ -153,6 +154,15 @@ function quoteForBash(value: string): string {
 
 function pause(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+/**
+ * A thrown error's message as the bounded diagnostic a `spawn-failed` outcome
+ * carries — the same form the probe's own failure uses, so a refused spawn is
+ * never indistinguishable from a refused probe.
+ */
+function spawnDiagnostic(err: unknown): Uint8Array {
+  return Buffer.from(err instanceof Error ? err.message : String(err));
 }
 
 /**
@@ -544,8 +554,11 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     if (session === null) {
       try {
         session = this.spawnFresh();
-      } catch {
-        return failedOutcome('spawn-failed', fresh, wedgeReset);
+      } catch (err) {
+        // The pre-flight's own message (a cwd that vanished or is not a
+        // directory) is the diagnostic: without it, this failure is
+        // indistinguishable from a failed probe.
+        return failedOutcome('spawn-failed', fresh, wedgeReset, spawnDiagnostic(err));
       }
     }
 
@@ -580,8 +593,10 @@ export class PtyTerminalRuntime implements TerminalRuntime {
         this.session = null;
         try {
           session = this.spawnFresh();
-        } catch {
-          return failedOutcome('spawn-failed', fresh, wedgeReset);
+        } catch (err) {
+          // Same diagnostic as the first spawn: the respawn's refusal is a
+          // spawn failure, not a silent unconfined session.
+          return failedOutcome('spawn-failed', fresh, wedgeReset, spawnDiagnostic(err));
         }
         slot = attach(session, slot);
         await this.freezeTtyTarget(session, signal);

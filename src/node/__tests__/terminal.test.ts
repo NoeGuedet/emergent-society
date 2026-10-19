@@ -6,7 +6,9 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  afterEach, beforeEach, describe, expect, it, vi,
+} from 'vitest';
 import { buildSandboxSpec, type SandboxSpec } from '../tools/sandbox.js';
 import {
   DEFAULT_TERMINAL_ENV, PtyTerminalRuntime,
@@ -337,14 +339,73 @@ describe('PtyTerminalRuntime', () => {
     expect(after.status).toBe('spawn-failed');
   }, 15000);
 
-  it('a spawn failure is an outcome, never a throw', async () => {
+  it('a spawn failure is an outcome carrying the pre-flight diagnostic, never a throw', async () => {
     // The cwd pre-flight (statSync) refuses a missing directory before node-pty
     // can fork a child that would die in chdir masquerading as a session_exit.
-    const rt = new PtyTerminalRuntime(join(dir, 'no-such-dir'), DEFAULT_TERMINAL_ENV, 'off');
+    const missing = join(dir, 'no-such-dir');
+    const rt = new PtyTerminalRuntime(missing, DEFAULT_TERMINAL_ENV, 'off');
     runtimes.push(rt);
     const outcome = await rt.run('echo x', limits(), new AbortController().signal);
     expect(outcome).toMatchObject({ status: 'spawn-failed', exitCode: null, reset: false });
+    // The thrown error's message is the outcome's diagnostic: a spawn failure
+    // that raced the filesystem must not look like a failed probe.
+    expect(text(outcome)).toContain(missing);
   }, 10000);
+
+  it('surfaces the exact pre-flight message when the cwd is not a directory', async () => {
+    const notADirectory = join(dir, 'cwd-is-a-file');
+    await writeFile(notADirectory, 'this is not a directory\n');
+    const rt = new PtyTerminalRuntime(notADirectory, DEFAULT_TERMINAL_ENV, 'off');
+    runtimes.push(rt);
+    const outcome = await rt.run('echo x', limits(), new AbortController().signal);
+    expect(outcome).toMatchObject({ status: 'spawn-failed', exitCode: null, reset: false });
+    expect(text(outcome)).toContain(`execute cwd is not a directory: ${notADirectory}`);
+  }, 10000);
+
+  it('surfaces the spawn diagnostic when the pre-write respawn throws', async () => {
+    // The second catch (the respawn after a fresh fork is found dead before the
+    // command is written) is only reachable through an OS-level race: the
+    // spawn's tty is normally already frozen when the runtime looks, so no
+    // await separates the two liveness probes and a wall-clock test would be
+    // flaky by construction. The branch under test is the catch-and-diagnose
+    // wiring, not the PTY: the session is real, and only the second `kill(pid,
+    // 0)` probe is substituted to report the death the branch exists for.
+    const cwd = join(dir, 'respawn-cwd');
+    await mkdir(cwd);
+    const rt = new PtyTerminalRuntime(cwd, DEFAULT_TERMINAL_ENV, 'off');
+    runtimes.push(rt);
+    const signal = new AbortController().signal;
+    const first = await rt.run('echo $$', limits(), signal);
+    expect(first).toMatchObject({ status: 'completed', exitCode: 0 });
+    const shellPid = Number(text(first).trim());
+    expect(Number.isSafeInteger(shellPid) && shellPid > 0).toBe(true);
+
+    // Let the entry check's probe pass, then report the shell gone on every
+    // later one — the documented "freshly forked shell died before the write"
+    // state. The cwd becomes a file at the same time, so the respawn's own
+    // pre-flight is what throws.
+    let probes = 0;
+    const realKill = process.kill.bind(process);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((pid, sig) => {
+      if (pid === shellPid && sig === 0) {
+        probes += 1;
+        if (probes > 1) throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' });
+      }
+      return realKill(pid, sig);
+    });
+    try {
+      await rm(cwd, { recursive: true, force: true });
+      await writeFile(cwd, 'this is not a directory\n');
+      const outcome = await rt.run('echo never', limits(), signal);
+      expect(outcome).toMatchObject({ status: 'spawn-failed', exitCode: null, reset: false });
+      expect(text(outcome)).toContain(`execute cwd is not a directory: ${cwd}`);
+      expect(probes).toBeGreaterThanOrEqual(2);
+    } finally {
+      killSpy.mockRestore();
+      // The runtime dropped the session before the respawn threw; reap it here.
+      try { realKill(shellPid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  }, 15000);
 
   it('a spawn failure after a stdin wedge reports the reset it performed', async () => {
     // The wedge reset runs before the respawn; when that respawn then fails,
@@ -360,6 +421,8 @@ describe('PtyTerminalRuntime', () => {
     expect(outcome).toMatchObject({
       status: 'spawn-failed', exitCode: null, reset: true, fresh: 'stdin-wedge',
     });
+    // The reset-and-refuse path carries its own diagnostic too.
+    expect(text(outcome)).toContain(gone);
   }, 15000);
 });
 
