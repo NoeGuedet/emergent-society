@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { JournalWriter, SessionAlreadyOwnedError, JournalClosedError, TornTailError } from '../writer.js';
 import { repair, JournalReader } from '../reader.js';
 import { ChainBreakError } from '../verify.js';
@@ -8,10 +9,11 @@ import { verifyEvent, makeEvent, eventLine, GENESIS_HASH } from '../envelope.js'
 import {
   CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, BlobStore, ReservedBlobRefError, isBlobRef,
 } from '../blobs.js';
-import { canonicalizeJson } from '../canon.js';
+import { canonicalizeJson, NonCanonicalizableError } from '../canon.js';
 import { journalPath, lockPath, nodeDir } from '../layout.js';
 import {
-  appendTear, EPOCH, forgedEnvelope, logPath, rewriteLog, useTempHome, withFailingWrite,
+  appendTear, BIG_PAYLOAD_CHARS, collectEvents, EPOCH, forgedEnvelope, logPath, rewriteLog,
+  useTempHome, withFailingWrite,
 } from './helpers.js';
 
 const home = useTempHome('cell-writer-');
@@ -162,6 +164,24 @@ describe('JournalWriter', () => {
     expect(e.data).toEqual({ nested: { n: 1 }, list: [1, 2] });
     expect(verifyEvent(e)).toBe(true);
     await w.close();
+  });
+  it('rolls back the blob of an append refused after claimCheck', async () => {
+    // A non-finite time makes `makeEvent` throw in canonicalization, after the
+    // payload has already been registered as a pending blob. That registration
+    // must be rolled back: otherwise the next flush writes a blob no event names.
+    let time = Number.NaN;
+    const w = await JournalWriter.open(home(), 'n1', { now: () => time, batchWindowMs: 60_000 });
+    expect(() => w.append('test/big', { payload: 'a'.repeat(BIG_PAYLOAD_CHARS) }))
+      .toThrow(NonCanonicalizableError);
+    time = EPOCH;
+    await w.flush();
+    // An orphaned blob would have created the store and been drained here.
+    await expect(readdir(join(home(), 'blobs'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await readFile(logPath(home()))).length).toBe(0);
+    // The refusal consumed no seq and left the writer usable.
+    expect(w.append('test/ping', { n: 0 }).seq).toBe(0);
+    await w.close();
+    expect((await collectEvents(home())).map((e) => e.seq)).toEqual([0]);
   });
 });
 

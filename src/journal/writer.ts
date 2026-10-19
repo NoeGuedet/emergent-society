@@ -247,32 +247,40 @@ export class JournalWriter {
     this.throwIfUnusable();
     if (this.closed) throw new JournalClosedError();
     const claimed = this.claimCheck(data);
-    const e = makeEvent({
-      type, data: claimed.data, seq: this.seq, time: this.now(),
-      prevHash: this.prevHash, ...opts,
-    });
-    // The canonical line is captured here, once: `flush` writes these exact
-    // bytes, so a caller mutating `data` afterwards cannot desynchronize the
-    // persisted bytes from the hash that was chained.
-    const line = eventLine(e);
-    // The bound is measured on the line because a frame's decompressed content
-    // is exactly its lines and separators; an event that alone reaches it fits
-    // no split. Refusing *here*, before `seq`/`prevHash` advance, leaves the
-    // writer and the journal usable instead of admitting an event that no
-    // reader could ever accept.
-    const lineBytes = Buffer.byteLength(line, 'utf8');
-    if (lineBytes >= MAX_DECOMPRESSED_BATCH_BYTES) {
-      // `claimCheck` may already have registered this payload. Roll back only
-      // the blob this very append added, so the refusal leaves no orphan for a
-      // later drain and cannot remove one an earlier pending event still needs.
+    // Everything between `claimCheck` and a successful `pending.push` must roll
+    // back the blob it may have registered: an event that never enters the
+    // batch would otherwise leave an orphan for the next flush to write, with
+    // nothing in the log referencing it.
+    let prepared: PendingEvent;
+    try {
+      const e = makeEvent({
+        type, data: claimed.data, seq: this.seq, time: this.now(),
+        prevHash: this.prevHash, ...opts,
+      });
+      // The canonical line is captured here, once: `flush` writes these exact
+      // bytes, so a caller mutating `data` afterwards cannot desynchronize the
+      // persisted bytes from the hash that was chained.
+      const line = eventLine(e);
+      // The bound is measured on the line because a frame's decompressed content
+      // is exactly its lines and separators; an event that alone reaches it fits
+      // no split. Refusing *here*, before `seq`/`prevHash` advance, leaves the
+      // writer and the journal usable instead of admitting an event that no
+      // reader could ever accept.
+      const lineBytes = Buffer.byteLength(line, 'utf8');
+      if (lineBytes >= MAX_DECOMPRESSED_BATCH_BYTES) throw new OversizedEventError(lineBytes);
+      prepared = { event: e, line };
+    } catch (err) {
+      // Roll back only the blob this very append added, so the refusal leaves
+      // no orphan for a later drain and cannot remove one an earlier pending
+      // event still needs.
       if (claimed.addedBlob !== null) this.pendingBlobs.delete(claimed.addedBlob);
-      throw new OversizedEventError(lineBytes);
+      throw err;
     }
 
     this.seq += 1;
-    this.prevHash = e.hash;
-    this.firstHash ??= e.hash;
-    this.pending.push({ event: e, line });
+    this.prevHash = prepared.event.hash;
+    this.firstHash ??= prepared.event.hash;
+    this.pending.push(prepared);
     // No debounce: the window starts with the first event of the burst. The
     // guard makes a timer that outlives `close()` a no-op instead of a
     // synchronous throw from `flush()` inside a callback nothing can catch.
@@ -280,7 +288,7 @@ export class JournalWriter {
       if (this.closed) return;
       void this.flush().catch((err: unknown) => { this.recordAsyncFailure(err); });
     }, this.batchWindowMs);
-    return e;
+    return prepared.event;
   }
 
   /**
