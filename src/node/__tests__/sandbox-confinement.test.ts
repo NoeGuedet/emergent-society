@@ -421,8 +421,10 @@ describe('the world stays usable', () => {
       const out = text(outcome);
       const self = /self:(\d+)/.exec(out);
       if (self === null) throw new Error('the shell pid marker is missing');
-      // `ps` reads its own domain's /proc freely and names the shell.
-      expect(out).toContain(` ${self[1]}`);
+      // `ps` reads its own domain's /proc freely and names the shell. The pid
+      // column is right-justified to the widest pid, so a 7-digit pid fills it
+      // and carries no leading space — match the row, not a fixed padding.
+      expect(out).toMatch(new RegExp(`^\\s*${self[1]}\\s+bash\\s*$`, 'm'));
       expect(out).toMatch(/bash/);
       // Another process's cmdline/stat stay world-readable (the documented
       // residual); the pid is listed even though its environ is not.
