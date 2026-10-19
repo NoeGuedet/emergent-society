@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import {
   afterEach, beforeEach, describe, expect, it, vi,
 } from 'vitest';
+import { journalPath, nodeDir } from '../../journal/layout.js';
 import { buildSandboxSpec, type SandboxSpec } from '../tools/sandbox.js';
 import { DEFAULT_TERMINAL_ENV, PtyTerminalRuntime } from '../tools/terminal.js';
 import type { CommandLimits, CommandOutcome, TerminalRuntime } from '../tools/terminal.js';
@@ -18,11 +19,14 @@ import type { CommandLimits, CommandOutcome, TerminalRuntime } from '../tools/te
  * The confinement battery (C1.4c): real confined sessions through
  * `PtyTerminalRuntime` behind the real Landlock launcher, over a real spec —
  * a tmp home and world, and a canary credential store at
- * `<home>/providers.json`. Three faces, each a non-vacuous assertion:
+ * `<home>/providers.json`. Four faces, each a non-vacuous assertion:
  *
  * - the credential guarantee: the canary's *content* is unreadable and
  *   unwritable from raw bash, including the escape shapes, while the
  *   unconfined kernel still reads it;
+ * - the out-of-worktree paths: the world's git dir (`<root>/world.git`, next
+ *   to the worktree) and the node's journal (`<home>/nodes/<uid>`) are EACCES
+ *   for read and write, by relative and absolute path — never ENOENT;
  * - the world stays usable: file operations, executable scripts, large
  *   heredocs against the scratch `TMPDIR`, the system toolchain, `/proc`,
  *   the ptrace face and the granted devices all work;
@@ -42,6 +46,12 @@ const launcherPresent = existsSync(launcherBinary);
 const TEST_TIMEOUT_MS = 20_000;
 /** Unique enough that no output can contain it by accident. */
 const CANARY = 'ES_C14C_CANARY_9c1f4a7b2e';
+/** A marker in the world git dir's config: its bytes must never reach the shell. */
+const GIT_CANARY = 'ES_C14C_GIT_CANARY_5d8e2f1a';
+/** A marker in the node's journal log: its bytes must never reach the shell. */
+const JOURNAL_CANARY = 'ES_C14C_JOURNAL_CANARY_2b7c4d9e';
+/** The uid `confined()` builds the spec for; the journal is addressed through it. */
+const NODE_UID = 'node-a';
 
 if (!launcherPresent) {
   console.warn(
@@ -54,6 +64,11 @@ let root = '';
 let home = '';
 let world = '';
 let canaryPath = '';
+/** `<root>/world.git` — the world's git dir, outside the worktree (helpers.ts layout). */
+let worldGit = '';
+/** `<home>/nodes/<uid>` and the log inside it, as the journal layer lays them out. */
+let journalDir = '';
+let journalFile = '';
 let runtimes: TerminalRuntime[] = [];
 
 beforeEach(async () => {
@@ -67,6 +82,30 @@ beforeEach(async () => {
   // The umask can only clear bits from `writeFile`'s mode; pin the literal mode
   // the residual test asserts, independent of the caller's environment.
   await chmod(canaryPath, 0o644);
+
+  // The world's git dir lives NEXT TO the worktree, not inside it (the layout
+  // `useWorld` pins in helpers.ts). It is written by hand rather than
+  // initialized as a repo: a `.git` inside the world would make `git status`
+  // succeed and void the "not a git repository" assertion below.
+  worldGit = join(root, 'world.git');
+  await mkdir(worldGit);
+  await writeFile(join(worldGit, 'HEAD'), 'ref: refs/heads/main\n', { mode: 0o644 });
+  await writeFile(
+    join(worldGit, 'config'),
+    `[core]\n\trepositoryformatversion = 0\n# ${GIT_CANARY}\n`,
+    { mode: 0o644 },
+  );
+
+  // The journal's real on-disk layout, written from the kernel side with the
+  // modes the journal layer creates (0700/0600): no turn runs in this suite, so
+  // the fixture supplies the log the battery attacks.
+  journalDir = nodeDir(home, NODE_UID);
+  await mkdir(journalDir, { recursive: true, mode: 0o700 });
+  await chmod(journalDir, 0o700);
+  journalFile = journalPath(journalDir);
+  await writeFile(journalFile, `${JOURNAL_CANARY}\n`, { mode: 0o600 });
+  await chmod(journalFile, 0o600);
+
   runtimes = [];
 });
 
@@ -101,7 +140,7 @@ async function environOf(pid: number): Promise<string | null> {
 
 /** The real policy (default launcher), a runtime whose cwd is the world. */
 async function confined(): Promise<{ rt: PtyTerminalRuntime; spec: SandboxSpec }> {
-  const spec = await buildSandboxSpec({ world, home, uid: 'node-a' });
+  const spec = await buildSandboxSpec({ world, home, uid: NODE_UID });
   const rt = new PtyTerminalRuntime(world, DEFAULT_TERMINAL_ENV, spec);
   runtimes.push(rt);
   return { rt, spec };
@@ -189,6 +228,94 @@ describe('the credential guarantee', () => {
       expect(status).toMatchObject({ mode: 'landlock', enforcement: 'full' });
       if (status?.mode === 'landlock') expect(status.abi).toBeGreaterThanOrEqual(3);
       expect(await readFile(canaryPath, 'utf8')).toBe(`${CANARY}\n`);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('the out-of-worktree paths', () => {
+  it.skipIf(!launcherPresent)(
+    'denies the world git dir by relative and absolute path, for reads and writes',
+    async () => {
+      // Outside control: the git dir's files exist and are readable from the
+      // unconfined kernel, so every denial below is EACCES, never ENOENT.
+      const headPath = join(worldGit, 'HEAD');
+      const configPath = join(worldGit, 'config');
+      expect(await readFile(headPath, 'utf8')).toBe('ref: refs/heads/main\n');
+      const configBefore = await readFile(configPath);
+      const { rt } = await confined();
+      const outcome = await rt.run(
+        'cat ../world.git/HEAD; echo "git-relative-read:$?"; '
+          + `cat '${headPath}'; echo "git-absolute-read:$?"; `
+          // Metadata is unmediated (arbitration 13): the stat succeeding on the
+          // very file the read could not open is what proves EACCES, not ENOENT.
+          + `stat -c 'git-head-size:%s' '${headPath}'; echo "git-stat:$?"; `
+          + `echo x >> '${configPath}'; echo "git-append:$?"; `
+          + `printf 'planted\\n' > '${join(worldGit, 'planted')}'; echo "git-create:$?"; `
+          + `ls '${worldGit}'; echo "git-ls:$?"`,
+        limits(), signal(),
+      );
+      expect(outcome.status).toBe('completed');
+      const out = text(outcome);
+      // Reads: both path shapes are refused with EACCES.
+      expect(out).toContain('cat: ../world.git/HEAD: Permission denied');
+      expect(out).toContain(`cat: ${headPath}: Permission denied`);
+      expect(out).toMatch(/git-relative-read:[1-9]\d*/);
+      expect(out).toMatch(/git-absolute-read:[1-9]\d*/);
+      expect(out).toMatch(/git-head-size:\d+/);
+      expect(out).toMatch(/git-stat:0/);
+      // Writes: appending to a config, creating an entry, and listing the dir.
+      expect(out).toContain(`cannot open directory '${worldGit}'`);
+      expect(out).toMatch(/git-append:[1-9]\d*/);
+      expect(out).toMatch(/git-create:[1-9]\d*/);
+      expect(out).toMatch(/git-ls:[1-9]\d*/);
+      expect(out.match(/Permission denied/g)?.length).toBe(5);
+      // Non-vacuous: nothing landed, and no config byte reached the shell.
+      await expect(stat(join(worldGit, 'planted'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect((await readFile(configPath)).equals(configBefore)).toBe(true);
+      expect(out).not.toContain(GIT_CANARY);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it.skipIf(!launcherPresent)(
+    'denies the node journal directory and log, for reads and writes',
+    async () => {
+      // Outside control: the log exists at the journal layer's own path and is
+      // readable here — the bytes below are there to leak.
+      expect(await readFile(journalFile, 'utf8')).toBe(`${JOURNAL_CANARY}\n`);
+      const journalBefore = await readFile(journalFile);
+      const { rt } = await confined();
+      const outcome = await rt.run(
+        `ls '${journalDir}'; echo "journal-ls:$?"; `
+          + `ls ../home/nodes/${NODE_UID}; echo "journal-relative-ls:$?"; `
+          + `cat '${journalFile}'; echo "journal-read:$?"; `
+          + `stat -c 'journal-size:%s' '${journalFile}'; echo "journal-stat:$?"; `
+          + `printf 'planted\\n' > '${join(journalDir, 'planted')}'; echo "journal-create:$?"; `
+          + `: > '${journalFile}'; echo "journal-truncate:$?"`,
+        limits(), signal(),
+      );
+      expect(outcome.status).toBe('completed');
+      const out = text(outcome);
+      // The directory cannot even be listed (READ_DIR denied), by either shape.
+      expect(out).toContain(`cannot open directory '${journalDir}': Permission denied`);
+      expect(out).toContain(
+        `cannot open directory '../home/nodes/${NODE_UID}': Permission denied`);
+      expect(out).toMatch(/journal-ls:[1-9]\d*/);
+      expect(out).toMatch(/journal-relative-ls:[1-9]\d*/);
+      // The log itself: the read is EACCES, and the stat proves it exists.
+      expect(out).toContain(`cat: ${journalFile}: Permission denied`);
+      expect(out).toMatch(/journal-read:[1-9]\d*/);
+      expect(out).toMatch(/journal-size:\d+/);
+      expect(out).toMatch(/journal-stat:0/);
+      // Writes: a new entry in the directory, a truncation of the log.
+      expect(out).toMatch(/journal-create:[1-9]\d*/);
+      expect(out).toMatch(/journal-truncate:[1-9]\d*/);
+      expect(out.match(/Permission denied/g)?.length).toBe(5);
+      // Non-vacuous: the log is byte-identical and no journal byte leaked.
+      await expect(stat(join(journalDir, 'planted'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect((await readFile(journalFile)).equals(journalBefore)).toBe(true);
+      expect(out).not.toContain(JOURNAL_CANARY);
     },
     TEST_TIMEOUT_MS,
   );
