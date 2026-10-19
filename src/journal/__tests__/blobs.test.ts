@@ -72,8 +72,9 @@ describe('BlobStore', () => {
     const content = Buffer.from('permissions');
     const hash = await store.put(content);
     const shard = join(home(), 'blobs', hash.slice(0, 2));
-    // Journal payloads are private to the cell: the store's directories are
-    // owner-only and so is every blob, regardless of the process umask.
+    // Journal payloads are private to the cell: the store creates directories
+    // 0700 and blobs 0600, so group/other bits are never granted; owner bits
+    // follow the umask.
     expect((await stat(join(home(), 'blobs'))).mode & 0o777).toBe(0o700);
     expect((await stat(shard)).mode & 0o777).toBe(0o700);
     expect((await stat(join(shard, hash))).mode & 0o777).toBe(0o600);

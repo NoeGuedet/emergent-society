@@ -188,8 +188,9 @@ describe('JournalWriter', () => {
     w.append('test/ping', { n: 0 });
     await w.flush();
     const dir = nodeDir(home(), 'n1');
-    // The journal's own tree and every file in it are owner-only, regardless of
-    // the process umask. The owner record is written by the lock guard process.
+    // Journal directories and files are created with 0700/0600 creation modes:
+    // group/other bits are never granted; owner bits follow the umask. The
+    // owner record is written by the lock guard process.
     expect((await stat(join(home(), 'nodes'))).mode & 0o777).toBe(0o700);
     expect((await stat(dir)).mode & 0o777).toBe(0o700);
     expect((await stat(journalPath(dir))).mode & 0o777).toBe(0o600);
