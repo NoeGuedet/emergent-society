@@ -10,7 +10,7 @@ import {
   CLAIM_CHECK_THRESHOLD, MAX_BLOB_BYTES, BlobStore, ReservedBlobRefError, isBlobRef,
 } from '../blobs.js';
 import { canonicalizeJson, NonCanonicalizableError } from '../canon.js';
-import { headPath, journalPath, lockPath, nodeDir, ownerPath } from '../layout.js';
+import { nodeLayout } from '../layout.js';
 import {
   appendTear, BIG_PAYLOAD_CHARS, collectEvents, EPOCH, forgedEnvelope, logPath, rewriteLog,
   useTempHome, withFailingWrite,
@@ -18,11 +18,12 @@ import {
 
 const home = useTempHome('cell-writer-');
 
-/** Writes a lock file for the current test's node. */
-async function writeLock(dir: string, contents: string): Promise<void> {
+/** Writes a legacy lock record for the current test's node. */
+async function writeLock(contents: string): Promise<void> {
   const { mkdir, writeFile } = await import('node:fs/promises');
-  await mkdir(dir, { recursive: true });
-  await writeFile(lockPath(dir), contents);
+  const layout = nodeLayout(home(), 'n1');
+  await mkdir(layout.dir, { recursive: true });
+  await writeFile(join(layout.dir, layout.lockFile), contents);
 }
 
 describe('JournalWriter', () => {
@@ -187,15 +188,17 @@ describe('JournalWriter', () => {
     const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
     w.append('test/ping', { n: 0 });
     await w.flush();
-    const dir = nodeDir(home(), 'n1');
+    const layout = nodeLayout(home(), 'n1');
     // Journal directories and files are created with 0700/0600 creation modes:
     // group/other bits are never granted; owner bits follow the umask. The
-    // owner record is written by the lock guard process.
+    // owner record is written by the lock guard process and the flock sidecar is
+    // pre-created by the parent before the guard touches it.
     expect((await stat(join(home(), 'nodes'))).mode & 0o777).toBe(0o700);
-    expect((await stat(dir)).mode & 0o777).toBe(0o700);
-    expect((await stat(journalPath(dir))).mode & 0o777).toBe(0o600);
-    expect((await stat(headPath(dir))).mode & 0o777).toBe(0o600);
-    expect((await stat(ownerPath(dir))).mode & 0o777).toBe(0o600);
+    expect((await stat(layout.dir)).mode & 0o777).toBe(0o700);
+    expect((await stat(join(layout.dir, layout.logFile))).mode & 0o777).toBe(0o600);
+    expect((await stat(join(layout.dir, layout.headFile))).mode & 0o777).toBe(0o600);
+    expect((await stat(join(layout.dir, layout.ownerFile))).mode & 0o777).toBe(0o600);
+    expect((await stat(join(layout.dir, layout.lockFile))).mode & 0o777).toBe(0o600);
     await w.close();
   });
 });
@@ -293,7 +296,7 @@ describe('JournalWriter durability and ownership', () => {
     await w.close();
   });
   it('takes over a lock whose owner is dead', async () => {
-    await writeLock(nodeDir(home(), 'n1'), '999999999');
+    await writeLock('999999999');
     const w = await JournalWriter.open(home(), 'n1');
     await w.close();
   });
@@ -301,7 +304,7 @@ describe('JournalWriter durability and ownership', () => {
     const w = await JournalWriter.open(home(), 'n1');
     w.append('test/ping', { n: 0 });
     await w.close();
-    await rewriteLog(journalPath(nodeDir(home(), 'n1')), (lines) => [...lines, forgedEnvelope()]);
+    await rewriteLog(logPath(home()), (lines) => [...lines, forgedEnvelope()]);
     const err = await JournalWriter.open(home(), 'n1').catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ChainBreakError);
     // Canonically encoded, so the linkage is what refuses the resume.
@@ -325,7 +328,7 @@ describe('JournalWriter durability and ownership', () => {
     },
   );
   it('refuses a lock held by the current live process', async () => {
-    await writeLock(nodeDir(home(), 'n1'), JSON.stringify({
+    await writeLock(JSON.stringify({
       pid: process.pid, startedAt: await currentProcessStartTime(),
     }));
     await expect(JournalWriter.open(home(), 'n1')).rejects.toThrow(SessionAlreadyOwnedError);
@@ -333,13 +336,13 @@ describe('JournalWriter durability and ownership', () => {
   it('takes over a lock whose PID was recycled by an unrelated process', async () => {
     // The PID is alive (ours) but the recorded start time cannot match, so the
     // lock belongs to a process that is gone.
-    await writeLock(nodeDir(home(), 'n1'), JSON.stringify({ pid: process.pid, startedAt: 1 }));
+    await writeLock(JSON.stringify({ pid: process.pid, startedAt: 1 }));
     const w = await JournalWriter.open(home(), 'n1');
     await w.close();
   });
   it('takes over a lock whose contents are garbage', async () => {
     for (const garbage of ['', 'abc', '0', '-1', '9999999999999', '{"pid":']) {
-      await writeLock(nodeDir(home(), 'n1'), garbage);
+      await writeLock(garbage);
       const w = await JournalWriter.open(home(), 'n1');
       await w.close();
     }

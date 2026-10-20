@@ -2,7 +2,7 @@
 // through the same flock-guarded helper the writer uses, then stays alive so
 // its recorded pid can be observed as a live owner (and reclaimed once killed).
 //
-// argv: <dir> <mode>   mode = hold | contend
+// argv: <dir> <mode> <lock-file> <owner-file>   mode = hold | contend
 //   hold    — acquire immediately, report `{owned, code}`, stay alive.
 //   contend — wait for the 'go' message, then acquire and report; stay alive
 //             only while owned, so a loser exits.
@@ -12,9 +12,9 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const [dir, mode = 'hold'] = process.argv.slice(2);
+const [dir, mode = 'hold', lockFile, ownerFile] = process.argv.slice(2);
 const helper = fileURLToPath(new URL('../../lock-guard.mjs', import.meta.url));
-const sidecar = join(dir, 'journal.v0.lock');
+const sidecar = join(dir, lockFile);
 const token = randomBytes(16).toString('hex');
 
 function selfStart() {
@@ -28,6 +28,7 @@ function acquire() {
   return spawnSync('/usr/bin/flock', [
     '-F', '-E', '3', '--wait=5', '--exclusive', sidecar,
     process.execPath, helper, 'acquire', dir, String(process.pid), String(selfStart()), token,
+    '--lock', lockFile, '--owner', ownerFile,
   ]).status;
 }
 

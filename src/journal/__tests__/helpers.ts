@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { BlobStore, CLAIM_CHECK_THRESHOLD } from '../blobs.js';
 import { canonicalizeJson, sha256HexOf, type JsonValue } from '../canon.js';
 import { encodeBatch, scanBatches } from '../framing.js';
-import { journalPath, nodeDir } from '../layout.js';
+import { nodeLayout } from '../layout.js';
 import { JournalReader } from '../reader.js';
 import { computeHash, type EventEnvelope } from '../envelope.js';
 
@@ -38,7 +38,8 @@ export function useTempHome(prefix: string): () => string {
 
 /** The canonical log path of a node inside `home`. */
 export function logPath(home: string, node = 'n1'): string {
-  return journalPath(nodeDir(home, node));
+  const layout = nodeLayout(home, node);
+  return join(layout.dir, layout.logFile);
 }
 
 /** Collects every event the reader serves, optionally from a watermark. */

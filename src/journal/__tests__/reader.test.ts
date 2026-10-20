@@ -10,7 +10,7 @@ import { UnknownEventTypeError, computeHash, verifyEvent, type EventEnvelope } f
 import { canonicalizeJson, NonCanonicalizableError, sha256HexOf } from '../canon.js';
 import { isCorruption } from '../errors.js';
 import { encodeBatch, scanBatches, CorruptFrameError } from '../framing.js';
-import { headPath, journalPath, nodeDir } from '../layout.js';
+import { nodeLayout } from '../layout.js';
 import {
   BlobIntegrityError, CLAIM_CHECK_THRESHOLD, isBlobRef, MAX_BLOB_BYTES, TruncatedBlobError,
 } from '../blobs.js';
@@ -30,9 +30,9 @@ async function collect(r: JournalReader, fromSeq = 0) {
 
 /** A fresh reader over a log whose only line is the given hand-encoded raw line. */
 async function readerOverRawLine(line: string): Promise<JournalReader> {
-  const dir = nodeDir(home(), 'n1');
-  await mkdir(dir, { recursive: true });
-  await writeFile(journalPath(dir), encodeBatch([line]));
+  const layout = nodeLayout(home(), 'n1');
+  await mkdir(layout.dir, { recursive: true });
+  await writeFile(join(layout.dir, layout.logFile), encodeBatch([line]));
   return JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES });
 }
 
@@ -169,8 +169,9 @@ describe('JournalReader verification and repair edges', () => {
     await w.flush();
     await w.close();
     const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN });
+    const layout = nodeLayout(home(), 'n1');
     for (const bad of ['null', '[]', '{"count":2}', '{"first_hash":"x","last_hash":"y","count":-1,"ts":1}', 'not json']) {
-      await writeFile(headPath(nodeDir(home(), 'n1')), bad);
+      await writeFile(join(layout.dir, layout.headFile), bad);
       expect(await r.head()).toBeNull();
     }
   });
@@ -561,7 +562,7 @@ describe('repair error precedence', () => {
     await appendTear(home());
     expect(await repair(home(), 'n1')).toEqual({ tornBytes: 9 });
     // The release ran, so a fresh acquire succeeds instead of seeing a live owner.
-    const owner = await acquireLock(nodeDir(home(), 'n1'), 'n1');
+    const owner = await acquireLock(nodeLayout(home(), 'n1'));
     await owner.release();
   });
 });

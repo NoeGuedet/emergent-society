@@ -3,20 +3,28 @@ import { HASH_RE } from './canon.js';
 import { InvalidNodeUidError } from './errors.js';
 
 /**
- * Where a node's journal lives, in one place. The on-disk layout is an interface
- * of its own (kernel.md §3): C1.2's kernel addresses these files at boot without
+ * Where a journal lives, in one place. The on-disk layout is an interface of
+ * its own (kernel.md §3): C1.2's kernel addresses these files at boot without
  * going through the writer, so every literal that spells a journal path belongs
  * here rather than at the call site.
  *
- * `nodeDir(home, uid)` builds a node's directory from the home; the `…Path(dir)`
- * helpers take that directory, which is what a writer or reader holds once it
- * has been resolved. The module also owns `Head` and `parseHead` — the shape of
- * the one disposable checkpoint that sits beside the log — so that the reader
- * and the writer share it without importing each other.
+ * A layout names one journal: the cell home (the durability root and the shared
+ * blob store root), the directory holding the log, the lock's diagnostic label,
+ * and the four file names. Two profiles exist: the node's local log
+ * (`nodeLayout(home, uid)`, named `log.v0.*`) and the cell's global frontier
+ * journal (`frontierLayout(home)`, named `journal.v0.*`). The storage machinery
+ * is identical; only the names differ.
  *
  * The uid is a technical identifier (kernel.md §3), and this module is where it
- * is validated: every path builder funnels through `nodeDir`, so a rejected uid
- * can never reach the filesystem from any caller, direct writer included.
+ * is validated: the `(home, uid)` constructors — `nodeDir` and `nodeLayout` —
+ * funnel through `assertNodeUid`, so a rejected uid can never reach the
+ * filesystem from any caller, direct writer included. `frontierLayout` takes no
+ * uid and validates nothing: it builds a trusted layout for the directory the
+ * kernel itself owns.
+ *
+ * The module also owns `Head` and `parseHead` — the shape of the one disposable
+ * checkpoint that sits beside the log — so that the reader and the writer share
+ * it without importing each other.
  */
 
 /**
@@ -41,10 +49,32 @@ export function assertNodeUid(uid: string): string {
   return uid;
 }
 
-export const LOG_FILE = 'journal.v0.jsonl.zstd';
-export const LOCK_FILE = 'journal.v0.lock';
-export const OWNER_FILE = 'journal.v0.owner';
-export const HEAD_FILE = 'journal.v0.head';
+/**
+ * One journal's layout. `home` is the durability root and the shared blob store
+ * root; `dir` is the directory holding the log; `label` is the lock's
+ * diagnostic identity (`'frontier'` or the node uid); the four names are the
+ * log, its disposable head, the flock sidecar and the owner record.
+ */
+export type JournalLayout = {
+  readonly home: string;
+  readonly dir: string;
+  readonly label: string;
+  readonly logFile: string;
+  readonly headFile: string;
+  readonly lockFile: string;
+  readonly ownerFile: string;
+};
+
+export const LOG_FILE = 'log.v0.jsonl.zstd';
+export const LOCK_FILE = 'log.v0.lock';
+export const OWNER_FILE = 'log.v0.owner';
+export const HEAD_FILE = 'log.v0.head';
+
+const FRONTIER_DIR = 'frontier';
+const FRONTIER_LOG_FILE = 'journal.v0.jsonl.zstd';
+const FRONTIER_LOCK_FILE = 'journal.v0.lock';
+const FRONTIER_OWNER_FILE = 'journal.v0.owner';
+const FRONTIER_HEAD_FILE = 'journal.v0.head';
 
 /**
  * `nodes/<uid>/` — the node's journal directory, inside the cell home. The uid
@@ -55,33 +85,31 @@ export function nodeDir(home: string, nodeUid: string): string {
   return join(home, 'nodes', assertNodeUid(nodeUid));
 }
 
-/** The canonical log of a node. */
-export function journalPath(dir: string): string {
-  return join(dir, LOG_FILE);
+/** The node's local log, in its `log.v0.*` profile. */
+export function nodeLayout(home: string, nodeUid: string): JournalLayout {
+  const uid = assertNodeUid(nodeUid);
+  return {
+    home,
+    dir: join(home, 'nodes', uid),
+    label: uid,
+    logFile: LOG_FILE,
+    headFile: HEAD_FILE,
+    lockFile: LOCK_FILE,
+    ownerFile: OWNER_FILE,
+  };
 }
 
-/** The chain checkpoint of a node. */
-export function headPath(dir: string): string {
-  return join(dir, HEAD_FILE);
-}
-
-/**
- * The stable flock sidecar of a node. It is the lock target and is never
- * unlinked or atomically replaced, so every lifecycle transition contends on
- * the same inode; its content is only ever a legacy record from an older
- * writer.
- */
-export function lockPath(dir: string): string {
-  return join(dir, LOCK_FILE);
-}
-
-/**
- * The owner record: the durable `{pid, startedAt, token}` that grants lifetime
- * exclusion. It is a separate file from the flock sidecar because it must be
- * written atomically (temp + rename) while the sidecar inode stays fixed.
- */
-export function ownerPath(dir: string): string {
-  return join(dir, OWNER_FILE);
+/** The cell's global frontier journal, in its `journal.v0.*` profile. */
+export function frontierLayout(home: string): JournalLayout {
+  return {
+    home,
+    dir: join(home, FRONTIER_DIR),
+    label: 'frontier',
+    logFile: FRONTIER_LOG_FILE,
+    headFile: FRONTIER_HEAD_FILE,
+    lockFile: FRONTIER_LOCK_FILE,
+    ownerFile: FRONTIER_OWNER_FILE,
+  };
 }
 
 /**

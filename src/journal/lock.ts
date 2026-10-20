@@ -1,24 +1,29 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { open, readFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JournalError } from './errors.js';
-import { lockPath } from './layout.js';
+import type { JournalLayout } from './layout.js';
 
 /**
- * Single-writer ownership for one node's journal.
+ * Single-writer ownership for one journal.
  *
- * The invariant: at most one live owner may hold a node's journal. A stable
- * flock sidecar serializes every lifecycle transition; the exclusive right
- * itself is a durable record naming the owner process (`{pid, startedAt,
- * token}`), so a crashed helper cannot strand or duplicate an ownership. The
- * read-decide-write of that record runs in a short-lived helper process held
- * under the flock — never in the parent — so a partial record is impossible
- * and a dead helper releases the kernel lock by itself.
+ * The invariant: at most one live owner may hold a journal. A stable flock
+ * sidecar serializes every lifecycle transition; the exclusive right itself is
+ * a durable record naming the owner process (`{pid, startedAt, token}`), so a
+ * crashed helper cannot strand or duplicate an ownership. The read-decide-write
+ * of that record runs in a short-lived helper process held under the flock —
+ * never in the parent — so a partial record is impossible and a dead helper
+ * releases the kernel lock by itself.
+ *
+ * The journal is named by its `JournalLayout`; every diagnostic uses the
+ * layout's `label` (`'frontier'` or a node uid), so the lock layer knows nothing
+ * about nodes.
  */
 export class SessionAlreadyOwnedError extends JournalError {
-  constructor(nodeUid: string) {
-    super(`journal for node "${nodeUid}" is already owned by a live writer`);
+  constructor(label: string) {
+    super(`journal "${label}" is already owned by a live writer`);
   }
 }
 
@@ -28,8 +33,8 @@ export class SessionAlreadyOwnedError extends JournalError {
  * a live owner: the caller may retry.
  */
 export class JournalLockBusyError extends JournalError {
-  constructor(public readonly nodeUid: string) {
-    super(`journal for node "${nodeUid}": the ownership guard is busy`);
+  constructor(public readonly label: string) {
+    super(`journal "${label}": the ownership guard is busy`);
   }
 }
 
@@ -39,8 +44,8 @@ export class JournalLockBusyError extends JournalError {
  * caller must fail closed rather than assume the journal is free.
  */
 export class JournalLockUnavailableError extends JournalError {
-  constructor(public readonly nodeUid: string, reason: string) {
-    super(`journal for node "${nodeUid}": ownership guard unavailable — ${reason}`);
+  constructor(public readonly label: string, reason: string) {
+    super(`journal "${label}": ownership guard unavailable — ${reason}`);
   }
 }
 
@@ -52,7 +57,7 @@ export interface OwnerIdentity {
 }
 
 /**
- * The exclusive right to write one node's journal. `release` is idempotent and
+ * The exclusive right to write one journal. `release` is idempotent and
  * token-bound: it clears only the record it created, never a later owner's.
  */
 export interface JournalOwnership {
@@ -102,13 +107,43 @@ const FLOCK_STARTUP_EXITS = new Set([1, 64, 66, 69]);
 class UnknownGuardOutcomeError extends JournalLockUnavailableError {}
 
 /**
+ * One safe file name: no separator, no traversal, no empty name. The guard
+ * applies exactly the same predicate to the names it receives, but the parent
+ * applies it first: `/usr/bin/flock` opens its target before the guard parses
+ * argv, so guard-side validation alone cannot protect the sidecar path.
+ */
+function isSafeFileName(name: string): boolean {
+  return basename(name) === name && name !== '' && name !== '.' && name !== '..';
+}
+
+/**
+ * Refuses a layout whose lock or owner name is not a plain file name. Applied
+ * before either name is used, by the parent's sidecar pre-creation as well as
+ * by the guard's argv build.
+ */
+function assertSafeNames(layout: JournalLayout): void {
+  if (!isSafeFileName(layout.lockFile)) {
+    throw new JournalLockUnavailableError(
+      layout.label, `invalid lock file name ${JSON.stringify(layout.lockFile)}`,
+    );
+  }
+  if (!isSafeFileName(layout.ownerFile)) {
+    throw new JournalLockUnavailableError(
+      layout.label, `invalid owner file name ${JSON.stringify(layout.ownerFile)}`,
+    );
+  }
+}
+
+/**
  * Runs the ownership helper under the flock sidecar. A narrow seam so tests can
  * inject a guard failure at the dependency boundary without a production flag.
  */
 export class LockGuard {
-  constructor(private readonly dir: string, private readonly nodeUid: string) {}
+  constructor(private readonly layout: JournalLayout) {}
 
   async run(command: 'acquire' | 'release', owner: OwnerIdentity): Promise<void> {
+    const { dir, label, lockFile, ownerFile } = this.layout;
+    assertSafeNames(this.layout);
     const args = [
       // -F: flock execs the helper in place, so the spawned pid *is* the
       // critical section; killing it on timeout releases the kernel lock and
@@ -119,41 +154,42 @@ export class LockGuard {
       '-E', String(FLOCK_CONFLICT_EXIT),
       `--wait=${GUARD_WAIT_SECONDS}`,
       '--exclusive',
-      lockPath(this.dir),
+      join(dir, lockFile),
       process.execPath,
       GUARD_PATH,
       command,
-      this.dir,
+      dir,
       String(owner.pid),
       owner.startedAt === null ? 'null' : String(owner.startedAt),
       owner.token,
+      '--lock', lockFile, '--owner', ownerFile,
     ];
     const { code, diagnostic } = await this.spawnFlock(args);
     switch (code) {
       case 0:
         return;
       case EXIT_OWNED:
-        throw new SessionAlreadyOwnedError(this.nodeUid);
+        throw new SessionAlreadyOwnedError(label);
       case EXIT_OWNER_GONE:
-        throw new JournalLockUnavailableError(this.nodeUid, 'owning process is no longer alive');
+        throw new JournalLockUnavailableError(label, 'owning process is no longer alive');
       case EXIT_BAD_PROTOCOL:
-        throw new JournalLockUnavailableError(this.nodeUid, 'guard rejected the request');
+        throw new JournalLockUnavailableError(label, 'guard rejected the request');
       case EXIT_HELPER_ERROR:
         throw new JournalLockUnavailableError(
-          this.nodeUid, diagnostic === '' ? 'guard failed before deciding' : diagnostic,
+          label, diagnostic === '' ? 'guard failed before deciding' : diagnostic,
         );
       case FLOCK_CONFLICT_EXIT:
-        throw new JournalLockBusyError(this.nodeUid);
+        throw new JournalLockBusyError(label);
       default:
         // flock could not start the helper: a clean failure, not contention.
         if (FLOCK_STARTUP_EXITS.has(code)) {
           throw new JournalLockUnavailableError(
-            this.nodeUid, diagnostic === '' ? `guard could not start (exit ${code})` : diagnostic,
+            label, diagnostic === '' ? `guard could not start (exit ${code})` : diagnostic,
           );
         }
         // Any other code is not one the helper emits, so the outcome is unknown.
         throw new UnknownGuardOutcomeError(
-          this.nodeUid, diagnostic === '' ? `guard exited ${code}` : diagnostic,
+          label, diagnostic === '' ? `guard exited ${code}` : diagnostic,
         );
     }
   }
@@ -166,13 +202,13 @@ export class LockGuard {
         if (diagnostic.length < MAX_DIAGNOSTIC) diagnostic += chunk.toString('utf8');
       });
       child.once('error', (err) => {
-        reject(new JournalLockUnavailableError(this.nodeUid, sanitize(err.message)));
+        reject(new JournalLockUnavailableError(this.layout.label, sanitize(err.message)));
       });
       child.once('close', (code) => {
         if (code === null) {
           // Killed at the wait ceiling (or by a signal): the critical section
           // may have partially run, so the outcome is unknown.
-          reject(new UnknownGuardOutcomeError(this.nodeUid, 'guard timed out'));
+          reject(new UnknownGuardOutcomeError(this.layout.label, 'guard timed out'));
           return;
         }
         resolve({ code, diagnostic: sanitize(diagnostic) });
@@ -182,20 +218,45 @@ export class LockGuard {
 }
 
 /**
- * Acquires exclusive ownership of a node's journal for this process.
+ * Creates the flock sidecar before `flock` touches it, with the journal's
+ * owner-only mode. The external binary would otherwise create it with the
+ * umask's modes.
+ *
+ * The file is opened for append, never truncated and never atomically replaced:
+ * the sidecar must keep one inode across every lifecycle transition, and its
+ * content may be a legacy record an older writer left there. An existing file's
+ * mode is likewise left alone — re-moding would race another owner and break
+ * the inode-identity guarantee the lock relies on.
+ */
+async function createLockSidecar(layout: JournalLayout): Promise<void> {
+  assertSafeNames(layout);
+  try {
+    const handle = await open(join(layout.dir, layout.lockFile), 'a', 0o600);
+    await handle.close();
+  } catch (err) {
+    throw new JournalLockUnavailableError(
+      layout.label,
+      `cannot create the lock sidecar — ${sanitize(err instanceof Error ? err.message : String(err))}`,
+    );
+  }
+}
+
+/**
+ * Acquires exclusive ownership of a journal for this process.
  *
  * @throws SessionAlreadyOwnedError when a live (or conservatively live) owner
  * already holds the journal.
  * @throws JournalLockBusyError when the guard is momentarily contended.
  * @throws JournalLockUnavailableError when the guard cannot run at all.
  */
-export async function acquireLock(dir: string, nodeUid: string): Promise<JournalOwnership> {
+export async function acquireLock(layout: JournalLayout): Promise<JournalOwnership> {
+  await createLockSidecar(layout);
   const identity: OwnerIdentity = {
     pid: process.pid,
     startedAt: await processStartTime(process.pid),
     token: randomBytes(16).toString('hex'),
   };
-  const guard = new LockGuard(dir, nodeUid);
+  const guard = new LockGuard(layout);
   try {
     await guard.run('acquire', identity);
   } catch (err) {

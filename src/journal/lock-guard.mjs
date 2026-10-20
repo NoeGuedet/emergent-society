@@ -13,9 +13,8 @@
 import {
   closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, truncateSync, writeSync,
 } from 'node:fs';
+import { basename, join } from 'node:path';
 
-const LOCK_FILE = 'journal.v0.lock';
-const OWNER_FILE = 'journal.v0.owner';
 const MAX_PID = 2 ** 31 - 1;
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 
@@ -31,8 +30,17 @@ function fail(code, reason) {
   process.exit(code);
 }
 
+// The guard is the security boundary: the lock and owner names arrive as argv
+// here, and the parent cannot protect the sidecar path (`flock` opens its
+// target before this process parses argv). One safe path segment, nothing else.
+function isSafeFileName(name) {
+  return typeof name === 'string' && basename(name) === name
+    && name !== '' && name !== '.' && name !== '..';
+}
+
 function parseArgv(argv) {
-  const [command, dir, pidRaw, startedRaw, token] = argv;
+  const [command, dir, pidRaw, startedRaw, token, lockFlag, lockFile, ownerFlag, ownerFile] = argv;
+  if (argv.length !== 9) fail(EXIT_BAD_PROTOCOL, 'bad argument count');
   if (command !== 'acquire' && command !== 'release') fail(EXIT_BAD_PROTOCOL, 'unknown command');
   if (typeof dir !== 'string' || dir.length === 0) fail(EXIT_BAD_PROTOCOL, 'bad dir');
   const pid = Number(pidRaw);
@@ -44,7 +52,9 @@ function parseArgv(argv) {
     if (!Number.isInteger(startedAt) || startedAt < 0) fail(EXIT_BAD_PROTOCOL, 'bad startedAt');
   }
   if (typeof token !== 'string' || !TOKEN_RE.test(token)) fail(EXIT_BAD_PROTOCOL, 'bad token');
-  return { command, dir, pid, startedAt, token };
+  if (lockFlag !== '--lock' || !isSafeFileName(lockFile)) fail(EXIT_BAD_PROTOCOL, 'bad lock file');
+  if (ownerFlag !== '--owner' || !isSafeFileName(ownerFile)) fail(EXIT_BAD_PROTOCOL, 'bad owner file');
+  return { command, dir, pid, startedAt, token, lockFile, ownerFile };
 }
 
 /**
@@ -215,8 +225,8 @@ function release(owner, identity) {
 
 try {
   const identity = parseArgv(process.argv.slice(2));
-  const sidecar = `${identity.dir}/${LOCK_FILE}`;
-  const owner = `${identity.dir}/${OWNER_FILE}`;
+  const sidecar = join(identity.dir, identity.lockFile);
+  const owner = join(identity.dir, identity.ownerFile);
   if (identity.command === 'acquire') acquire(sidecar, owner, identity);
   else release(owner, identity);
 } catch (err) {

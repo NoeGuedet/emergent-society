@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { fork, spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { chmod, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -10,7 +10,7 @@ import {
 } from '../lock.js';
 import { JournalWriter, TornTailError } from '../writer.js';
 import { repair } from '../reader.js';
-import { lockPath, nodeDir, ownerPath } from '../layout.js';
+import { frontierLayout, nodeLayout, type JournalLayout } from '../layout.js';
 import { appendTear, logPath, useTempHome, withFailingWrite } from './helpers.js';
 
 const home = useTempHome('cell-lock-');
@@ -30,23 +30,31 @@ interface ChildMessage {
   code?: number;
 }
 
-async function prepareDir(uid = 'n1'): Promise<string> {
-  const dir = nodeDir(home(), uid);
-  await mkdir(dir, { recursive: true });
-  return dir;
+async function prepareLayout(uid = 'n1'): Promise<JournalLayout> {
+  const layout = nodeLayout(home(), uid);
+  await mkdir(layout.dir, { recursive: true });
+  return layout;
 }
 
-async function readOwnerRaw(dir: string): Promise<string | null> {
+function ownerPathOf(layout: JournalLayout): string {
+  return join(layout.dir, layout.ownerFile);
+}
+
+function lockPathOf(layout: JournalLayout): string {
+  return join(layout.dir, layout.lockFile);
+}
+
+async function readOwnerRaw(layout: JournalLayout): Promise<string | null> {
   try {
-    return await readFile(ownerPath(dir), 'utf8');
+    return await readFile(ownerPathOf(layout), 'utf8');
   } catch {
     return null;
   }
 }
 
-async function ownerExists(dir: string): Promise<boolean> {
+async function ownerExists(layout: JournalLayout): Promise<boolean> {
   try {
-    await stat(ownerPath(dir));
+    await stat(ownerPathOf(layout));
     return true;
   } catch {
     return false;
@@ -85,13 +93,13 @@ describe('journal ownership', () => {
 
   it('repair on a missing journal creates nothing', async () => {
     expect(await repair(home(), 'ghost')).toEqual({ tornBytes: 0 });
-    await expect(stat(nodeDir(home(), 'ghost'))).rejects.toThrow();
+    await expect(stat(nodeLayout(home(), 'ghost').dir)).rejects.toThrow();
   });
 
   it('grants exactly one live owner among many concurrent acquisitions', async () => {
-    const dir = await prepareDir();
+    const layout = await prepareLayout();
     const results = await Promise.allSettled([
-      acquireLock(dir, 'n1'), acquireLock(dir, 'n1'), acquireLock(dir, 'n1'),
+      acquireLock(layout), acquireLock(layout), acquireLock(layout),
     ]);
     const owned = results.filter((r) => r.status === 'fulfilled');
     expect(owned).toHaveLength(1);
@@ -108,73 +116,88 @@ describe('journal ownership', () => {
   });
 
   it('reclaims a stale owner record but refuses a live one', async () => {
-    const dir = await prepareDir();
-    await writeFile(ownerPath(dir), JSON.stringify({ pid: 999999999, startedAt: 1, token: 'x'.repeat(32) }));
-    const owner = await acquireLock(dir, 'n1');
-    await expect(acquireLock(dir, 'n1')).rejects.toThrow(SessionAlreadyOwnedError);
+    const layout = await prepareLayout();
+    await writeFile(ownerPathOf(layout), JSON.stringify({ pid: 999999999, startedAt: 1, token: 'x'.repeat(32) }));
+    const owner = await acquireLock(layout);
+    await expect(acquireLock(layout)).rejects.toThrow(SessionAlreadyOwnedError);
     await owner.release();
   });
 
   it('is token-bound: a replaced owner record is never removed', async () => {
-    const dir = await prepareDir();
-    const first = await acquireLock(dir, 'n1');
+    const layout = await prepareLayout();
+    const first = await acquireLock(layout);
     // A later owner reclaimed the journal after the first was assumed dead.
-    await writeFile(ownerPath(dir), JSON.stringify({
+    await writeFile(ownerPathOf(layout), JSON.stringify({
       pid: process.pid, startedAt: await processStartTime(process.pid), token: 'b'.repeat(32),
     }));
     await first.release();
-    expect(JSON.parse((await readOwnerRaw(dir))!).token).toBe('b'.repeat(32));
-    await rm(ownerPath(dir), { force: true });
+    expect(JSON.parse((await readOwnerRaw(layout))!).token).toBe('b'.repeat(32));
+    await rm(ownerPathOf(layout), { force: true });
   });
 
   it('release is idempotent and cannot remove a later live owner', async () => {
-    const dir = await prepareDir();
-    const first = await acquireLock(dir, 'n1');
+    const layout = await prepareLayout();
+    const first = await acquireLock(layout);
     await first.release();
-    const later = await acquireLock(dir, 'n1');
+    const later = await acquireLock(layout);
     await first.release();
-    expect(await ownerExists(dir)).toBe(true);
+    expect(await ownerExists(layout)).toBe(true);
     await later.release();
-    expect(await ownerExists(dir)).toBe(false);
+    expect(await ownerExists(layout)).toBe(false);
   });
 
   it('reclaims a stale legacy sidecar record but refuses a live one', async () => {
-    const dir = await prepareDir();
-    await writeFile(lockPath(dir), '999999999');
-    const owner = await acquireLock(dir, 'n1');
+    const layout = await prepareLayout();
+    await writeFile(lockPathOf(layout), '999999999');
+    const owner = await acquireLock(layout);
     await owner.release();
-    await writeFile(lockPath(dir), JSON.stringify({
+    await writeFile(lockPathOf(layout), JSON.stringify({
       pid: process.pid, startedAt: await processStartTime(process.pid),
     }));
-    await expect(acquireLock(dir, 'n1')).rejects.toThrow(SessionAlreadyOwnedError);
+    await expect(acquireLock(layout)).rejects.toThrow(SessionAlreadyOwnedError);
   });
 
-  it('keeps the flock sidecar inode across acquire and release', async () => {
-    const dir = await prepareDir();
-    const before = (await stat(lockPath(dir)).catch(() => null));
-    const owner = await acquireLock(dir, 'n1');
+  it('pins the local lock and owner file names beside the log', async () => {
+    const layout = await prepareLayout();
+    const owner = await acquireLock(layout);
+    expect((await readdir(layout.dir)).sort()).toEqual([layout.lockFile, layout.ownerFile].sort());
     await owner.release();
-    const after = await stat(lockPath(dir));
-    expect(after.isFile()).toBe(true);
-    if (before !== null) expect(after.ino).toBe(before.ino);
+    expect(await readdir(layout.dir)).toEqual([layout.lockFile]);
+  });
+
+  it('pre-creates the flock sidecar 0600 and keeps its inode across release and re-acquire', async () => {
+    const layout = await prepareLayout();
+    const sidecar = lockPathOf(layout);
+    const first = await acquireLock(layout);
+    const created = await stat(sidecar);
+    expect(created.isFile()).toBe(true);
+    expect(created.mode & 0o777).toBe(0o600);
+    await first.release();
+    const second = await acquireLock(layout);
+    const again = await stat(sidecar);
+    expect(again.ino).toBe(created.ino);
+    expect(again.mode & 0o777).toBe(0o600);
+    await second.release();
   });
 });
 
 describe('journal ownership across processes', () => {
   it('refuses a live child owner and reclaims a killed one without unlinking', async () => {
-    const dir = await prepareDir();
-    const child = fork(FIXTURE, [dir, 'hold'], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+    const layout = await prepareLayout();
+    const child = fork(FIXTURE, [
+      layout.dir, 'hold', layout.lockFile, layout.ownerFile,
+    ], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
     try {
       const message = await waitMessage(child, (m) => m.owned !== undefined);
       expect(message.owned).toBe(true);
       await expect(JournalWriter.open(home(), 'n1')).rejects.toThrow(SessionAlreadyOwnedError);
-      expect((await stat(lockPath(dir))).isFile()).toBe(true);
+      expect((await stat(lockPathOf(layout))).isFile()).toBe(true);
 
       child.kill('SIGKILL');
       await waitExit(child);
       const w = await JournalWriter.open(home(), 'n1');
       await w.close();
-      expect((await stat(lockPath(dir))).isFile()).toBe(true);
+      expect((await stat(lockPathOf(layout))).isFile()).toBe(true);
     } finally {
       child.kill('SIGKILL');
       await waitExit(child);
@@ -182,9 +205,10 @@ describe('journal ownership across processes', () => {
   });
 
   it('yields exactly one owner from two contenders released by an IPC barrier', async () => {
-    const dir = await prepareDir();
-    const a = fork(FIXTURE, [dir, 'contend'], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
-    const b = fork(FIXTURE, [dir, 'contend'], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+    const layout = await prepareLayout();
+    const childArgv = [layout.dir, 'contend', layout.lockFile, layout.ownerFile];
+    const a = fork(FIXTURE, childArgv, { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+    const b = fork(FIXTURE, childArgv, { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
     try {
       const readyA = waitMessage(a, (m) => m.ready === true);
       const readyB = waitMessage(b, (m) => m.ready === true);
@@ -196,7 +220,7 @@ describe('journal ownership across processes', () => {
       const [ra, rb] = await Promise.all([ownedA, ownedB]);
       expect([ra, rb].filter((r) => r.owned === true)).toHaveLength(1);
       expect([ra, rb].filter((r) => r.owned === false)).toHaveLength(1);
-      expect(await ownerExists(dir)).toBe(true);
+      expect(await ownerExists(layout)).toBe(true);
     } finally {
       a.kill('SIGKILL');
       b.kill('SIGKILL');
@@ -207,7 +231,7 @@ describe('journal ownership across processes', () => {
 
 describe('ownership guard failure', () => {
   it('bounds a lingering guard, kills it, and leaves no record or lock', async () => {
-    const dir = await prepareDir();
+    const layout = await prepareLayout();
     const spy = vi.spyOn(guardLauncher, 'spawn').mockImplementation((args: string[]) => {
       // Run the real `flock` with the production options, but swap the helper
       // for a stand-in that outlives the shortened wait. `flock -F` execs it in
@@ -218,7 +242,7 @@ describe('ownership guard failure', () => {
       return spawn(FLOCK, next, { stdio: ['ignore', 'ignore', 'pipe'], timeout: 800 });
     });
     try {
-      const guard = new LockGuard(dir, 'n1');
+      const guard = new LockGuard(layout);
       const started = Date.now();
       const err = await guard.run('acquire', await identity()).catch((e: unknown) => e);
       const elapsed = Date.now() - started;
@@ -227,9 +251,9 @@ describe('ownership guard failure', () => {
       // shortened 800 ms timeout was honored rather than the 10 s default. It is
       // deliberately loose so a loaded host's process reaping cannot flip it.
       expect(elapsed).toBeLessThan(5000);
-      expect(await ownerExists(dir)).toBe(false);
+      expect(await ownerExists(layout)).toBe(false);
       // No orphan still holds the kernel lock: a fresh flock acquires it at once.
-      const probe = spawnSync(FLOCK, ['--nonblock', '--exclusive', lockPath(dir), '/bin/true']);
+      const probe = spawnSync(FLOCK, ['--nonblock', '--exclusive', lockPathOf(layout), '/bin/true']);
       expect(probe.status).toBe(0);
     } finally {
       spy.mockRestore();
@@ -237,7 +261,7 @@ describe('ownership guard failure', () => {
   }, 15_000);
 
   it('reports a spawn failure as unavailable and spawns no cleanup release', async () => {
-    const dir = await prepareDir();
+    const layout = await prepareLayout();
     const spy = vi.spyOn(guardLauncher, 'spawn').mockImplementation(() => {
       const child = new EventEmitter() as unknown as ChildProcess;
       Object.assign(child, { stderr: null, kill: () => true });
@@ -245,7 +269,7 @@ describe('ownership guard failure', () => {
       return child;
     });
     try {
-      const err = await acquireLock(dir, 'n1').catch((e: unknown) => e);
+      const err = await acquireLock(layout).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(JournalLockUnavailableError);
       expect(err).not.toBeInstanceOf(JournalLockBusyError);
       // The guard never ran, so a cleanup release would be a guaranteed no-op.
@@ -253,15 +277,15 @@ describe('ownership guard failure', () => {
     } finally {
       spy.mockRestore();
     }
-    expect(await ownerExists(dir)).toBe(false);
+    expect(await ownerExists(layout)).toBe(false);
   });
 
   it('maps the reserved conflict exit code to busy, never to unavailable', async () => {
-    const dir = await prepareDir();
+    const layout = await prepareLayout();
     const spy = vi.spyOn(guardLauncher, 'spawn').mockImplementation(() =>
       spawn('/bin/sh', ['-c', 'exit 3'], { stdio: ['ignore', 'ignore', 'pipe'] }));
     try {
-      const err = await acquireLock(dir, 'n1').catch((e: unknown) => e);
+      const err = await acquireLock(layout).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(JournalLockBusyError);
       expect(err).not.toBeInstanceOf(SessionAlreadyOwnedError);
       expect(spy).toHaveBeenCalledTimes(1);
@@ -271,12 +295,12 @@ describe('ownership guard failure', () => {
   });
 
   it('maps real flock contention on the sidecar to busy, never unavailable', async () => {
-    const dir = await prepareDir();
+    const layout = await prepareLayout();
     const marker = join(home(), 'sidecar-held');
     // A real flock holds the sidecar (the marker is touched only after the lock
     // is acquired), so the guard's flock meets genuine contention.
     const holder = spawn(FLOCK, [
-      '-F', '--exclusive', lockPath(dir), '/bin/sh', '-c', `touch '${marker}'; sleep 30`,
+      '-F', '--exclusive', lockPathOf(layout), '/bin/sh', '-c', `touch '${marker}'; sleep 30`,
     ], { stdio: ['ignore', 'ignore', 'ignore'] });
     try {
       await vi.waitFor(async () => { await stat(marker); }, { timeout: 5_000 });
@@ -287,7 +311,7 @@ describe('ownership guard failure', () => {
         return realSpawn(args.map((a) => (a.startsWith('--wait=') ? '--wait=0' : a)), timeoutMs);
       });
       try {
-        const err = await acquireLock(dir, 'n1').catch((e: unknown) => e);
+        const err = await acquireLock(layout).catch((e: unknown) => e);
         expect(err).toBeInstanceOf(JournalLockBusyError);
         expect(err).not.toBeInstanceOf(JournalLockUnavailableError);
       } finally {
@@ -300,11 +324,11 @@ describe('ownership guard failure', () => {
   }, 15_000);
 
   it('treats any other guard exit code as unavailable, not busy', async () => {
-    const dir = await prepareDir();
+    const layout = await prepareLayout();
     const spy = vi.spyOn(guardLauncher, 'spawn').mockImplementation(() =>
       spawn('/bin/sh', ['-c', 'exit 1'], { stdio: ['ignore', 'ignore', 'pipe'] }));
     try {
-      const err = await acquireLock(dir, 'n1').catch((e: unknown) => e);
+      const err = await acquireLock(layout).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(JournalLockUnavailableError);
       expect(err).not.toBeInstanceOf(JournalLockBusyError);
       expect(spy).toHaveBeenCalledTimes(1);
@@ -313,8 +337,26 @@ describe('ownership guard failure', () => {
     }
   });
 
+  it('names the frontier, never a node, in a guard failure', async () => {
+    const layout = frontierLayout(home());
+    await mkdir(layout.dir, { recursive: true });
+    const spy = vi.spyOn(guardLauncher, 'spawn').mockImplementation(() => {
+      const child = new EventEmitter() as unknown as ChildProcess;
+      Object.assign(child, { stderr: null, kill: () => true });
+      setImmediate(() => child.emit('error', Object.assign(new Error('spawn flock ENOENT'), { code: 'ENOENT' })));
+      return child;
+    });
+    try {
+      const err = await acquireLock(layout).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(JournalLockUnavailableError);
+      expect((err as JournalLockUnavailableError).label).toBe('frontier');
+      expect((err as Error).message).toContain('journal "frontier"');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('persists the whole owner record through short writeSync calls', async () => {
-    const dir = await prepareDir();
     const preload = join(home(), 'shortwrite-preload.cjs');
     // A test-owned preload that forces every `writeSync` to advance at most three
     // bytes, then re-syncs the builtin ESM bindings so the helper's named import
@@ -337,25 +379,64 @@ describe('ownership guard failure', () => {
     ].join('\n'));
     const helper = fileURLToPath(new URL('../lock-guard.mjs', import.meta.url));
     const token = 'b'.repeat(32);
+    const layout = nodeLayout(home(), 'n1');
+    await mkdir(layout.dir, { recursive: true });
     const res = spawnSync(process.execPath, [
-      helper, 'acquire', dir, String(process.pid), 'null', token,
+      helper, 'acquire', layout.dir, String(process.pid), 'null', token,
+      '--lock', layout.lockFile, '--owner', layout.ownerFile,
     ], { env: { ...process.env, NODE_OPTIONS: `--require ${preload}` } });
     expect(res.status).toBe(0);
     // The record is the complete JSON object, not a truncated prefix.
-    expect(JSON.parse(await readFile(ownerPath(dir), 'utf8')))
+    expect(JSON.parse(await readFile(ownerPathOf(layout), 'utf8')))
       .toEqual({ pid: process.pid, startedAt: null, token });
   });
 
   it('rejects unknown commands and malformed tokens without writing a record', async () => {
-    const dir = await prepareDir();
+    const layout = await prepareLayout();
     const helper = fileURLToPath(new URL('../lock-guard.mjs', import.meta.url));
-    const unknown = spawnSync(process.execPath, [helper, 'bogus', dir, '1', '1', 'a'.repeat(32)]);
+    const names = ['--lock', layout.lockFile, '--owner', layout.ownerFile];
+    const unknown = spawnSync(process.execPath, [
+      helper, 'bogus', layout.dir, '1', '1', 'a'.repeat(32), ...names,
+    ]);
     expect(unknown.status).toBe(12);
     const badToken = spawnSync(process.execPath, [
-      helper, 'acquire', dir, String(process.pid), 'null', 'not-a-token',
+      helper, 'acquire', layout.dir, String(process.pid), 'null', 'not-a-token', ...names,
     ]);
     expect(badToken.status).toBe(12);
-    expect(await ownerExists(dir)).toBe(false);
+    expect(await ownerExists(layout)).toBe(false);
+  });
+
+  it('refuses a separator or dot-dot in the guard file names', async () => {
+    const layout = await prepareLayout();
+    const helper = fileURLToPath(new URL('../lock-guard.mjs', import.meta.url));
+    const token = 'a'.repeat(32);
+    const base = [helper, 'acquire', layout.dir, String(process.pid), 'null', token];
+    const status = (lockFile: string, ownerFile: string): number | null =>
+      spawnSync(process.execPath, [...base, '--lock', lockFile, '--owner', ownerFile]).status;
+    expect(status('..', layout.ownerFile)).toBe(12);
+    expect(status('../escape', layout.ownerFile)).toBe(12);
+    expect(status(layout.lockFile, '..')).toBe(12);
+    expect(status(layout.lockFile, 'a/b')).toBe(12);
+    expect(await ownerExists(layout)).toBe(false);
+  });
+
+  it('refuses an unsafe layout name before building the guard argv', async () => {
+    const layout = await prepareLayout();
+    const spy = vi.spyOn(guardLauncher, 'spawn');
+    try {
+      for (const bad of [{ lockFile: '..' }, { lockFile: 'a/b' }, { ownerFile: '../escape' }]) {
+        const guard = new LockGuard({ ...layout, ...bad });
+        const err = await guard.run('acquire', await identity()).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(JournalLockUnavailableError);
+        expect((err as JournalLockUnavailableError).label).toBe('n1');
+        // The parent's sidecar pre-creation is refused too, before any path is used.
+        const acquired = await acquireLock({ ...layout, ...bad }).catch((e: unknown) => e);
+        expect(acquired).toBeInstanceOf(JournalLockUnavailableError);
+      }
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('releases ownership when writer.open fails after acquiring', async () => {
@@ -364,8 +445,8 @@ describe('ownership guard failure', () => {
     await w.close();
     await appendTear(home());
     await expect(JournalWriter.open(home(), 'n1')).rejects.toThrow(TornTailError);
-    expect(await ownerExists(nodeDir(home(), 'n1'))).toBe(false);
-    const owner = await acquireLock(nodeDir(home(), 'n1'), 'n1');
+    expect(await ownerExists(nodeLayout(home(), 'n1'))).toBe(false);
+    const owner = await acquireLock(nodeLayout(home(), 'n1'));
     await owner.release();
   });
 
@@ -373,33 +454,33 @@ describe('ownership guard failure', () => {
     const w = await JournalWriter.open(home(), 'n1', { batchWindowMs: 60_000 });
     w.append('test/ping', { n: 0 });
     await expect(withFailingWrite(home(), () => w.close(), 1)).rejects.toThrow('injected EIO');
-    expect(await ownerExists(nodeDir(home(), 'n1'))).toBe(false);
+    expect(await ownerExists(nodeLayout(home(), 'n1'))).toBe(false);
   });
 });
 
 describe('owner record read semantics', () => {
   it('treats an unparseable owner record as no owner and reclaims it', async () => {
-    const dir = await prepareDir();
-    await writeFile(ownerPath(dir), '{"pid": not-json');
-    const owner = await acquireLock(dir, 'n1');
+    const layout = await prepareLayout();
+    await writeFile(ownerPathOf(layout), '{"pid": not-json');
+    const owner = await acquireLock(layout);
     await owner.release();
   });
 
   it.skipIf(process.getuid?.() === 0)(
     'fails closed when the owner record is unreadable instead of overwriting it',
     async () => {
-      const dir = await prepareDir();
+      const layout = await prepareLayout();
       const original = JSON.stringify({ pid: 999999999, startedAt: 1, token: 'c'.repeat(32) });
-      await writeFile(ownerPath(dir), original);
-      await chmod(ownerPath(dir), 0o000);
+      await writeFile(ownerPathOf(layout), original);
+      await chmod(ownerPathOf(layout), 0o000);
       try {
-        const err = await acquireLock(dir, 'n1').catch((e: unknown) => e);
+        const err = await acquireLock(layout).catch((e: unknown) => e);
         expect(err).toBeInstanceOf(JournalLockUnavailableError);
       } finally {
-        await chmod(ownerPath(dir), 0o600).catch(() => {});
+        await chmod(ownerPathOf(layout), 0o600).catch(() => {});
       }
       // A live owner's record was not replaced by a blind new record.
-      expect(await readFile(ownerPath(dir), 'utf8')).toBe(original);
+      expect(await readFile(ownerPathOf(layout), 'utf8')).toBe(original);
     },
   );
 });

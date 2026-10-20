@@ -1,5 +1,6 @@
 import { open as openFile, truncate } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
+import { join } from 'node:path';
 import { canonicalJsonForm, sha256HexOf, type JsonValue } from './canon.js';
 import { GENESIS_HASH, makeEvent, eventLine, type EventDataFor, type EventEnvelope } from './envelope.js';
 import {
@@ -10,14 +11,14 @@ import {
 } from './framing.js';
 import { CorruptionError, JournalError } from './errors.js';
 import { atomicWriteFile, ensureDurableDirectory, readFileOrNull, syncPath, writeAll } from './fsutil.js';
-import { headPath, journalPath, nodeDir, type Head } from './layout.js';
+import { nodeLayout, type Head, type JournalLayout } from './layout.js';
 import { acquireLock, SessionAlreadyOwnedError, type JournalOwnership } from './lock.js';
 import { genesisState, verifyAll } from './verify.js';
 
 export { SessionAlreadyOwnedError };
 
 /**
- * The append side of the journal: the only writer of a node's canonical log.
+ * The append side of the journal: the only writer of one journal's log.
  *
  * Appends are synchronous and in-memory; a bounded write-behind window turns a
  * burst into consecutive length-prefixed frames — split so that no frame
@@ -27,6 +28,10 @@ export { SessionAlreadyOwnedError };
  * a failed write is retried, and a writer that cannot make progress ends in a
  * typed terminal state rather than silently skipping events the caller was told
  * were logged.
+ *
+ * A writer is bound to a `JournalLayout`: the local `(home, uid)` form delegates
+ * to `nodeLayout`, and `openIn` serves any layout, the frontier journal
+ * included.
  */
 export class JournalClosedError extends JournalError {
   constructor() {
@@ -37,11 +42,11 @@ export class JournalClosedError extends JournalError {
 /**
  * The log ends in a fragment that is not a whole batch. Appending on top of it
  * would hide every later event from the reader, so the writer refuses and the
- * caller runs `repair()` first.
+ * caller runs `repair()` or `repairIn()` first.
  */
 export class TornTailError extends CorruptionError {
   constructor(public readonly dir: string, public readonly tornBytes: number) {
-    super(`${dir}: torn trailing fragment of ${tornBytes} bytes — run repair() before opening`);
+    super(`${dir}: torn trailing fragment of ${tornBytes} bytes — run repair() or repairIn() before opening`);
   }
 }
 
@@ -107,7 +112,7 @@ interface Watermark {
  */
 const systemClock = (): number => Date.now();
 
-/** Options for `JournalWriter.open`. */
+/** Options for `JournalWriter.open` and `JournalWriter.openIn`. */
 export interface JournalWriterOptions {
   now?: () => number;
   /** Write-behind window; defaults to `DEFAULT_BATCH_WINDOW_MS`. */
@@ -149,7 +154,7 @@ export class JournalWriter {
   private pendingFailure: Error | null = null;
 
   private constructor(
-    private readonly dir: string,
+    private readonly layout: JournalLayout,
     private readonly blobs: BlobStore,
     private readonly now: () => number,
     private readonly batchWindowMs: number,
@@ -159,39 +164,50 @@ export class JournalWriter {
   ) {}
 
   /**
-   * Opens (or creates) a node's journal for exclusive writing.
+   * Opens (or creates) a node's local log for exclusive writing.
    *
-   * @throws SessionAlreadyOwnedError when a live writer already owns the node.
+   * @throws SessionAlreadyOwnedError when a live writer already owns the journal.
    * @throws TornTailError when the log ends in a torn fragment — run `repair()`
-   * first; the failed open releases its lock so the repair can proceed.
+   * (or `repairIn()`) first; the failed open releases its lock so the repair can
+   * proceed.
    * @throws ChainBreakError when the existing log does not verify.
    * @throws any raw fs error (EACCES, EIO) from creating or reading the log.
    */
   static async open(
     home: string, nodeUid: string, opts: JournalWriterOptions = {},
   ): Promise<JournalWriter> {
-    const dir = nodeDir(home, nodeUid);
-    await ensureDurableDirectory(dir, home);
-    const ownership = await acquireLock(dir, nodeUid);
+    return JournalWriter.openIn(nodeLayout(home, nodeUid), opts);
+  }
+
+  /**
+   * Opens (or creates) the journal a layout names for exclusive writing.
+   *
+   * Same guarantees as `open`; the layout may be the frontier journal's.
+   */
+  static async openIn(
+    layout: JournalLayout, opts: JournalWriterOptions = {},
+  ): Promise<JournalWriter> {
+    await ensureDurableDirectory(layout.dir, layout.home);
+    const ownership = await acquireLock(layout);
     let log: FileHandle;
     try {
       // 'a' both creates the log and makes every write an append: no code path
       // can seek backwards into journaled history. The mode applies only when
       // the file is created; an existing log keeps its permissions.
-      log = await openFile(journalPath(dir), 'a', 0o600);
+      log = await openFile(join(layout.dir, layout.logFile), 'a', 0o600);
     } catch (err) {
       // Same-token cleanup; the open failure stays the surfaced cause.
       await ownership.release().catch(() => {});
       throw err;
     }
     const w = new JournalWriter(
-      dir, new BlobStore(home),
+      layout, new BlobStore(layout.home),
       opts.now ?? systemClock, opts.batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS, opts.onError, log, ownership,
     );
     try {
       // The log file was just created: fsync the directory so its entry is
       // durable even if the process dies before the first flush.
-      await syncPath(dir);
+      await syncPath(layout.dir);
       await w.resume();
     } catch (err) {
       // Preserve the open failure as the surfaced cause: cleanup is best-effort.
@@ -201,8 +217,9 @@ export class JournalWriter {
     return w;
   }
 
-  private get logPath(): string { return journalPath(this.dir); }
-  private get headFilePath(): string { return headPath(this.dir); }
+  private get dir(): string { return this.layout.dir; }
+  private get logPath(): string { return join(this.layout.dir, this.layout.logFile); }
+  private get headFilePath(): string { return join(this.layout.dir, this.layout.headFile); }
 
   private async resume(): Promise<void> {
     // A missing log is a brand-new journal. Any other read error (EACCES, EIO)
@@ -210,9 +227,9 @@ export class JournalWriter {
     // existing log would corrupt it silently, so readFileOrNull rethrows it.
     const raw = await readFileOrNull(this.logPath);
     if (raw === null) return;
-    // repair() must have run first (kernel.md §3: at boot, before the writer
-    // opens). Appending after a torn fragment would bury the fragment inside
-    // the log, where the reader — which stops at the first torn region —
+    // repair()/repairIn() must have run first (kernel.md §3: at boot, before the
+    // writer opens). Appending after a torn fragment would bury the fragment
+    // inside the log, where the reader — which stops at the first torn region —
     // could never see the events that follow it.
     const { batches, tornBytes } = scanBatches(raw);
     if (tornBytes > 0) throw new TornTailError(this.dir, tornBytes);

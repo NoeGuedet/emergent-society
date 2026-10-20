@@ -1,13 +1,14 @@
 import { readFile, rm, truncate } from 'node:fs/promises';
+import { join } from 'node:path';
 import { BlobStore, isBlobRef, resolveBlobRef } from './blobs.js';
 import { scanBatches } from './framing.js';
 import { readFileOrNull, syncPath } from './fsutil.js';
-import { headPath, journalPath, nodeDir, parseHead, type Head } from './layout.js';
+import { nodeLayout, parseHead, type Head, type JournalLayout } from './layout.js';
 import { acquireLock } from './lock.js';
 import { genesisState, verifyChain } from './verify.js';
 import type { EventEnvelope } from './envelope.js';
 
-/** Options for `JournalReader.open`. */
+/** Options for `JournalReader.open` and `JournalReader.openIn`. */
 export interface JournalReaderOptions {
   knownTypes: ReadonlySet<string>;
   /**
@@ -23,8 +24,8 @@ export interface JournalReaderOptions {
 /**
  * The read side of the journal: verification and crash repair.
  *
- * `events()` serves only the fully linked, `v`-matching prefix of a node's log
- * and refuses to rebuild past a break rather than guessing; the reader is
+ * `events()` serves only the fully linked, `v`-matching prefix of a journal's
+ * log and refuses to rebuild past a break rather than guessing; the reader is
  * otherwise stateless and never mutates the log.
  */
 export class JournalReader {
@@ -37,13 +38,13 @@ export class JournalReader {
   private lastTornBytes = 0;
 
   private constructor(
-    private readonly dir: string,
+    private readonly layout: JournalLayout,
     private readonly known: ReadonlySet<string>,
     private readonly blobs: BlobStore | null,
   ) {}
 
   /**
-   * Opens a reader over a node's journal.
+   * Opens a reader over a node's local log.
    *
    * `knownTypes` is required: a reader that cannot say which event types it
    * understands cannot honour the "refuse to rebuild" rule, so there is no
@@ -56,11 +57,25 @@ export class JournalReader {
   static async open(
     home: string, nodeUid: string, opts: JournalReaderOptions,
   ): Promise<JournalReader> {
+    return JournalReader.openIn(nodeLayout(home, nodeUid), opts);
+  }
+
+  /**
+   * Opens a reader over the journal a layout names.
+   *
+   * @throws never — the log is read lazily by `events()`.
+   */
+  static async openIn(
+    layout: JournalLayout, opts: JournalReaderOptions,
+  ): Promise<JournalReader> {
     return new JournalReader(
-      nodeDir(home, nodeUid), opts.knownTypes,
-      opts.resolveBlobs === true ? new BlobStore(home) : null,
+      layout, opts.knownTypes,
+      opts.resolveBlobs === true ? new BlobStore(layout.home) : null,
     );
   }
+
+  private get logPath(): string { return join(this.layout.dir, this.layout.logFile); }
+  private get headFilePath(): string { return join(this.layout.dir, this.layout.headFile); }
 
   /**
    * The torn trailing bytes seen by the last `events()` read attempt (0 before
@@ -83,7 +98,7 @@ export class JournalReader {
     // the log itself, no read error here is worth surfacing.
     let raw: string;
     try {
-      raw = await readFile(headPath(this.dir), 'utf8');
+      raw = await readFile(this.headFilePath, 'utf8');
     } catch {
       return null;
     }
@@ -110,7 +125,7 @@ export class JournalReader {
     this.lastTornBytes = 0;
     // A missing log is an empty journal. Anything else (EACCES, EIO) must not
     // be mistaken for genesis, so readFileOrNull rethrows it.
-    const raw = await readFileOrNull(journalPath(this.dir));
+    const raw = await readFileOrNull(this.logPath);
     if (raw === null) return;
     const { batches, tornBytes } = scanBatches(raw);
     // Record the scan outcome before yielding: a caller iterating a live log
@@ -156,11 +171,19 @@ export class JournalReader {
  * through valid committed events; any other read error propagates.
  */
 export async function repair(home: string, nodeUid: string): Promise<{ tornBytes: number }> {
-  const dir = nodeDir(home, nodeUid);
-  const path = journalPath(dir);
+  return repairIn(nodeLayout(home, nodeUid));
+}
+
+/**
+ * The layout-explicit form of `repair`, for any journal (the frontier included).
+ */
+export async function repairIn(layout: JournalLayout): Promise<{ tornBytes: number }> {
+  const { dir } = layout;
+  const path = join(layout.dir, layout.logFile);
+  const headFile = join(layout.dir, layout.headFile);
   // Probe first: repairing a journal that does not exist must not create one.
   if ((await readFileOrNull(path)) === null) return { tornBytes: 0 };
-  const ownership = await acquireLock(dir, nodeUid);
+  const ownership = await acquireLock(layout);
   let result: { tornBytes: number } | undefined;
   let failed = false;
   let failure: unknown;
@@ -182,7 +205,7 @@ export async function repair(home: string, nodeUid: string): Promise<{ tornBytes
         // head whose count points past a shorter, durable log. (Truncating
         // first would open a window where a crash resurrects the old head over
         // already-shortened bytes.)
-        await rm(headPath(dir), { force: true });
+        await rm(headFile, { force: true });
         // The unlink is a directory metadata change: without this sync a crash
         // can resurrect the removed head.
         await syncPath(dir);

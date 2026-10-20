@@ -22,7 +22,7 @@ import { JournalReader, repair } from '../reader.js';
 import { canonicalizeJson } from '../canon.js';
 import { eventLine, verifyEvent, type EventEnvelope } from '../envelope.js';
 import { scanBatches, encodeBatch } from '../framing.js';
-import { headPath, journalPath, nodeDir } from '../layout.js';
+import { nodeLayout } from '../layout.js';
 import {
   appendTear, countSyncs, fileHandleProto, logPath, payloadOfCanonicalBytes, useTempHome,
 } from './helpers.js';
@@ -63,7 +63,9 @@ describe('fsync discipline', () => {
     await w.flush();
     await w.close();
     await appendTear(home());
-    const dir = nodeDir(home(), 'n1');
+    const layout = nodeLayout(home(), 'n1');
+    const dir = layout.dir;
+    const head = join(layout.dir, layout.headFile);
     const log = logPath(home());
     const before = (await readFile(log)).length;
     // The invariant: a crash may leave a torn tail for a later repair to
@@ -72,7 +74,7 @@ describe('fsync discipline', () => {
     // truncation. Capture the head's presence at the truncate call itself, and
     // what each fsync saw, so the order cannot silently regress.
     let headAtTruncate: boolean | null = null;
-    truncateSeam.onTruncate = () => { headAtTruncate = existsSync(headPath(dir)); };
+    truncateSeam.onTruncate = () => { headAtTruncate = existsSync(head); };
     const headAtDirSync: boolean[] = [];
     const logAtDirSync: number[] = [];
     const logAtFileSync: number[] = [];
@@ -81,7 +83,7 @@ describe('fsync discipline', () => {
     const spy = vi.spyOn(proto, 'sync').mockImplementation(async function (this: { fd: number }) {
       const target = await readlink(`/proc/self/fd/${this.fd}`);
       if (target === dir) {
-        headAtDirSync.push(existsSync(headPath(dir)));
+        headAtDirSync.push(existsSync(head));
         logAtDirSync.push((await readFile(log)).length);
       } else if (target === log) {
         logAtFileSync.push((await readFile(log)).length);
@@ -175,9 +177,9 @@ describe('frozen v0 format vectors', () => {
       batches: [{ offset: 0, size: frame.length, lines: [GOLDEN_LINE] }],
       tornBytes: 0,
     });
-    const dir = nodeDir(home(), 'golden');
-    await mkdir(dir, { recursive: true });
-    await writeFile(journalPath(dir), frame);
+    const layout = nodeLayout(home(), 'golden');
+    await mkdir(layout.dir, { recursive: true });
+    await writeFile(join(layout.dir, layout.logFile), frame);
     const r = await JournalReader.open(home(), 'golden', {
       knownTypes: new Set(['test/ping']),
     });

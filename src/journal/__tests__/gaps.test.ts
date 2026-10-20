@@ -5,7 +5,7 @@ import { JournalWriter, JournalClosedError, JournalPoisonedError } from '../writ
 import { repair } from '../reader.js';
 import { BlobStore } from '../blobs.js';
 import { encodeBatch, scanBatches, CorruptFrameError } from '../framing.js';
-import { headPath, nodeDir } from '../layout.js';
+import { nodeLayout } from '../layout.js';
 import {
   BIG_PAYLOAD_CHARS, collectEvents, fileHandleProto, injectBlobPut,
   logPath, tearFragment, useTempHome,
@@ -228,18 +228,19 @@ describe('head checkpoint is disposable', () => {
       batchWindowMs: 60_000, onError: (e) => failures.push(e),
     });
     w.append('test/ping', { n: 0 });
+    const layout = nodeLayout(home(), 'n1');
     // A directory occupies the head's path, so the atomic rename must fail.
-    await mkdir(headPath(nodeDir(home(), 'n1')), { recursive: true });
+    await mkdir(join(layout.dir, layout.headFile), { recursive: true });
     // The batch is already fsynced into the log, so the head failure is a
     // diagnostic: the flush succeeds rather than poisoning the writer.
     await w.flush();
     expect(failures.length).toBeGreaterThan(0);
-    const leaked = (await readdir(nodeDir(home(), 'n1'))).filter((n) => n.endsWith('.tmp'));
+    const leaked = (await readdir(layout.dir)).filter((n) => n.endsWith('.tmp'));
     expect(leaked).toEqual([]);
     // The committed log is readable and the writer is still usable: with the
     // path fixed the next flush rebuilds the head over both batches.
     expect((await collectEvents(home())).map((e) => e.seq)).toEqual([0]);
-    await rm(headPath(nodeDir(home(), 'n1')), { recursive: true });
+    await rm(join(layout.dir, layout.headFile), { recursive: true });
     w.append('test/ping', { n: 1 });
     await w.flush();
     await w.close();

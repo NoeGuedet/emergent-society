@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import {
   afterEach, beforeEach, describe, expect, it, vi,
 } from 'vitest';
-import { journalPath, nodeDir } from '../../journal/layout.js';
+import { nodeLayout } from '../../journal/layout.js';
 import { buildSandboxSpec, type SandboxSpec } from '../tools/sandbox.js';
 import { DEFAULT_TERMINAL_ENV, PtyTerminalRuntime } from '../tools/terminal.js';
 import type { CommandLimits, CommandOutcome, TerminalRuntime } from '../tools/terminal.js';
@@ -99,10 +99,11 @@ beforeEach(async () => {
   // The journal's real on-disk layout, written from the kernel side with the
   // modes the journal layer creates (0700/0600): no turn runs in this suite, so
   // the fixture supplies the log the battery attacks.
-  journalDir = nodeDir(home, NODE_UID);
+  const layout = nodeLayout(home, NODE_UID);
+  journalDir = layout.dir;
   await mkdir(journalDir, { recursive: true, mode: 0o700 });
   await chmod(journalDir, 0o700);
-  journalFile = journalPath(journalDir);
+  journalFile = join(layout.dir, layout.logFile);
   await writeFile(journalFile, `${JOURNAL_CANARY}\n`, { mode: 0o600 });
   await chmod(journalFile, 0o600);
 

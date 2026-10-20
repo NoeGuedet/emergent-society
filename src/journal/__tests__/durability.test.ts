@@ -9,7 +9,7 @@ import { JournalReader } from '../reader.js';
 import {
   MAX_DECOMPRESSED_BATCH_BYTES, OversizedEventError, scanBatches,
 } from '../framing.js';
-import { headPath, nodeDir } from '../layout.js';
+import { nodeLayout } from '../layout.js';
 import {
   BIG_PAYLOAD_CHARS, collectEvents, injectBlobPut, KNOWN_TYPES, logPath, payloadOfCanonicalBytes,
   useTempHome, withFailingWrite,
@@ -275,15 +275,16 @@ describe('disposable head checkpoint', () => {
       batchWindowMs: 60_000, onError: (e) => failures.push(e),
     });
     w.append('test/ping', { n: 0 });
+    const layout = nodeLayout(home(), 'n1');
     // A directory occupies the head's path, so the atomic rename must fail.
-    await mkdir(headPath(nodeDir(home(), 'n1')), { recursive: true });
+    await mkdir(join(layout.dir, layout.headFile), { recursive: true });
     // The batch is already fsynced into the log, so the flush resolves and the
     // head failure is only a diagnostic — not a lost batch.
     await w.flush();
     expect(failures.length).toBeGreaterThan(0);
     expect((await collectEvents(home())).map((e) => e.seq)).toEqual([0]);
     // The writer is still usable: fixing the path lets the next flush rebuild it.
-    await rm(headPath(nodeDir(home(), 'n1')), { recursive: true });
+    await rm(join(layout.dir, layout.headFile), { recursive: true });
     w.append('test/ping', { n: 1 });
     await w.flush();
     await w.close();
@@ -299,13 +300,14 @@ describe('disposable head checkpoint', () => {
     const w = await JournalWriter.open(home(), 'n1', {
       batchWindowMs: 5, onError: (e) => { failures.push(e); signal(); },
     });
-    await mkdir(headPath(nodeDir(home(), 'n1')), { recursive: true });
+    const layout = nodeLayout(home(), 'n1');
+    await mkdir(join(layout.dir, layout.headFile), { recursive: true });
     w.append('test/ping', { n: 0 });
     // Wait for the write-behind timer's callback rather than sleeping.
     await headFailed;
     expect(failures.length).toBeGreaterThan(0);
     expect((await collectEvents(home())).map((e) => e.seq)).toEqual([0]);
-    await rm(headPath(nodeDir(home(), 'n1')), { recursive: true });
+    await rm(join(layout.dir, layout.headFile), { recursive: true });
     w.append('test/ping', { n: 1 });
     await w.flush();
     await w.close();
@@ -323,7 +325,8 @@ describe('disposable head checkpoint', () => {
         batchWindowMs: 5,
         onError: () => { signal(); throw new Error('head callback boom'); },
       });
-      await mkdir(headPath(nodeDir(home(), 'n1')), { recursive: true });
+      const layout = nodeLayout(home(), 'n1');
+      await mkdir(join(layout.dir, layout.headFile), { recursive: true });
       w.append('test/ping', { n: 0 });
       await headFailed;
       // Give any rejection escaping the callback a chance to surface.
@@ -331,7 +334,7 @@ describe('disposable head checkpoint', () => {
       expect(unhandled).toEqual([]);
       // The authoritative log still holds the batch the callback was reporting on.
       expect((await collectEvents(home())).map((e) => e.seq)).toEqual([0]);
-      await rm(headPath(nodeDir(home(), 'n1')), { recursive: true });
+      await rm(join(layout.dir, layout.headFile), { recursive: true });
       w.append('test/ping', { n: 1 });
       await w.flush();
       await w.close();

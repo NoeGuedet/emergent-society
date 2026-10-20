@@ -20,8 +20,8 @@ export {
 } from './lock.js';
 
 // Reading and repair.
-export { JournalReader, repair, type JournalReaderOptions } from './reader.js';
-export type { Head } from './layout.js';
+export { JournalReader, repair, repairIn, type JournalReaderOptions } from './reader.js';
+export type { Head, JournalLayout } from './layout.js';
 
 // The envelope and its event union.
 export {
@@ -69,10 +69,15 @@ export {
 } from './blobs.js';
 
 // Layout, for callers that need to address a journal directly.
-export { LOG_FILE, LOCK_FILE, NODE_UID_RE, assertNodeUid, journalPath, headPath, nodeDir } from './layout.js';
+export {
+  HEAD_FILE, LOG_FILE, LOCK_FILE, NODE_UID_RE, OWNER_FILE,
+  assertNodeUid, frontierLayout, nodeDir, nodeLayout,
+} from './layout.js';
 
 // The typed error family.
-export { InvalidNodeUidError, JournalError, isCorruption, isRetryable } from './errors.js';
+export {
+  CorruptionError, InvalidNodeUidError, JournalError, isCorruption, isRetryable,
+} from './errors.js';
 // The durable-write primitives are part of the contract for callers that keep
 // derived state beside a journal (the context snapshots): they must use the same
 // fsync/rename discipline, not their own.
