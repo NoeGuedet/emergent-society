@@ -3,7 +3,9 @@ import { createServer, type Server } from 'node:http';
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { canonicalizeJson } from '../../journal/index.js';
+import { readFrontier } from '../../frontier/__tests__/helpers.js';
+import type { HttpRequest, HttpResponse } from '../../frontier/index.js';
+import { BlobStore, canonicalizeJson } from '../../journal/index.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { resolveArtifact } from '../../context/artifacts.js';
@@ -47,6 +49,22 @@ function artifactRefs(value: unknown, out: ArtifactRef[] = []): ArtifactRef[] {
     const o = value as Record<string, unknown>;
     if (o['kind'] === 'c13-artifact') out.push(o as unknown as ArtifactRef);
     else for (const item of Object.values(o)) artifactRefs(item, out);
+  }
+  return out;
+}
+
+/** Every blob's bytes in the cell home, for the frontier-side credential scan. */
+async function blobFiles(home: string): Promise<Buffer[]> {
+  let entries;
+  try {
+    entries = await readdir(join(home, 'blobs'), { recursive: true, withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+  const out: Buffer[] = [];
+  for (const entry of entries) {
+    if (entry.isFile()) out.push(await readFile(join(entry.parentPath, entry.name)));
   }
   return out;
 }
@@ -127,7 +145,8 @@ describe('C1.4a web tools end to end', () => {
     const defaults = defaultAgentConfig();
     const config = { ...defaults, policy: { ...defaults.policy,
       shellTimeoutMs: 1000, killGraceMs: 20, retryDelayMs: 1, requestTimeoutMs: 5000 } };
-    const webTools = webToolsFromProviders(await loadProviders(home));
+    const journal = await fixture().frontier();
+    const webTools = webToolsFromProviders(await loadProviders(home), journal.gate);
     if (webTools === undefined) throw new Error('providers not loaded');
 
     let driver: NodeDriver | null = null;
@@ -194,15 +213,56 @@ describe('C1.4a web tools end to end', () => {
       ]);
       const results = events.filter((event) => event.type === 'tool/result');
       expect(results).toHaveLength(2);
-      for (const [index, body] of [SEARCH_RESPONSE, EXTRACT_RESPONSE].entries()) {
+      const localCalls: (string | null)[] = [];
+      for (const [index] of [SEARCH_RESPONSE, EXTRACT_RESPONSE].entries()) {
         const data = results[index]!.data as unknown as {
-          isError: boolean; failure: unknown; raw: ArtifactRef;
+          isError: boolean; failure: unknown; raw: ArtifactRef | null;
+          frontierCall: string | null;
           message: { content: string } };
         expect(data.isError).toBe(false);
         expect(data.failure).toBeNull();
-        expect(Buffer.from(resolveArtifact(events, data.raw)).toString('utf8')).toBe(body);
+        // The frontier journal has the body: the local log keeps only the reference.
+        expect(data.raw).toBeNull();
+        expect(data.frontierCall).toEqual(expect.any(String));
+        localCalls.push(data.frontierCall);
         expect(data.message.content).toContain('provider: tavily');
       }
+
+      // The two mediated calls are frontier facts: durable requests and responses
+      // whose bodies resolve to the exact bytes the provider sent.
+      const frontierEvents = await readFrontier(home);
+      const frontierRequests = frontierEvents
+        .filter((event) => event.type === 'http/request')
+        .map((event) => event.data as unknown as HttpRequest);
+      const frontierResponses = frontierEvents
+        .filter((event) => event.type === 'http/response')
+        .map((event) => event.data as unknown as HttpResponse);
+      const tavilyBase = `http://127.0.0.1:${tavilyAddress.port}`;
+      const webRequests = frontierRequests.filter((request) => request.url.startsWith(`${tavilyBase}/`));
+      expect(webRequests.map((request) => request.url))
+        .toEqual([`${tavilyBase}/search`, `${tavilyBase}/extract`]);
+      for (const request of webRequests) {
+        expect(request.credentials).toEqual([{ id: 'tavily', where: 'authorization' }]);
+        expect(request.headers).toEqual({ 'content-type': 'application/json' });
+      }
+      const responsesByCall = new Map(frontierResponses.map((response) => [response.call, response]));
+      for (const request of webRequests) {
+        const response = responsesByCall.get(request.call);
+        expect(response).toMatchObject({
+          status: 200, body: { complete: true }, error: null,
+        });
+        const captured = await new BlobStore(home).get(response!.body.sha256);
+        expect(captured.toString('utf8'))
+          .toBe(request.url.endsWith('/search') ? SEARCH_RESPONSE : EXTRACT_RESPONSE);
+      }
+      // The local → frontier join: every web result names a journaled terminal.
+      expect(localCalls.filter((call) => call !== null && responsesByCall.has(call)))
+        .toHaveLength(2);
+      // No credential rides the frontier request path: no payload, no blob.
+      for (const event of frontierEvents) {
+        expect(canonicalizeJson(event.data)).not.toContain(TAVILY_KEY);
+      }
+      for (const blob of await blobFiles(home)) expect(blob.includes(TAVILY_KEY)).toBe(false);
 
       // The model visibly received the rendered results (model-visible means logged).
       expect(llmBodies).toHaveLength(2);

@@ -1,120 +1,271 @@
 import { Buffer } from 'node:buffer';
 import type { SafeFailure } from '../../context/contracts.js';
+import { filterHeaders, validateFrontierUrl } from '../../frontier/index.js';
+import type {
+  CallId, Frontier, FrontierErrorCode, FrontierOutcome,
+} from '../../frontier/index.js';
 import { readBoundedBody } from '../../net/bounded-body.js';
 import { isRecord } from '../../util.js';
 import { decodeToolText } from './text.js';
 import type { ProviderEntry, ProviderRegistry } from './providers.js';
 
 /**
- * Kernel-mediated web tools (kernel.md §7, C1.4a): `web_search` and `web_fetch`
- * are executed by the kernel itself against the configured provider (Tavily),
- * so every request crosses the gate and is journaled by `tool/call`/`tool/result`,
- * and the credential only ever travels in an `Authorization` header this module
- * writes. No streaming to the model and no retry: a failure is an agent-visible
- * classified outcome. `WebOutcome` never carries request URLs, error objects, or the key —
- * only a status, bounded body bytes and a `SafeFailure`. That is one half of the
- * bound: a provider response body is captured and journaled verbatim, so a
- * hostile provider could reflect the credential back into the journal —
- * unfiltered, accepted for the experiment phase. The bounded streamed read is
- * the neutral `src/net/bounded-body.ts` helper, shared with the transport: node
- * must not import provider code (that would invert the layering), so the loop
- * itself lives below both.
+ * Kernel-mediated web tools (kernel.md §7, C1.4a / C1.4d): `web_search` and
+ * `web_fetch` are executed by the kernel itself against the configured provider
+ * (Tavily), so every request crosses the frontier — `begin` is durable and
+ * read-back verified before the fetch is sent, `complete` is durable before the
+ * caller proceeds — and the raw provider body is a frontier fact. The local
+ * `tool/call`/`tool/result` pair carries only the call reference. The credential
+ * only ever travels in an `Authorization` header this module writes: it is never
+ * a journaled header, URL, body or id (the journaled credential id is the
+ * registry key, never the value). One residual is accepted for the experiment
+ * phase and stated plainly: a provider response body is journaled verbatim, so
+ * a hostile provider could reflect the credential back into the frontier.
+ *
+ * No streaming to the model and no retry: a failure is an agent-visible
+ * classified outcome. `WebOutcome` never carries request URLs, error objects or
+ * the key — only a status, bounded body bytes, a `SafeFailure` and the frontier
+ * `frontierCall` (null exactly on the already-aborted path, where no call was
+ * ever begun). The bounded streamed read is the neutral
+ * `src/net/bounded-body.ts` helper, shared with the transport: node must not
+ * import provider code (that would invert the layering), so the loop itself
+ * lives below both.
  */
 
 export type WebOutcome =
-  | { readonly ok: true; readonly status: number; readonly body: Uint8Array }
+  | { readonly ok: true; readonly status: number; readonly body: Uint8Array;
+      readonly frontierCall: CallId | null }
   | { readonly ok: false; readonly failure: SafeFailure; readonly status: number | null;
-      readonly body: Uint8Array; readonly complete: boolean };
+      readonly body: Uint8Array; readonly complete: boolean;
+      readonly frontierCall: CallId | null };
 
 export interface WebTools {
   search(query: string, maxResults: number | undefined, signal: AbortSignal): Promise<WebOutcome>;
   extract(url: string, signal: AbortSignal): Promise<WebOutcome>;
 }
 
-export function webToolsFromProviders(registry: ProviderRegistry): WebTools | undefined {
-  return registry.tavily === undefined ? undefined : new TavilyWebTools(registry.tavily);
+/** The credential id the frontier journals: the registry key, never its value. */
+const CREDENTIAL_ID = 'tavily';
+/** The one request header this client sets besides the authorization value. */
+const REQUEST_HEADERS: Readonly<Record<string, string>> = { 'content-type': 'application/json' };
+const EMPTY = new Uint8Array();
+
+/**
+ * The one place a Tavily request body is built, shared with the acceptance
+ * harness (which recomputes the expected body from the recorded `tool/call`
+ * arguments). The `maxResults` clamp lives here; the object form is not a
+ * second public surface — the `WebTools` port keeps its positional signatures.
+ */
+export function webRequestBody(
+  args: { readonly kind: 'web_search'; readonly query: string;
+          readonly maxResults: number | undefined }
+      | { readonly kind: 'web_fetch'; readonly url: string },
+  entry: ProviderEntry,
+): Uint8Array {
+  const payload = args.kind === 'web_search'
+    ? { query: args.query,
+        max_results: Math.min(args.maxResults ?? entry.maxResults, entry.maxResults),
+        search_depth: 'basic' }
+    : { urls: [args.url], extract_depth: 'basic' };
+  return Buffer.from(JSON.stringify(payload), 'utf8');
+}
+
+export function webToolsFromProviders(
+  registry: ProviderRegistry, frontier: Frontier,
+): WebTools | undefined {
+  return registry.tavily === undefined
+    ? undefined : new TavilyWebTools(registry.tavily, frontier);
 }
 
 function failureOutcome(
   failure: SafeFailure, status: number | null, body: Uint8Array, complete: boolean,
+  frontierCall: CallId | null,
 ): WebOutcome {
-  return { ok: false, failure, status, body, complete };
+  return { ok: false, failure, status, body, complete, frontierCall };
+}
+
+/** The exchange's pure outcome, before the frontier reference is attached. */
+type Exchange =
+  | { readonly ok: true; readonly status: number; readonly body: Uint8Array;
+      readonly headers: Record<string, string> }
+  | { readonly ok: false; readonly failure: SafeFailure; readonly status: number | null;
+      readonly body: Uint8Array; readonly complete: boolean;
+      readonly headers: Record<string, string> };
+
+function failureExchange(
+  failure: SafeFailure, status: number | null, body: Uint8Array, complete: boolean,
+  headers: Record<string, string>,
+): Exchange {
+  return { ok: false, failure, status, body, complete, headers };
+}
+
+/**
+ * Maps a captured exchange to the frontier's terminal vocabulary. A stop
+ * observed after a whole-body read records the exchange's own completed outcome
+ * (the adapter's rule: the terminal is the outcome classified at the exchange) —
+ * only the caller-visible failure is the cancellation. An incomplete capture can
+ * never claim completeness, so it keeps its code.
+ */
+function frontierOutcome(exchange: Exchange): FrontierOutcome {
+  const headers = filterHeaders(exchange.headers, 'response');
+  if (exchange.ok) {
+    return { status: exchange.status, headers, body: exchange.body,
+      encoding: 'binary', complete: true };
+  }
+  const code = toFrontierCode(exchange.failure);
+  if (exchange.status !== null && exchange.complete && code !== 'http' && code !== 'body-limit') {
+    return exchange.status === 200
+      ? { status: exchange.status, headers, body: exchange.body,
+          encoding: 'binary', complete: true }
+      : { status: exchange.status, headers, body: exchange.body,
+          encoding: 'binary', complete: true, error: 'http' };
+  }
+  return { status: exchange.status, headers, body: exchange.body,
+    encoding: 'binary', complete: exchange.complete, error: code };
+}
+
+/** The web side's own narrowing: only the wire codes can reach a terminal. */
+function toFrontierCode(failure: SafeFailure): FrontierErrorCode {
+  switch (failure.code) {
+    case 'http': case 'network': case 'timeout': case 'cancelled': case 'body-limit':
+      return failure.code;
+    default:
+      throw new Error(`no frontier code for failure ${JSON.stringify(failure.code)}`);
+  }
 }
 
 export class TavilyWebTools implements WebTools {
-  constructor(private readonly entry: ProviderEntry) {}
+  private readonly urls: { readonly search: string; readonly extract: string };
+
+  constructor(private readonly entry: ProviderEntry, private readonly frontier: Frontier) {
+    // The two URLs this client will journal are validated once, at construction,
+    // with the same predicate `begin` applies — so a misconfigured base URL
+    // fails loudly here and never becomes a per-call begin failure.
+    this.urls = {
+      search: validateFrontierUrl(`${entry.baseUrl}/search`),
+      extract: validateFrontierUrl(`${entry.baseUrl}/extract`),
+    };
+  }
 
   search(query: string, maxResults: number | undefined, signal: AbortSignal): Promise<WebOutcome> {
-    const payload = Buffer.from(JSON.stringify({
-      query, max_results: Math.min(maxResults ?? this.entry.maxResults, this.entry.maxResults),
-      search_depth: 'basic',
-    }), 'utf8');
-    return this.post('/search', payload, signal);
+    return this.call({ kind: 'web_search', query, maxResults }, this.urls.search, signal);
   }
 
   extract(url: string, signal: AbortSignal): Promise<WebOutcome> {
-    const payload = Buffer.from(
-      JSON.stringify({ urls: [url], extract_depth: 'basic' }), 'utf8');
-    return this.post('/extract', payload, signal);
+    return this.call({ kind: 'web_fetch', url }, this.urls.extract, signal);
   }
 
-  private async post(path: string, payload: Uint8Array, signal: AbortSignal): Promise<WebOutcome> {
+  private async call(
+    args: { readonly kind: 'web_search'; readonly query: string;
+            readonly maxResults: number | undefined }
+        | { readonly kind: 'web_fetch'; readonly url: string },
+    url: string, signal: AbortSignal,
+  ): Promise<WebOutcome> {
+    const body = webRequestBody(args, this.entry);
     const controller = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; controller.abort(); }, this.entry.timeoutMs);
     const onGate = (): void => { controller.abort(); };
-    if (signal.aborted) {
-      clearTimeout(timer);
-      return failureOutcome({ code: 'cancelled', status: null }, null, new Uint8Array(), false);
-    }
-    signal.addEventListener('abort', onGate, { once: true });
     try {
-      let response: Response;
-      try {
-        response = await fetch(`${this.entry.baseUrl}${path}`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            authorization: `Bearer ${this.entry.key}`,
-          },
-          body: payload, signal: controller.signal,
-        });
-      } catch {
-        return failureOutcome(
-          signal.aborted ? { code: 'cancelled', status: null }
-            : timedOut ? { code: 'timeout', status: null }
-            : { code: 'network', status: null },
-          null, new Uint8Array(), false);
-      }
-      const status = response.status;
-      const { body, complete, outcome } = await readBoundedBody(
-        response.body, this.entry.maxResponseBytes, () => signal.aborted);
-      // Web's vocabulary: an in-stream timeout has no transport analogue; every
-      // other neutral outcome maps to the same safe code the old inline loop used.
-      const failure: SafeFailure | null = outcome === 'body-limit'
-        ? { code: 'body-limit', status }
-        : outcome === 'cancelled-by-caller' ? { code: 'cancelled', status }
-        : outcome === 'read-error' ? (timedOut ? { code: 'timeout', status } : { code: 'network', status })
-        : null;
-      if (failure !== null) {
-        // A gate abort or the timeout that landed during the final reads — including
-        // inside `reader.cancel()` — still outranks a recorded body-limit or network.
-        if (signal.aborted) {
-          return failureOutcome({ code: 'cancelled', status }, status, body, complete);
-        }
-        if (timedOut) return failureOutcome({ code: 'timeout', status }, status, body, complete);
-        return failureOutcome(failure, status, body, complete);
-      }
-      // A gate abort that landed during the final reads still wins over success.
+      // No call exists for an already-stopped caller: no begin, no event.
       if (signal.aborted) {
-        return failureOutcome({ code: 'cancelled', status }, status, body, complete);
+        return failureOutcome({ code: 'cancelled', status: null }, null, EMPTY, false, null);
       }
-      if (status !== 200) return failureOutcome({ code: 'http', status }, status, body, true);
-      return { ok: true, status, body };
+
+      // Durable and read-back verified before the send; a failure here throws
+      // and the fetch never happens.
+      const call = await this.frontier.begin({
+        method: 'POST',
+        url,
+        headers: filterHeaders(REQUEST_HEADERS, 'request'),
+        credentials: [{ id: CREDENTIAL_ID, where: 'authorization' }],
+        body,
+        encoding: 'utf8',
+      });
+      // A stop that landed during `begin` closes the durable request as the
+      // cancellation it is, and no POST is sent.
+      if (signal.aborted) {
+        await this.frontier.complete(call, {
+          status: null, error: 'cancelled', body: EMPTY, encoding: 'binary', complete: false,
+        });
+        return failureOutcome({ code: 'cancelled', status: null }, null, EMPTY, false, call.call);
+      }
+
+      signal.addEventListener('abort', onGate, { once: true });
+      // Close the narrow window between the check above and the listener.
+      if (signal.aborted) controller.abort();
+
+      const exchange = await this.exchange(
+        url, body, controller.signal, () => signal.aborted, () => timedOut);
+      // The terminal is durable before the caller proceeds; a failure here
+      // propagates as a fatal environment error, never as a WebOutcome.
+      await this.frontier.complete(call, frontierOutcome(exchange));
+      return exchange.ok
+        ? { ok: true, status: exchange.status, body: exchange.body, frontierCall: call.call }
+        : { ok: false, failure: exchange.failure, status: exchange.status,
+            body: exchange.body, complete: exchange.complete, frontierCall: call.call };
     } finally {
       clearTimeout(timer);
       signal.removeEventListener('abort', onGate);
     }
+  }
+
+  /**
+   * The HTTP exchange itself, computed purely on every path — transport throw,
+   * bounded capture, capture failure, abort mid-read, non-200, success. It never
+   * touches the frontier; `call` records its outcome.
+   */
+  private async exchange(
+    url: string, body: Uint8Array, fetchSignal: AbortSignal,
+    gateAborted: () => boolean, timedOut: () => boolean,
+  ): Promise<Exchange> {
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { ...REQUEST_HEADERS, authorization: `Bearer ${this.entry.key}` },
+        body, signal: fetchSignal,
+        // A redirect would re-send the request to a URL the journal never
+        // recorded; it arrives as the non-200 response it is.
+        redirect: 'manual',
+      });
+    } catch {
+      return failureExchange(
+        gateAborted() ? { code: 'cancelled', status: null }
+          : timedOut() ? { code: 'timeout', status: null }
+          : { code: 'network', status: null },
+        null, EMPTY, false, {});
+    }
+    const status = response.status;
+    const headers = Object.fromEntries(response.headers);
+    const { body: captured, complete, outcome } = await readBoundedBody(
+      response.body, this.entry.maxResponseBytes, gateAborted);
+    // Web's vocabulary: an in-stream timeout has no transport analogue; every
+    // other neutral outcome maps to the same safe code the old inline loop used.
+    const failure: SafeFailure | null = outcome === 'body-limit'
+      ? { code: 'body-limit', status }
+      : outcome === 'cancelled-by-caller' ? { code: 'cancelled', status }
+      : outcome === 'read-error' ? (timedOut() ? { code: 'timeout', status } : { code: 'network', status })
+      : null;
+    if (failure !== null) {
+      // A gate abort or the timeout that landed during the final reads — including
+      // inside `reader.cancel()` — still outranks a recorded body-limit or network.
+      if (gateAborted()) {
+        return failureExchange({ code: 'cancelled', status }, status, captured, complete, headers);
+      }
+      if (timedOut()) {
+        return failureExchange({ code: 'timeout', status }, status, captured, complete, headers);
+      }
+      return failureExchange(failure, status, captured, complete, headers);
+    }
+    // A gate abort that landed during the final reads still wins over success.
+    if (gateAborted()) {
+      return failureExchange({ code: 'cancelled', status }, status, captured, complete, headers);
+    }
+    if (status !== 200) {
+      return failureExchange({ code: 'http', status }, status, captured, true, headers);
+    }
+    return { ok: true, status, body: captured, headers };
   }
 }
 

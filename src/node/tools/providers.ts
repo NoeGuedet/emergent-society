@@ -1,6 +1,7 @@
 import { open, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { toJson } from '../../context/artifacts.js';
+import { isLoopback } from '../../util.js';
 
 /**
  * The kernel-side credential store (kernel.md §7, C1.4a subset).
@@ -25,13 +26,22 @@ import { toJson } from '../../context/artifacts.js';
  * content: pathname UNIX sockets, metadata mutations and `/proc` stat surfaces
  * remain unmediated (the residual list is kernel.md §7). The guarantee bought
  * here is precise: the kernel interpolates the key into no event, artifact,
- * world write or model request; a provider response body is captured verbatim,
- * so a hostile provider can still reflect the key into the journal.
+ * world write or model request; a provider response body is journaled verbatim,
+ * so a hostile provider can still reflect the key into the frontier journal.
+ *
+ * The registry key is also the credential id the frontier journals:
+ * `webToolsFromProviders` passes the literal `'tavily'` into every `http/request`
+ * — `ProviderEntry` carries no `name` field, so this registry key is the one
+ * home for the id — and never the entry's `key`, which is the secret. The
+ * factory validates the two URLs it will journal (`<baseUrl>/search`,
+ * `<baseUrl>/extract`) with the frontier's own URL predicate at construction,
+ * so a misconfigured base URL fails once, loudly, there.
+ *
  * Library-only composition (no host exists yet): load the store, build the
- * port, and pass it as the optional `webTools` field — under
- * `exactOptionalPropertyTypes` that property is spread conditionally, never
- * assigned `undefined`:
- * `const webTools = webToolsFromProviders(await loadProviders(home));`
+ * port against the cell's frontier gate, and pass it as the optional
+ * `webTools` field — under `exactOptionalPropertyTypes` that property is spread
+ * conditionally, never assigned `undefined`:
+ * `const webTools = webToolsFromProviders(await loadProviders(home), journal.gate);`
  * `createAgentRuntime({ ...options, ...(webTools !== undefined ? { webTools } : {}) });`
  *
  * Not to be confused with `src/provider/adapter.ts`: this module stores web-tool
@@ -57,20 +67,6 @@ const MAX_RESPONSE_BYTES_CEILING = 8 * 1024 * 1024;
 const ENTRY_FIELDS = ['key', 'baseUrl', 'timeoutMs', 'maxResults', 'maxResponseBytes'];
 /** The provider store's ceiling: an oversize file is refused before parsing. */
 const MAX_PROVIDERS_BYTES = 1024 * 1024;
-
-/**
- * A loopback host may use plain `http:`; everything else must be `https:`, so a
- * base-url typo cannot send the Bearer key across the network in cleartext.
- * `URL.hostname` keeps IPv6 brackets, so `[::1]` is unwrapped first.
- */
-function isLoopback(hostname: string): boolean {
-  const host = hostname.startsWith('[') && hostname.endsWith(']')
-    ? hostname.slice(1, -1) : hostname;
-  if (host === 'localhost' || host === '::1') return true;
-  const octets = host.split('.');
-  return octets.length === 4 && octets[0] === '127'
-    && octets.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
-}
 
 function fail(message: string): never {
   throw new Error(`invalid ${PROVIDERS_BASENAME}: ${message}`);

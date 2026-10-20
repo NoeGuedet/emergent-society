@@ -3,6 +3,7 @@ import {
   FRONTIER_MAX_CREDENTIAL_ID, FrontierValidationError, validateFrontierUrl,
 } from '../frontier/events.js';
 import { readBoundedBody } from '../net/bounded-body.js';
+import { isLoopback } from '../util.js';
 
 /**
  * The one HTTP transport (T6, kernel.md §4).
@@ -68,20 +69,9 @@ export type TransportConfig = {
 const REQUEST_HEADERS: Readonly<Record<string, string>> = { 'content-type': 'application/json' };
 
 /**
- * A loopback host may use plain `http:`; everything else must be `https:`, so a
- * misconfigured endpoint cannot send the Bearer key in cleartext. The same rule
- * `providers.ts` applies to a base URL, applied once at construction.
+ * Validates the endpoint once: the frontier URL predicate plus the https rule
+ * (the shared `isLoopback` predicate `providers.ts` applies to a base URL).
  */
-function isLoopback(hostname: string): boolean {
-  const host = hostname.startsWith('[') && hostname.endsWith(']')
-    ? hostname.slice(1, -1) : hostname;
-  if (host === 'localhost' || host === '::1') return true;
-  const octets = host.split('.');
-  return octets.length === 4 && octets[0] === '127'
-    && octets.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
-}
-
-/** Validates the endpoint once: the frontier URL predicate plus the https rule. */
 function validateEndpoint(endpoint: string): string {
   const url = validateFrontierUrl(endpoint);
   let parsed: URL;

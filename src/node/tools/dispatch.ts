@@ -1,5 +1,5 @@
 import type {
-  AgentConfig, ArtifactRef, AssistantProjection, FunctionCall, RequestId, SafeFailure,
+  AgentConfig, AssistantProjection, FunctionCall, RequestId, SafeFailure,
 } from '../../context/contracts.js';
 import { isRecord } from '../../util.js';
 import type { BoundaryGate } from '../gate.js';
@@ -17,13 +17,15 @@ import type { WebOutcome, WebTools } from './web.js';
  * runs one command in the node's persistent shell session (marker-encapsulated,
  * typed statuses, reset-on-timeout), `wait` is loop control, `web_search` and
  * `web_fetch` run through the injected `WebTools` port (its client is the only
- * place the credential is written, and only into an `Authorization` header), and
- * any other name is an unknown tool that never becomes bash. Arguments stay raw
- * until here, where they are parsed as a plain JSON object; a malformed, unknown
- * or denied call yields a fixed error result with the matching `tool_call_id` and
- * no shell. An extract-level `failed: true` render is an error result with a null
- * `SafeFailure`, the ordinary-nonzero-exit precedent. `called` counts the calls
- * actually accepted (each has its own `tool/call`).
+ * place the credential is written, and only into an `Authorization` header; its
+ * raw body is a frontier fact, so the local result carries only `frontierCall`
+ * and no artifact), and any other name is an unknown tool that never becomes
+ * bash. Arguments stay raw until here, where they are parsed as a plain JSON
+ * object; a malformed, unknown or denied call yields a fixed error result with
+ * the matching `tool_call_id` and no shell. An extract-level `failed: true`
+ * render is an error result with a null `SafeFailure`, the ordinary-nonzero-exit
+ * precedent. `called` counts the calls actually accepted (each has its own
+ * `tool/call`).
  */
 
 export type DispatchResult = { readonly waited: boolean; readonly called: number };
@@ -211,50 +213,52 @@ async function appendExecuteResult(
   });
 }
 
-/** Captures the raw provider body and appends the bounded web result. */
+/**
+ * Appends the bounded web result. The frontier has the body, so the local log
+ * carries only the call reference and no raw capture; a truncation notice names
+ * that call instead of an artifact digest.
+ */
 async function appendWebResult(
   gate: BoundaryGate, id: RequestId, callId: string,
   kind: 'web_search' | 'web_fetch', outcome: WebOutcome, maxToolResultBytes: number,
 ): Promise<void> {
-  const append = (
-    content: string, isError: boolean, raw: ArtifactRef | null, failure: SafeFailure | null,
-  ): void => {
+  const call = outcome.frontierCall;
+  const bounded = (text: string): string => call === null
+    // The already-aborted path: a fixed short text, never truncated, and no
+    // frontier reference for a notice to name.
+    ? text
+    : boundToolText(text, maxToolResultBytes, {
+        kind: 'frontier', call, bytes: outcome.body.length,
+        complete: outcome.ok ? true : outcome.complete,
+      });
+  const append = (content: string, isError: boolean, failure: SafeFailure | null): void => {
     gate.append('tool/result', {
       turn: id.turn, request: id, callId,
       message: { role: 'tool', content, tool_call_id: callId },
-      isError, raw, failure, synthetic: false,
-      // The web tools cross the frontier in T6; until then their results carry
-      // no frontier reference (and still capture their raw body locally).
-      frontierCall: null,
+      isError, raw: null, failure, synthetic: false,
+      frontierCall: call,
     });
   };
-  const captureOf = (raw: ArtifactRef): {
-    kind: 'artifact'; sha256: string; bytes: number; complete: boolean;
-  } => ({ kind: 'artifact', sha256: raw.sha256, bytes: raw.bytes, complete: raw.complete });
   if (!outcome.ok) {
-    // No capture for an empty failure body; a kept prefix has its real complete flag.
-    const raw = outcome.body.length > 0
-      ? await gate.capture(outcome.body, 'utf8', outcome.complete) : null;
     const head = outcome.status === null
       ? `error: ${outcome.failure.code}`
       : `error: ${outcome.failure.code}\nstatus: ${outcome.status}`;
-    append(raw === null ? head
-      : boundToolText(`${head}\nbody:\n${decodeToolText(outcome.body)}`,
-        maxToolResultBytes, captureOf(raw)),
-      true, raw, outcome.failure);
+    append(outcome.body.length === 0
+      ? head
+      : bounded(`${head}\nbody:\n${decodeToolText(outcome.body)}`),
+      true, outcome.failure);
     return;
   }
-  const raw = await gate.capture(outcome.body, 'utf8', true);
   const rendered = kind === 'web_search' ? renderSearch(outcome.body) : renderExtract(outcome.body);
   if (rendered === null) {
-    append(boundToolText(
-      `error: malformed\nstatus: ${outcome.status}\nbody:\n${decodeToolText(outcome.body)}`,
-      maxToolResultBytes, captureOf(raw)), true, raw, { code: 'malformed', status: outcome.status });
+    append(bounded(
+      `error: malformed\nstatus: ${outcome.status}\nbody:\n${decodeToolText(outcome.body)}`),
+      true, { code: 'malformed', status: outcome.status });
     return;
   }
   const text = typeof rendered === 'string' ? rendered : rendered.text;
   const failed = typeof rendered === 'string' ? false : rendered.failed;
-  append(boundToolText(text, maxToolResultBytes, captureOf(raw)), failed, raw, null);
+  append(bounded(text), failed, null);
 }
 
 export async function dispatchCalls(

@@ -1,13 +1,32 @@
 import { Buffer } from 'node:buffer';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
-import { afterEach, describe, expect, it } from 'vitest';
-import { TavilyWebTools, renderExtract, renderSearch, webToolsFromProviders } from '../tools/web.js';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { openTestFrontier, readFrontier } from '../../frontier/__tests__/helpers.js';
+import { FrontierValidationError } from '../../frontier/index.js';
+import type {
+  Frontier, FrontierJournal, HttpRequest, HttpResponse,
+} from '../../frontier/index.js';
+import { BlobStore, canonicalizeJson } from '../../journal/index.js';
+import type { EventEnvelope } from '../../journal/index.js';
+import { TavilyWebTools, renderExtract, renderSearch, webRequestBody, webToolsFromProviders } from '../tools/web.js';
 import type { ProviderEntry } from '../tools/providers.js';
 
 const KEY = 'tvly-test-never-log';
 const servers: Server[] = [];
+let home = '';
+let journal: FrontierJournal | null = null;
+
+beforeEach(async () => {
+  home = await mkdtemp(join(tmpdir(), 'c14a-web-'));
+});
 
 afterEach(async () => {
+  const open = journal;
+  journal = null;
+  if (open !== null) await open.close().catch(() => {});
   while (servers.length > 0) {
     const server = servers.pop()!;
     server.closeAllConnections();
@@ -15,6 +34,7 @@ afterEach(async () => {
       server.close((error) => { if (error) reject(error); else resolve(); });
     });
   }
+  await rm(home, { recursive: true, force: true });
 });
 
 type Request = { readonly path: string; readonly method: string;
@@ -49,6 +69,60 @@ function entry(baseUrl: string, over: Partial<ProviderEntry> = {}): ProviderEntr
   return { key: KEY, baseUrl, timeoutMs: 1000, maxResults: 8, maxResponseBytes: 65536, ...over };
 }
 
+/** The suite's one frontier journal, opened on first use. */
+async function frontier(): Promise<FrontierJournal> {
+  if (journal === null) journal = await openTestFrontier(home);
+  return journal;
+}
+
+/** The web tools under test, wired to this suite's frontier gate. */
+async function tools(provider: ProviderEntry): Promise<TavilyWebTools> {
+  return new TavilyWebTools(provider, (await frontier()).gate);
+}
+
+async function log(): Promise<EventEnvelope[]> {
+  return readFrontier(home);
+}
+
+function requestsOf(events: EventEnvelope[]): HttpRequest[] {
+  return events.filter((event) => event.type === 'http/request')
+    .map((event) => event.data as unknown as HttpRequest);
+}
+
+function responsesOf(events: EventEnvelope[]): HttpResponse[] {
+  return events.filter((event) => event.type === 'http/response')
+    .map((event) => event.data as unknown as HttpResponse);
+}
+
+async function bodyOf(ref: { readonly sha256: string }): Promise<Buffer> {
+  return new BlobStore(home).get(ref.sha256);
+}
+
+/** Every blob's bytes in the cell home, for the credential-absence scan. */
+async function allBlobs(): Promise<Buffer[]> {
+  let entries;
+  try {
+    entries = await readdir(join(home, 'blobs'), { recursive: true, withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+  const out: Buffer[] = [];
+  for (const found of entries) {
+    if (found.isFile()) out.push(await readFile(join(found.parentPath, found.name)));
+  }
+  return out;
+}
+
+/** A `Frontier` whose halves are overridden; the unused half rejects loudly. */
+function stubFrontier(over: Partial<Frontier>): Frontier {
+  return {
+    begin: () => Promise.reject(new Error('begin not stubbed')),
+    complete: () => Promise.resolve(),
+    ...over,
+  };
+}
+
 const SEARCH_BODY = JSON.stringify({
   request_id: 'req-1', query: 'q',
   results: [
@@ -63,9 +137,11 @@ describe('TavilyWebTools', () => {
       res.setHeader('content-type', 'application/json');
       res.end(SEARCH_BODY);
     });
-    const outcome = await new TavilyWebTools(entry(baseUrl))
+    const provider = entry(baseUrl);
+    const outcome = await (await tools(provider))
       .search('q', 5, new AbortController().signal);
     expect(outcome).toMatchObject({ ok: true, status: 200 });
+    expect(outcome.frontierCall).toEqual(expect.any(String));
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({
       path: '/search', method: 'POST', contentType: 'application/json',
@@ -73,21 +149,56 @@ describe('TavilyWebTools', () => {
     expect(requests[0]!.authorization).toBe(`Bearer ${KEY}`);
     expect(requests[0]!.body.toString('utf8'))
       .toBe(JSON.stringify({ query: 'q', max_results: 5, search_depth: 'basic' }));
+    expect(requests[0]!.body.toString('utf8'))
+      .toBe(Buffer.from(webRequestBody({ kind: 'web_search', query: 'q', maxResults: 5 }, provider))
+        .toString('utf8'));
+  });
+
+  it('a web_search journals one request and one response whose body resolves', async () => {
+    const { baseUrl } = await serve((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(SEARCH_BODY);
+    });
+    const provider = entry(baseUrl);
+    const outcome = await (await tools(provider)).search('q', 5, new AbortController().signal);
+    const events = await log();
+    const requests = requestsOf(events);
+    const responses = responsesOf(events);
+    expect(requests).toHaveLength(1);
+    expect(responses).toHaveLength(1);
+    const request = requests[0]!;
+    const response = responses[0]!;
+    expect(request).toMatchObject({
+      method: 'POST', url: `${baseUrl}/search`,
+      headers: { 'content-type': 'application/json' },
+      credentials: [{ id: 'tavily', where: 'authorization' }],
+      attempt: 0, world_head: null,
+    });
+    expect(request.body).toMatchObject({
+      encoding: 'utf8', complete: true, bytes: Buffer.byteLength(JSON.stringify(
+        { query: 'q', max_results: 5, search_depth: 'basic' }), 'utf8'),
+    });
+    expect((await bodyOf(request.body)).toString('utf8'))
+      .toBe(JSON.stringify({ query: 'q', max_results: 5, search_depth: 'basic' }));
+    expect(response).toMatchObject({ call: request.call, status: 200, error: null });
+    expect(response.body).toMatchObject({ encoding: 'binary', complete: true });
+    expect((await bodyOf(response.body)).toString('utf8')).toBe(SEARCH_BODY);
+    expect(outcome.frontierCall).toBe(request.call);
   });
 
   it('search caps max_results at the entry ceiling', async () => {
     const { baseUrl, requests } = await serve((_req, res) => res.end(SEARCH_BODY));
-    await new TavilyWebTools(entry(baseUrl, { maxResults: 3 }))
+    await (await tools(entry(baseUrl, { maxResults: 3 })))
       .search('q', 20, new AbortController().signal);
     expect(JSON.parse(requests[0]!.body.toString('utf8'))['max_results']).toBe(3);
   });
 
-  it('extract sends a one-element urls array', async () => {
+  it('extract sends a one-element urls array to the extract URL', async () => {
     const body = JSON.stringify({
       results: [{ url: 'https://a.example/', raw_content: 'page text' }], failed_results: [],
     });
     const { baseUrl, requests } = await serve((_req, res) => res.end(body));
-    const outcome = await new TavilyWebTools(entry(baseUrl))
+    const outcome = await (await tools(entry(baseUrl)))
       .extract('https://a.example/', new AbortController().signal);
     expect(outcome).toMatchObject({ ok: true, status: 200 });
     expect(requests[0]).toMatchObject({
@@ -95,6 +206,8 @@ describe('TavilyWebTools', () => {
     });
     expect(requests[0]!.body.toString('utf8'))
       .toBe(JSON.stringify({ urls: ['https://a.example/'], extract_depth: 'basic' }));
+    const [request] = requestsOf(await log());
+    expect(request!.url).toBe(`${baseUrl}/extract`);
   });
 
   it('an http error status keeps the body and classifies', async () => {
@@ -102,58 +215,117 @@ describe('TavilyWebTools', () => {
       res.statusCode = 429;
       res.end('{"detail":"rate limited"}');
     });
-    const outcome = await new TavilyWebTools(entry(baseUrl))
+    const outcome = await (await tools(entry(baseUrl)))
       .search('q', undefined, new AbortController().signal);
     expect(outcome).toMatchObject({ ok: false, status: 429, complete: true,
       failure: { code: 'http', status: 429 } });
-    if (!outcome.ok) expect(Buffer.from(outcome.body).toString('utf8')).toBe('{"detail":"rate limited"}');
+    expect(outcome.frontierCall).toEqual(expect.any(String));
+    if (!outcome.ok) {
+      expect(Buffer.from(outcome.body).toString('utf8')).toBe('{"detail":"rate limited"}');
+    }
+    const [response] = responsesOf(await log());
+    expect(response).toMatchObject({
+      status: 429, body: { complete: true }, error: { code: 'http' },
+    });
+    if (!outcome.ok) expect(outcome.frontierCall).toBe(response!.call);
   });
 
-  it('a timeout classifies without a status', async () => {
+  it('a timeout classifies without a status and leaves a durable terminal', async () => {
     const { baseUrl } = await serve(() => { /* never answers */ });
-    const outcome = await new TavilyWebTools(entry(baseUrl, { timeoutMs: 50 }))
+    const outcome = await (await tools(entry(baseUrl, { timeoutMs: 50 })))
       .search('q', undefined, new AbortController().signal);
     expect(outcome).toMatchObject({ ok: false, status: null,
       failure: { code: 'timeout', status: null } });
+    const [response] = responsesOf(await log());
+    expect(response).toMatchObject({
+      status: null, body: { complete: false }, error: { code: 'timeout' },
+    });
   });
 
   it('gate cancellation wins over the timeout', async () => {
     const { baseUrl } = await serve(() => { /* never answers */ });
     const controller = new AbortController();
-    const pending = new TavilyWebTools(entry(baseUrl, { timeoutMs: 60000 }))
+    const pending = (await tools(entry(baseUrl, { timeoutMs: 60000 })))
       .search('q', undefined, controller.signal);
     controller.abort();
     await expect(pending).resolves.toMatchObject({ ok: false,
       failure: { code: 'cancelled', status: null } });
+    const [response] = responsesOf(await log());
+    expect(response).toMatchObject({
+      status: null, body: { complete: false }, error: { code: 'cancelled' },
+    });
   });
 
-  it('a pre-aborted gate signal cancels without any request', async () => {
+  it('a pre-aborted gate signal cancels with no request and no frontier event', async () => {
     const { baseUrl, requests } = await serve((_req, res) => res.end(SEARCH_BODY));
+    await frontier();
     const controller = new AbortController();
     controller.abort();
-    const outcome = await new TavilyWebTools(entry(baseUrl))
+    const outcome = await (await tools(entry(baseUrl)))
+      .search('q', undefined, controller.signal);
+    expect(outcome).toMatchObject({ ok: false, status: null, frontierCall: null,
+      failure: { code: 'cancelled', status: null } });
+    expect(requests).toHaveLength(0);
+    expect(await log()).toHaveLength(0);
+  });
+
+  it('an abort observed after begin completes cancelled without any fetch', async () => {
+    const { baseUrl, requests } = await serve((_req, res) => res.end(SEARCH_BODY));
+    const controller = new AbortController();
+    const gate = (await frontier()).gate;
+    // The wrapper starts the real durable request, then stops the caller before
+    // `post` gets a chance to send — the one window the caller cannot arrange.
+    const frontierAfterBegin: Frontier = {
+      begin: async (input) => {
+        const call = await gate.begin(input);
+        controller.abort();
+        return call;
+      },
+      complete: (call, outcome) => gate.complete(call, outcome),
+    };
+    const outcome = await new TavilyWebTools(entry(baseUrl), frontierAfterBegin)
       .search('q', undefined, controller.signal);
     expect(outcome).toMatchObject({ ok: false, status: null,
       failure: { code: 'cancelled', status: null } });
+    expect(outcome.frontierCall).toEqual(expect.any(String));
     expect(requests).toHaveLength(0);
+    const events = await log();
+    expect(requestsOf(events)).toHaveLength(1);
+    const [response] = responsesOf(events);
+    expect(response).toMatchObject({
+      call: outcome.frontierCall, status: null, error: { code: 'cancelled' },
+      body: { complete: false },
+    });
   });
 
-  it('an over-cap body is a bounded body-limit', async () => {
+  it('an over-cap body is a bounded body-limit with a durable terminal', async () => {
     const { baseUrl } = await serve((_req, res) => res.end('x'.repeat(2048)));
-    const outcome = await new TavilyWebTools(entry(baseUrl, { maxResponseBytes: 1024 }))
+    const outcome = await (await tools(entry(baseUrl, { maxResponseBytes: 1024 })))
       .search('q', undefined, new AbortController().signal);
     expect(outcome).toMatchObject({ ok: false, status: 200, complete: false,
       failure: { code: 'body-limit', status: 200 } });
     if (!outcome.ok) expect(outcome.body.length).toBe(1024);
+    const [response] = responsesOf(await log());
+    expect(response).toMatchObject({
+      status: 200, body: { complete: false }, error: { code: 'body-limit' },
+    });
+    expect(response!.body.bytes).toBe(1024);
+    expect((await bodyOf(response!.body)).length).toBe(1024);
   });
 
-  it('a connection failure before any status is a network failure with no body', async () => {
+  it('a connection failure before any status is a network terminal with no body', async () => {
     // Port 1 has no listener, so fetch rejects before any header arrives.
-    const outcome = await new TavilyWebTools(entry('http://127.0.0.1:1'))
+    const outcome = await (await tools(entry('http://127.0.0.1:1')))
       .search('q', undefined, new AbortController().signal);
     expect(outcome).toMatchObject({ ok: false, status: null,
       failure: { code: 'network', status: null } });
     if (!outcome.ok) expect(outcome.body.length).toBe(0);
+    const [response] = responsesOf(await log());
+    expect(response).toMatchObject({
+      status: null, body: { complete: false }, error: { code: 'network' },
+    });
+    expect(response!.body.bytes).toBe(0);
+    expect((await bodyOf(response!.body)).length).toBe(0);
   });
 
   it('an interrupted body keeps the captured prefix', async () => {
@@ -164,27 +336,114 @@ describe('TavilyWebTools', () => {
       // captured prefix before the stream errors — no wall-clock timer.
       res.write('{"results":[', () => { res.destroy(); });
     });
-    const outcome = await new TavilyWebTools(entry(baseUrl))
+    const outcome = await (await tools(entry(baseUrl)))
       .search('q', undefined, new AbortController().signal);
     expect(outcome).toMatchObject({ ok: false, status: 200, complete: false,
       failure: { code: 'network', status: 200 } });
-    if (!outcome.ok) expect(Buffer.from(outcome.body).toString('utf8')).toBe('{"results":[');
+    if (!outcome.ok) {
+      expect(Buffer.from(outcome.body).toString('utf8')).toBe('{"results":[');
+    }
+    const [response] = responsesOf(await log());
+    expect(response).toMatchObject({
+      status: 200, body: { complete: false }, error: { code: 'network' },
+    });
   });
 
-  it('the credential never appears in any outcome', async () => {
+  it('a redirect is journaled as a non-200 terminal and never followed', async () => {
+    const { baseUrl, requests } = await serve((_req, res) => {
+      res.statusCode = 302;
+      res.setHeader('location', 'https://elsewhere.example/target');
+      res.end();
+    });
+    const outcome = await (await tools(entry(baseUrl)))
+      .search('q', undefined, new AbortController().signal);
+    expect(outcome).toMatchObject({ ok: false, status: 302,
+      failure: { code: 'http', status: 302 } });
+    expect(requests).toHaveLength(1);
+    const [response] = responsesOf(await log());
+    expect(response).toMatchObject({
+      status: 302, body: { complete: true }, error: { code: 'http' },
+    });
+  });
+
+  it('a begin failure means fetch is never called', async () => {
+    const { baseUrl, requests } = await serve((_req, res) => res.end(SEARCH_BODY));
+    const failing = stubFrontier({
+      begin: () => Promise.reject(new Error('injected begin failure')),
+    });
+    await expect(new TavilyWebTools(entry(baseUrl), failing)
+      .search('q', undefined, new AbortController().signal))
+      .rejects.toThrow('injected begin failure');
+    expect(requests).toHaveLength(0);
+  });
+
+  it('a complete failure propagates instead of becoming a WebOutcome failure', async () => {
+    const { baseUrl } = await serve((_req, res) => res.end(SEARCH_BODY));
+    const rejecting = stubFrontier({
+      begin: () => Promise.resolve({ call: 'c1', group: 'g1' }),
+      complete: () => Promise.reject(new Error('injected complete failure')),
+    });
+    await expect(new TavilyWebTools(entry(baseUrl), rejecting)
+      .search('q', undefined, new AbortController().signal))
+      .rejects.toThrow('injected complete failure');
+  });
+
+  it('the credential never appears in any outcome, frontier payload or blob', async () => {
     const { baseUrl } = await serve((_req, res) => {
       res.statusCode = 500;
       res.end('upstream boom');
     });
-    const ok = await new TavilyWebTools(entry(baseUrl)).search('q', 1, new AbortController().signal);
+    const ok = await (await tools(entry(baseUrl)))
+      .search('q', 1, new AbortController().signal);
     expect(JSON.stringify(ok)).not.toContain(KEY);
     if (!ok.ok) expect(Buffer.from(ok.body).includes(KEY)).toBe(false);
+    const events = await log();
+    for (const event of events) {
+      expect(canonicalizeJson(event.data)).not.toContain(KEY);
+    }
+    for (const blob of await allBlobs()) expect(blob.includes(KEY)).toBe(false);
+    const [request] = requestsOf(events);
+    expect(request!.credentials).toEqual([{ id: 'tavily', where: 'authorization' }]);
+    expect(JSON.stringify(request)).not.toContain(`Bearer ${KEY}`);
   });
 
-  it('webToolsFromProviders only builds a client for a configured provider', () => {
-    expect(webToolsFromProviders({})).toBeUndefined();
-    expect(webToolsFromProviders({ tavily: entry('http://127.0.0.1:1') }))
+  it('webToolsFromProviders only builds a client for a configured provider', async () => {
+    const gate = (await frontier()).gate;
+    expect(webToolsFromProviders({}, gate)).toBeUndefined();
+    expect(webToolsFromProviders({ tavily: entry('http://127.0.0.1:1') }, gate))
       .toBeInstanceOf(TavilyWebTools);
+  });
+
+  it('a baseUrl the frontier predicate refuses is a construction error', async () => {
+    // A space in the path parses as a URL but is outside the RFC 3986 class the
+    // frontier journals, so the factory must refuse it before any begin.
+    const bad = entry('https://api.tavily.com/a b');
+    const gate = (await frontier()).gate;
+    expect(() => webToolsFromProviders({ tavily: bad }, gate))
+      .toThrow(FrontierValidationError);
+    expect(() => new TavilyWebTools(bad, gate)).toThrow(FrontierValidationError);
+    expect(await log()).toHaveLength(0);
+  });
+});
+
+describe('webRequestBody', () => {
+  it('builds the search payload with the entry clamp', () => {
+    const provider = entry('https://api.tavily.com', { maxResults: 3 });
+    expect(Buffer.from(webRequestBody({ kind: 'web_search', query: 'q', maxResults: undefined },
+      provider)).toString('utf8'))
+      .toBe(JSON.stringify({ query: 'q', max_results: 3, search_depth: 'basic' }));
+    expect(Buffer.from(webRequestBody({ kind: 'web_search', query: 'q', maxResults: 20 },
+      provider)).toString('utf8'))
+      .toBe(JSON.stringify({ query: 'q', max_results: 3, search_depth: 'basic' }));
+    expect(Buffer.from(webRequestBody({ kind: 'web_search', query: 'q', maxResults: 2 },
+      provider)).toString('utf8'))
+      .toBe(JSON.stringify({ query: 'q', max_results: 2, search_depth: 'basic' }));
+  });
+
+  it('builds the extract payload as a one-element urls array', () => {
+    expect(Buffer.from(webRequestBody({ kind: 'web_fetch', url: 'https://a.example/' },
+      entry('https://api.tavily.com'))).toString('utf8'))
+      .toBe(JSON.stringify({ urls: ['https://a.example/'], extract_depth: 'basic' }));
   });
 });
 

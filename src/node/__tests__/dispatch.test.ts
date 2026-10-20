@@ -122,6 +122,7 @@ async function exists(path: string): Promise<boolean> {
 interface ResultData {
   readonly callId: string; readonly isError: boolean; readonly failure: unknown;
   readonly raw: ArtifactRef | null; readonly synthetic: boolean;
+  readonly frontierCall: string | null;
   readonly message: { readonly content: string; readonly tool_call_id: string };
 }
 
@@ -189,6 +190,8 @@ describe('dispatchCalls: execute', () => {
       await dispatchCalls(proj, ID, s.gate('turn', 0), config(), terminal);
       const data = await firstResult(home);
       expect(data.message.content).toMatch(/^exit: 0\noutput:\nhello-42/);
+      // A shell effect is never a frontier fact: the raw stays local.
+      expect(data.frontierCall).toBeNull();
       const durable = await events(home);
       const rawBytes = resolveArtifact(durable, data.raw!);
       expect(Buffer.from(rawBytes).toString('utf8')).toMatch(/hello-42\r?\n/);
@@ -626,17 +629,11 @@ describe('dispatchCalls: web tools', () => {
     failed_results: [{ url: 'https://a.example/', error: 'Failed to retrieve content' }],
   });
 
-  function okSearch(body = SEARCH_JSON): WebOutcome {
-    return { ok: true, status: 200, body: Buffer.from(body, 'utf8') };
+  function okSearch(body = SEARCH_JSON, frontierCall = 'call-web'): WebOutcome {
+    return { ok: true, status: 200, body: Buffer.from(body, 'utf8'), frontierCall };
   }
 
-  async function rawText(home: string): Promise<string> {
-    const durable = await events(home);
-    const data = ofType(durable, 'tool/result')[0]!.data as unknown as { raw: ArtifactRef | null };
-    return Buffer.from(resolveArtifact(durable, data.raw!)).toString('utf8');
-  }
-
-  it('journals a bounded web_search result with its raw artifact', async () => {
+  it('journals a bounded web_search result with its frontier reference and no raw', async () => {
     const { home } = world();
     const s = await openSession(home);
     try {
@@ -654,8 +651,10 @@ describe('dispatchCalls: web tools', () => {
         'provider: tavily', 'request: req-dispatch', 'results: 1', '',
         '[1] One', 'https://one.example', 'first snippet',
       ].join('\n'));
-      expect(await rawText(home)).toBe(SEARCH_JSON);
-      expect(await artifactComplete(home)).toBe(true);
+      // The frontier has the body: the local log carries only the reference.
+      expect(data.raw).toBeNull();
+      expect(data.frontierCall).toBe('call-web');
+      expect(ofType(durable, 'artifact/end')).toHaveLength(0);
     } finally {
       await s.shutdown();
     }
@@ -743,13 +742,14 @@ describe('dispatchCalls: web tools', () => {
       }
     }, 15000);
 
-  it('a failed outcome keeps its failure and captured prefix', async () => {
+  it('a failed outcome keeps its failure, its captured prefix and the call id', async () => {
     const { home } = world();
     const s = await openSession(home);
     try {
       const outcome: WebOutcome = {
         ok: false, failure: { code: 'http', status: 429 }, status: 429,
         body: Buffer.from('{"detail":"rate limited"}', 'utf8'), complete: true,
+        frontierCall: 'call-web',
       };
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
       await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(), neverTerminal,
@@ -758,13 +758,16 @@ describe('dispatchCalls: web tools', () => {
       expect(data.isError).toBe(true);
       expect(data.failure).toEqual({ code: 'http', status: 429 });
       expect(data.message.content).toBe('error: http\nstatus: 429\nbody:\n{"detail":"rate limited"}');
-      expect(await rawText(home)).toBe('{"detail":"rate limited"}');
+      // A provider-failure result is anchored locally, and only by reference.
+      expect(data.frontierCall).toBe('call-web');
+      expect(data.raw).toBeNull();
+      expect(ofType(await events(home), 'artifact/end')).toHaveLength(0);
     } finally {
       await s.shutdown();
     }
   }, 15000);
 
-  it('a malformed success body is a malformed failure with the raw kept', async () => {
+  it('a malformed success body is a malformed failure with the frontier reference', async () => {
     const { home } = world();
     const s = await openSession(home);
     try {
@@ -775,8 +778,9 @@ describe('dispatchCalls: web tools', () => {
       expect(data.isError).toBe(true);
       expect(data.failure).toEqual({ code: 'malformed', status: 200 });
       expect(data.message.content).toBe('error: malformed\nstatus: 200\nbody:\nnot json');
-      expect(await rawText(home)).toBe('not json');
-      expect(await artifactComplete(home)).toBe(true);
+      expect(data.frontierCall).toBe('call-web');
+      expect(data.raw).toBeNull();
+      expect(ofType(await events(home), 'artifact/end')).toHaveLength(0);
     } finally {
       await s.shutdown();
     }
@@ -805,7 +809,7 @@ describe('dispatchCalls: web tools', () => {
     try {
       const outcome: WebOutcome = {
         ok: false, failure: { code: 'network', status: null }, status: null,
-        body: new Uint8Array(), complete: false,
+        body: new Uint8Array(), complete: false, frontierCall: 'call-web',
       };
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
       await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(), neverTerminal,
@@ -828,7 +832,7 @@ describe('dispatchCalls: web tools', () => {
     try {
       const outcome: WebOutcome = {
         ok: false, failure: { code: 'body-limit', status: 200 }, status: 200,
-        body: Buffer.alloc(2048, 120), complete: false,
+        body: Buffer.alloc(2048, 120), complete: false, frontierCall: 'call-web',
       };
       const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
       await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(), neverTerminal,
@@ -836,14 +840,14 @@ describe('dispatchCalls: web tools', () => {
       const data = await firstResult(home);
       expect(data.failure).toEqual({ code: 'body-limit', status: 200 });
       expect(data.message.content.startsWith('error: body-limit\nstatus: 200\nbody:\n')).toBe(true);
-      expect(data.raw!.complete).toBe(false);
-      expect(await artifactComplete(home)).toBe(false);
+      expect(data.raw).toBeNull();
+      expect(ofType(await events(home), 'artifact/end')).toHaveLength(0);
     } finally {
       await s.shutdown();
     }
   }, 15000);
 
-  it('bounds a long successful render with the truncation notice', async () => {
+  it('bounds a long successful render with the frontier truncation notice', async () => {
     const { home } = world();
     const s = await openSession(home);
     try {
@@ -855,17 +859,42 @@ describe('dispatchCalls: web tools', () => {
       await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig({ policy }),
         neverTerminal, stubWeb([okSearch(big)], []));
       const data = await firstResult(home);
-      const raw = data.raw!;
       // Every byte of the render is ASCII, so the retained prefix is exactly the
-      // 256-byte model cap; the notice must name the cap and the raw's own facts.
-      const notice = /\n\[output truncated: model text capped at (\d+) bytes; raw artifact: (\d+) captured bytes, complete: (yes|no); raw sha256 ([0-9a-f]{64})\]$/
+      // 256-byte model cap; the notice names the frontier call and the capture's
+      // own facts, and claims no artifact digest.
+      const notice = /\n\[output truncated: model text capped at (\d+) bytes; frontier call: ([^,]+), (\d+) captured bytes, complete: (yes|no)\]$/
         .exec(data.message.content);
       expect(notice).not.toBeNull();
       expect(Number(notice![1])).toBe(256);
-      expect(Number(notice![2])).toBe(raw.bytes);
-      expect(notice![3]).toBe('yes');
-      expect(notice![4]).toBe(raw.sha256);
+      expect(notice![2]).toBe('call-web');
+      expect(Number(notice![3])).toBe(Buffer.byteLength(big, 'utf8'));
+      expect(notice![4]).toBe('yes');
+      expect(data.message.content).not.toContain('sha256');
       expect(data.message.content.startsWith('provider: tavily')).toBe(true);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('an already-aborted web call carries no frontier reference', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      const outcome: WebOutcome = {
+        ok: false, failure: { code: 'cancelled', status: null }, status: null,
+        body: new Uint8Array(), complete: false, frontierCall: null,
+      };
+      const proj = projection([call('w1', 'web_search', JSON.stringify({ query: 'q' }))]);
+      await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(), neverTerminal,
+        stubWeb([outcome], []));
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'cancelled', status: null });
+      expect(data.frontierCall).toBeNull();
+      expect(data.raw).toBeNull();
+      // The fixed short text never needs a truncation notice.
+      expect(data.message.content).toBe('error: cancelled');
+      expect(ofType(await events(home), 'artifact/end')).toHaveLength(0);
     } finally {
       await s.shutdown();
     }
