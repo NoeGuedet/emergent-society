@@ -148,7 +148,9 @@ describe('C1.4a web tools end to end', () => {
             schedule: (ms, callback) => {
               const timer = setTimeout(callback, ms);
               return () => { clearTimeout(timer); };
-            } }),
+            } },
+          (await fixture().frontier()).gate,
+        ),
         webTools,
       });
       driver = await NodeDriver.open(home, 'n1', runtime.handler, world, {

@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http';
 import { access, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { canonicalizeJson } from '../../journal/index.js';
+import { BlobStore, canonicalizeJson } from '../../journal/index.js';
 import { loadVerifiedEvents, type VerifiedEvents } from '../../context/loader.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { ContextFold } from '../../context/fold.js';
@@ -10,8 +10,9 @@ import { resolveArtifact, resolveStored, toJson } from '../../context/artifacts.
 import { validateRequestPlan } from '../../context/events.js';
 import { rederivePlans } from '../../context/assembler.js';
 import { serializeWire } from '../../provider/wire.js';
-import { ProviderAdapter } from '../../provider/adapter.js';
+import { ProviderAdapter, type ProviderPolicy } from '../../provider/adapter.js';
 import { OpenAITransport } from '../../provider/transport.js';
+import { readFrontier } from '../../frontier/__tests__/helpers.js';
 import { NodeDriver } from '../driver.js';
 import { createAgentRuntime, defaultAgentConfig } from '../loop.js';
 import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
@@ -53,6 +54,23 @@ async function delay(ms: number, signal: AbortSignal): Promise<void> {
     }, ms);
     signal.addEventListener('abort', abort, { once: true });
   });
+}
+
+const providerPolicy: ProviderPolicy = {
+  delay,
+  schedule: (ms, callback) => {
+    const timer = setTimeout(callback, ms);
+    return () => { clearTimeout(timer); };
+  },
+};
+
+/** The adapter bound to the fixture's frontier journal. */
+async function adapterFor(endpoint: string): Promise<ProviderAdapter> {
+  return new ProviderAdapter(
+    new OpenAITransport({ endpoint, key: 'test-key-never-log' }),
+    providerPolicy,
+    (await fixture().frontier()).gate,
+  );
 }
 
 describe('C1.3 real boundaries', () => {
@@ -155,21 +173,15 @@ describe('C1.3 real boundaries', () => {
     const config = { ...defaults, policy: { ...defaults.policy,
       shellTimeoutMs: 5000, killGraceMs: 20, retryDelayMs: 1, requestTimeoutMs: 1000,
     } };
-    const makeRuntime = () => createAgentRuntime({
+    const makeRuntime = async () => createAgentRuntime({
       home, uid: 'n1', world, initialConfig: config,
       terminal: { env: DEFAULT_TERMINAL_ENV },
-      adapter: new ProviderAdapter(new OpenAITransport({ endpoint, key: 'test-key-never-log' }), {
-        delay,
-        schedule: (ms, callback) => {
-          const timer = setTimeout(callback, ms);
-          return () => { clearTimeout(timer); };
-        },
-      }),
+      adapter: await adapterFor(endpoint),
     });
     let driver: NodeDriver | null = null;
     let running: Promise<void> | null = null;
     try {
-      const runtime = makeRuntime();
+      const runtime = await makeRuntime();
       driver = await NodeDriver.open(home, 'n1', runtime.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
         onCheckpoint: (mark) => runtime.checkpoint(mark),
@@ -186,6 +198,34 @@ describe('C1.3 real boundaries', () => {
       await parked(driver, world);
       expect(JSON.parse(bodies[2]!.toString('utf8')).messages[1].content).toBe('New heading, verbatim.');
       expect(runtime.snapshot().config?.value.version).toBe(2);
+      // Every exchange crossed the frontier: each request record is durable
+      // with the exact bytes the server received, and each has one terminal.
+      const frontier = await readFrontier(home);
+      const requests = frontier.filter((event) => event.type === 'http/request')
+        .map((event) => event.data as unknown as {
+          call: string; url: string; attempt: number;
+          credentials: Array<{ id: string; where: string }>;
+          body: { sha256: string };
+        });
+      const terminals = frontier.filter((event) => event.type === 'http/response')
+        .map((event) => event.data as unknown as {
+          call: string; status: number; error: unknown;
+        });
+      expect(requests).toHaveLength(bodies.length);
+      expect(terminals).toHaveLength(bodies.length);
+      expect(requests.every((request) => request.url === endpoint)).toBe(true);
+      expect(requests.every((request) => request.attempt === 0)).toBe(true);
+      expect(requests.every((request) => request.credentials.length === 1
+        && request.credentials[0]!.id === 'llm'
+        && request.credentials[0]!.where === 'authorization')).toBe(true);
+      expect(new Set(terminals.map((terminal) => terminal.call)))
+        .toEqual(new Set(requests.map((request) => request.call)));
+      expect(terminals.every((terminal) => terminal.status === 200 && terminal.error === null))
+        .toBe(true);
+      const blobs = new BlobStore(home);
+      for (const [index, request] of requests.entries()) {
+        expect((await blobs.get(request.body.sha256)).equals(bodies[index]!)).toBe(true);
+      }
       driver.stop();
       await running;
       running = null;
@@ -195,7 +235,7 @@ describe('C1.3 real boundaries', () => {
       expect((turnStarts[0]!.data as unknown as { world: { to: string } }).world.to).toBe(initialHead);
       expect((turnStarts[1]!.data as unknown as { world: { to: string } }).world.to).toBe(later);
       expect(beforeRestart.some((event) => event.type === 'turn/end' && event.ignorable === true)).toBe(true);
-      const restarted = makeRuntime();
+      const restarted = await makeRuntime();
       driver = await NodeDriver.open(home, 'n1', restarted.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: restarted.hooks, worldPollMs: 0,
       });
@@ -297,13 +337,7 @@ describe('C1.3 real boundaries', () => {
     const runtime = createAgentRuntime({
       home, uid: 'n1', world, initialConfig: config,
       terminal: { env: DEFAULT_TERMINAL_ENV },
-      adapter: new ProviderAdapter(new OpenAITransport({ endpoint, key: 'test-key-never-log' }), {
-        delay,
-        schedule: (ms, callback) => {
-          const timer = setTimeout(callback, ms);
-          return () => { clearTimeout(timer); };
-        },
-      }),
+      adapter: await adapterFor(endpoint),
     });
     let driver: NodeDriver | null = null;
     let running: Promise<void> | null = null;

@@ -61,7 +61,7 @@ async function serveModel(script: ScriptEntry[]): Promise<{ url: string; close: 
   };
 }
 
-function runtimeOptions(home: string, world: WorldRepo, endpoint: string) {
+async function runtimeOptions(home: string, world: WorldRepo, endpoint: string) {
   const defaults = defaultAgentConfig();
   const config = { ...defaults, policy: { ...defaults.policy,
     shellTimeoutMs: 5000, killGraceMs: 50, retryDelayMs: 1, requestTimeoutMs: 5000 } };
@@ -79,7 +79,9 @@ function runtimeOptions(home: string, world: WorldRepo, endpoint: string) {
         schedule: (ms, callback) => {
           const timer = setTimeout(callback, ms);
           return () => { clearTimeout(timer); };
-        } }),
+        } },
+      (await fixture().frontier()).gate,
+    ),
   };
 }
 
@@ -104,7 +106,7 @@ describe('C1.4b persistent terminal end to end', () => {
     let driver: NodeDriver | null = null;
     let running: Promise<void> | null = null;
     try {
-      const runtime = createAgentRuntime(runtimeOptions(home, world, model.url));
+      const runtime = createAgentRuntime(await runtimeOptions(home, world, model.url));
       driver = await NodeDriver.open(home, 'n1', runtime.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
         onCheckpoint: (mark) => runtime.checkpoint(mark),
@@ -169,7 +171,7 @@ describe('C1.4b persistent terminal end to end', () => {
     ]);
     try {
       // First boot: cd into subdir, park, stop (the stop disposes the session).
-      const first = createAgentRuntime(runtimeOptions(home, world, model.url));
+      const first = createAgentRuntime(await runtimeOptions(home, world, model.url));
       let driver = await NodeDriver.open(home, 'n1', first.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: first.hooks, worldPollMs: 0, batchWindowMs: 10000,
         onCheckpoint: (mark) => first.checkpoint(mark),
@@ -180,7 +182,7 @@ describe('C1.4b persistent terminal end to end', () => {
       await running;
 
       // Second boot on the same home: the session is gone with the process.
-      const second = createAgentRuntime(runtimeOptions(home, world, model.url));
+      const second = createAgentRuntime(await runtimeOptions(home, world, model.url));
       driver = await NodeDriver.open(home, 'n1', second.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: second.hooks, worldPollMs: 0, batchWindowMs: 10000,
         onCheckpoint: (mark) => second.checkpoint(mark),

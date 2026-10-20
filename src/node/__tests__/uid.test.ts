@@ -5,7 +5,8 @@ import { NodeDriver } from '../driver.js';
 import { createAgentRuntime, defaultAgentConfig } from '../loop.js';
 import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import { ProviderAdapter } from '../../provider/adapter.js';
-import type { SerializedTransport, TransportResult } from '../../provider/transport.js';
+import type { SerializedTransport, TransportFacts, TransportResult } from '../../provider/transport.js';
+import type { Frontier } from '../../frontier/index.js';
 import type { TurnHandler } from '../driver.js';
 import { useWorld, type WorldFixture } from './helpers.js';
 
@@ -13,11 +14,26 @@ const fixture = useWorld('node-uid-');
 
 /** A transport that is never reached: the uid is refused before any turn. */
 class UnusedTransport implements SerializedTransport {
+  readonly facts: TransportFacts = {
+    url: 'https://test.invalid/v1/chat/completions',
+    headers: { 'content-type': 'application/json' },
+    credentialId: 'test',
+  };
   async post(_body: Uint8Array, signal: AbortSignal, _maxBytes: number): Promise<TransportResult> {
     void signal;
     throw new Error('transport must not be reached with an invalid uid');
   }
 }
+
+/**
+ * A stub frontier: this suite never crosses one — the uid is refused first —
+ * and a stub keeps the refused construction from creating a `frontier/`
+ * directory, which the emptiness assertions read.
+ */
+const UNUSED_FRONTIER: Frontier = {
+  begin: () => Promise.reject(new Error('frontier must not be reached with an invalid uid')),
+  complete: () => Promise.reject(new Error('frontier must not be reached with an invalid uid')),
+};
 
 const delay = (ms: number, signal: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
   if (signal.aborted) { reject(new Error('cancelled')); return; }
@@ -34,7 +50,7 @@ function runtimeWithUid(fx: WorldFixture, uid: string): unknown {
     adapter: new ProviderAdapter(new UnusedTransport(), {
       delay,
       schedule: (ms, callback) => { const timer = setTimeout(callback, ms); return () => { clearTimeout(timer); }; },
-    }),
+    }, UNUSED_FRONTIER),
   });
 }
 

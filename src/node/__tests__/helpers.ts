@@ -5,6 +5,8 @@ import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, vi } from 'vitest';
 import { collectEvents } from '../../journal/__tests__/helpers.js';
 import type { EventEnvelope } from '../../journal/index.js';
+import { openTestFrontier } from '../../frontier/__tests__/helpers.js';
+import type { FrontierJournal } from '../../frontier/index.js';
 import { NODE_EVENT_TYPES } from '../events.js';
 import { HeadWatcher } from '../watcher.js';
 import { WorldRepo, gitEnv } from '../world.js';
@@ -12,7 +14,8 @@ import { WorldRepo, gitEnv } from '../world.js';
 /**
  * Scaffolding shared by the node suites: a temp root holding one node home and
  * one world repo, torn down afterwards, plus the git-side helpers a test needs
- * to act as a second writer (another node, or the human).
+ * to act as a second writer (another node, or the human), and the cell's
+ * frontier journal the adapter must cross.
  */
 
 export interface WorldFixture {
@@ -20,6 +23,12 @@ export interface WorldFixture {
   readonly home: string;
   /** The world repo, shared by every node of the fixture. */
   readonly world: WorldRepo;
+  /**
+   * The cell's frontier journal, opened on first use and memoized. The teardown
+   * closes it (tolerating a fault-poisoned writer's rejection) before removing
+   * the home, so a test that never asks for it leaves no `frontier/` directory.
+   */
+  frontier(): Promise<FrontierJournal>;
 }
 
 /**
@@ -30,18 +39,38 @@ export interface WorldFixture {
 export function useWorld(prefix: string, opts: { pollMs?: number } = {}): () => WorldFixture {
   let root = '';
   let fixture: WorldFixture | null = null;
+  let opening: Promise<FrontierJournal> | null = null;
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), prefix));
     const world = await WorldRepo.init(join(root, 'world'), { gitDir: join(root, 'world.git') });
     // The cadence is fixed before any driver can subscribe: the watcher is one
     // per repo and its first caller sets it.
     HeadWatcher.for(world, opts.pollMs ?? 0);
-    fixture = { home: join(root, 'home'), world };
-    await mkdir(fixture.home, { recursive: true });
+    const home = join(root, 'home');
+    await mkdir(home, { recursive: true });
+    opening = null;
+    fixture = {
+      home, world,
+      frontier: () => {
+        if (opening === null) {
+          opening = openTestFrontier(home, () => world.headHash()).catch((err: unknown) => {
+            opening = null;
+            throw err;
+          });
+        }
+        return opening;
+      },
+    };
   });
   afterEach(async () => {
     vi.restoreAllMocks();
     fixture = null;
+    const pending = opening;
+    opening = null;
+    if (pending !== null) {
+      const journal = await pending.catch(() => null);
+      if (journal !== null) await journal.close().catch(() => {});
+    }
     await rm(root, { recursive: true, force: true });
   });
   return () => {

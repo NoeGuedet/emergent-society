@@ -11,7 +11,7 @@ import { rederivePlans } from '../../context/assembler.js';
 import { resolveArtifact } from '../../context/artifacts.js';
 import { serializeWire } from '../../provider/wire.js';
 import { ProviderAdapter } from '../../provider/adapter.js';
-import type { SerializedTransport, TransportResult } from '../../provider/transport.js';
+import type { SerializedTransport, TransportFacts, TransportResult } from '../../provider/transport.js';
 import type { AgentConfig, ArtifactRef, FunctionCall } from '../../context/contracts.js';
 import { DEFAULT_TERMINAL_ENV, PtyTerminalRuntime } from '../tools/terminal.js';
 import type { TerminalFactory } from '../tools/terminal.js';
@@ -79,7 +79,15 @@ function guardedTerminalFactory(): TerminalFactory {
   };
 }
 
+/** The wire facts a scripted transport declares. */
+const TEST_FACTS: TransportFacts = {
+  url: 'https://test.invalid/v1/chat/completions',
+  headers: { 'content-type': 'application/json' },
+  credentialId: 'test',
+};
+
 class ScriptedTransport implements SerializedTransport {
+  readonly facts: TransportFacts = TEST_FACTS;
   readonly sends: Uint8Array[] = [];
   private readonly script: TransportResult[];
   /** When set, any post is a hard failure: it proves offline replay never sends. */
@@ -93,7 +101,7 @@ class ScriptedTransport implements SerializedTransport {
     if (this.throwIfCalled) throw new Error('transport called offline');
     if (signal.aborted) {
       return {
-        status: null, body: new Uint8Array(), complete: false,
+        status: null, headers: {}, body: new Uint8Array(), complete: false,
         failure: { code: 'cancelled', status: null },
       };
     }
@@ -119,14 +127,14 @@ const providerPolicy = {
 
 function noCalls(content: string): TransportResult {
   return {
-    status: 200, complete: true, failure: null,
+    status: 200, headers: {}, complete: true, failure: null,
     body: Buffer.from(JSON.stringify({ choices: [{ message: { role: 'assistant', content } }] })),
   };
 }
 
 function calling(calls: readonly FunctionCall[]): TransportResult {
   return {
-    status: 200, complete: true, failure: null,
+    status: 200, headers: {}, complete: true, failure: null,
     body: Buffer.from(JSON.stringify({
       choices: [{ message: { role: 'assistant', content: null, tool_calls: calls } }],
     })),
@@ -134,7 +142,7 @@ function calling(calls: readonly FunctionCall[]): TransportResult {
 }
 
 function statusResponse(status: number): TransportResult {
-  return { status, complete: true, failure: null, body: new Uint8Array() };
+  return { status, headers: {}, complete: true, failure: null, body: new Uint8Array() };
 }
 
 function execute(id: string, cmd: string): FunctionCall {
@@ -145,12 +153,14 @@ function waitCall(id: string): FunctionCall {
   return { id, type: 'function', function: { name: 'wait', arguments: '{}' } };
 }
 
-function runtimeFor(fx: WorldFixture, config: AgentConfig, transport: ScriptedTransport): AgentRuntime {
-  return createAgentRuntime({
+function runtimeFor(
+  fx: WorldFixture, config: AgentConfig, transport: ScriptedTransport,
+): Promise<AgentRuntime> {
+  return fx.frontier().then((journal) => createAgentRuntime({
     home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
     terminal: { env: DEFAULT_TERMINAL_ENV, create: guardedTerminalFactory() },
-    adapter: new ProviderAdapter(transport, providerPolicy),
-  });
+    adapter: new ProviderAdapter(transport, providerPolicy, journal.gate),
+  }));
 }
 
 function openRuntime(fx: WorldFixture, runtime: AgentRuntime): Promise<NodeDriver> {
@@ -203,7 +213,7 @@ describe('C1.3 runtime-seeded replay', () => {
       calling([execute('c2', "printf 'world' > note2.txt"), waitCall('w2')]),
       calling([execute('c9', 'boom')]),
     ]);
-    const runtime = runtimeFor(fx, config, transport);
+    const runtime = await runtimeFor(fx, config, transport);
     let driver: NodeDriver | null = null;
     let running: Promise<void> | null = null;
     try {
@@ -312,7 +322,9 @@ describe('C1.3 runtime-seeded replay', () => {
       const restarted = createAgentRuntime({
         home: fx.home, uid: 'n1', world: fx.world, initialConfig: differing,
         terminal: { env: DEFAULT_TERMINAL_ENV, create: guardedTerminalFactory() },
-        adapter: new ProviderAdapter(restartedTransport, providerPolicy),
+        adapter: new ProviderAdapter(
+          restartedTransport, providerPolicy, (await fx.frontier()).gate,
+        ),
       });
       driver = await NodeDriver.open(fx.home, 'n1', restarted.handler, fx.world, {
         knownTypes: C13_EVENT_TYPES, hooks: restarted.hooks, worldPollMs: 0,
@@ -367,7 +379,7 @@ describe('C1.3 runtime-seeded replay', () => {
       policy: { ...base.policy, maxDiffBytes: MiB, stepsPerTurn: 1 },
     };
     const transport = new ScriptedTransport([]);
-    const runtime = runtimeFor(fx, config, transport);
+    const runtime = await runtimeFor(fx, config, transport);
     let driver: NodeDriver | null = null;
     let running: Promise<void> | null = null;
     try {
@@ -415,7 +427,7 @@ describe('C1.3 runtime-seeded replay', () => {
       ...base, policy: { ...base.policy, maxAttempts: 2, retryDelayMs: 1 },
     };
     const transport = new ScriptedTransport([statusResponse(429), noCalls('recovered')]);
-    const runtime = runtimeFor(fx, config, transport);
+    const runtime = await runtimeFor(fx, config, transport);
     let driver: NodeDriver | null = null;
     let running: Promise<void> | null = null;
     try {

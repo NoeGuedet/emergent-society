@@ -124,7 +124,7 @@ async function serveModel(script: ScriptEntry[]): Promise<ModelServer> {
 }
 
 /** The runtime options of the real, default-confined kernel: no factory, no opt-out. */
-function runtimeOptions(home: string, world: WorldRepo, endpoint: string) {
+async function runtimeOptions(home: string, world: WorldRepo, endpoint: string) {
   const defaults = defaultAgentConfig();
   const config = { ...defaults, policy: { ...defaults.policy,
     shellTimeoutMs: 5000, killGraceMs: 50, retryDelayMs: 1, requestTimeoutMs: 5000 } };
@@ -142,7 +142,9 @@ function runtimeOptions(home: string, world: WorldRepo, endpoint: string) {
         schedule: (ms, callback) => {
           const timer = setTimeout(callback, ms);
           return () => { clearTimeout(timer); };
-        } }),
+        } },
+      (await fixture().frontier()).gate,
+    ),
   };
 }
 
@@ -153,7 +155,7 @@ type Boot = {
 };
 
 async function bootRuntime(home: string, world: WorldRepo, endpoint: string): Promise<Boot> {
-  const runtime = createAgentRuntime(runtimeOptions(home, world, endpoint));
+  const runtime = createAgentRuntime(await runtimeOptions(home, world, endpoint));
   const driver = await NodeDriver.open(home, 'n1', runtime.handler, world, {
     knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
     onCheckpoint: (mark) => runtime.checkpoint(mark),

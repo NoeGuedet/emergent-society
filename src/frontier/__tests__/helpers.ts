@@ -7,8 +7,9 @@ import {
   FORMAT_VERSION, GENESIS_HASH, computeHash, type EventEnvelope,
 } from '../../journal/envelope.js';
 import { encodeBatch, scanBatches } from '../../journal/framing.js';
-import { frontierLayout } from '../../journal/layout.js';
+import { frontierLayout, type JournalLayout } from '../../journal/layout.js';
 import { JournalReader } from '../../journal/reader.js';
+import { JournalWriter } from '../../journal/writer.js';
 import { FRONTIER_EVENT_TYPES } from '../events.js';
 import { openFrontierJournal, type FrontierJournal } from '../journal.js';
 
@@ -116,6 +117,28 @@ export async function appendFrontierEvent(
   const line = canonicalizeJson({ ...unsigned, hash: computeHash(unsigned) });
   await writeFile(path, encodeBatch([...lines, line]));
   return JSON.parse(line) as EventEnvelope;
+}
+
+/**
+ * Injects one frontier-flush fault: every flush of the writer bound to this
+ * home's frontier layout rejects while the injection lives. The filter is the
+ * writer's own layout directory, so the local log's writer and every blob write
+ * are untouched — a global `FileHandle.write` patch would hit both.
+ *
+ * Returns the restore function (the suite's `vi.restoreAllMocks()` also
+ * restores it). The shared seam the acceptance harness (T8.2) reuses.
+ */
+export function failFrontierFlushes(home: string): () => void {
+  const dir = frontierLayout(home).dir;
+  const real = JournalWriter.prototype.flush;
+  const spy = vi.spyOn(JournalWriter.prototype, 'flush').mockImplementation(
+    async function (this: JournalWriter): Promise<void> {
+      const layout = (this as unknown as { readonly layout: JournalLayout }).layout;
+      if (layout.dir === dir) throw new Error('injected frontier flush failure');
+      return real.call(this);
+    },
+  );
+  return () => { spy.mockRestore(); };
 }
 
 /** Appends a physically torn trailing fragment to the frontier log. */

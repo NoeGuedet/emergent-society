@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { Buffer } from 'node:buffer';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { FrontierValidationError } from '../../frontier/index.js';
 import { OpenAITransport } from '../transport.js';
 
 // A file-level restore for the one global `fetch` patch below, so an aborted
@@ -74,6 +75,7 @@ describe('OpenAITransport: exact bytes and headers', () => {
       req.on('end', () => {
         bodies.push(Buffer.concat(chunks));
         res.setHeader('content-type', 'application/json');
+        res.setHeader('x-request-id', 'req-1');
         res.end('{"ok":true}');
       });
     });
@@ -86,6 +88,10 @@ describe('OpenAITransport: exact bytes and headers', () => {
       expect(result.complete).toBe(true);
       expect(result.failure).toBeNull();
       expect(Buffer.from(result.body).toString('utf8')).toBe('{"ok":true}');
+      // The raw response headers ride the result: the frontier journals the
+      // allowlisted subset of them.
+      expect(result.headers['content-type']).toBe('application/json');
+      expect(result.headers['x-request-id']).toBe('req-1');
       expect(Buffer.from(bodies[0]!).equals(body)).toBe(true);
       expect(headers[0]!['content-type']).toBe('application/json');
       expect(headers[0]!['authorization']).toBe('Bearer test-key-never-log');
@@ -123,6 +129,47 @@ describe('OpenAITransport: exact bytes and headers', () => {
       expect(Buffer.from(result.body).toString('utf8')).toBe('slow down');
     } finally {
       await close(server);
+    }
+  });
+});
+
+describe('OpenAITransport: the facts the frontier journals', () => {
+  it('exposes the endpoint, the non-secret headers and the credential id — never the key', () => {
+    const endpoint = 'https://api.example.com/v1/chat/completions';
+    const transport = new OpenAITransport({ endpoint, key: 'test-key-never-log' });
+    expect(transport.facts).toEqual({
+      url: endpoint,
+      headers: { 'content-type': 'application/json' },
+      credentialId: 'llm',
+    });
+    expect(JSON.stringify(transport.facts)).not.toContain('test-key-never-log');
+  });
+
+  it('accepts an explicit credential id', () => {
+    const transport = new OpenAITransport({
+      endpoint: 'https://api.example.com/v1/chat/completions', key: 'k', credentialId: 'other',
+    });
+    expect(transport.facts.credentialId).toBe('other');
+    expect(JSON.stringify(transport.facts)).not.toContain('"k"');
+  });
+
+  it.each([
+    ['a query string', 'https://api.example.com/v1/chat/completions?stream=false'],
+    ['a fragment', 'https://api.example.com/v1/chat/completions#part'],
+    ['embedded credentials', 'https://user:pass@api.example.com/v1/chat/completions'],
+  ])('refuses an endpoint carrying %s at construction', (_name, endpoint) => {
+    expect(() => new OpenAITransport({ endpoint, key: 'k' }))
+      .toThrow(FrontierValidationError);
+  });
+
+  it('requires https except on a loopback host', () => {
+    expect(() => new OpenAITransport({
+      endpoint: 'http://api.example.com/v1/chat/completions', key: 'k',
+    })).toThrow(FrontierValidationError);
+    for (const loopback of ['127.0.0.1:8080', 'localhost:8080', '[::1]:8080']) {
+      expect(() => new OpenAITransport({
+        endpoint: `http://${loopback}/v1/chat/completions`, key: 'k',
+      })).not.toThrow();
     }
   });
 });

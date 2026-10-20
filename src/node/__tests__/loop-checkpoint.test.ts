@@ -11,7 +11,7 @@ import { loadVerifiedEvents } from '../../context/loader.js';
 import { readSnapshot } from '../../context/snapshots.js';
 import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import { ProviderAdapter, type ProviderPolicy } from '../../provider/adapter.js';
-import type { SerializedTransport, TransportResult } from '../../provider/transport.js';
+import type { SerializedTransport, TransportFacts, TransportResult } from '../../provider/transport.js';
 import type { AgentConfig } from '../../context/contracts.js';
 import { readNode, useWorld, type WorldFixture } from './helpers.js';
 
@@ -32,7 +32,15 @@ const providerPolicy: ProviderPolicy = {
   schedule: () => () => {},
 };
 
+/** The wire facts a scripted transport declares. */
+const TEST_FACTS: TransportFacts = {
+  url: 'https://test.invalid/v1/chat/completions',
+  headers: { 'content-type': 'application/json' },
+  credentialId: 'test',
+};
+
 class ScriptedTransport implements SerializedTransport {
+  readonly facts: TransportFacts = TEST_FACTS;
   readonly sends: Uint8Array[] = [];
   private readonly script: TransportResult[];
 
@@ -43,7 +51,7 @@ class ScriptedTransport implements SerializedTransport {
   async post(body: Uint8Array, signal: AbortSignal, _maxBytes: number): Promise<TransportResult> {
     if (signal.aborted) {
       return {
-        status: null, body: new Uint8Array(), complete: false,
+        status: null, headers: {}, body: new Uint8Array(), complete: false,
         failure: { code: 'cancelled', status: null },
       };
     }
@@ -56,7 +64,7 @@ class ScriptedTransport implements SerializedTransport {
 
 function noCalls(content: string): TransportResult {
   return {
-    status: 200, complete: true, failure: null,
+    status: 200, headers: {}, complete: true, failure: null,
     body: Buffer.from(JSON.stringify({ choices: [{ message: { role: 'assistant', content } }] })),
   };
 }
@@ -64,7 +72,7 @@ function noCalls(content: string): TransportResult {
 /** One advertised `execute` call: a turn that cannot park, so the driver chains. */
 function executeCall(id: string, cmd: string): TransportResult {
   return {
-    status: 200, complete: true, failure: null,
+    status: 200, headers: {}, complete: true, failure: null,
     body: Buffer.from(JSON.stringify({
       choices: [{
         message: {
@@ -91,12 +99,14 @@ async function canonicalRows(fx: WorldFixture): Promise<number[]> {
   return seqs.sort((a, b) => a - b);
 }
 
-function runtimeFor(fx: WorldFixture, config: AgentConfig, transport: ScriptedTransport): AgentRuntime {
-  return createAgentRuntime({
+function runtimeFor(
+  fx: WorldFixture, config: AgentConfig, transport: ScriptedTransport,
+): Promise<AgentRuntime> {
+  return fx.frontier().then((journal) => createAgentRuntime({
     home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
     terminal: { env: DEFAULT_TERMINAL_ENV },
-    adapter: new ProviderAdapter(transport, providerPolicy),
-  });
+    adapter: new ProviderAdapter(transport, providerPolicy, journal.gate),
+  }));
 }
 
 function openRuntime(
@@ -143,7 +153,7 @@ describe('checkpoint wiring', () => {
   it('writes a verified checkpoint from the durable closer and round-trips it', async () => {
     const fx = fixture();
     const transport = new ScriptedTransport([noCalls('idle')]);
-    const runtime = runtimeFor(fx, defaultAgentConfig(), transport);
+    const runtime = await runtimeFor(fx, defaultAgentConfig(), transport);
     const marks: DurableWatermark[] = [];
     const parked = deferred();
     const driver = await openRuntime(fx, runtime, (mark) => {
@@ -183,7 +193,7 @@ describe('checkpoint wiring', () => {
       executeCall('c1', 'true'),
       noCalls('idle'),
     ]);
-    const runtime = runtimeFor(fx, config, transport);
+    const runtime = await runtimeFor(fx, config, transport);
     const marks: DurableWatermark[] = [];
     // The signal fires once the third checkpoint call has returned. `runToSignal`
     // then stops the driver and awaits the run, so the `access` below confirms the
@@ -231,7 +241,7 @@ describe('checkpoint wiring', () => {
         .rejects.toMatchObject({ code: 'EACCES' });
 
       const transport = new ScriptedTransport([noCalls('idle')]);
-      const runtime = runtimeFor(fx, defaultAgentConfig(), transport);
+      const runtime = await runtimeFor(fx, defaultAgentConfig(), transport);
       const marks: DurableWatermark[] = [];
       const parked = deferred();
       const driver = await openRuntime(fx, runtime, (mark) => {
@@ -259,7 +269,7 @@ describe('checkpoint wiring', () => {
   it('parks with no maintenance error when the checkpoint hook throws', async () => {
     const fx = fixture();
     const transport = new ScriptedTransport([noCalls('idle')]);
-    const runtime = runtimeFor(fx, defaultAgentConfig(), transport);
+    const runtime = await runtimeFor(fx, defaultAgentConfig(), transport);
     let calls = 0;
     const parked = deferred();
     const driver = await openRuntime(fx, runtime, () => {

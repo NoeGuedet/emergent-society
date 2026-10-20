@@ -2,8 +2,10 @@ import { Buffer } from 'node:buffer';
 import { toJson } from '../context/artifacts.js';
 import { truncationNotice, utf8Prefix } from '../text.js';
 import { isRecord } from '../util.js';
+import { filterHeaders } from '../frontier/index.js';
 import { serializeWire } from './wire.js';
 import { normalizeUsage } from './usage.js';
+import type { Frontier, FrontierErrorCode, FrontierOutcome } from '../frontier/index.js';
 import type { BoundaryGate } from '../node/gate.js';
 import type {
   ArtifactRef, AssistantProjection, ChatMessage, FunctionCall, RequestId, RequestPlan,
@@ -14,24 +16,35 @@ import type { SerializedTransport, TransportResult } from './transport.js';
 /**
  * The provider adapter (T6, kernel.md §4).
  *
- * It owns the exact, bounded request path: store the immutable plan and record
- * `request/plan` once, serialize the single wire, capture and journal the wire,
- * then POST those exact bytes. The raw provider body is captured and journaled
- * (and flushed) *before* any UTF-8 validation, decoding, parsing, usage, assistant
- * or tool work, so a malformed or unprojectable body is a safe terminal failure
- * after the raw fact is durable — never a fatal kernel error. A flush/invariant
- * failure raised while journaling the raw response, an attempt or the projection
- * is rethrown fatally and is never converted into a `SendResult.failure`.
+ * It owns the exact, bounded request path: store the immutable plan, serialize
+ * the single wire, then cross the frontier — `begin` is durable and verified
+ * before the transport sends, and the terminal `complete` is durable before the
+ * caller proceeds or a retry is decided. Classification (`classifyNoStatus`/
+ * `classifyIncomplete`/the status branch) computes that terminal at the
+ * exchange; a stop arriving later rewrites only the returned `SafeFailure` and
+ * the local turn, never the frontier record.
+ *
+ * The local log keeps its facts as before (plan, wire, raw body, usage,
+ * attempt, assistant message), captured and flushed before any decode, parse,
+ * usage, assistant or tool work, so a malformed or unprojectable body is a safe
+ * terminal failure after the raw fact is durable — never a fatal kernel error.
+ * A flush/invariant failure raised while journaling an attempt or the
+ * projection is rethrown fatally and is never converted into a
+ * `SendResult.failure`; a frontier `begin`/`complete` failure propagates the
+ * same way (nothing crossed the frontier, or the send's terminal is pending).
  *
  * Retries are bounded by the plan's persisted policy and cover only network/
- * timeout or HTTP 408/429/500/502/503/504; a retry reuses the same body artifact
- * and bytes with an incremented attempt — it never reserializes. The timeout is
- * armed with the injected `schedule` and cleared in `finally`; an already-aborted
- * signal prevents any send, and a stop during the body or the delay yields a
- * terminal cancellation with no later send. A status-known but incomplete body
- * keeps the transport's own `body-limit` (non-retryable), lets a gate abort win
- * as a non-retryable `cancelled` with the status preserved, and turns the
- * adapter's own timer into a retryable `timeout` rather than a cancellation.
+ * timeout or HTTP 408/429/500/502/503/504; a retry re-begins with the same
+ * group and an incremented attempt, and reuses the same body bytes without
+ * reserializing. The timeout is armed with the injected `schedule` and cleared
+ * in `finally`; a machinery failure while arming is a pre-send marker (the
+ * frontier terminal is `local`, nothing was handed to the transport). An
+ * already-aborted signal prevents any send, and a stop during the body or the
+ * delay yields a terminal cancellation with no later send. A status-known but
+ * incomplete body keeps the transport's own `body-limit` (non-retryable), lets
+ * a gate abort win as a non-retryable `cancelled` with the status preserved,
+ * and turns the adapter's own timer into a retryable `timeout` rather than a
+ * cancellation.
  *
  * Not to be confused with `src/node/tools/providers.ts`: this module is the LLM
  * request path; that one is the web-tool credential store.
@@ -167,10 +180,35 @@ function boundAssistant(
   };
 }
 
+/**
+ * Maps a `SafeFailure` to the frontier terminal's error code. Only the wire
+ * codes can describe an exchange: `malformed` (a 200 whose projection fails)
+ * and `request-limit` never reach a terminal, so mapping one is a programmer
+ * error and throws instead of inventing a code.
+ */
+function toFrontierCode(failure: SafeFailure): FrontierErrorCode {
+  switch (failure.code) {
+    case 'http':
+    case 'network':
+    case 'timeout':
+    case 'cancelled':
+    case 'body-limit':
+      return failure.code;
+    default:
+      throw new Error(`no frontier code for failure ${JSON.stringify(failure.code)}`);
+  }
+}
+
+/** One `post` outcome: an exchange result, or the pre-send machinery marker. */
+type Posted =
+  | { readonly kind: 'result'; readonly result: TransportResult; readonly timedOut: boolean }
+  | { readonly kind: 'pre-send'; readonly error: unknown };
+
 export class ProviderAdapter {
   constructor(
     private readonly transport: SerializedTransport,
     private readonly policy: ProviderPolicy,
+    private readonly frontier: Frontier,
   ) {}
 
   async send(plan: RequestPlan, gate: BoundaryGate): Promise<SendResult> {
@@ -193,6 +231,8 @@ export class ProviderAdapter {
     await gate.flush();
 
     let attempt = 0;
+    /** The first begin mints the group; every retry reuses it. */
+    let group: string | undefined;
     for (;;) {
       // An already-aborted signal prevents any send (a stop/park never sends).
       if (gate.signal.aborted) {
@@ -210,12 +250,51 @@ export class ProviderAdapter {
         }
       }
 
+      // 2. Cross the frontier: the request record (and its body blob) is
+      //    durable and read-back verified before the transport sends.
+      const facts = this.transport.facts;
+      const call = await this.frontier.begin({
+        method: 'POST',
+        url: facts.url,
+        headers: filterHeaders(facts.headers, 'request'),
+        credentials: [{ id: facts.credentialId, where: 'authorization' }],
+        body,
+        encoding: 'utf8',
+        ...(group !== undefined ? { group } : {}),
+        attempt,
+      });
+      group = call.group;
+      // A stop that landed during `begin`: the request is closed as the
+      // cancellation it is, and no POST is sent (today's durable-wire-no-POST
+      // behavior, now with the frontier terminal it needs).
+      if (gate.signal.aborted) {
+        await this.frontier.complete(call, {
+          status: null, error: 'cancelled', body: new Uint8Array(),
+          encoding: 'binary', complete: false,
+        });
+        return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
+      }
+
       const posted = await this.post(body, policy, gate);
+      if (posted.kind === 'pre-send') {
+        // The kernel's own machinery failed before anything was handed to the
+        // transport: close the call as `local` (or as the stop it became), then
+        // propagate the error.
+        await this.frontier.complete(call, {
+          status: null, body: new Uint8Array(), encoding: 'binary', complete: false,
+          error: gate.signal.aborted ? 'cancelled' : 'local',
+        });
+        throw posted.error;
+      }
       const result = posted.result;
 
       if (result.status === null) {
         // No status: journal the attempt only (no raw body was received).
         const failure = this.classifyNoStatus(result, posted.timedOut, gate);
+        await this.frontier.complete(call, {
+          status: null, body: new Uint8Array(), encoding: 'binary', complete: false,
+          error: toFrontierCode(failure),
+        });
         const retryable = failure.code === 'network' || failure.code === 'timeout';
         const next = await this.maybeRetry(gate, id, attempt, failure, retryable, policy);
         if (next === 'continue') { attempt += 1; continue; }
@@ -231,14 +310,16 @@ export class ProviderAdapter {
       });
       await gate.flush();
 
-      let failure: SafeFailure;
-      let retryable: boolean;
-      if (!result.complete) {
-        ({ failure, retryable } = this.classifyIncomplete(result, posted.timedOut, gate));
-      } else if (result.status !== 200) {
-        failure = { code: 'http', status: result.status };
-        retryable = RETRYABLE_STATUS.has(result.status);
-      } else {
+      if (result.complete && result.status === 200) {
+        // The exchange's outcome is the 200 itself; the projection (and a
+        // malformed failure) is a local fact recorded after this terminal.
+        await this.frontier.complete(call, {
+          status: result.status,
+          headers: filterHeaders(result.headers, 'response'),
+          body: result.body,
+          encoding: 'binary',
+          complete: true,
+        });
         let projected: Projected;
         try {
           projected = project(result.body, plan);
@@ -257,7 +338,26 @@ export class ProviderAdapter {
         return { kind: 'response', projection };
       }
 
-      const next = await this.maybeRetry(gate, id, attempt, failure, retryable, policy);
+      const classified: { readonly failure: SafeFailure; readonly retryable: boolean } =
+        result.complete
+          ? { failure: { code: 'http', status: result.status },
+              retryable: RETRYABLE_STATUS.has(result.status) }
+          : this.classifyIncomplete(result, posted.timedOut, gate);
+      const failure = classified.failure;
+      // The terminal is the outcome classified at the exchange. A stop that
+      // arrives later (during the retry delay, say) rewrites only the adapter's
+      // returned failure and the local turn/end — never this record.
+      const outcome: FrontierOutcome = {
+        status: result.status,
+        headers: filterHeaders(result.headers, 'response'),
+        body: result.body,
+        encoding: 'binary',
+        complete: result.complete,
+        error: toFrontierCode(failure),
+      };
+      await this.frontier.complete(call, outcome);
+
+      const next = await this.maybeRetry(gate, id, attempt, failure, classified.retryable, policy);
       if (next === 'continue') { attempt += 1; continue; }
       // A stop observed before headers or during the retry delay is a boundary
       // cancellation; a stop already classified from a status-known body keeps
@@ -308,14 +408,20 @@ export class ProviderAdapter {
    * removed in `finally`; a transport throw becomes a safe network result and the
    * arbitrary Error is never stringified into any event. `timedOut` reports only
    * whether the adapter's own timer fired, so it can be told apart from a stop.
+   *
+   * A failure while arming (`addEventListener` or the injected `schedule`) is a
+   * discriminated pre-send marker, not a throw: nothing was handed to the
+   * transport, so the caller can close the frontier call as `local` before
+   * propagating. The timer clear is made non-throwing — a failure after the
+   * transport returned must never be classified as that pre-send fault.
    */
   private async post(
     body: Uint8Array, policy: RequestPlan['policy'], gate: BoundaryGate,
-  ): Promise<{ readonly result: TransportResult; readonly timedOut: boolean }> {
+  ): Promise<Posted> {
     const controller = new AbortController();
     let timedOut = false;
     const onAbort = (): void => { controller.abort(); };
-    let clearTimer: () => void = () => {};
+    let clearTimer: (() => void) | null = null;
     // Register the listener and arm the timer as one guarded step: a throwing
     // injected `schedule` would otherwise leak the listener on the gate signal.
     try {
@@ -326,15 +432,16 @@ export class ProviderAdapter {
       });
     } catch (error) {
       gate.signal.removeEventListener('abort', onAbort);
-      throw error;
+      return { kind: 'pre-send', error };
     }
     try {
       const result = await this.transport.post(body, controller.signal, policy.maxCaptureBytes);
-      return { result, timedOut };
+      return { kind: 'result', result, timedOut };
     } catch {
       return {
+        kind: 'result',
         result: {
-          status: null, body: new Uint8Array(), complete: false,
+          status: null, headers: {}, body: new Uint8Array(), complete: false,
           failure: { code: 'network', status: null },
         },
         timedOut,
@@ -342,7 +449,7 @@ export class ProviderAdapter {
     } finally {
       // Remove the listener first: a throwing timer-clear must not leak it.
       gate.signal.removeEventListener('abort', onAbort);
-      clearTimer();
+      try { clearTimer?.(); } catch { /* the exchange outcome stands */ }
     }
   }
 

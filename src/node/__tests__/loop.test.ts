@@ -17,7 +17,7 @@ import { C13_EVENT_TYPES, createBoundaryRegistry } from '../../context/events.js
 import { loadVerifiedEvents } from '../../context/loader.js';
 import type { BoundaryGate, DriverHooks } from '../gate.js';
 import { ProviderAdapter, type ProviderPolicy } from '../../provider/adapter.js';
-import type { SerializedTransport, TransportResult } from '../../provider/transport.js';
+import type { SerializedTransport, TransportFacts, TransportResult } from '../../provider/transport.js';
 import type {
   AgentConfig, FunctionCall, SeedPolicy, ToolSchema,
 } from '../../context/contracts.js';
@@ -79,8 +79,16 @@ const providerPolicy: ProviderPolicy = {
   schedule: () => () => {},
 };
 
+/** The wire facts a scripted transport declares. */
+const TEST_FACTS: TransportFacts = {
+  url: 'https://test.invalid/v1/chat/completions',
+  headers: { 'content-type': 'application/json' },
+  credentialId: 'test',
+};
+
 /** Records every send and answers from a fixed script, in order. */
 class ScriptedTransport implements SerializedTransport {
+  readonly facts: TransportFacts = TEST_FACTS;
   readonly sends: Uint8Array[] = [];
   private readonly script: TransportResult[];
 
@@ -91,7 +99,7 @@ class ScriptedTransport implements SerializedTransport {
   async post(body: Uint8Array, signal: AbortSignal, _maxBytes: number): Promise<TransportResult> {
     if (signal.aborted) {
       return {
-        status: null, body: new Uint8Array(), complete: false,
+        status: null, headers: {}, body: new Uint8Array(), complete: false,
         failure: { code: 'cancelled', status: null },
       };
     }
@@ -104,14 +112,14 @@ class ScriptedTransport implements SerializedTransport {
 
 function noCalls(content: string): TransportResult {
   return {
-    status: 200, complete: true, failure: null,
+    status: 200, headers: {}, complete: true, failure: null,
     body: Buffer.from(JSON.stringify({ choices: [{ message: { role: 'assistant', content } }] })),
   };
 }
 
 function calling(calls: readonly FunctionCall[]): TransportResult {
   return {
-    status: 200, complete: true, failure: null,
+    status: 200, headers: {}, complete: true, failure: null,
     body: Buffer.from(JSON.stringify({
       choices: [{ message: { role: 'assistant', content: null, tool_calls: calls } }],
     })),
@@ -119,7 +127,7 @@ function calling(calls: readonly FunctionCall[]): TransportResult {
 }
 
 function statusResponse(status: number): TransportResult {
-  return { status, complete: true, failure: null, body: new Uint8Array() };
+  return { status, headers: {}, complete: true, failure: null, body: new Uint8Array() };
 }
 
 function execute(id: string, cmd: string): FunctionCall {
@@ -144,13 +152,19 @@ function configWith(over: {
   };
 }
 
-function runtimeFor(
+async function adapterFor(
+  fx: WorldFixture, transport: SerializedTransport, policy: ProviderPolicy = providerPolicy,
+): Promise<ProviderAdapter> {
+  return new ProviderAdapter(transport, policy, (await fx.frontier()).gate);
+}
+
+async function runtimeFor(
   fx: WorldFixture, config: AgentConfig, transport: ScriptedTransport,
-): AgentRuntime {
+): Promise<AgentRuntime> {
   return createAgentRuntime({
     home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
     terminal: { env: DEFAULT_TERMINAL_ENV },
-    adapter: new ProviderAdapter(transport, providerPolicy),
+    adapter: await adapterFor(fx, transport),
   });
 }
 
@@ -168,7 +182,7 @@ describe('turn control', () => {
   it('waits a turn whose assistant makes no tool calls', async () => {
     const fx = fixture();
     const transport = new ScriptedTransport([noCalls('thinking')]);
-    const runtime = runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
+    const runtime = await runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
     const driver = await openRuntime(fx, runtime);
     const running = driver.run();
     await vi.waitFor(() => expect(driver.state).toBe('waiting'));
@@ -187,7 +201,7 @@ describe('turn control', () => {
   it('finishes a complete wait group before it waits', async () => {
     const fx = fixture();
     const transport = new ScriptedTransport([calling([waitCall('w1')])]);
-    const runtime = runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
+    const runtime = await runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
     const driver = await openRuntime(fx, runtime);
     const running = driver.run();
     await vi.waitFor(() => expect(driver.state).toBe('waiting'));
@@ -213,7 +227,7 @@ describe('turn control', () => {
       calling([execute('c1', 'true')]),
       noCalls('done'),
     ]);
-    const runtime = runtimeFor(
+    const runtime = await runtimeFor(
       fx, configWith({ policy: { stepsPerTurn: 1, retryDelayMs: 1 } }), transport,
     );
     const driver = await openRuntime(fx, runtime);
@@ -260,7 +274,7 @@ describe('turn control', () => {
     const runtime = createAgentRuntime({
       home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
       terminal: { env: DEFAULT_TERMINAL_ENV, create },
-      adapter: new ProviderAdapter(transport, providerPolicy),
+      adapter: await adapterFor(fx, transport),
     });
     const driver = await openRuntime(fx, runtime);
     const running = driver.run();
@@ -287,7 +301,7 @@ describe('turn control', () => {
     const runtime = createAgentRuntime({
       home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
       terminal: { env: DEFAULT_TERMINAL_ENV, create },
-      adapter: new ProviderAdapter(transport, providerPolicy),
+      adapter: await adapterFor(fx, transport),
     });
     // The turn performs a real effect, then the handler fails: the run ends
     // through the fatal path, which must still tear the session down.
@@ -331,7 +345,7 @@ describe('runtime reuse across sequential drivers', () => {
     const runtime = createAgentRuntime({
       home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
       terminal: { env: DEFAULT_TERMINAL_ENV, create },
-      adapter: new ProviderAdapter(transport, providerPolicy),
+      adapter: await adapterFor(fx, transport),
     });
 
     const first = await openRuntime(fx, runtime);
@@ -388,7 +402,7 @@ describe('recoverable provider failure', () => {
     const transport = new ScriptedTransport([
       statusResponse(429), statusResponse(429), noCalls('recovered'),
     ]);
-    const runtime = runtimeFor(
+    const runtime = await runtimeFor(
       fx, configWith({ policy: { maxAttempts: 2, retryDelayMs: 1 } }), transport,
     );
     const driver = await openRuntime(fx, runtime);
@@ -422,7 +436,7 @@ describe('stop', () => {
   it('parks instead of journaling an error turn when a stop reaches the send', async () => {
     const fx = fixture();
     const transport = new ScriptedTransport([]);
-    const runtime = runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
+    const runtime = await runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
     // Stop after the turn's start barrier (so the perception is durable) but
     // before the provider send. The adapter reports a cancelled failure; that
     // is a boundary cancellation, not a failed turn.
@@ -454,13 +468,14 @@ describe('stop', () => {
     // body cannot be projected. The abort is real, but the failure is not a
     // cancellation: only a `cancelled` code may park.
     class StopOnPostTransport implements SerializedTransport {
+      readonly facts: TransportFacts = TEST_FACTS;
       driver: NodeDriver | null = null;
       sends = 0;
       async post(): Promise<TransportResult> {
         this.sends += 1;
         this.driver?.stop();
         return {
-          status: 200, complete: true, failure: null,
+          status: 200, headers: {}, complete: true, failure: null,
           body: Buffer.from('not json'),
         };
       }
@@ -470,7 +485,7 @@ describe('stop', () => {
       home: fx.home, uid: 'n1', world: fx.world,
       initialConfig: configWith({ policy: { retryDelayMs: 1 } }),
       terminal: { env: DEFAULT_TERMINAL_ENV },
-      adapter: new ProviderAdapter(transport, providerPolicy),
+      adapter: await adapterFor(fx, transport),
     });
     const driver = await openRuntime(fx, runtime);
     transport.driver = driver;
@@ -489,7 +504,7 @@ describe('stop', () => {
     const transport = new ScriptedTransport([
       calling([execute('s1', 'touch started.txt && sleep 30')]),
     ]);
-    const runtime = runtimeFor(
+    const runtime = await runtimeFor(
       fx, configWith({ policy: { stepsPerTurn: 8, retryDelayMs: 1 } }), transport,
     );
     const driver = await openRuntime(fx, runtime);
@@ -523,7 +538,7 @@ describe('parking', () => {
   it('makes no extra request when a static world is re-checked while parked', async () => {
     const fx = fixture();
     const transport = new ScriptedTransport([noCalls('idle')]);
-    const runtime = runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
+    const runtime = await runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
     const driver = await openRuntime(fx, runtime);
     const running = driver.run();
     await vi.waitFor(() => expect(driver.state).toBe('waiting'));
@@ -544,7 +559,7 @@ describe('world perception identity', () => {
   it('refuses a perception whose uid is not the runtime uid before any effect', async () => {
     const fx = fixture();
     const transport = new ScriptedTransport([]);
-    const runtime = runtimeFor(fx, defaultAgentConfig(), transport);
+    const runtime = await runtimeFor(fx, defaultAgentConfig(), transport);
     presenter.override = (world, _uid, range, maxBytes, maxCommits) =>
       presenter.real(world, 'intruder', range, maxBytes, maxCommits);
     try {
@@ -575,7 +590,7 @@ describe('configuration', () => {
     const fx = fixture();
     const base = configWith({ policy: { retryDelayMs: 1 } });
     const transport = new ScriptedTransport([noCalls('one')]);
-    const runtime = runtimeFor(fx, base, transport);
+    const runtime = await runtimeFor(fx, base, transport);
     const driver = await openRuntime(fx, runtime);
     runtime.scheduleConfig({ ...base, version: base.version + 1, heading: 'A newer direction.' });
     const running = driver.run();
@@ -597,7 +612,7 @@ describe('configuration', () => {
     const fx = fixture();
     const base = configWith({ policy: { retryDelayMs: 1 } });
     const transport = new ScriptedTransport([noCalls('one')]);
-    const runtime = runtimeFor(fx, base, transport);
+    const runtime = await runtimeFor(fx, base, transport);
     const driver = await openRuntime(fx, runtime);
     runtime.scheduleConfig({ ...base, version: base.version, heading: 'Stale direction.' });
     const running = driver.run();
@@ -621,7 +636,9 @@ describe('configuration parameters', () => {
     const fx = fixture();
     const bad = { ...configWith({}), parameters: { n: 2 } };
     const transport = new ScriptedTransport([]);
-    expect(() => runtimeFor(fx, bad, transport)).toThrow(/parameter|n/);
+    // The construction refusal is checked before any send; the fixture's
+    // frontier open is async, so the refusal surfaces as a rejection.
+    await expect(runtimeFor(fx, bad, transport)).rejects.toThrow(/parameter|n/);
     expect(transport.sends).toHaveLength(0);
   });
 
@@ -629,7 +646,7 @@ describe('configuration parameters', () => {
     const fx = fixture();
     const base = configWith({ policy: { retryDelayMs: 1 } });
     const transport = new ScriptedTransport([noCalls('one')]);
-    const runtime = runtimeFor(fx, base, transport);
+    const runtime = await runtimeFor(fx, base, transport);
     const driver = await openRuntime(fx, runtime);
     expect(() => runtime.scheduleConfig({ ...base, version: 2, parameters: { stream: true } }))
       .toThrow(/parameter|stream/);
@@ -647,7 +664,7 @@ describe('configuration parameters', () => {
     const fx = fixture();
     const base = configWith({ policy: { retryDelayMs: 1 } });
     const transport = new ScriptedTransport([noCalls('one')]);
-    const runtime = runtimeFor(fx, base, transport);
+    const runtime = await runtimeFor(fx, base, transport);
     const driver = await openRuntime(fx, runtime);
     runtime.scheduleConfig({
       ...base, version: base.version + 1, parameters: { temperature: 0.5 },
@@ -672,7 +689,7 @@ describe('offline reconstruction', () => {
     const fx = fixture();
     await commitAs(fx.world, 'n2', { 'n2/hi.md': 'hello' });
     const transport = new ScriptedTransport([noCalls('seen')]);
-    const runtime = runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
+    const runtime = await runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
     const driver = await openRuntime(fx, runtime);
     const running = driver.run();
     await vi.waitFor(() => expect(driver.state).toBe('waiting'));
@@ -733,7 +750,7 @@ describe('durable world acknowledgement', () => {
     const h0 = await commitAs(fx.world, 'n2', { 'n2/a.md': 'a' });
     // Turn 0 perceives null..h0 and acknowledges it, then parks.
     const transport = new ScriptedTransport([noCalls('seen')]);
-    const runtime = runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
+    const runtime = await runtimeFor(fx, configWith({ policy: { retryDelayMs: 1 } }), transport);
     const first = await openRuntime(fx, runtime);
     const run0 = first.run();
     await vi.waitFor(() => expect(first.state).toBe('waiting'));
@@ -745,7 +762,7 @@ describe('durable world acknowledgement', () => {
     // after its durable turn/start but before it records any perception.
     const h1 = await commitAs(fx.world, 'n3', { 'n3/b.md': 'b' });
     presenter.override = () => { throw new Error('render boom'); };
-    const failing = runtimeFor(
+    const failing = await runtimeFor(
       fx, configWith({ policy: { retryDelayMs: 1 } }), new ScriptedTransport([]),
     );
     const d2 = await NodeDriver.open(fx.home, 'n1', failing.handler, fx.world,
@@ -782,7 +799,7 @@ describe('durable world acknowledgement', () => {
     // Turn 0 perceives null..h0 and acknowledges it, then the provider fails
     // recoverably and the node parks.
     const transport = new ScriptedTransport([statusResponse(429), statusResponse(429)]);
-    const runtime = runtimeFor(
+    const runtime = await runtimeFor(
       fx, configWith({ policy: { maxAttempts: 2, retryDelayMs: 1 } }), transport,
     );
     const first = await openRuntime(fx, runtime);
@@ -819,7 +836,7 @@ describe('durable world acknowledgement', () => {
       ...base, policy: { ...base.policy, stepsPerTurn: 1, retryDelayMs: 1 },
     };
     const transport = new ScriptedTransport([calling([execute('c1', 'true')]), noCalls('done')]);
-    const runtime = runtimeFor(fx, config, transport);
+    const runtime = await runtimeFor(fx, config, transport);
     const driver = await openRuntime(fx, runtime);
     const running = driver.run();
     // The confined path: spec build + launcher probe + PTY + bash before `waiting`.
@@ -848,7 +865,7 @@ describe('durable world acknowledgement', () => {
     const h0 = await commitAs(fx.world, 'n2', { 'n2/a.md': 'a' });
     // The runtime's own onTurnStart records and flushes the perception; the
     // handler then throws, so the turn closes with a durable error closer.
-    const runtime = runtimeFor(
+    const runtime = await runtimeFor(
       fx, configWith({ policy: { retryDelayMs: 1 } }), new ScriptedTransport([]),
     );
     const d0 = await NodeDriver.open(fx.home, 'n1', async () => {
@@ -901,7 +918,7 @@ describe('shell confinement wiring (C1.4c)', () => {
       home: fx.home, uid: 'n1', world: fx.world,
       initialConfig: configWith({ policy: { retryDelayMs: 1 } }),
       terminal: { env: DEFAULT_TERMINAL_ENV, sandbox: false },
-      adapter: new ProviderAdapter(transport, providerPolicy),
+      adapter: await adapterFor(fx, transport),
     });
     const driver = await openRuntime(fx, runtime);
     const running = driver.run();
@@ -933,7 +950,7 @@ describe('shell confinement wiring (C1.4c)', () => {
       home: nestedHome, uid: 'n1', world: fx.world,
       initialConfig: configWith({ policy: { retryDelayMs: 1 } }),
       terminal: { env: DEFAULT_TERMINAL_ENV },
-      adapter: new ProviderAdapter(transport, providerPolicy),
+      adapter: await adapterFor(fx, transport),
     });
     // The journal lives outside the world (the driver's home); only the
     // runtime's own home is nested, which is what the policy refuses.
@@ -1005,7 +1022,7 @@ describe('shell confinement wiring (C1.4c)', () => {
       home: fx.home, uid: 'n1', world: fx.world,
       initialConfig: configWith({ policy: { retryDelayMs: 1 } }),
       terminal: { env: DEFAULT_TERMINAL_ENV, create },
-      adapter: new ProviderAdapter(transport, providerPolicy),
+      adapter: await adapterFor(fx, transport),
     });
     stopHook = runtime.hooks.onStop ?? null;
 
@@ -1052,7 +1069,7 @@ describe('shell confinement wiring (C1.4c)', () => {
       home: fx.home, uid: 'n1', world: fx.world,
       initialConfig: configWith({ policy: { stepsPerTurn: 1, retryDelayMs: 1 } }),
       terminal: { env: DEFAULT_TERMINAL_ENV },
-      adapter: new ProviderAdapter(transport, providerPolicy),
+      adapter: await adapterFor(fx, transport),
     });
 
     const first = await openRuntime(fx, runtime);
@@ -1103,7 +1120,7 @@ describe('shell confinement wiring (C1.4c)', () => {
       home: fx.home, uid: 'n1', world: fx.world,
       initialConfig: configWith({ policy: { retryDelayMs: 1 } }),
       terminal: { env: DEFAULT_TERMINAL_ENV, sandbox: { launcherPath: copy } },
-      adapter: new ProviderAdapter(transport, providerPolicy),
+      adapter: await adapterFor(fx, transport),
     });
 
     const first = await openRuntime(fx, runtime);

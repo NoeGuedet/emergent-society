@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { access } from 'node:fs/promises';
 import { join } from 'node:path';
 import { withFailingWrite } from '../../journal/__tests__/helpers.js';
+import { readFrontier } from '../../frontier/__tests__/helpers.js';
 import { useWorld, type WorldFixture } from './helpers.js';
 import { NodeDriver } from '../driver.js';
 import { createAgentRuntime, defaultAgentConfig } from '../loop.js';
@@ -9,20 +10,30 @@ import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
 import { ProviderAdapter } from '../../provider/adapter.js';
-import type { SerializedTransport, TransportResult } from '../../provider/transport.js';
+import type {
+  SerializedTransport, TransportFacts, TransportResult,
+} from '../../provider/transport.js';
 import type { AgentConfig } from '../../context/contracts.js';
 
 const fixture = useWorld('c13-barrier-');
 
 /** Records every send; returns a valid no-op response if it is ever reached. */
 class CountingTransport implements SerializedTransport {
+  readonly facts: TransportFacts = {
+    url: 'https://test.invalid/v1/chat/completions',
+    headers: { 'content-type': 'application/json' },
+    credentialId: 'test',
+  };
   readonly sends: Uint8Array[] = [];
   async post(body: Uint8Array, signal: AbortSignal, _maxBytes: number): Promise<TransportResult> {
     if (signal.aborted) {
-      return { status: null, body: new Uint8Array(), complete: false, failure: { code: 'cancelled', status: null } };
+      return {
+        status: null, headers: {}, body: new Uint8Array(), complete: false,
+        failure: { code: 'cancelled', status: null },
+      };
     }
     this.sends.push(body);
-    return { status: 200, complete: true, failure: null,
+    return { status: 200, headers: {}, complete: true, failure: null,
       body: Buffer.from(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'noop' } }] })) };
   }
 }
@@ -34,14 +45,15 @@ const delay = (ms: number, signal: AbortSignal): Promise<void> => new Promise((r
   signal.addEventListener('abort', onAbort, { once: true });
 });
 
-function runtimeFor(fx: WorldFixture, transport: CountingTransport, config: AgentConfig) {
+async function runtimeFor(fx: WorldFixture, transport: CountingTransport, config: AgentConfig) {
+  const journal = await fx.frontier();
   return createAgentRuntime({
     home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
     terminal: { env: DEFAULT_TERMINAL_ENV },
     adapter: new ProviderAdapter(transport, {
       delay,
       schedule: (ms, callback) => { const timer = setTimeout(callback, ms); return () => { clearTimeout(timer); }; },
-    }),
+    }, journal.gate),
   });
 }
 
@@ -50,7 +62,7 @@ describe('C1.3 request barrier fault', () => {
     const fx = fixture();
     const config = defaultAgentConfig();
     const transport = new CountingTransport();
-    const runtime = runtimeFor(fx, transport, config);
+    const runtime = await runtimeFor(fx, transport, config);
     let driver: NodeDriver | null = null;
     let running: Promise<void> | null = null;
     try {
@@ -70,6 +82,9 @@ describe('C1.3 request barrier fault', () => {
       const events = await loadVerifiedEvents(fx.home, 'n1', C13_EVENT_TYPES);
       expect(events.some((event) => event.type === 'turn/start')).toBe(true);
       expect(events.some((event) => event.type === 'request/wire')).toBe(false);
+      // Nothing crossed the frontier either: no request record, so no begin.
+      const frontier = await readFrontier(fx.home);
+      expect(frontier.filter((event) => event.type === 'http/request')).toHaveLength(0);
     } finally {
       if (driver) {
         driver.stop();
