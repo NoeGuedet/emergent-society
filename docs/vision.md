@@ -11,7 +11,7 @@ An autonomous system that follows a direction defined by a continuous chat betwe
 Only two things exist at the start:
 
 1. **The chat with agent zero** — the single interface.
-2. **The kernel** — async, event-native, append-only journal, modules hot-reversible.
+2. **The kernel** — async, event-native, one append-only frontier journal (plus each node's local cold-start log), modules hot-reversible.
 
 Everything else is either the expected emergence (structure, roles, process) or long-term scope (the Loop, self-enterprise).
 
@@ -31,10 +31,10 @@ The state of the art ([research/sota-autonomous-agents.md](research/sota-autonom
 
 - **Imposed physics, emergent organization.** Every mechanism of the kernel must be justified; otherwise it stays out. No organizational structure is coded — no roles, no workflow, no hierarchy vocabulary.
 - **Every effect reversible.** Cordis-style reversibility (`effect → disposer`, inverses composed in LIFO order) is what makes operating live possible.
-- **The journal is the only truth.** Everything else — dashboards, metrics, agent memory — is a disposable projection.
+- **The frontier journal is the only truth.** Everything else — dashboards, metrics, agent memory, and the per-node local log — is a disposable projection or a cold-start artifact; the world's git history is the second observation surface.
 - **Metrics are invisible to the agents** (anti-Goodhart). Instrumentation lives outside the graph.
 - **Fidelity is measured on acts, never on declarations.**
-- **Autonomy is not a kernel concept.** The kernel provides bare physics only: kill switch + budget ceiling + the filesystem-confinement boundary (which constrains where agent effects can land, not what the kernel records). Graduation, if it is to exist, emerges as a request from agent zero to the human through the chat.
+- **Autonomy is not a kernel concept.** The kernel provides bare physics only: the frontier journal + kill switch + budget ceiling + the filesystem-confinement boundary (which constrains where agent effects can land, not what the kernel records). Graduation, if it is to exist, emerges as a request from agent zero to the human through the chat.
 - **Operating live is the concept.** The Cordis kernel exists for it; the mirror/fork/benchmark is a methodology for developing the engine by an instance, not a law of the kernel.
 
 ## 4. What is measured: viability, not performance
@@ -52,24 +52,24 @@ A preliminary exploration conversation provided the architectural reasoning reta
 
 There are two memories of different kinds, and the immutable/emergent boundary runs between them.
 
-1. **The observed memory (the instrument) = the journal.** Wired directly at the level of the LLM API calls (Langfuse-style): everything is captured, analyzed and ratified. The trace is therefore *physical* — it exists because the system acted, not because an agent declared it acted. This is the "model-visible means logged" invariant of dsh-session. Immutable, append-only, out of the agents' reach. The 3 sensors + the metronome live on this side.
-2. **The useful memory (theirs) = emergent.** Knowledge base or anything else: used and managed by the agents, it **emerges on its own** and is not designed. Its organization is experiment data (is a librarian observed? rot? memory rituals?). Its *content* belongs to the agents, but its *usage* remains visible in the journal through the journaled tool invocations and raw boundary events that record its effects — those **recorded effects**, not an exhaustive syscall-level or per-file-access trace — giving observability without control.
+1. **The observed memory (the instrument) = the frontier journal + the world's history.** Wired directly at the level of the LLM API calls and the mediated tool calls (Langfuse-style): every exchange is captured, analyzed and ratified, and the world's commits carry the acts. The trace is therefore *physical* — it exists because the system acted, not because an agent declared it acted. This is the "model-visible means logged" invariant of dsh-session, moved to the HTTP frontier. Immutable, append-only, out of the agents' reach. The 3 sensors + the metronome live on this side. The per-node local log is **not** part of it: it is a cold-start artifact that no observer reads.
+2. **The useful memory (theirs) = emergent.** Knowledge base or anything else: used and managed by the agents, it **emerges on its own** and is not designed. Its organization is experiment data (is a librarian observed? rot? memory rituals?). Its *content* belongs to the agents, but its *usage* remains visible in the frontier journal and the world through the mediated invocations and the commits that record its effects — those **recorded effects**, not an exhaustive syscall-level or per-file-access trace — giving observability without control.
 
-The journal is layer 1 (physical); the useful memory is layer 3 (emergent). No managed memory mechanism is provided — no kernel-side "private memory" tool: [seed.md](seed.md) gives the agents the raw filesystem means, and any memory they build emerges on its own. The cold-start constraint — what the seed must contain to become a tree without drawing the tree in advance — is specified in [seed.md](seed.md).
+The frontier journal (with the world's history) is layer 1 (physical); the useful memory is layer 3 (emergent). No managed memory mechanism is provided — no kernel-side "private memory" tool: [seed.md](seed.md) gives the agents the raw filesystem means, and any memory they build emerges on its own. The cold-start constraint — what the seed must contain to become a tree without drawing the tree in advance — is specified in [seed.md](seed.md).
 
 ## 6. The monitoring instrument
 
-**Monitoring precedes all software design.** The instrument defines the apparatus: the journal, memory, persistence and kernel are designed *after* the conceptual instrument.
+**Monitoring precedes all software design.** The instrument defines the apparatus: the frontier journal, memory, persistence and kernel are designed *after* the conceptual instrument.
 
 ### The cycle
 
 The conceptual model of the instrument is the **cycle**: change of heading (a timestamped event) → rising exploration → relaxation → exploitation plateau (value) → new heading. The two diseases are **ossification** (can no longer explore) and **perpetual reorganization** (can no longer exploit).
 
-**Value is defined per cycle.** Each change of direction crystallizes its own success proxy in the chat ("how we will know this works") plus promises→actions→effects accounting on the journal. There is no universal value metric — that would reintroduce a disguised fixed objective.
+**Value is defined per cycle.** Each change of direction crystallizes its own success proxy in the chat ("how we will know this works") plus promises→actions→effects accounting on the frontier journal + the world. There is no universal value metric — that would reintroduce a disguised fixed objective.
 
 ### The battery
 
-All instruments are computed on the journal and are invisible to the agents (anti-Goodhart):
+All instruments are computed on the frontier journal + the world and are invisible to the agents (anti-Goodhart):
 
 | Family | Instruments | Key references |
 |---|---|---|
@@ -86,9 +86,9 @@ All instruments are computed on the journal and are invisible to the agents (ant
 - **Sensor 3 — value registry** promises→actions→effects (→ value per cycle, cost, promises kept).
 - **Metronome — versioned direction** (labels adaptation versus drift).
 
-The catalogue of ~20 metrics becomes a diagnostic manual: a posteriori queries on the sensors, recomputable retroactively — the journal's central property. Day-1 minimum: phase + relaxation + value.
+The catalogue of ~20 metrics becomes a diagnostic manual: a posteriori queries on the sensors, recomputable retroactively — the frontier's central property. Day-1 minimum: phase + relaxation + value.
 
-**E/E by embeddings, not by dictionaries.** Uotila's textual ratio is abandoned as too fragile (synonyms, paraphrases). The method is: journal windows → embeddings → trajectory in semantic space; exploration and exploitation are two reference poles (prototype texts), and the phase is the trajectory's position between the poles. The embedding model is **frozen** at the start; fine-tuning only if the noise is excessive (YAGNI). Published precedents: SemNovel (2025, novelty = distance to the past in a "semantic universe", validated) and semantic drift by cosine distance on agent logs (arXiv:2601.17617). Honest limitation: embeddings measure movement, not intention → mandatory cross-checking with the versioned direction.
+**E/E by embeddings, not by dictionaries.** Uotila's textual ratio is abandoned as too fragile (synonyms, paraphrases). The method is: frontier-journal windows → embeddings → trajectory in semantic space; exploration and exploitation are two reference poles (prototype texts), and the phase is the trajectory's position between the poles. The embedding model is **frozen** at the start; fine-tuning only if the noise is excessive (YAGNI). Published precedents: SemNovel (2025, novelty = distance to the past in a "semantic universe", validated) and semantic drift by cosine distance on agent logs (arXiv:2601.17617). Honest limitation: embeddings measure movement, not intention → mandatory cross-checking with the versioned direction.
 
 **Temporal novelty.** Novelty is "an action never seen before" OR "an old action in a new world", where the world is the org + direction + current knowledge. An old action in an unchanged world is repetition; an old action in a changed world is legitimate re-exploration. This makes cycles measurable without a false "non-explorer" diagnosis.
 
@@ -100,7 +100,7 @@ Attacks handled by design: **sycophancy** (→ fidelity to actions), **meltdown 
 
 ## 7. Research backing
 
-- **Kernel mechanics** — [research/harness-deep-dive.md](research/harness-deep-dive.md): a single mutation gate (`effect(install) → disposer`, inverses composed in LIFO order; Cordis fits in ~2000 lines); the dsh-session journal (log = the only truth, everything else is a projection; "model-visible means logged"; `{type, contiguous seq, time, data}`; extensibility with a required refusal to read an unknown type); the chat as a second application on top of the same kernel (Chat and Trajectory are two projections of the same stream, and human input enters the same stream as everything else); the identified gap we fill — in DeepSeek Harness self-written plugins live in memory only and are lost on restart, whereas ours must persist (journal + persistent modules); **confluence (Th. 80)** — the final state depends only on the final config, not on the order, a decisive property for a self-modifying system.
+- **Kernel mechanics** — [research/harness-deep-dive.md](research/harness-deep-dive.md): a single mutation gate (`effect(install) → disposer`, inverses composed in LIFO order; Cordis fits in ~2000 lines); the dsh-session journal as the *reference* protocol (log = the only truth, everything else is a projection; "model-visible means logged"; `{type, contiguous seq, time, data}`; extensibility with a required refusal to read an unknown type) — ours keeps the pattern, moves its truth to the frontier journal and demotes the per-node stream to a cold-start log; the chat as a second application on top of the same kernel (Chat and Trajectory are two projections of the same stream, and human input enters the same stream as everything else); the identified gap we fill — in DeepSeek Harness self-written plugins live in memory only and are lost on restart, whereas ours must persist (local-log replay + persistent modules); **confluence (Th. 80)** — the final state depends only on the final config, not on the order, a decisive property for a self-modifying system.
 - **Models** — [research/models-overview.md](research/models-overview.md). No hardware constraint: the "local Qwen on a 3090" prerequisite is dropped (local inference remains available for free routing and summaries). Candidates to test (price per M tokens in/out, all *reported* as of 11/09/2026 and subject to re-verification):
   - **GLM-5.3-Flash** — quoted at a **$0.075/$0.25 promo** in that snapshot (*reported*; the promo has since expired, list reported around $0.15/$0.50) → candidate for agents in volume
   - **DeepSeek V4.1 Flash** ($0.15–0.30/$0.60–1.20, cache hit $0.003, MIT) — no independent eval yet

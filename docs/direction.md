@@ -11,14 +11,14 @@ are stated in `seed.md`.
 
 - **The human** — the source. The idea, the thinking, the goal come from them. They speak only to agent zero.
 - **Agent zero** — **translator co-orchestrator**. Its function: translate in both directions — human intent → system heading, and system state → human language. It does not work, it does not govern on its own initiative: it makes governance possible. Its output is the heading; its memory is the continuity of the intent.
-  - **Reading equipment**: to perform the system → human translation (reports, chronology, who does what, analysis), it reads the **raw journal**, the **projections** (custody, authority) and the **world**, and it can **question the nodes**. The right to question is granted with full awareness of the influence bias; the trade-off is accepted because each question is a journal event, so the influence channel is traced and measurable as an intervention. Founding property: "model-visible means logged" makes its understanding possible *through the trace* — everything a node would say is already there.
-  - **The anti-Goodhart line**: it reads the **raw facts**, never the **metrics** (the 3 sensors and their analyses remain the human's instrument — otherwise it would leak them into its heading drafts). Its own readings and questions are journaled: its mediation is itself auditable.
+  - **Reading equipment**: to perform the system → human translation (reports, chronology, who does what, analysis), it reads the **raw frontier journal**, the **projections** (custody, authority) and the **world**, and it can **question the nodes**. The right to question is granted with full awareness of the influence bias; the trade-off is accepted because each question is recorded in agent zero's own local log (a C1.6 design point), so the influence channel is traced and measurable as an intervention — it is a local event, **never a frontier fact** (the frontier records HTTP exchanges only). Founding property: "model-visible means logged" makes its understanding possible *through the trace* — everything a node would say is already there.
+  - **The anti-Goodhart line**: it reads the **raw facts**, never the **metrics** (the 3 sensors and their analyses remain the human's instrument — otherwise it would leak them into its heading drafts). Its own readings and questions are recorded in its local log (a C1.6 design point, never a frontier fact): its mediation is itself auditable.
   - **Never the only window**: the human keeps direct access to the same raw projections (the cockpit); agent zero's reports are verifiable against the raw evidence ("explain this spike" pattern — and "audit by an agent independent of the population being audited": it is not part of the population that works).
 - **The first node** (and all those after it) — standard nodes of the recursive graph. They receive the heading pinned by the kernel, **exactly like any future node**. Agent zero exists precisely so that the first node is not special: the same shape everywhere, from the start.
 
 **Consequence for `speak`**: the human channel belongs only to agent zero — it is the only node that reaches the human, and no other node has a direct human channel. Between nodes there is no transport at all: a node is heard by **writing in the world**, which the kernel commits at the end of its turn with its own uid as author (`kernel.md` §5). Uniform and recursive: the root is the only node whose "parent" is the human. Corollary for the seed prompt: "the person talking to you" is not the human, it is agent zero.
 
-This separation also settles the observation surface: everything a node writes toward its parent is a commit in the world — authored, diffable and journaled — so the escalation of requests, reports and "I can no longer see the heading" (instincts I4/I5) becomes a free data point of the experiment.
+This separation also settles the observation surface: everything a node writes toward its parent is a commit in the world — authored, diffable and observable — so the escalation of requests, reports and "I can no longer see the heading" (instincts I4/I5) becomes a free data point of the experiment.
 
 ## 2. The direction object — a double artifact
 
@@ -35,14 +35,14 @@ Authority rule: **the current version is authoritative — not memory, not the l
 - **Initiative**: both sides can open a revision. The human whenever they want; agent zero via a simple chat message (consistent with v0's "any proposal is welcome" — no dedicated format, the proposal is an observable event like any other).
 - **Drafting**: agent zero drafts the version proposals (heading + proxy + letter). It is the secretary of the negotiation — and its reformulation reveals for free what it has understood of the heading.
 - **Activation**: a version becomes active only upon **explicit ratification by the human**. This is the effective single-writer: no ambiguity about "which is the current direction". It is not a guardrail — it is the constitutive act of the object.
-- **The ratification event is dated and immutable in the journal.** It is the ground truth of the whole metrology: post-heading relaxation time, drift vs adaptation distinction, event studies. Without it, none of these measurements has a reference.
+- **The ratification event is dated and immutable; its home is a C1.6 design point, not resolved here.** It is a local (or world) fact — never a frontier fact, since the frontier records HTTP exchanges only — and it is the ground truth of the whole metrology: post-heading relaxation time, drift vs adaptation distinction, event studies. Without it, none of these measurements has a reference.
 - **Cadence**: free, with a recorded recommendation — rare headings. Intervene only when viability demands it (Aubin's heavy solutions); headings that are too close together make relaxation unmeasurable (severe detection bounds on short series, Boettiger).
 
 ## 4. The channel
 
 - **Continuous and asynchronous** chat: the human's messages enter the world as commits authored by the human, and agent zero wakes on that change like on any other — no channel priority, no forced interruption.
 - Agent zero can **initiate**: propose a revision, relay a signal coming from the nodes, ask for clarification.
-- The chat is a **projection of the journal**; the trajectory will be another (monitoring / the cockpit). One single truth, two readings.
+- The chat and the trajectory are **projections over the frontier journal + world history** — chat messages are world commits — and the per-node local logs are cold-start artifacts no observer reads. One truth (the frontier + the world), two readings.
 
 ## 5. Non-goals
 
@@ -61,7 +61,7 @@ Authority rule: **the current version is authoritative — not memory, not the l
 
 - The technical nature of agent zero: a root node of the custody graph? Its loop, its exact tools (at minimum: `speak` toward the human + writing direction proposals).
 - The kernel's heading injection mechanism (pinning outside compaction, injection into every child context).
-- The event schema carrying direction versions and ratification.
+- The event schema carrying direction versions and ratification — a C1.6 design point; the frontier journal carries no such vocabulary (it records HTTP exchanges only).
 - Agent zero's place in the two graphs (custody / authority).
 
 ## Main justifications (corpus)

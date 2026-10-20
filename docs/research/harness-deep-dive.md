@@ -304,3 +304,8 @@ Recommendations directly actionable for the emergent-society kernel, sorted by i
 - [?] SitePoint details (`HarnessPlugin`, `agent.run()`, `harness` CLI) — inconsistent with the repository, judged invented.
 - [?] Direct HN/Reddit discussions — no primary HN thread fetched; the "metatheory cosplay" debate is reported by FindHarness [S].
 - [?] Source code of the packages (`packages/core/session/src/*`) read directly — no; the quoted declarations come from docs that declare themselves generated from the source with CI verification (`verify-cordis-catalog`).
+
+
+---
+
+**Status note (added 2026-10-20, C1.4d).** The DSH passages in this document describe the reference protocol and are left exactly as written: `assistant/attempt`, `assistant/message`, the dsh-session journal and its "log = the only truth" framing are quoted as DeepSeek Harness's design, not as this project's. Since C1.4d we keep the storage pattern (`src/journal/`) but move the truth to a **frontier journal** at the kernel-mediated HTTP boundary and demote the per-node stream to a `log.v0.*` cold-start artifact that observers never read; `assistant/attempt`, `request/plan`, `request/wire`, `response/raw` and `request/usage` are not part of our local vocabulary. Wherever this document calls a record "the truth", read it as describing DeepSeek Harness.
