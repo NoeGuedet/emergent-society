@@ -2,14 +2,12 @@ import { createServer, type Server } from 'node:http';
 import { access, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { BlobStore, canonicalizeJson } from '../../journal/index.js';
+import { BlobStore } from '../../journal/index.js';
 import { loadVerifiedEvents, type VerifiedEvents } from '../../context/loader.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { ContextFold } from '../../context/fold.js';
-import { resolveArtifact, resolveStored, toJson } from '../../context/artifacts.js';
-import { validateRequestPlan } from '../../context/events.js';
-import { rederivePlans } from '../../context/assembler.js';
-import { serializeWire } from '../../provider/wire.js';
+import { resolveStored } from '../../context/artifacts.js';
+import { verifyPerceptions } from '../../context/__tests__/verify-perceptions.js';
 import { ProviderAdapter, type ProviderPolicy } from '../../provider/adapter.js';
 import { OpenAITransport } from '../../provider/transport.js';
 import { readFrontier } from '../../frontier/__tests__/helpers.js';
@@ -18,7 +16,7 @@ import { createAgentRuntime, defaultAgentConfig } from '../loop.js';
 import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import { HeadWatcher } from '../watcher.js';
 import { commitAs, useWorld } from './helpers.js';
-import type { ArtifactRef, RequestId, RequestPlan, Stored } from '../../context/contracts.js';
+import type { AssistantProjection, Stored } from '../../context/contracts.js';
 
 const fixture = useWorld('c13-http-');
 
@@ -99,20 +97,16 @@ describe('C1.3 real boundaries', () => {
         chunks.push(chunk);
         if (started) return;
         started = true;
-        // Read the durable plan/wire once the request starts arriving. This async read
-        // proves they were durable before the handler answered; it does not prove a
-        // first-byte instant barrier — the fault fixture proves that ordering.
+        // Read the frontier once the request starts arriving. This async read
+        // proves the `http/request` was durable before the handler answered; it
+        // does not prove a first-byte instant barrier — the fault fixture proves
+        // that ordering.
         void (async () => {
-          const events = await resolved(home);
-          const wire = events.filter((event) => event.type === 'request/wire')[index];
-          const plan = events.filter((event) => event.type === 'request/plan')[index];
-          if (!wire || !plan) throw new Error('plan/wire not durable at first byte');
-          const wireData = wire.data as unknown as { id: RequestId; body: ArtifactRef };
-          const planData = plan.data as unknown as { id: RequestId; value: Stored<RequestPlan> };
-          const recorded = resolveStored(events, planData.value, validateRequestPlan);
-          const durableBody = Buffer.from(resolveArtifact(events, wireData.body));
-          expect(wireData.id).toEqual(planData.id);
-          expect(Buffer.from(serializeWire(recorded)).equals(durableBody)).toBe(true);
+          const frontierEvents = await readFrontier(home);
+          const requests = frontierEvents.filter((event) => event.type === 'http/request');
+          if (requests.length !== index + 1) {
+            throw new Error('http/request not durable at first byte');
+          }
           durableAtSend[index] = true;
           resolveCheck();
         })().catch(rejectCheck);
@@ -124,12 +118,13 @@ describe('C1.3 real boundaries', () => {
           await firstCheck;
           const body = Buffer.concat(chunks);
           bodies.push(body);
-          // The entire HTTP body must equal the durable wire body captured on arrival.
-          const events = await resolved(home);
-          const wire = events.filter((event) => event.type === 'request/wire')[index];
-          if (!wire) throw new Error('missing durable wire');
-          const durableBody = Buffer.from(
-            resolveArtifact(events, (wire.data as unknown as { body: ArtifactRef }).body));
+          // The entire HTTP body must equal the durable frontier request body.
+          const frontierEvents = await readFrontier(home);
+          const requests = frontierEvents.filter((event) => event.type === 'http/request');
+          const request = requests[index];
+          if (!request) throw new Error('missing durable http/request');
+          const durableBody = await new BlobStore(home)
+            .get((request.data as unknown as { body: { sha256: string } }).body.sha256);
           expect(body.equals(durableBody)).toBe(true);
           const parsed = JSON.parse(body.toString('utf8')) as {
             messages: { role: string; content: string | null; tool_call_id?: string;
@@ -258,27 +253,29 @@ describe('C1.3 real boundaries', () => {
       await running;
       running = null;
       const events = await resolved(home);
-      const plans = events.filter((event) => event.type === 'request/plan');
-      const wires = events.filter((event) => event.type === 'request/wire');
-      const raws = events.filter((event) => event.type === 'response/raw');
-      expect(plans).toHaveLength(4);
-      expect(wires).toHaveLength(4);
-      expect(raws).toHaveLength(4);
-      for (let index = 0; index < wires.length; index += 1) {
-        const planData = plans[index]!.data as unknown as { id: RequestId; value: Stored<RequestPlan> };
-        const plan = resolveStored(events, planData.value, validateRequestPlan);
-        const wireRef = (wires[index]!.data as unknown as { body: ArtifactRef }).body;
-        expect(Buffer.from(resolveArtifact(events, wireRef)).equals(bodies[index]!)).toBe(true);
-        expect(Buffer.from(serializeWire(plan)).equals(bodies[index]!)).toBe(true);
-        const rawRef = (raws[index]!.data as unknown as { body: ArtifactRef }).body;
-        expect(Buffer.from(resolveArtifact(events, rawRef)).equals(responses[index]!)).toBe(true);
+      const assistants = events.filter((event) => event.type === 'assistant/message');
+      expect(assistants).toHaveLength(4);
+      const allFrontier = await readFrontier(home);
+      const allRequests = allFrontier.filter((event) => event.type === 'http/request')
+        .map((event) => event.data as unknown as { call: string; body: { sha256: string } });
+      const allTerminals = allFrontier.filter((event) => event.type === 'http/response')
+        .map((event) => event.data as unknown as { call: string; body: { sha256: string } });
+      expect(allRequests).toHaveLength(4);
+      expect(allTerminals).toHaveLength(4);
+      const finalBlobs = new BlobStore(home);
+      for (let index = 0; index < allRequests.length; index += 1) {
+        expect((await finalBlobs.get(allRequests[index]!.body.sha256)).equals(bodies[index]!)).toBe(true);
+        expect((await finalBlobs.get(allTerminals[index]!.body.sha256)).equals(responses[index]!))
+          .toBe(true);
       }
-      const comparisons = await rederivePlans(events, world);
-      expect(comparisons).toHaveLength(4);
-      for (const comparison of comparisons) {
-        expect(canonicalizeJson(toJson(comparison.rederived)))
-          .toBe(canonicalizeJson(toJson(comparison.recorded)));
+      // Every assistant message names the successful frontier call that produced it.
+      for (const [index, assistant] of assistants.entries()) {
+        const data = assistant.data as unknown as { value: Stored<AssistantProjection> };
+        expect(resolveStored(events, data.value, (value) => value as AssistantProjection).frontierCall)
+          .toBe(allRequests[index]!.call);
       }
+      // The perception half of the retired reconstruction survives as a helper.
+      await verifyPerceptions(world, events);
       expect(durableAtSend).toEqual([true, true, true, true]);
       expect(errors).toEqual([]);
     } finally {
@@ -355,59 +352,53 @@ describe('C1.3 real boundaries', () => {
       await running;
       running = null;
 
-      // An offline rebuild of the exact durable history folds the incomplete then
-      // complete attempts: `onAssistant` binds the projection's raw to *the*
-      // complete 200 response for the same request, so a mismatched or missing
-      // raw would fail the fold. (This turn produces no world effect, so the
-      // driver marks its waiting closer ignorable and the dialogue is not
-      // promoted into the surface — the binding still runs.)
+      // An offline rebuild of the exact durable history folds one assistant
+      // message: the local log records the semantic result only, while the two
+      // attempts and their terminals are frontier facts. (This turn produces no
+      // world effect, so the driver marks its waiting closer ignorable and the
+      // dialogue is not promoted into the surface.)
       const events = await resolved(home);
       const offline = new ContextFold();
       await offline.observe(events);
       expect(offline.orphanCompactions()).toEqual([]);
-      const raws = events.filter((event) => event.type === 'response/raw');
-      expect(raws).toHaveLength(2);
-      const first = raws[0]!.data as unknown as { status: number; complete: boolean; body: ArtifactRef };
-      const second = raws[1]!.data as unknown as { status: number; complete: boolean; body: ArtifactRef };
-      expect(first).toMatchObject({ status: 200, complete: false });
-      expect(second).toMatchObject({ status: 200, complete: true });
-      // The two attempts carry distinct response refs: the binding must be unique.
-      expect(second.body).not.toEqual(first.body);
-      expect(Buffer.from(resolveArtifact(events, first.body)).toString('utf8')).toBe(prefix);
 
-      const attempts = events.filter((event) => event.type === 'assistant/attempt');
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]!.data).toMatchObject({ terminal: false, failure: { code: 'timeout', status: 200 } });
+      const frontier = await readFrontier(home);
+      const requests = frontier.filter((event) => event.type === 'http/request')
+        .map((event) => event.data as unknown as {
+          call: string; group: string; attempt: number; body: { sha256: string };
+        });
+      const terminals = frontier.filter((event) => event.type === 'http/response')
+        .map((event) => event.data as unknown as {
+          call: string; status: number; body: { sha256: string; complete: boolean };
+        });
+      expect(requests).toHaveLength(2);
+      expect(terminals).toHaveLength(2);
+      expect([requests[0]!.attempt, requests[1]!.attempt]).toEqual([0, 1]);
+      expect(requests[1]!.group).toBe(requests[0]!.group);
+      expect(requests[1]!.body.sha256).toBe(requests[0]!.body.sha256);
+      expect(terminals.map((terminal) => terminal.body.complete)).toEqual([false, true]);
+      expect(terminals[1]!.status).toBe(200);
+      expect((await new BlobStore(home).get(terminals[0]!.body.sha256)).toString('utf8'))
+        .toBe(prefix);
 
-      const wires = events.filter((event) => event.type === 'request/wire');
-      expect(wires).toHaveLength(2);
-      const wire0 = wires[0]!.data as unknown as { attempt: number; body: ArtifactRef };
-      const wire1 = wires[1]!.data as unknown as { attempt: number; body: ArtifactRef };
-      expect([wire0.attempt, wire1.attempt]).toEqual([0, 1]);
-      expect(wire1.body).toEqual(wire0.body);
       const assistantEvents = events.filter((event) => event.type === 'assistant/message');
       expect(assistantEvents).toHaveLength(1);
-      // The bound projection's raw is the complete second attempt's ref, never the
+      // The projection names the successful second attempt's call, never the
       // incomplete first attempt's.
       const stored = (assistantEvents[0]!.data as unknown as {
-        value: Stored<{ raw: ArtifactRef }>;
+        value: Stored<AssistantProjection>;
       }).value;
-      const bind = resolveStored(events, stored, (value) => value as { raw: ArtifactRef });
-      expect(bind.raw).toEqual(second.body);
-      expect(bind.raw).not.toEqual(first.body);
+      const projection = resolveStored(events, stored, (value) => value as AssistantProjection);
+      expect(projection.frontierCall).toBe(requests[1]!.call);
+      expect(projection.frontierCall).not.toBe(requests[0]!.call);
 
       // A second offline fold is identical: replay writes nothing.
       const again = new ContextFold();
       await again.observe(events);
       expect(again.snapshot()).toEqual(offline.snapshot());
 
-      // Offline re-derivation reproduces the recorded plans; nothing new is written.
-      const comparisons = await rederivePlans(events, world);
-      expect(comparisons.length).toBeGreaterThan(0);
-      for (const comparison of comparisons) {
-        expect(canonicalizeJson(toJson(comparison.rederived)))
-          .toBe(canonicalizeJson(toJson(comparison.recorded)));
-      }
+      // The perception half of the offline join still verifies.
+      await verifyPerceptions(world, events);
       expect((await resolved(home)).length).toBe(events.length);
     } finally {
       const current = driver;

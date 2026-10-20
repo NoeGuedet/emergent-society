@@ -7,9 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BlobStore, JournalWriter } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
-import { createBoundaryRegistry, C13_EVENT_TYPES, validateRequestPlan } from '../../context/events.js';
+import { createBoundaryRegistry, C13_EVENT_TYPES } from '../../context/events.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
-import { resolveArtifact, resolveStored } from '../../context/artifacts.js';
 import { defaultAgentConfig } from '../../context/config.js';
 import { createBoundaryGate } from '../../node/gate.js';
 import type { BoundaryGate, GateCallbacks, GateScope } from '../../node/gate.js';
@@ -20,7 +19,7 @@ import { ProviderAdapter, type ProviderPolicy } from '../adapter.js';
 import { OpenAITransport } from '../transport.js';
 import type { SerializedTransport, TransportFacts, TransportResult } from '../transport.js';
 import type {
-  ArtifactRef, AssistantProjection, CanonicalUsage, RequestId, RequestPlan, SeedPolicy, Source, Stored,
+  AssistantProjection, RequestPlan, SeedPolicy, Source, Stored,
 } from '../../context/contracts.js';
 
 /**
@@ -247,7 +246,7 @@ async function close(server: Server): Promise<void> {
 // --- HTTP acceptance -------------------------------------------------------------
 
 describe('ProviderAdapter: real HTTP acceptance', () => {
-  it('sends exact durable bytes and preserves unknown fields/usage in response/raw', async () => {
+  it('sends exact durable bytes and journals the exchange on the frontier', async () => {
     const session = await openSession();
     const request = plan();
     const responses: Buffer[] = [];
@@ -274,19 +273,12 @@ describe('ProviderAdapter: real HTTP acceptance', () => {
         chunks.push(chunk);
         if (checked) return;
         checked = true;
-        // Read the durable plan/wire on the FIRST request data: it proves they
-        // were durable before the handler answered.
+        // Read the frontier on the FIRST request data: the http/request record
+        // proves the exchange was durable before the handler answered.
         void (async () => {
-          const durable = await events();
-          const wire = ofType(durable, 'request/wire')[i];
-          const planEvent = ofType(durable, 'request/plan')[i];
-          if (!wire || !planEvent) throw new Error('plan/wire not durable at first byte');
-          const wireData = wire.data as unknown as { id: RequestId; body: ArtifactRef };
-          const planData = planEvent.data as unknown as { id: RequestId; value: Stored<RequestPlan> };
-          const recorded = resolveStored(durable, planData.value, validateRequestPlan);
-          const durableBody = Buffer.from(resolveArtifact(durable, wireData.body));
-          expect(wireData.id).toEqual(planData.id);
-          expect(Buffer.from(serializeWire(recorded)).equals(durableBody)).toBe(true);
+          const durable = await readFrontier(home);
+          const requests = durable.filter((event) => event.type === 'http/request');
+          if (requests.length !== i + 1) throw new Error('http/request not durable at first byte');
           resolveCheck();
         })().catch(rejectCheck);
       });
@@ -335,16 +327,23 @@ describe('ProviderAdapter: real HTTP acceptance', () => {
       }
 
       const durable = await events();
-      const raw = ofType(durable, 'response/raw')[0]!;
-      const rawRef = (raw.data as unknown as { body: ArtifactRef }).body;
-      expect(rawRef.complete).toBe(true);
-      expect(Buffer.from(resolveArtifact(durable, rawRef)).equals(responses[0]!)).toBe(true);
-
-      const usageEvent = ofType(durable, 'request/usage')[0]!;
-      expect((usageEvent.data as unknown as { value: CanonicalUsage }).value).toEqual({
-        inputTotal: 100, inputUncached: 30, output: 5, cacheRead: 70, cacheWrite: null,
-      });
-      expect(ofType(durable, 'assistant/message')).toHaveLength(1);
+      // The local log keeps the semantic assistant fact and none of the retired
+      // wire/usage/attempt types.
+      const types = new Set(durable.map((event) => event.type));
+      for (const retired of [
+        'request/plan', 'request/wire', 'response/raw', 'request/usage', 'assistant/attempt',
+      ]) expect(types.has(retired)).toBe(false);
+      const assistant = ofType(durable, 'assistant/message');
+      expect(assistant).toHaveLength(1);
+      const storedProjection = (assistant[0]!.data as unknown as {
+        value: Stored<AssistantProjection>;
+      }).value;
+      expect(storedProjection.kind).toBe('inline');
+      const projection = storedProjection.kind === 'inline'
+        ? storedProjection.value : null;
+      const { requests } = await frontierRecords();
+      expect(requests).toHaveLength(1);
+      expect(projection?.frontierCall).toBe(requests[0]!.call);
 
       expect(auth).toEqual(['Bearer test-key-never-log']);
       expect(Buffer.from(requestBodies[0]!).equals(Buffer.from(serializeWire(request)))).toBe(true);
@@ -356,6 +355,10 @@ describe('ProviderAdapter: real HTTP acceptance', () => {
       const requestEvent = frontierEvents.find((event) => event.type === 'http/request')!;
       expect((requestEvent.data as unknown as { headers: Record<string, string> }).headers)
         .toEqual({ 'content-type': 'application/json' });
+      // The frontier response body is the exact bytes the server sent.
+      const responseEvent = frontierEvents.find((event) => event.type === 'http/response')!;
+      expect((await frontierBody((responseEvent.data as unknown as FrontierResponseData).body))
+        .equals(responses[0]!)).toBe(true);
       // The durability barrier's failures are assertions, not swallowed work.
       expect(errors).toEqual([]);
     } finally {
@@ -380,7 +383,7 @@ const MALFORMED: ReadonlyArray<readonly [string, Uint8Array | string]> = [
 ];
 
 describe('ProviderAdapter: malformed responses', () => {
-  it.each(MALFORMED)('journals the raw body then fails terminally: %s', async (_name, body) => {
+  it.each(MALFORMED)('journals the frontier terminal then fails terminally: %s', async (_name, body) => {
     const session = await openSession();
     try {
       const bytes = typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
@@ -389,14 +392,11 @@ describe('ProviderAdapter: malformed responses', () => {
       expect(result).toEqual({ kind: 'failure', failure: { code: 'malformed', status: 200 } });
 
       const durable = await events();
-      const raw = ofType(durable, 'response/raw');
-      expect(raw).toHaveLength(1);
-      const rawRef = (raw[0]!.data as unknown as { body: ArtifactRef }).body;
-      expect(Buffer.from(resolveArtifact(durable, rawRef)).equals(Buffer.from(bytes))).toBe(true);
       expect(ofType(durable, 'assistant/message')).toHaveLength(0);
-      expect(ofType(durable, 'request/usage')).toHaveLength(0);
       expect(ofType(durable, 'tool/call')).toHaveLength(0);
-      expect(ofType(durable, 'assistant/attempt')).toHaveLength(1);
+      expect(durable.some((event) => [
+        'request/plan', 'request/wire', 'response/raw', 'request/usage', 'assistant/attempt',
+      ].includes(event.type))).toBe(false);
 
       // The malformed body is a local failure AFTER the frontier record: the
       // exchange's terminal is the outcome classified at the exchange — a
@@ -422,7 +422,7 @@ describe('ProviderAdapter: unprojectable lone surrogates', () => {
       + '{"id":"c1","type":"function","function":{"name":"execute","arguments":"\\ud800"}}]}}]}'],
   ];
 
-  it.each(cases)('is a safe terminal malformed failure after raw durability: %s', async (_name, body) => {
+  it.each(cases)('is a safe terminal malformed failure with no local event: %s', async (_name, body) => {
     const session = await openSession();
     try {
       // The body is UTF-8-valid JSON and parses; it fails only when projected.
@@ -432,10 +432,7 @@ describe('ProviderAdapter: unprojectable lone surrogates', () => {
       const result = await adapter.send(plan(), session.gate('turn', 0));
       expect(result).toEqual({ kind: 'failure', failure: { code: 'malformed', status: 200 } });
 
-      const durable = await events();
-      expect(ofType(durable, 'response/raw')).toHaveLength(1);
-      expect(ofType(durable, 'assistant/message')).toHaveLength(0);
-      expect(ofType(durable, 'request/usage')).toHaveLength(0);
+      expect(ofType(await events(), 'assistant/message')).toHaveLength(0);
     } finally {
       await session.shutdown();
     }
@@ -465,23 +462,10 @@ describe('ProviderAdapter: bounded retries', () => {
       expect(result.kind).toBe('response');
 
       const durable = await events();
-      const wires = ofType(durable, 'request/wire');
-      expect(wires).toHaveLength(2);
-      const first = (wires[0]!.data as unknown as { body: ArtifactRef; attempt: number });
-      const second = (wires[1]!.data as unknown as { body: ArtifactRef; attempt: number });
-      expect(first.attempt).toBe(0);
-      expect(second.attempt).toBe(1);
-      expect(second.body).toEqual(first.body);
-      expect(Buffer.from(resolveArtifact(durable, first.body))
-        .equals(Buffer.from(resolveArtifact(durable, second.body)))).toBe(true);
-
-      expect(ofType(durable, 'response/raw').map(
-        (event) => (event.data as unknown as { status: number }).status)).toEqual([429, 200]);
-      const attempts = ofType(durable, 'assistant/attempt');
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]!.data).toMatchObject({ terminal: false, failure: { code: 'http', status: 429 } });
       expect(ofType(durable, 'assistant/message')).toHaveLength(1);
-      expect(ofType(durable, 'request/usage')).toHaveLength(1);
+      expect(durable.some((event) => [
+        'request/plan', 'request/wire', 'response/raw', 'request/usage', 'assistant/attempt',
+      ].includes(event.type))).toBe(false);
 
       // One logical operation across the frontier: the retry re-begins with the
       // same group, an incremented attempt and the same body digest (one blob).
@@ -524,11 +508,9 @@ describe('ProviderAdapter: retry-status matrix', () => {
       );
       expect(result.kind).toBe('response');
       expect(transport.sends).toBe(2);
-      const attempts = ofType(await events(), 'assistant/attempt');
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]!.data).toMatchObject({
-        terminal: false, failure: { code: 'http', status },
-      });
+      const { responses } = await frontierRecords();
+      expect(responses.map((response) => response.status)).toEqual([status, 200]);
+      expect(responses[0]!.error).toEqual({ code: 'http' });
     } finally {
       await session.shutdown();
     }
@@ -544,11 +526,10 @@ describe('ProviderAdapter: retry-status matrix', () => {
       );
       expect(result).toEqual({ kind: 'failure', failure: { code: 'http', status } });
       expect(transport.sends).toBe(1);
-      const attempts = ofType(await events(), 'assistant/attempt');
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]!.data).toMatchObject({
-        terminal: true, failure: { code: 'http', status },
-      });
+      const { responses } = await frontierRecords();
+      expect(responses).toHaveLength(1);
+      expect(responses[0]!.status).toBe(status);
+      expect(responses[0]!.error).toEqual({ code: 'http' });
     } finally {
       await session.shutdown();
     }
@@ -586,11 +567,11 @@ describe('ProviderAdapter: retry-status matrix', () => {
         kind: 'failure', failure: { code: 'body-limit', status: 200 },
       });
       expect(transport.sends).toBe(1);
-      const attempts = ofType(await events(), 'assistant/attempt');
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]!.data).toMatchObject({
-        terminal: true, failure: { code: 'body-limit', status: 200 },
-      });
+      const { responses } = await frontierRecords();
+      expect(responses).toHaveLength(1);
+      expect(responses[0]!.status).toBe(200);
+      expect(responses[0]!.error).toEqual({ code: 'body-limit' });
+      expect(responses[0]!.body.complete).toBe(false);
     } finally {
       await session.shutdown();
     }
@@ -641,10 +622,8 @@ describe('ProviderAdapter: anti-abuse projection bounds', () => {
       });
       // The refusal happens after the one response: no retry, no projection.
       expect(transport.sends).toBe(1);
-      const durable = await events();
-      expect(ofType(durable, 'response/raw')).toHaveLength(1);
-      expect(ofType(durable, 'assistant/message')).toHaveLength(0);
-      expect(ofType(durable, 'request/usage')).toHaveLength(0);
+      expect(ofType(await events(), 'assistant/message')).toHaveLength(0);
+      expect((await frontierRecords()).responses).toHaveLength(1);
     } finally {
       await session.shutdown();
     }
@@ -673,9 +652,7 @@ describe('ProviderAdapter: anti-abuse projection bounds', () => {
         kind: 'failure', failure: { code: 'malformed', status: 200 },
       });
       expect(transport.sends).toBe(1);
-      const durable = await events();
-      expect(ofType(durable, 'response/raw')).toHaveLength(1);
-      expect(ofType(durable, 'assistant/message')).toHaveLength(0);
+      expect(ofType(await events(), 'assistant/message')).toHaveLength(0);
     } finally {
       await session.shutdown();
     }
@@ -721,30 +698,23 @@ describe('ProviderAdapter: status-known incomplete bodies', () => {
       expect(requestBodies).toHaveLength(2);
 
       const durable = await events();
-      const raw = ofType(durable, 'response/raw');
-      expect(raw).toHaveLength(2);
-      const first = raw[0]!.data as unknown as { status: number; complete: boolean; body: ArtifactRef };
-      const second = raw[1]!.data as unknown as { status: number; complete: boolean };
-      expect(first.status).toBe(200);
-      expect(first.complete).toBe(false);
-      expect(Buffer.from(resolveArtifact(durable, first.body)).toString('utf8')).toBe(prefix);
-      expect(second.status).toBe(200);
-      expect(second.complete).toBe(true);
+      expect(ofType(durable, 'assistant/message')).toHaveLength(1);
+      const { requests, responses } = await frontierRecords();
+      expect(responses).toHaveLength(2);
+      expect(responses[0]!.status).toBe(200);
+      expect(responses[0]!.body.complete).toBe(false);
+      expect((await frontierBody(responses[0]!.body)).toString('utf8')).toBe(prefix);
+      expect(responses[0]!.error).toEqual({ code: 'timeout' });
+      expect(responses[1]!.status).toBe(200);
+      expect(responses[1]!.body.complete).toBe(true);
+      expect(responses[1]!.error).toBeNull();
 
-      const attempts = ofType(durable, 'assistant/attempt');
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]!.data).toMatchObject({
-        terminal: false, failure: { code: 'timeout', status: 200 },
-      });
-
-      // The retry reuses the one retained wire artifact byte-for-byte.
-      const wires = ofType(durable, 'request/wire');
-      expect(wires).toHaveLength(2);
-      const firstWire = wires[0]!.data as unknown as { attempt: number; body: ArtifactRef };
-      const secondWire = wires[1]!.data as unknown as { attempt: number; body: ArtifactRef };
-      expect(firstWire.attempt).toBe(0);
-      expect(secondWire.attempt).toBe(1);
-      expect(secondWire.body).toEqual(firstWire.body);
+      // The retry reuses the one frontier body blob byte-for-byte.
+      expect(requests).toHaveLength(2);
+      expect(requests[0]!.attempt).toBe(0);
+      expect(requests[1]!.attempt).toBe(1);
+      expect(requests[1]!.group).toBe(requests[0]!.group);
+      expect(requests[1]!.body).toEqual(requests[0]!.body);
       expect(requestBodies[1]!.equals(requestBodies[0]!)).toBe(true);
     } finally {
       await session.shutdown();
@@ -790,18 +760,14 @@ describe('ProviderAdapter: status-known incomplete bodies', () => {
       expect(transport.sends).toBe(1);
 
       const durable = await events();
-      const raw = ofType(durable, 'response/raw');
-      expect(raw).toHaveLength(1);
-      const data = raw[0]!.data as unknown as { status: number; complete: boolean; body: ArtifactRef };
-      expect(data.status).toBe(200);
-      expect(data.complete).toBe(false);
-      expect(Buffer.from(resolveArtifact(durable, data.body)).toString('utf8')).toBe(prefix);
-      const attempts = ofType(durable, 'assistant/attempt');
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]!.data).toMatchObject({
-        terminal: true, failure: { code: 'cancelled', status: 200 },
-      });
-      expect(ofType(durable, 'request/wire')).toHaveLength(1);
+      expect(ofType(durable, 'assistant/message')).toHaveLength(0);
+      const { requests, responses } = await frontierRecords();
+      expect(requests).toHaveLength(1);
+      expect(responses).toHaveLength(1);
+      expect(responses[0]!.status).toBe(200);
+      expect(responses[0]!.body.complete).toBe(false);
+      expect((await frontierBody(responses[0]!.body)).toString('utf8')).toBe(prefix);
+      expect(responses[0]!.error).toEqual({ code: 'cancelled' });
     } finally {
       await session.shutdown();
     }
@@ -847,16 +813,14 @@ describe('ProviderAdapter: status-known incomplete bodies', () => {
       expect(transport.sends).toBe(1);
 
       const durable = await events();
-      const raw = ofType(durable, 'response/raw');
-      expect(raw).toHaveLength(1);
-      const data = raw[0]!.data as unknown as { status: number; complete: boolean; body: ArtifactRef };
-      expect(data.status).toBe(200);
-      expect(data.complete).toBe(false);
-      expect(Buffer.from(resolveArtifact(durable, data.body)).toString('utf8')).toBe(prefix);
-      expect(ofType(durable, 'assistant/attempt')[0]!.data).toMatchObject({
-        terminal: true, failure: { code: 'cancelled', status: 200 },
-      });
-      expect(ofType(durable, 'request/wire')).toHaveLength(1);
+      expect(ofType(durable, 'assistant/message')).toHaveLength(0);
+      const { requests, responses } = await frontierRecords();
+      expect(requests).toHaveLength(1);
+      expect(responses).toHaveLength(1);
+      expect(responses[0]!.status).toBe(200);
+      expect(responses[0]!.body.complete).toBe(false);
+      expect((await frontierBody(responses[0]!.body)).toString('utf8')).toBe(prefix);
+      expect(responses[0]!.error).toEqual({ code: 'cancelled' });
     } finally {
       await session.shutdown();
     }
@@ -895,28 +859,24 @@ describe('ProviderAdapter: status-known incomplete bodies', () => {
       expect(result.kind).toBe('response');
 
       const durable = await events();
-      const raw = ofType(durable, 'response/raw');
-      expect(raw).toHaveLength(2);
-      for (const event of raw) {
-        const data = event.data as unknown as {
-          status: number; complete: boolean; body: ArtifactRef;
-        };
-        seen.push({ status: data.status, complete: data.complete, bytes: data.body.bytes });
+      expect(ofType(durable, 'assistant/message')).toHaveLength(1);
+      const { requests, responses } = await frontierRecords();
+      expect(requests).toHaveLength(2);
+      expect(responses).toHaveLength(2);
+      for (const response of responses) {
+        seen.push({
+          status: response.status as number,
+          complete: response.body.complete,
+          bytes: response.body.bytes,
+        });
       }
-      const first = raw[0]!.data as unknown as { body: ArtifactRef };
-      const second = raw[1]!.data as unknown as { body: ArtifactRef };
       expect(seen[0]!.status).toBe(200);
       expect(seen[0]!.complete).toBe(false);
       expect(seen[0]!.bytes).toBeGreaterThan(0);
-      expect(Buffer.from(resolveArtifact(durable, first.body)).toString('utf8')).toBe(prefix);
+      expect((await frontierBody(responses[0]!.body)).toString('utf8')).toBe(prefix);
       expect(seen[1]!.complete).toBe(true);
-
-      const attempts = ofType(durable, 'assistant/attempt');
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]!.data).toMatchObject({
-        terminal: false, failure: { code: 'network', status: 200 },
-      });
-      expect(second).toBeDefined();
+      expect(responses[0]!.error).toEqual({ code: 'network' });
+      expect(responses[1]!.error).toBeNull();
     } finally {
       await session.shutdown();
       await close(server);
@@ -927,7 +887,7 @@ describe('ProviderAdapter: status-known incomplete bodies', () => {
 // --- oversize request refusal ----------------------------------------------------
 
 describe('ProviderAdapter: oversize request refusal below the ceiling', () => {
-  it('stores the plan, then journals a terminal request-limit attempt with no send', async () => {
+  it('refuses terminally before any begin and journals nothing local', async () => {
     const session = await openSession();
     const request = plan({
       history: [{ role: 'user', content: 'x'.repeat(2000) }],
@@ -941,14 +901,10 @@ describe('ProviderAdapter: oversize request refusal below the ceiling', () => {
       expect(transport.sends).toBe(0);
 
       const durable = await events();
-      expect(ofType(durable, 'request/plan')).toHaveLength(1);
-      expect(ofType(durable, 'request/wire')).toHaveLength(0);
-      expect(ofType(durable, 'response/raw')).toHaveLength(0);
-      const attempts = ofType(durable, 'assistant/attempt');
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]!.data).toMatchObject({
-        terminal: true, failure: { code: 'request-limit', status: null },
-      });
+      expect(durable).toHaveLength(0);
+      const { requests, responses } = await frontierRecords();
+      expect(requests).toHaveLength(0);
+      expect(responses).toHaveLength(0);
     } finally {
       await session.shutdown();
     }
@@ -968,10 +924,7 @@ describe('ProviderAdapter: transport failures', () => {
       const result = await adapter.send(plan(), session.gate('turn', 0));
       expect(result).toEqual({ kind: 'failure', failure: { code: 'network', status: null } });
       const durable = await events();
-      expect(ofType(durable, 'response/raw')).toHaveLength(0);
-      expect(ofType(durable, 'assistant/attempt')[0]!.data).toMatchObject({
-        terminal: true, failure: { code: 'network', status: null },
-      });
+      expect(durable).toHaveLength(0);
       // The frontier terminal is durable before the failure returns: no status
       // and a `network` code, with the empty capture the exchange produced.
       const { requests, responses } = await frontierRecords();
@@ -1008,8 +961,6 @@ describe('ProviderAdapter: transport failures', () => {
       );
       expect(result).toEqual({ kind: 'failure', failure: { code: 'timeout', status: null } });
       expect(cleared).toBeGreaterThan(0);
-      expect(ofType(await events(), 'assistant/attempt')[0]!.data)
-        .toMatchObject({ terminal: true, failure: { code: 'timeout', status: null } });
       const { responses } = await frontierRecords();
       expect(responses).toHaveLength(1);
       expect(responses[0]!.status).toBeNull();
@@ -1031,13 +982,7 @@ describe('ProviderAdapter: transport failures', () => {
       );
       expect(result).toEqual({ kind: 'failure', failure: { code: 'body-limit', status: 200 } });
       const durable = await events();
-      const raw = ofType(durable, 'response/raw')[0]!;
-      const data = raw.data as unknown as { body: ArtifactRef; complete: boolean };
-      expect(data.complete).toBe(false);
-      expect(data.body.bytes).toBe(32);
-      expect(ofType(durable, 'assistant/message')).toHaveLength(0);
-      expect(ofType(durable, 'request/usage')).toHaveLength(0);
-      expect(ofType(durable, 'tool/call')).toHaveLength(0);
+      expect(durable).toHaveLength(0);
       const { responses } = await frontierRecords();
       expect(responses).toHaveLength(1);
       expect(responses[0]!.status).toBe(200);
@@ -1074,7 +1019,10 @@ describe('ProviderAdapter: transport failures', () => {
       session.controller.abort();
       const result = await sending;
       expect(result).toEqual({ kind: 'failure', failure: { code: 'cancelled', status: null } });
-      expect(ofType(await events(), 'request/wire')).toHaveLength(1);
+      const { requests, responses } = await frontierRecords();
+      expect(requests).toHaveLength(1);
+      expect(responses).toHaveLength(1);
+      expect(responses[0]!.error).toEqual({ code: 'cancelled' });
     } finally {
       await session.shutdown();
       await close(server);
@@ -1098,7 +1046,7 @@ describe('ProviderAdapter: transport failures', () => {
         plan({ policy: seedPolicy({ maxAttempts: 2 }) }), session.gate('turn', 0),
       );
       await vi.waitFor(async () => {
-        expect(ofType(await events(), 'assistant/attempt')).toHaveLength(1);
+        expect((await frontierRecords()).responses).toHaveLength(1);
       });
       session.controller.abort();
       const result = await sending;
@@ -1106,7 +1054,7 @@ describe('ProviderAdapter: transport failures', () => {
       // preserved rather than recorded as an unknown cancellation.
       expect(result).toEqual({ kind: 'failure', failure: { code: 'cancelled', status: 500 } });
       expect(transport.sends).toBe(1);
-      expect(ofType(await events(), 'request/wire')).toHaveLength(1);
+      expect(ofType(await events(), 'assistant/message')).toHaveLength(0);
 
       // The stop rewrites only the adapter's returned failure: no further
       // begin, and the one terminal stays the outcome classified at its
@@ -1122,94 +1070,37 @@ describe('ProviderAdapter: transport failures', () => {
     }
   });
 
-  it('stops when the abort lands before the retry delay registers', async () => {
-    const session = await openSession();
-    const transport = new ScriptedTransport([
-      { status: 500, headers: {}, body: Buffer.from('{}'), complete: true, failure: null },
-      transportResult(validBody()),
-    ]);
-    // A listener-only delay (the original flake): if the abort already fired at
-    // entry, the listener never fires and the send never settles.
-    const adapter = await adapterWith(transport, policies({
-      delay: (_ms, signal) => new Promise<void>((_resolve, reject) => {
-        signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
-      }),
-    }));
-    // Abort the gate during the non-terminal attempt's flush, i.e. in the
-    // window between that flush resolving and the retry delay being entered.
-    const inner = session.gate('turn', 0);
-    let armed = false;
-    const guarded: BoundaryGate = {
-      get signal() { return inner.signal; },
-      append: (type, data) => {
-        if (type === 'assistant/attempt') armed = true;
-        return inner.append(type, data);
-      },
-      flush: async () => {
-        await inner.flush();
-        if (armed && !session.controller.signal.aborted) {
-          armed = false;
-          session.controller.abort();
-        }
-      },
-      capture: (bytes, encoding, complete) => inner.capture(bytes, encoding, complete),
-      store: (value) => inner.store(value),
-    };
-    try {
-      const sending = adapter.send(plan({ policy: seedPolicy({ maxAttempts: 2 }) }), guarded);
-      const result = await sending;
-      expect(result).toEqual({ kind: 'failure', failure: { code: 'cancelled', status: 500 } });
-      expect(transport.sends).toBe(1);
-      expect(ofType(await events(), 'request/wire')).toHaveLength(1);
-    } finally {
-      await session.shutdown();
-    }
-  });
 });
 
 // --- late stops and policy seams --------------------------------------------------
 
-/** A gate whose flush aborts the session after its `at`-th flush returns. */
-function abortAfterFlush(
-  gate: BoundaryGate, controller: AbortController, at: number,
-): BoundaryGate {
-  let flushes = 0;
-  return {
-    get signal() { return gate.signal; },
-    append: (type, data) => gate.append(type, data),
-    flush: async () => {
-      flushes += 1;
-      await gate.flush();
-      if (flushes === at) controller.abort();
-    },
-    capture: (bytes, encoding, complete) => gate.capture(bytes, encoding, complete),
-    store: (value) => gate.store(value),
-  };
-}
-
 describe('ProviderAdapter: a late stop preserves the classified status', () => {
-  it('journals cancelled with the known status when the stop lands after response/raw', async () => {
+  it('returns cancelled with the known status when the stop lands after the frontier terminal', async () => {
     const session = await openSession();
     const transport = new ScriptedTransport([transportResult('{"error":"bad"}', 400)]);
+    const journal = await openFrontier();
+    // The stop lands exactly after the terminal is durable, before the adapter
+    // returns: only the returned failure is rewritten, never the record.
+    const frontier: Frontier = {
+      begin: (input) => journal.gate.begin(input),
+      complete: async (call, outcome) => {
+        await journal.gate.complete(call, outcome);
+        session.controller.abort();
+      },
+    };
     try {
-      const adapter = await adapterWith(transport);
-      // Flush #1 is the wire barrier, #2 the response/raw barrier: the 400 is
-      // classified afterwards but before the terminal attempt is journaled.
-      const guarded = abortAfterFlush(session.gate('turn', 0), session.controller, 2);
-      const result = await adapter.send(plan(), guarded);
+      const adapter = new ProviderAdapter(transport, policies(), frontier);
+      const result = await adapter.send(plan(), session.gate('turn', 0));
       expect(result).toEqual({
         kind: 'failure', failure: { code: 'cancelled', status: 400 },
       });
 
-      const durable = await events();
-      const raw = ofType(durable, 'response/raw');
-      expect(raw).toHaveLength(1);
-      expect((raw[0]!.data as unknown as { status: number }).status).toBe(400);
-      const attempts = ofType(durable, 'assistant/attempt');
-      expect(attempts).toHaveLength(1);
-      expect(attempts[0]!.data).toMatchObject({
-        terminal: true, failure: { code: 'cancelled', status: 400 },
-      });
+      const { requests, responses } = await frontierRecords();
+      expect(requests).toHaveLength(1);
+      expect(responses).toHaveLength(1);
+      expect(responses[0]!.status).toBe(400);
+      expect(responses[0]!.error).toEqual({ code: 'http' });
+      expect(ofType(await events(), 'assistant/message')).toHaveLength(0);
     } finally {
       await session.shutdown();
     }
@@ -1246,41 +1137,6 @@ describe('ProviderAdapter: the post seam', () => {
       expect(responses[0]!.error).toEqual({ code: 'local' });
       expect(responses[0]!.body.bytes).toBe(0);
       expect(responses[0]!.body.complete).toBe(false);
-    } finally {
-      await session.shutdown();
-    }
-  });
-
-  it('tolerates a stop during the next-wire flush as a durable wire with no send', async () => {
-    const session = await openSession();
-    const transport = new ScriptedTransport([
-      transportResult('{"error":"retry"}', 500),
-      transportResult(validBody()),
-    ]);
-    try {
-      const adapter = await adapterWith(transport);
-      // Flushes: #1 wire, #2 response/raw, #3 non-terminal attempt, #4 the next
-      // attempt's wire. A stop landing during #4 cannot be observed before the
-      // wire is durable; no POST follows, so the wire is inert.
-      const guarded = abortAfterFlush(session.gate('turn', 0), session.controller, 4);
-      const result = await adapter.send(
-        plan({ policy: seedPolicy({ maxAttempts: 2 }) }), guarded,
-      );
-      expect(result).toEqual({
-        kind: 'failure', failure: { code: 'cancelled', status: null },
-      });
-      expect(transport.sends).toBe(1);
-
-      const durable = await events();
-      const wires = ofType(durable, 'request/wire');
-      expect(wires).toHaveLength(2);
-      const first = wires[0]!.data as unknown as { attempt: number; body: ArtifactRef };
-      const second = wires[1]!.data as unknown as { attempt: number; body: ArtifactRef };
-      expect(first.attempt).toBe(0);
-      expect(second.attempt).toBe(1);
-      expect(second.body).toEqual(first.body);
-      expect(ofType(durable, 'assistant/attempt').map(
-        (event) => (event.data as unknown as { terminal: boolean }).terminal)).toEqual([false, true]);
     } finally {
       await session.shutdown();
     }
@@ -1507,26 +1363,30 @@ function flushFaultGate(gate: BoundaryGate, failOnCall: number): BoundaryGate {
   });
 }
 
-describe('ProviderAdapter: fatal flush faults are never swallowed', () => {
-  it('rethrows a response/raw flush failure and projects nothing', async () => {
+describe('ProviderAdapter: fatal frontier faults are never swallowed', () => {
+  it('rethrows a frontier complete failure and records no assistant message', async () => {
     const session = await openSession();
+    const journal = await openFrontier();
+    const frontier: Frontier = {
+      begin: (input) => journal.gate.begin(input),
+      complete: async () => { throw new Error('injected terminal failure'); },
+    };
     try {
-      const adapter = await adapterWith(
-        new ScriptedTransport([transportResult(validBody())]),
+      const adapter = new ProviderAdapter(
+        new ScriptedTransport([transportResult(validBody())]), policies(), frontier,
       );
-      // Flush #1 is the wire barrier, #2 is the response/raw flush.
-      const faulty = flushFaultGate(session.gate('turn', 0), 2);
-      await expect(adapter.send(plan(), faulty)).rejects.toThrow('injected flush failure');
+      await expect(adapter.send(plan(), session.gate('turn', 0)))
+        .rejects.toThrow('injected terminal failure');
 
       let durable = await events();
       expect(ofType(durable, 'assistant/message')).toHaveLength(0);
-      expect(ofType(durable, 'request/usage')).toHaveLength(0);
-      expect(ofType(durable, 'tool/call')).toHaveLength(0);
+      expect(durable.some((event) => [
+        'request/plan', 'request/wire', 'response/raw', 'request/usage', 'assistant/attempt',
+      ].includes(event.type))).toBe(false);
       // Restart: the same facts still cause no replayed model/tool calls.
       await session.shutdown();
       durable = await events();
       expect(ofType(durable, 'assistant/message')).toHaveLength(0);
-      expect(ofType(durable, 'tool/call')).toHaveLength(0);
     } finally {
       await session.shutdown();
     }
@@ -1538,8 +1398,8 @@ describe('ProviderAdapter: fatal flush faults are never swallowed', () => {
       const adapter = await adapterWith(
         new ScriptedTransport([transportResult(validBody())]),
       );
-      // Flush #3 is the final projection barrier.
-      const faulty = flushFaultGate(session.gate('turn', 0), 3);
+      // Flush #1 is the projection barrier: the only local flush left.
+      const faulty = flushFaultGate(session.gate('turn', 0), 1);
       await expect(adapter.send(plan(), faulty)).rejects.toThrow('injected flush failure');
     } finally {
       await session.shutdown();
@@ -1555,20 +1415,27 @@ async function journaledProjection(): Promise<AssistantProjection> {
   const event = ofType(durable, 'assistant/message')[0]!;
   const value = (event.data as unknown as { value: Stored<AssistantProjection> }).value;
   if (value.kind === 'inline') return value.value;
-  const bytes = resolveArtifact(durable, value.ref);
+  const bytes = await new BlobStore(home).get(value.ref.sha256);
   return JSON.parse(Buffer.from(bytes).toString('utf8')) as AssistantProjection;
 }
 
-/** The response/raw ArtifactRef the projection links, for the notice's digest/bytes. */
-async function rawRef(): Promise<ArtifactRef> {
-  const durable = await events();
-  return (ofType(durable, 'response/raw')[0]!.data as unknown as { body: ArtifactRef }).body;
+/** The frontier capture the projection names, for the notice's call/bytes. */
+async function captureOf(): Promise<{
+  readonly call: string; readonly bytes: number; readonly complete: boolean;
+}> {
+  const projection = await journaledProjection();
+  const { responses } = await frontierRecords();
+  const response = responses.find((record) => record.call === projection.frontierCall);
+  if (response === undefined) throw new Error('missing frontier terminal for the projection');
+  return {
+    call: response.call, bytes: response.body.bytes, complete: response.body.complete,
+  };
 }
 
-const NOTICE = /^\[content truncated: model text capped at (\d+) bytes; raw artifact: (\d+) captured bytes, complete: (yes|no); raw sha256 ([0-9a-f]{64})\]$/;
+const NOTICE = /^\[content truncated: model text capped at (\d+) bytes; frontier call: (.+), (\d+) captured bytes, complete: (yes|no)\]$/;
 
 describe('ProviderAdapter: assistant content bounding', () => {
-  it('truncates to maxAssistantBytes and appends a notice naming the raw artifact', async () => {
+  it('truncates to maxAssistantBytes and appends a notice naming the frontier call', async () => {
     const session = await openSession();
     const content = 'a'.repeat(1000);
     try {
@@ -1585,18 +1452,20 @@ describe('ProviderAdapter: assistant content bounding', () => {
 
       const projection = await journaledProjection();
       expect(projection.contentTruncated).toBe(true);
-      const raw = await rawRef();
+      const capture = await captureOf();
       const expectedNotice = `\n[content truncated: model text capped at 256 bytes; `
-        + `raw artifact: ${raw.bytes} captured bytes, complete: ${raw.complete ? 'yes' : 'no'}; `
-        + `raw sha256 ${raw.sha256}]`;
+        + `frontier call: ${capture.call}, ${capture.bytes} captured bytes, `
+        + `complete: ${capture.complete ? 'yes' : 'no'}]`;
       expect(projection.message.content).toBe('a'.repeat(256) + expectedNotice);
-      // The notice matches the binding format and names the raw artifact exactly.
+      // The notice matches the binding format, names the call, and carries no
+      // artifact digest: the capture is the frontier's, not a local artifact.
       const match = NOTICE.exec(expectedNotice.slice(1));
       expect(match).not.toBeNull();
       expect(match![1]).toBe('256');
-      expect(match![2]).toBe(String(raw.bytes));
-      expect(match![3]).toBe(raw.complete ? 'yes' : 'no');
-      expect(match![4]).toBe(raw.sha256);
+      expect(match![2]).toBe(capture.call);
+      expect(match![3]).toBe(String(capture.bytes));
+      expect(match![4]).toBe(capture.complete ? 'yes' : 'no');
+      expect(projection.message.content).not.toContain('raw sha256');
       // The truncated text (before the notice) is exactly maxAssistantBytes.
       expect(Buffer.byteLength(projection.message.content!.slice(0, 256), 'utf8')).toBe(256);
     } finally {
@@ -1622,14 +1491,15 @@ describe('ProviderAdapter: assistant content bounding', () => {
 
       const projection = await journaledProjection();
       expect(projection.contentTruncated).toBe(true);
-      const raw = await rawRef();
+      const capture = await captureOf();
       // The retained text is the 255 ASCII bytes, then the notice; no replacement.
       expect(projection.message.content!.startsWith('a'.repeat(255) + '\n[content truncated:')).toBe(true);
       expect(projection.message.content).not.toContain('\uFFFD');
       expect(Buffer.byteLength(projection.message.content!.slice(0, 255), 'utf8')).toBe(255);
       // The notice states the cap, not the retained prefix's smaller size.
       expect(projection.message.content).toContain('model text capped at 256 bytes');
-      expect(projection.message.content).toContain(`raw artifact: ${raw.bytes} captured bytes`);
+      expect(projection.message.content).toContain(`frontier call: ${capture.call}, `
+        + `${capture.bytes} captured bytes`);
       expect(Buffer.from(projection.message.content!.slice(0, 255), 'utf8').toString('utf8')).toBe('a'.repeat(255));
     } finally {
       await session.shutdown();

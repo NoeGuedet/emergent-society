@@ -5,11 +5,11 @@ import {
   eventKey, parseArtifactJson, requireCompleteArtifact, resolveArtifact, resolveStored, toJson,
 } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
-import { createBoundaryRegistry, validateRequestPlan } from './events.js';
+import { createBoundaryRegistry } from './events.js';
 import { SAME, sortUnique } from './groups.js';
 import type {
   AgentConfig, ArtifactRef, AssistantProjection, ChatMessage, CompactionStart, CompactionSummary,
-  FunctionCall, OpenTurn, ProjectionState, RecoveryGroup, RequestId, RequestPlan, Source, Stored,
+  FunctionCall, OpenTurn, ProjectionState, RecoveryGroup, RequestId, Source, Stored,
   SurfaceGroup, WorldPerception,
 } from './contracts.js';
 import type { VerifiedEvent, VerifiedEvents } from './loader.js';
@@ -38,10 +38,6 @@ const SIGNAL = new AbortController().signal;
 
 const SAME_ID = (a: RequestId, b: RequestId): boolean =>
   a.turn === b.turn && a.ordinal === b.ordinal;
-/** The exact artifact tuple: two refs are the same artifact only if every field agrees. */
-const sameRef = (a: ArtifactRef, b: ArtifactRef): boolean =>
-  SAME(a.manifest, b.manifest) && a.sha256 === b.sha256 && a.bytes === b.bytes
-  && a.encoding === b.encoding && a.complete === b.complete;
 const rangeEquals = (a: WorldRange, b: WorldRange): boolean => a.from === b.from && a.to === b.to;
 
 function invariant(message: string): never {
@@ -76,11 +72,6 @@ function dataString(value: unknown, where: string): string {
 function dataArray(value: unknown, where: string): unknown[] {
   if (!Array.isArray(value)) invariant(`${where} is not an array`);
   return value as unknown[];
-}
-
-function dataBool(value: unknown, where: string): boolean {
-  if (typeof value !== 'boolean') invariant(`${where} is not a boolean`);
-  return value as boolean;
 }
 
 function dataRequestId(value: unknown, where: string): RequestId {
@@ -137,24 +128,11 @@ interface ResultEntry {
   readonly synthetic: boolean;
 }
 
-interface RecordedResponse {
-  readonly body: ArtifactRef;
-  readonly status: number;
-  readonly complete: boolean;
-}
-
 interface DialogueBuffer {
   readonly request: RequestId;
-  planSource: Source | null;
   refused: boolean;
-  wireSeen: boolean;
-  firstBodySha: string | null;
-  readonly attempts: Set<number>;
-  /** The recorded `response/raw` per attempt: its body tuple, status and completeness. */
-  readonly responses: Map<number, RecordedResponse>;
   assistantSource: Source | null;
   assistant: AssistantMessage | null;
-  rawSource: Source | null;
   advertised: FunctionCall[];
   readonly callReceipts: Map<string, Source>;
   readonly results: Map<string, ResultEntry>;
@@ -175,7 +153,6 @@ interface RecoveryEntry {
   readonly request: RequestId;
   readonly assistant: AssistantMessage;
   readonly assistantSource: Source;
-  readonly rawSource: Source | null;
   readonly advertised: FunctionCall[];
   readonly callReceipts: Map<string, Source>;
   readonly results: Map<string, ResultEntry>;
@@ -183,16 +160,14 @@ interface RecoveryEntry {
 
 function emptyBuffer(request: RequestId): DialogueBuffer {
   return {
-    request, planSource: null, refused: false, wireSeen: false, firstBodySha: null,
-    attempts: new Set(), responses: new Map(), assistantSource: null, assistant: null,
-    rawSource: null, advertised: [], callReceipts: new Map(), results: new Map(),
+    request, refused: false, assistantSource: null, assistant: null,
+    advertised: [], callReceipts: new Map(), results: new Map(),
   };
 }
 
 function bufferSources(buffer: DialogueBuffer): Source[] {
   const sources: Source[] = [];
   if (buffer.assistantSource !== null) sources.push(buffer.assistantSource);
-  if (buffer.rawSource !== null) sources.push(buffer.rawSource);
   for (const source of buffer.callReceipts.values()) sources.push(source);
   for (const entry of buffer.results.values()) sources.push(entry.source);
   return sortUnique(sources);
@@ -289,17 +264,12 @@ export class ContextFold {
       case 'node/shutdown':
       case 'artifact/chunk':
       case 'artifact/end':
-      case 'request/usage':
-      case 'assistant/attempt':
         return;
       case 'system/message': this.onConfig(event); return;
       case 'turn/start': this.onTurnStart(event); return;
       case 'turn/end': this.onTurnEnd(event); return;
       case 'world/perception': this.onPerception(event); return;
-      case 'request/plan': this.onPlan(event); return;
       case 'request/refused': this.onRefused(event); return;
-      case 'request/wire': this.onWire(event); return;
-      case 'response/raw': this.onResponse(event); return;
       case 'assistant/message': this.onAssistant(event); return;
       case 'tool/call': this.onToolCall(event); return;
       case 'tool/result': this.onToolResult(event); return;
@@ -433,25 +403,6 @@ export class ContextFold {
 
   // --- request pipeline -------------------------------------------------------
 
-  private onPlan(event: VerifiedEvent): void {
-    const open = this.requireOpen('request/plan');
-    const raw = dataRecord(event.data, 'request/plan data');
-    const data = {
-      id: dataRequestId(raw['id'], 'request/plan.id'),
-      value: dataStored<RequestPlan>(raw['value'], 'request/plan.value'),
-    };
-    if (data.id.turn !== open.turn) invariant('request/plan id.turn mismatch');
-    const buffer = this.buffer(open, data.id);
-    if (buffer.refused) invariant('request/plan after request/refused');
-    if (buffer.planSource !== null) invariant('duplicate request/plan');
-    const plan = resolveStored(this.verifiedIndex, data.value, validateRequestPlan);
-    if (!SAME_ID(plan.id, data.id)) invariant('request/plan id does not match its payload');
-    if (this.config === null || !SAME(plan.config, this.config.source)) {
-      invariant('request/plan config does not equal the active config');
-    }
-    buffer.planSource = sourceOf(event);
-  }
-
   private onRefused(event: VerifiedEvent): void {
     const open = this.requireOpen('request/refused');
     const raw = dataRecord(event.data, 'request/refused data');
@@ -459,62 +410,10 @@ export class ContextFold {
     if (data.id.turn !== open.turn) invariant('request/refused id.turn mismatch');
     const buffer = this.buffer(open, data.id);
     if (buffer.refused) invariant('duplicate request/refused for a request');
-    if (buffer.planSource !== null || buffer.wireSeen || buffer.assistant !== null) {
-      invariant('request/refused after a plan, wire or assistant');
+    if (buffer.assistant !== null) {
+      invariant('request/refused after an assistant message');
     }
     buffer.refused = true;
-  }
-
-  private onWire(event: VerifiedEvent): void {
-    const open = this.requireOpen('request/wire');
-    const raw = dataRecord(event.data, 'request/wire data');
-    const data = {
-      id: dataRequestId(raw['id'], 'request/wire.id'),
-      attempt: dataInt(raw['attempt'], 'request/wire.attempt'),
-      body: raw['body'] as ArtifactRef,
-    };
-    if (data.id.turn !== open.turn) invariant('request/wire id.turn mismatch');
-    const buffer = this.buffer(open, data.id);
-    if (buffer.refused) invariant('request/wire after request/refused');
-    if (buffer.planSource === null) invariant('request/wire without a recorded plan');
-    resolveArtifact(this.verifiedIndex, data.body);
-    if (data.attempt === 0) {
-      if (buffer.wireSeen) invariant('duplicate first request/wire');
-      buffer.wireSeen = true;
-      buffer.firstBodySha = data.body.sha256;
-      // The queue entry is consumed only by the first durable wire; a retry
-      // reuses the same serialized body and must not duplicate the perception.
-      if (open.perceptionGroup !== null && !open.perceptionConsumed) {
-        open.perceptionConsumed = true;
-      }
-    } else {
-      if (!buffer.wireSeen) invariant('retry request/wire before the first wire');
-      if (data.body.sha256 !== buffer.firstBodySha) {
-        invariant('retry request/wire does not reuse the first body');
-      }
-      if (buffer.attempts.has(data.attempt)) invariant('duplicate request/wire attempt');
-    }
-    buffer.attempts.add(data.attempt);
-  }
-
-  private onResponse(event: VerifiedEvent): void {
-    const open = this.requireOpen('response/raw');
-    const raw = dataRecord(event.data, 'response/raw data');
-    const data = {
-      id: dataRequestId(raw['id'], 'response/raw.id'),
-      attempt: dataInt(raw['attempt'], 'response/raw.attempt'),
-      status: dataInt(raw['status'], 'response/raw.status'),
-      body: raw['body'] as ArtifactRef,
-      complete: dataBool(raw['complete'], 'response/raw.complete'),
-    };
-    if (data.id.turn !== open.turn) invariant('response/raw id.turn mismatch');
-    const buffer = this.buffer(open, data.id);
-    if (!buffer.attempts.has(data.attempt)) invariant('response/raw without a preceding wire');
-    if (buffer.responses.has(data.attempt)) invariant('duplicate response/raw for an attempt');
-    resolveArtifact(this.verifiedIndex, data.body);
-    buffer.responses.set(data.attempt, {
-      body: data.body, status: data.status, complete: data.complete,
-    });
   }
 
   private resolveAssistant(id: RequestId, value: Stored<AssistantProjection>): AssistantProjection {
@@ -543,27 +442,8 @@ export class ContextFold {
     if (data.id.turn !== open.turn) invariant('assistant/message id.turn mismatch');
     const buffer = this.buffer(open, data.id);
     if (buffer.refused) invariant('assistant/message after request/refused');
-    if (buffer.planSource === null) invariant('assistant/message without a recorded plan');
-    if (!buffer.wireSeen) invariant('assistant/message without a preceding wire');
     if (buffer.assistant !== null) invariant('duplicate assistant/message for a request');
     const projection = this.resolveAssistant(data.id, data.value);
-    // The projection's raw must be a real artifact (its manifest, digest, size,
-    // encoding and completeness all verified) and must be *the* body of a
-    // successful complete 200 response recorded for this same request: neither an
-    // arbitrary valid artifact, nor a shared digest, nor a 429/incomplete body can
-    // support an assistant projection.
-    resolveArtifact(this.verifiedIndex, projection.raw);
-    requireCompleteArtifact(projection.raw);
-    let bound = false;
-    for (const response of buffer.responses.values()) {
-      if (response.status !== 200 || !response.complete) continue;
-      if (!sameRef(response.body, projection.raw)) continue;
-      if (bound) invariant('assistant/message matches more than one complete 200 response');
-      bound = true;
-    }
-    if (!bound) {
-      invariant('assistant/message raw does not match a complete 200 response for the request');
-    }
     const ids = new Set<string>();
     for (const call of projection.message.tool_calls) {
       if (ids.has(call.id)) invariant(`duplicate call id ${call.id} within a response`);
@@ -571,8 +451,14 @@ export class ContextFold {
     }
     buffer.assistant = projection.message;
     buffer.assistantSource = sourceOf(event);
-    buffer.rawSource = projection.raw.manifest;
     buffer.advertised = [...projection.message.tool_calls];
+    // The queue entry is consumed by the turn's first assistant message: an
+    // intra-turn assembly hint for history-vs-queue rendering. A turn whose
+    // requests all failed at the transport, or whose only response failed
+    // projection, records no assistant message and leaves this unset.
+    if (open.perceptionGroup !== null && !open.perceptionConsumed) {
+      open.perceptionConsumed = true;
+    }
   }
 
   private onToolCall(event: VerifiedEvent): void {
@@ -724,7 +610,7 @@ export class ContextFold {
     }
     this.recovery.push({
       turn, request: buffer.request, assistant: buffer.assistant!,
-      assistantSource: buffer.assistantSource!, rawSource: buffer.rawSource,
+      assistantSource: buffer.assistantSource!,
       advertised: [...buffer.advertised], callReceipts: new Map(buffer.callReceipts), results,
     });
   }
@@ -737,7 +623,6 @@ export class ContextFold {
     ];
     const sources: Source[] = [];
     sources.push(entry.assistantSource);
-    if (entry.rawSource !== null) sources.push(entry.rawSource);
     for (const source of entry.callReceipts.values()) sources.push(source);
     for (const result of entry.results.values()) sources.push(result.source);
     this.surface.append({
@@ -882,7 +767,6 @@ export class ContextFold {
       .map((call) => entry.results.get(call.id)!.message);
     const missing = entry.advertised.filter((call) => !entry.results.has(call.id));
     const sources: Source[] = [entry.assistantSource];
-    if (entry.rawSource !== null) sources.push(entry.rawSource);
     for (const source of entry.callReceipts.values()) sources.push(source);
     for (const result of entry.results.values()) sources.push(result.source);
     return {

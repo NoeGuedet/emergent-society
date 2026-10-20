@@ -81,7 +81,9 @@ describe('C1.3 request barrier fault', () => {
       await expect(access(join(fx.world.path, 'note.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
       const events = await loadVerifiedEvents(fx.home, 'n1', C13_EVENT_TYPES);
       expect(events.some((event) => event.type === 'turn/start')).toBe(true);
-      expect(events.some((event) => event.type === 'request/wire')).toBe(false);
+      expect(events.some((event) => [
+        'request/plan', 'request/wire', 'response/raw', 'request/usage', 'assistant/attempt',
+      ].includes(event.type))).toBe(false);
       // Nothing crossed the frontier either: no request record, so no begin.
       const frontier = await readFrontier(fx.home);
       expect(frontier.filter((event) => event.type === 'http/request')).toHaveLength(0);

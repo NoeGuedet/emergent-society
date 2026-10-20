@@ -11,8 +11,8 @@ import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import type { TerminalRuntime } from '../tools/terminal.js';
 import { createAgentRuntime, defaultAgentConfig, type AgentRuntime } from '../loop.js';
 import { ContextFold } from '../../context/fold.js';
-import { rederivePlans } from '../../context/assembler.js';
-import { canonicalBytes } from '../../context/artifacts.js';
+import { verifyPerceptions } from '../../context/__tests__/verify-perceptions.js';
+import { readFrontier } from '../../frontier/__tests__/helpers.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../../context/events.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
 import type { BoundaryGate, DriverHooks } from '../gate.js';
@@ -413,9 +413,15 @@ describe('recoverable provider failure', () => {
     let events = await eventsOf(fx);
     const failed = events.find((event) => event.type === 'turn/end');
     expect(failed?.data).toMatchObject({ outcome: 'error', error: 'http 429' });
-    const attempts = events.filter((event) => event.type === 'assistant/attempt');
-    expect(attempts).toHaveLength(2);
-    expect((attempts[1]!.data as { terminal: boolean }).terminal).toBe(true);
+    // The attempts are frontier facts now; the local log records no failure.
+    const frontier = await readFrontier(fx.home);
+    const requests = frontier.filter((event) => event.type === 'http/request')
+      .map((event) => event.data as unknown as { attempt: number });
+    const terminals = frontier.filter((event) => event.type === 'http/response')
+      .map((event) => event.data as unknown as { status: number });
+    expect(requests.map((request) => request.attempt)).toEqual([0, 1]);
+    expect(terminals.map((terminal) => terminal.status)).toEqual([429, 429]);
+    expect(events.some((event) => event.type === 'assistant/attempt')).toBe(false);
 
     // A foreign commit wakes the parked node; the next turn succeeds.
     await commitAs(fx.world, 'n2', { 'n2/hi.md': 'hi' });
@@ -523,14 +529,14 @@ describe('stop', () => {
     expect(transport.sends).toHaveLength(1);
     const events = await eventsOf(fx);
     // The killed call completed the group; no second logical request was attempted.
-    expect(events.filter((event) => event.type === 'request/plan')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'assistant/message')).toHaveLength(1);
     expect(events.filter((event) => event.type === 'tool/result')).toHaveLength(1);
     const shutdown = events.findIndex((event) => event.type === 'node/shutdown');
     expect(shutdown).toBe(events.length - 1);
-    const lastAttempt = events.map((event, index) => ({ event, index }))
-      .filter(({ event }) => event.type === 'request/wire' || event.type === 'assistant/attempt')
+    const lastAssistant = events.map((event, index) => ({ event, index }))
+      .filter(({ event }) => event.type === 'assistant/message')
       .at(-1);
-    if (lastAttempt !== undefined) expect(lastAttempt.index).toBeLessThan(shutdown);
+    if (lastAssistant !== undefined) expect(lastAssistant.index).toBeLessThan(shutdown);
   });
 });
 
@@ -573,8 +579,9 @@ describe('world perception identity', () => {
       const events = await eventsOf(fx);
       expect(events.filter((event) => event.type === 'turn/start')).toHaveLength(1);
       expect(events.some((event) => event.type === 'world/perception')).toBe(false);
-      expect(events.some((event) => event.type === 'request/plan')).toBe(false);
-      expect(events.some((event) => event.type === 'request/wire')).toBe(false);
+      expect(events.some((event) => [
+        'request/plan', 'request/wire', 'response/raw', 'request/usage', 'assistant/attempt',
+      ].includes(event.type))).toBe(false);
       // The turn is still closed by the normal durable fatal closer.
       expect(events.find((event) => event.type === 'turn/end')?.data)
         .toMatchObject({ outcome: 'error' });
@@ -698,18 +705,14 @@ describe('offline reconstruction', () => {
     return fx;
   }
 
-  it('rederives every recorded plan and world perception canonically', async () => {
+  it('verifies every recorded world perception canonically', async () => {
     const fx = await journalWithOneTurn();
     const events = await eventsOf(fx);
     expect(events.filter((event) => event.type === 'world/perception')).toHaveLength(1);
-    expect(events.filter((event) => event.type === 'request/plan')).toHaveLength(1);
-
-    const comparisons = await rederivePlans(events, fx.world);
-    expect(comparisons).toHaveLength(1);
-    const only = comparisons[0]!;
-    expect(Buffer.from(canonicalBytes(only.rederived)).equals(Buffer.from(canonicalBytes(only.recorded))))
-      .toBe(true);
-    expect(only.source.seq).toBeGreaterThan(0);
+    expect(events.filter((event) => event.type === 'assistant/message')).toHaveLength(1);
+    // The plan↔wire reconstruction retired with `rederivePlans`; the perception
+    // re-derivation survives as the helper the offline-join tests use.
+    await verifyPerceptions(fx.world, events);
   });
 
   it('fails reconstruction explicitly when the world cannot re-render the perception', async () => {
@@ -718,7 +721,7 @@ describe('offline reconstruction', () => {
     const elsewhere = await WorldRepo.init(
       join(dirname(fx.home), 'elsewhere-world'),
       { gitDir: join(dirname(fx.home), 'elsewhere-world.git') });
-    await expect(rederivePlans(events, elsewhere)).rejects.toThrow();
+    await expect(verifyPerceptions(elsewhere, events)).rejects.toThrow();
   });
 });
 

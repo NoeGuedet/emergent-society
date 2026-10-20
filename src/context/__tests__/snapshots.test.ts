@@ -11,7 +11,7 @@ import type { BoundaryGate, GateCallbacks, GateScope } from '../../node/gate.js'
 import { canonicalBytes } from '../artifacts.js';
 import { defaultAgentConfig } from '../config.js';
 import type {
-  ArtifactRef, AssistantProjection, FunctionCall, ProjectionState, RequestId, RequestPlan, Source,
+  AssistantProjection, FunctionCall, ProjectionState, RequestId, Source,
 } from '../contracts.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../events.js';
 import { ContextFold } from '../fold.js';
@@ -88,28 +88,13 @@ function snapshotsDir(path: string): string {
   return join(nodeDir(path, 'n1'), 'snapshots');
 }
 
-function minimalPlan(id: RequestId, config: Source): RequestPlan {
-  return {
-    id, config, stateHash: 'a'.repeat(64), model: 'mock-model', parameters: {},
-    policy: defaultAgentConfig().policy, tools: [], toolsHash: 'b'.repeat(64),
-    sections: [
-      { name: 'tools', cache: 'stable', sources: [] },
-      { name: 'charter', cache: 'stable', sources: [] },
-      { name: 'heading', cache: 'stable', sources: [] },
-      { name: 'history', cache: 'advance', sources: [] },
-      { name: 'queue', cache: 'volatile', sources: [] },
-    ],
-    history: [], queue: [], charter: '', heading: '',
-  };
-}
-
 function projection(
-  calls: FunctionCall[], raw: ArtifactRef,
+  calls: FunctionCall[],
   content: string | null = calls.length === 0 ? 'final text' : null,
 ): AssistantProjection {
   return {
     message: { role: 'assistant', content, tool_calls: calls },
-    contentTruncated: false, raw,
+    contentTruncated: false, frontierCall: 'call-1',
   };
 }
 
@@ -147,21 +132,15 @@ async function seedJournal(
     ) => EventEnvelope)(type, data, opts));
 
   const ready = gate('ready', null);
-  const config = ready.append('system/message', {
+  ready.append('system/message', {
     version: 1, value: { kind: 'inline', value: defaultAgentConfig() },
   });
   await ready.flush();
-  const cfg: Source = { seq: config.seq, hash: config.hash };
 
   lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
   const turn = gate('turn', 0);
   const id: RequestId = { turn: 0, ordinal: 0 };
-  turn.append('request/plan', { id, value: await turn.store(minimalPlan(id, cfg)) });
-  const wire = await turn.capture(Buffer.from('{}'), 'utf8');
-  turn.append('request/wire', { id, attempt: 0, body: wire });
-  const raw = await turn.capture(Buffer.from('raw'), 'utf8');
-  turn.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
-  turn.append('assistant/message', { id, value: await turn.store(projection([], raw, content)) });
+  turn.append('assistant/message', { id, value: await turn.store(projection([], content)) });
   await turn.flush();
   if (closeTurn) {
     lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
@@ -378,7 +357,7 @@ describe('snapshots: round-trip', () => {
     await expect(readSnapshot(path, 'n1', events)).resolves.toEqual(checkpoint(state));
   });
 
-  it('accepts the hash schema the gate writes for plans and compaction starts', async () => {
+  it('accepts the hash schema the gate writes for compaction starts', async () => {
     const path = home();
     const events = await seedJournal(path);
     const state = await stateOf(events);
@@ -390,14 +369,6 @@ describe('snapshots: round-trip', () => {
       lookup: (source) => receipts.get(eventKeyOf(source)) ?? null,
     };
     const registry = createBoundaryRegistry();
-    const plan = minimalPlan({ turn: 0, ordinal: 0 }, config.source);
-
-    for (const field of ['stateHash', 'toolsHash'] as const) {
-      expect(() => registry['request/plan']({
-        id: plan.id,
-        value: { kind: 'inline', value: { ...plan, [field]: 'not-a-hash' } },
-      }, scope)).toThrow(new RegExp(field));
-    }
 
     const hash = mark.hash;
     const start = {
@@ -408,9 +379,6 @@ describe('snapshots: round-trip', () => {
       .toThrow(/revision/);
     expect(() => registry['compaction/start']({ ...start, id: 'not-a-hash' }, scope))
       .toThrow(/id/);
-    expect(() => registry['request/plan']({
-      id: plan.id, value: { kind: 'inline', value: plan },
-    }, scope)).not.toThrow();
     const validated = registry['compaction/start'](start, scope);
 
     const val = {

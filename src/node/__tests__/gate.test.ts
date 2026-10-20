@@ -116,8 +116,9 @@ describe('BoundaryGate.append', () => {
     const h = await harness('turn', 0);
     try {
       const spy = vi.spyOn(h.writer, 'append');
-      expect(() => h.created.gate.append('request/wire', {
-        id: { turn: 0, ordinal: 0 }, attempt: 0, body: { bad: true },
+      expect(() => h.created.gate.append('assistant/message', {
+        id: { turn: 0, ordinal: 0 },
+        value: { kind: 'inline', value: { message: null } },
       } as never)).toThrow();
       expect(spy).not.toHaveBeenCalled();
     } finally {

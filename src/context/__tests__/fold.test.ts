@@ -20,8 +20,8 @@ import { ArtifactMismatchError, loadVerifiedEvents } from '../loader.js';
 import type { VerifiedEvent } from '../loader.js';
 import { canonicalBytes } from '../artifacts.js';
 import type {
-  ArtifactRef, AssistantProjection, CompactionStart, CompactionSummary, FunctionCall, RequestId,
-  RequestPlan, Source, WorldPerception,
+  AssistantProjection, CompactionStart, CompactionSummary, FunctionCall, RequestId,
+  Source, WorldPerception,
 } from '../contracts.js';
 import type { WorldRange } from '../../node/world.js';
 
@@ -38,26 +38,14 @@ const perception = (text: string, range: WorldRange = { from: null, to: null }):
   commits: [], included: [], omittedOwn: [], text, truncated: false,
 });
 
-/** A structurally valid plan; the fold checks only its identity and config provenance. */
-function minimalPlan(id: RequestId, config: Source): RequestPlan {
-  return {
-    id, config, stateHash: 'a'.repeat(64), model: 'mock-model', parameters: {},
-    policy: defaultAgentConfig().policy, tools: [], toolsHash: 'b'.repeat(64),
-    sections: [
-      { name: 'tools', cache: 'stable', sources: [] },
-      { name: 'charter', cache: 'stable', sources: [] },
-      { name: 'heading', cache: 'stable', sources: [] },
-      { name: 'history', cache: 'advance', sources: [] },
-      { name: 'queue', cache: 'volatile', sources: [] },
-    ],
-    history: [], queue: [], charter: '', heading: '',
-  };
-}
-
-function projection(calls: FunctionCall[], raw: ArtifactRef): AssistantProjection {
+/**
+ * A structurally valid projection. The local log no longer carries the raw
+ * response artifact: the projection names the frontier call that produced it.
+ */
+function projection(calls: FunctionCall[], frontierCall = 'call-1'): AssistantProjection {
   return {
     message: { role: 'assistant', content: calls.length === 0 ? 'final text' : null, tool_calls: calls },
-    contentTruncated: false, raw,
+    contentTruncated: false, frontierCall,
   };
 }
 
@@ -114,12 +102,13 @@ async function foldOf(path: string): Promise<ContextFold> {
 }
 
 /**
- * Opens a turn and appends perception, plan, wire, response and an assistant
- * message (with the given advertised calls). The caller adds tool/call events,
- * results and the closer.
+ * Opens a turn and appends perception, one assistant message (with the given
+ * advertised calls) and the `tool/call` receipts. The caller adds results and
+ * the closer. The local log carries no plan, wire or raw response: those are
+ * frontier facts.
  */
 async function pipeline(
-  s: Session, turn: number, cfg: Source,
+  s: Session, turn: number, _cfg: Source,
   opts: { perceptionText?: string; calls?: FunctionCall[] },
 ): Promise<{ id: RequestId; gate: BoundaryGate }> {
   s.lifecycle('turn/start', { turn, trigger: 'boot', world: { from: null, to: null } });
@@ -129,14 +118,7 @@ async function pipeline(
     value: { kind: 'inline', value: perception(opts.perceptionText ?? '') },
   });
   const id: RequestId = { turn, ordinal: 0 };
-  gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-  const body = await gate.capture(Buffer.from('{}'), 'utf8');
-  gate.append('request/wire', { id, attempt: 0, body });
-  const raw = await gate.capture(Buffer.from('raw'), 'utf8');
-  gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
-  gate.append('assistant/message', {
-    id, value: await gate.store(projection(opts.calls ?? [], raw)),
-  });
+  gate.append('assistant/message', { id, value: await gate.store(projection(opts.calls ?? [])) });
   for (const advertised of opts.calls ?? []) {
     gate.append('tool/call', { turn, request: id, call: advertised });
   }
@@ -147,7 +129,7 @@ function result(id: RequestId, turn: number, callId: string, synthetic = false):
   return {
     turn, request: id, callId,
     message: { role: 'tool', content: synthetic ? 'Outcome unknown after interruption; not re-executed' : 'ok', tool_call_id: callId },
-    isError: synthetic, raw: null, failure: null, synthetic,
+    isError: synthetic, raw: null, failure: null, synthetic, frontierCall: null,
   } as unknown as JsonValue;
 }
 
@@ -200,49 +182,120 @@ describe('fold: two turns, committed history and an ignorable turn', () => {
   });
 });
 
-describe('fold: retry idempotence', () => {
-  it('folds a 429-then-200 retry into one perception, one dialogue and one response', async () => {
+describe('fold: dialogue promotion from the slimmed vocabulary alone', () => {
+  it('folds one perception and one dialogue from assistant/message + tool/* only', async () => {
     const s = await openSession(home());
     try {
       const cfg = await startConfig(s);
-      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
-      const gate = s.gate('turn', 0).gate;
-      gate.append('world/perception', {
-        turn: 0, range: { from: null, to: null },
-        value: { kind: 'inline', value: perception('evidence') },
-      });
-      const id: RequestId = { turn: 0, ordinal: 0 };
-      gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-      const body = await gate.capture(Buffer.from('{}'), 'utf8');
-      gate.append('request/wire', { id, attempt: 0, body });
-      const raw0 = await gate.capture(Buffer.from('raw0'), 'utf8');
-      gate.append('response/raw', { id, attempt: 0, status: 429, body: raw0, complete: true });
-      await gate.flush();
-
-      const mid = await foldOf(home());
-      // The queue entry is consumed by the first wire, before any retry.
-      expect(mid.snapshot().open?.perceptionConsumed).toBe(true);
-      expect(mid.snapshot().open?.perception?.messages[0]).toEqual(
-        { role: 'user', content: 'evidence' },
-      );
-
-      gate.append('request/wire', { id, attempt: 1, body });
-      const raw1 = await gate.capture(Buffer.from('raw1'), 'utf8');
-      gate.append('response/raw', { id, attempt: 1, status: 200, body: raw1, complete: true });
-      gate.append('assistant/message', { id, value: await gate.store(projection([], raw1)) });
-      await gate.flush();
+      const t = await pipeline(s, 0, cfg, { perceptionText: 'evidence', calls: [call('c1')] });
+      t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
+      await t.gate.flush();
       s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
       await s.writer.flush();
 
       const done = await foldOf(home());
       const nodes = done.snapshot().surface?.nodes ?? [];
       expect(nodes.map((node) => node.group.kind)).toEqual(['heading', 'perception', 'dialogue']);
-      expect(nodes.filter((node) => node.group.kind === 'perception')).toHaveLength(1);
       expect(nodes.filter((node) => node.group.kind === 'dialogue')).toHaveLength(1);
       const events = done.verifiedEvents();
-      expect(events.filter((e) => e.type === 'request/wire')).toHaveLength(2);
       expect(events.filter((e) => e.type === 'world/perception')).toHaveLength(1);
       expect(events.filter((e) => e.type === 'assistant/message')).toHaveLength(1);
+      expect(events.filter((e) => e.type === 'tool/result')).toHaveLength(1);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('never writes a retired vocabulary type into the local log', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const t = await pipeline(s, 0, cfg, { perceptionText: 'evidence', calls: [call('c1')] });
+      t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
+      await t.gate.flush();
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
+      await s.writer.flush();
+
+      const types = new Set((await foldOf(home())).verifiedEvents().map((e) => e.type));
+      const retired = [
+        'request/plan', 'request/wire', 'response/raw', 'request/usage', 'assistant/attempt',
+      ];
+      for (const type of retired) expect(types.has(type)).toBe(false);
+      expect(types.has('assistant/message')).toBe(true);
+      expect(types.has('tool/result')).toBe(true);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('consumes the queue at the first assistant/message, before the closer', async () => {
+    const s = await openSession(home());
+    try {
+      const cfg = await startConfig(s);
+      const t = await pipeline(s, 0, cfg, { perceptionText: 'evidence', calls: [] });
+      await t.gate.flush();
+
+      const mid = await foldOf(home());
+      expect(mid.snapshot().open?.perceptionConsumed).toBe(true);
+      expect(mid.snapshot().open?.perception?.messages[0]).toEqual(
+        { role: 'user', content: 'evidence' },
+      );
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('leaves the queue unconsumed on a refused-only turn', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      const gate = s.gate('turn', 0).gate;
+      gate.append('world/perception', {
+        turn: 0, range: { from: null, to: null },
+        value: { kind: 'inline', value: perception('evidence') },
+      });
+      gate.append('request/refused', {
+        id: { turn: 0, ordinal: 0 }, bytes: 5, limit: 10, phase: 'plan',
+      });
+      await gate.flush();
+
+      const mid = await foldOf(home());
+      expect(mid.snapshot().open?.perceptionConsumed).toBe(false);
+      // The perception group is still promoted at turn/end; consumption is only
+      // the intra-turn history-vs-queue hint.
+      s.lifecycle('turn/end', { turn: 0, outcome: 'error' });
+      await s.writer.flush();
+      const done = await foldOf(home());
+      expect(done.snapshot().surface?.nodes.map((node) => node.group.kind))
+        .toEqual(['heading', 'perception']);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('leaves the queue unconsumed when the only response failed projection', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      // A projection failure (or a transport failure) records no local fact:
+      // the turn has its perception and nothing else before the closer.
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      const gate = s.gate('turn', 0).gate;
+      gate.append('world/perception', {
+        turn: 0, range: { from: null, to: null },
+        value: { kind: 'inline', value: perception('evidence') },
+      });
+      await gate.flush();
+      s.lifecycle('turn/end', {
+        turn: 0, outcome: 'error', error: 'malformed response projection',
+      });
+      await s.writer.flush();
+
+      const done = await foldOf(home());
+      expect(done.snapshot().surface?.nodes.map((node) => node.group.kind))
+        .toEqual(['heading', 'perception']);
+      expect(done.verifiedEvents().some((e) => e.type === 'assistant/message')).toBe(false);
     } finally {
       await s.close();
     }
@@ -498,7 +551,7 @@ function hooksFor(fold: ContextFold, path: string, over: Partial<DriverHooks> = 
             role: 'tool', content: 'Outcome unknown after interruption; not re-executed',
             tool_call_id: unresolved.call.id,
           },
-          isError: true, raw: null, failure: null, synthetic: true,
+          isError: true, raw: null, failure: null, synthetic: true, frontierCall: null,
         });
       }
       await gate.flush();
@@ -525,19 +578,13 @@ async function runFirstBoot(
   const withResult = variant !== 'errorCloser';
   const ref: { d: NodeDriver | null } = { d: null };
   ref.d = await NodeDriver.open(path, 'n1', async (ctx) => {
-    const cfg = fold.snapshot().config!.source;
     ctx.gate.append('world/perception', {
       turn: ctx.turn, range: ctx.world,
       value: { kind: 'inline', value: perception('') },
     });
     const id: RequestId = { turn: ctx.turn, ordinal: 0 };
-    ctx.gate.append('request/plan', { id, value: await ctx.gate.store(minimalPlan(id, cfg)) });
-    const body = await ctx.gate.capture(Buffer.from('{}'), 'utf8');
-    ctx.gate.append('request/wire', { id, attempt: 0, body });
-    const raw = await ctx.gate.capture(Buffer.from('raw'), 'utf8');
-    ctx.gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
     ctx.gate.append('assistant/message', {
-      id, value: await ctx.gate.store(projection([call('c1'), call('c2')], raw)),
+      id, value: await ctx.gate.store(projection([call('c1'), call('c2')])),
     });
     ctx.gate.append('tool/call', { turn: ctx.turn, request: id, call: call('c1') });
     if (withResult) {
@@ -669,188 +716,29 @@ describe('fold recovery: interrupted dialogue through the real T2 driver', () =>
   });
 });
 
-// --- strict assistant provenance and sequencing invariants (T7) ------------------
+// --- assistant projection shapes --------------------------------------------------
 
-describe('fold: assistant provenance binds to a recorded complete 200 response', () => {
-  /**
-   * Opens one turn and drives it up to (and excluding) the closer. The assistant
-   * projection's raw ref defaults to the recorded response body; `assistantRawBytes`
-   * substitutes a different valid artifact and `assistantRawForge` mutates the ref.
-   */
-  async function turnWithAssistant(
-    s: Session, cfg: Source, opts: {
-      calls?: FunctionCall[]; response?: boolean; status?: number; complete?: boolean;
-      assistantRawBytes?: Uint8Array; assistantRawForge?: (ref: ArtifactRef) => ArtifactRef;
-      resultCount?: number;
-    } = {},
-  ): Promise<{ id: RequestId; gate: BoundaryGate }> {
-    s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
-    const gate = s.gate('turn', 0).gate;
-    gate.append('world/perception', {
-      turn: 0, range: { from: null, to: null },
-      value: { kind: 'inline', value: perception('evidence') },
-    });
-    const id: RequestId = { turn: 0, ordinal: 0 };
-    gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-    const body = await gate.capture(Buffer.from('{}'), 'utf8');
-    gate.append('request/wire', { id, attempt: 0, body });
-    const responseBody = await gate.capture(
-      Buffer.from('{"ok":true}'), 'utf8', opts.complete ?? true,
-    );
-    if (opts.response !== false) {
-      gate.append('response/raw', {
-        id, attempt: 0, status: opts.status ?? 200, body: responseBody,
-        complete: opts.complete ?? true,
+describe('fold: the assistant projection carries a frontier call', () => {
+  it('folds an inline projection and an artifact-json projection alike', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      const gate = s.gate('turn', 0).gate;
+      const id: RequestId = { turn: 0, ordinal: 0 };
+      gate.append('assistant/message', { id, value: await gate.store(projection([], 'inline-call')) });
+
+      const bytes = Buffer.from(JSON.stringify(projection([], 'artifact-call')), 'utf8');
+      const ref = await gate.capture(bytes, 'utf8');
+      gate.append('assistant/message', {
+        id: { turn: 0, ordinal: 1 }, value: { kind: 'artifact-json', ref },
       });
-    }
-    const chosen = opts.assistantRawBytes === undefined
-      ? responseBody
-      : await gate.capture(Buffer.from(opts.assistantRawBytes), 'utf8');
-    const raw = (opts.assistantRawForge ?? ((ref: ArtifactRef): ArtifactRef => ref))(chosen);
-    gate.append('assistant/message', { id, value: await gate.store(projection(opts.calls ?? [], raw)) });
-    const calls = opts.calls ?? [];
-    for (const advertised of calls) gate.append('tool/call', { turn: 0, request: id, call: advertised });
-    const count = opts.resultCount ?? calls.length;
-    for (let i = 0; i < count; i++) {
-      gate.append('tool/result', result(id, 0, calls[i]!.id) as never);
-    }
-    return { id, gate };
-  }
+      await gate.flush();
 
-  it('rejects an assistant message when no response was recorded for the request', async () => {
-    const s = await openSession(home());
-    try {
-      const cfg = await startConfig(s);
-      const t = await turnWithAssistant(s, cfg, { response: false });
-      await t.gate.flush();
-      await expect(foldOf(home())).rejects.toThrow(/response/);
-    } finally {
-      await s.close();
-    }
-  });
-
-  it('rejects an assistant whose raw is a different valid artifact than the response', async () => {
-    const s = await openSession(home());
-    try {
-      const cfg = await startConfig(s);
-      const t = await turnWithAssistant(s, cfg, {
-        assistantRawBytes: Buffer.from('{"other":true}'),
-      });
-      await t.gate.flush();
-      await expect(foldOf(home())).rejects.toThrow(/response/);
-    } finally {
-      await s.close();
-    }
-  });
-
-  it('rejects an assistant whose raw ref digest does not match its artifact', async () => {
-    const s = await openSession(home());
-    try {
-      const cfg = await startConfig(s);
-      const t = await turnWithAssistant(s, cfg, {
-        assistantRawForge: (ref) => ({ ...ref, sha256: 'f'.repeat(64) }),
-      });
-      await t.gate.flush();
-      await expect(foldOf(home())).rejects.toThrow(ArtifactMismatchError);
-    } finally {
-      await s.close();
-    }
-  });
-
-  it('does not bind an assistant to an HTTP 429 response', async () => {
-    const s = await openSession(home());
-    try {
-      const cfg = await startConfig(s);
-      const t = await turnWithAssistant(s, cfg, { status: 429 });
-      await t.gate.flush();
-      await expect(foldOf(home())).rejects.toThrow(/response/);
-    } finally {
-      await s.close();
-    }
-  });
-
-  it('does not bind an assistant to an incomplete response', async () => {
-    const s = await openSession(home());
-    try {
-      const cfg = await startConfig(s);
-      const t = await turnWithAssistant(s, cfg, { complete: false });
-      await t.gate.flush();
-      let err: unknown;
-      try {
-        await foldOf(home());
-      } catch (e) {
-        err = e;
-      }
-      expect(err).toBeInstanceOf(ArtifactMismatchError);
-      expect((err as ArtifactMismatchError).field).toBe('complete');
-    } finally {
-      await s.close();
-    }
-  });
-
-  it('accepts a 200 complete response whose raw covers the recorded body', async () => {
-    const s = await openSession(home());
-    try {
-      const cfg = await startConfig(s);
-      const t = await turnWithAssistant(s, cfg, { calls: [call('c1')] });
-      await t.gate.flush();
       const folded = await foldOf(home());
-      expect(folded.snapshot().open?.messages).toHaveLength(2);
-    } finally {
-      await s.close();
-    }
-  });
-
-  /**
-   * Opens one turn with the assistant projection captured as an `artifact-json`
-   * value (the same inner-projection shape a giant assistant message uses). The
-   * caller supplies the inner raw ref so the same binding path is exercised.
-   */
-  async function turnWithStoredAssistant(
-    s: Session, cfg: Source, innerRaw: (responseBody: ArtifactRef) => Promise<ArtifactRef>,
-  ): Promise<void> {
-    s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
-    const gate = s.gate('turn', 0).gate;
-    gate.append('world/perception', {
-      turn: 0, range: { from: null, to: null },
-      value: { kind: 'inline', value: perception('') },
-    });
-    const id: RequestId = { turn: 0, ordinal: 0 };
-    gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-    const body = await gate.capture(Buffer.from('{}'), 'utf8');
-    gate.append('request/wire', { id, attempt: 0, body });
-    const responseBody = await gate.capture(Buffer.from('{"ok":true}'), 'utf8');
-    gate.append('response/raw', {
-      id, attempt: 0, status: 200, body: responseBody, complete: true,
-    });
-    const raw = await innerRaw(responseBody);
-    const projectionBytes = Buffer.from(JSON.stringify(projection([], raw)), 'utf8');
-    const ref = await gate.capture(projectionBytes, 'utf8');
-    gate.append('assistant/message', { id, value: { kind: 'artifact-json', ref } });
-    await gate.flush();
-  }
-
-  it('applies the same binding to an artifact-json assistant projection', async () => {
-    const s = await openSession(home());
-    try {
-      const cfg = await startConfig(s);
-      await turnWithStoredAssistant(s, cfg, async (responseBody) => responseBody);
-      const folded = await foldOf(home());
-      expect(folded.snapshot().open?.messages).toHaveLength(1);
-    } finally {
-      await s.close();
-    }
-  });
-
-  it('rejects an artifact-json assistant whose inner raw is a different artifact', async () => {
-    const s = await openSession(home());
-    try {
-      const cfg = await startConfig(s);
-      await turnWithStoredAssistant(s, cfg, async () => {
-        const gate = s.gate('turn', 0).gate;
-        return gate.capture(Buffer.from('{"other":true}'), 'utf8');
-      });
-      await expect(foldOf(home())).rejects.toThrow(/response/);
+      const messages = folded.snapshot().open?.messages ?? [];
+      expect(messages.map((m) => (m.role === 'assistant' ? m.content : null)))
+        .toEqual(['final text', 'final text']);
     } finally {
       await s.close();
     }
@@ -1188,22 +1076,8 @@ describe('fold: forged chain-valid payloads fail as typed invariants', () => {
         pattern: /world\/perception\.range/, turn: true,
       },
       {
-        type: 'request/plan', data: { id: null, value: { kind: 'inline', value: {} } },
-        pattern: /request\/plan\.id/, turn: true,
-      },
-      {
         type: 'request/refused', data: { id: null, bytes: 1, limit: 2, phase: 'plan' },
         pattern: /request\/refused\.id/, turn: true,
-      },
-      {
-        type: 'request/wire',
-        data: { id: null, attempt: 0, body: null },
-        pattern: /request\/wire\.id/, turn: true,
-      },
-      {
-        type: 'response/raw',
-        data: { id: null, attempt: 0, status: 200, body: null, complete: true },
-        pattern: /response\/raw\.id/, turn: true,
       },
       {
         type: 'assistant/message', data: { id: null, value: { kind: 'inline', value: {} } },
@@ -1243,7 +1117,7 @@ describe('fold: an invariant never leaves the cached surface half-changed', () =
    * call has no result, leaving a durable state an ordinary closer would promote
    * from an unbalanced dialogue.
    */
-  async function unbalancedTurn(s: Session, cfg: Source): Promise<ContextFold> {
+  async function unbalancedTurn(s: Session, _cfg: Source): Promise<ContextFold> {
     const fold = new ContextFold();
     const syncTo = async (): Promise<void> => {
       await fold.observe(await loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES));
@@ -1256,13 +1130,8 @@ describe('fold: an invariant never leaves the cached surface half-changed', () =
       value: { kind: 'inline', value: perception('evidence') },
     });
     const id: RequestId = { turn: 0, ordinal: 0 };
-    gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-    const body = await gate.capture(Buffer.from('{}'), 'utf8');
-    gate.append('request/wire', { id, attempt: 0, body });
-    const raw = await gate.capture(Buffer.from('{"ok":true}'), 'utf8');
-    gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
     gate.append('assistant/message', {
-      id, value: await gate.store(projection([call('c1'), call('c2')], raw)),
+      id, value: await gate.store(projection([call('c1'), call('c2')])),
     });
     gate.append('tool/call', { turn: 0, request: id, call: call('c1') });
     gate.append('tool/result', result(id, 0, 'c1') as never);
@@ -1341,26 +1210,21 @@ describe('fold: request-sequencing invariants fail closed', () => {
     (s.writer.append as unknown as (t: string, d: JsonValue) => EventEnvelope)(type, data);
   }
 
-  /** Plan, wire, response and assistant, with tool/call receipts controlled by the caller. */
+  /** One assistant message, with tool/call receipts controlled by the caller. */
   async function announced(
-    s: Session, cfg: Source, calls: FunctionCall[], receipts: boolean,
-  ): Promise<{ id: RequestId; gate: BoundaryGate; raw: ArtifactRef }> {
+    s: Session, _cfg: Source, calls: FunctionCall[], receipts: boolean,
+  ): Promise<{ id: RequestId; gate: BoundaryGate }> {
     const gate = beginTurn(s);
     gate.append('world/perception', {
       turn: 0, range: { from: null, to: null },
       value: { kind: 'inline', value: perception('evidence') },
     });
     const id: RequestId = { turn: 0, ordinal: 0 };
-    gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-    const body = await gate.capture(Buffer.from('{}'), 'utf8');
-    gate.append('request/wire', { id, attempt: 0, body });
-    const raw = await gate.capture(Buffer.from('{"ok":true}'), 'utf8');
-    gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
     gate.append('assistant/message', {
-      id, value: await gate.store(projection(calls, raw)),
+      id, value: await gate.store(projection(calls)),
     });
     if (receipts) for (const call of calls) gate.append('tool/call', { turn: 0, request: id, call });
-    return { id, gate, raw };
+    return { id, gate };
   }
 
   const cases: readonly InvariantCase[] = [
@@ -1373,131 +1237,13 @@ describe('fold: request-sequencing invariants fail closed', () => {
       },
     },
     {
-      name: 'duplicate request/plan',
-      pattern: /duplicate request\/plan/,
-      run: async (s, cfg) => {
-        const t = await pipeline(s, 0, cfg, {});
-        t.gate.append('request/plan', {
-          id: t.id, value: await t.gate.store(minimalPlan(t.id, cfg)),
-        });
-      },
-    },
-    {
-      name: 'request/plan id does not match its payload',
-      pattern: /request\/plan id does not match its payload/,
-      run: async (s, cfg) => {
-        const gate = beginTurn(s);
-        gate.append('request/plan', {
-          id: { turn: 0, ordinal: 0 },
-          value: await gate.store(minimalPlan({ turn: 0, ordinal: 1 }, cfg)),
-        });
-      },
-    },
-    {
-      name: 'request/plan config differs from the active config',
-      pattern: /request\/plan config does not equal the active config/,
+      name: 'assistant/message after request/refused',
+      pattern: /assistant\/message after request\/refused/,
       run: async (s) => {
         const gate = beginTurn(s);
-        const foreign = { seq: 999, hash: 'c'.repeat(64) };
-        gate.append('request/plan', {
-          id: { turn: 0, ordinal: 0 },
-          value: await gate.store(minimalPlan({ turn: 0, ordinal: 0 }, foreign)),
-        });
-      },
-    },
-    {
-      name: 'request/wire without a recorded plan',
-      pattern: /request\/wire without a recorded plan/,
-      run: async (s) => {
-        const gate = beginTurn(s);
-        const body = await gate.capture(Buffer.from('{}'), 'utf8');
-        gate.append('request/wire', { id: { turn: 0, ordinal: 0 }, attempt: 0, body });
-      },
-    },
-    {
-      name: 'duplicate first request/wire',
-      pattern: /duplicate first request\/wire/,
-      run: async (s, cfg) => {
-        const gate = beginTurn(s);
         const id: RequestId = { turn: 0, ordinal: 0 };
-        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-        const body = await gate.capture(Buffer.from('{}'), 'utf8');
-        gate.append('request/wire', { id, attempt: 0, body });
-        gate.append('request/wire', { id, attempt: 0, body });
-      },
-    },
-    {
-      name: 'retry request/wire with different body bytes',
-      pattern: /retry request\/wire does not reuse the first body/,
-      run: async (s, cfg) => {
-        const gate = beginTurn(s);
-        const id: RequestId = { turn: 0, ordinal: 0 };
-        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-        const first = await gate.capture(Buffer.from('{}'), 'utf8');
-        const second = await gate.capture(Buffer.from('{"changed":true}'), 'utf8');
-        gate.append('request/wire', { id, attempt: 0, body: first });
-        gate.append('request/wire', { id, attempt: 1, body: second });
-      },
-    },
-    {
-      name: 'duplicate request/wire attempt',
-      pattern: /duplicate request\/wire attempt/,
-      run: async (s, cfg) => {
-        const gate = beginTurn(s);
-        const id: RequestId = { turn: 0, ordinal: 0 };
-        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-        const body = await gate.capture(Buffer.from('{}'), 'utf8');
-        gate.append('request/wire', { id, attempt: 0, body });
-        gate.append('request/wire', { id, attempt: 1, body });
-        gate.append('request/wire', { id, attempt: 1, body });
-      },
-    },
-    {
-      name: 'response/raw without a preceding wire',
-      pattern: /response\/raw without a preceding wire/,
-      run: async (s, cfg) => {
-        const gate = beginTurn(s);
-        const id: RequestId = { turn: 0, ordinal: 0 };
-        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-        const raw = await gate.capture(Buffer.from('raw'), 'utf8');
-        gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
-      },
-    },
-    {
-      name: 'duplicate response/raw for an attempt',
-      pattern: /duplicate response\/raw for an attempt/,
-      run: async (s, cfg) => {
-        const gate = beginTurn(s);
-        const id: RequestId = { turn: 0, ordinal: 0 };
-        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-        const body = await gate.capture(Buffer.from('{}'), 'utf8');
-        gate.append('request/wire', { id, attempt: 0, body });
-        const raw = await gate.capture(Buffer.from('raw'), 'utf8');
-        gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
-        gate.append('response/raw', { id, attempt: 0, status: 200, body: raw, complete: true });
-      },
-    },
-    {
-      name: 'assistant/message without a recorded plan',
-      pattern: /assistant\/message without a recorded plan/,
-      run: async (s) => {
-        const gate = beginTurn(s);
-        const raw = await gate.capture(Buffer.from('raw'), 'utf8');
-        gate.append('assistant/message', {
-          id: { turn: 0, ordinal: 0 },
-          value: await gate.store(projection([], raw)),
-        });
-      },
-    },
-    {
-      name: 'assistant/message without a preceding wire',
-      pattern: /assistant\/message without a preceding wire/,
-      run: async (s, cfg) => {
-        const gate = beginTurn(s);
-        const id: RequestId = { turn: 0, ordinal: 0 };
-        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-        const raw = await gate.capture(Buffer.from('raw'), 'utf8');
-        gate.append('assistant/message', { id, value: await gate.store(projection([], raw)) });
+        gate.append('request/refused', { id, bytes: 5, limit: 10, phase: 'plan' });
+        gate.append('assistant/message', { id, value: await gate.store(projection([])) });
       },
     },
     {
@@ -1506,7 +1252,7 @@ describe('fold: request-sequencing invariants fail closed', () => {
       run: async (s, cfg) => {
         const t = await announced(s, cfg, [], false);
         t.gate.append('assistant/message', {
-          id: t.id, value: await t.gate.store(projection([], t.raw)),
+          id: t.id, value: await t.gate.store(projection([])),
         });
       },
     },
@@ -1617,28 +1363,6 @@ describe('fold: request-sequencing invariants fail closed', () => {
           version: 1,
           value: { kind: 'inline', value: { ...defaultAgentConfig(), heading: 'A different heading.' } },
         });
-      },
-    },
-    {
-      name: 'retry request/wire before the first wire',
-      pattern: /retry request\/wire before the first wire/,
-      run: async (s, cfg) => {
-        const gate = beginTurn(s);
-        const id: RequestId = { turn: 0, ordinal: 0 };
-        gate.append('request/plan', { id, value: await gate.store(minimalPlan(id, cfg)) });
-        const body = await gate.capture(Buffer.from('{}'), 'utf8');
-        gate.append('request/wire', { id, attempt: 1, body });
-      },
-    },
-    {
-      name: 'request/wire after request/refused',
-      pattern: /request\/wire after request\/refused/,
-      run: async (s) => {
-        const gate = beginTurn(s);
-        const id: RequestId = { turn: 0, ordinal: 0 };
-        gate.append('request/refused', { id, bytes: 5, limit: 10, phase: 'plan' });
-        const body = await gate.capture(Buffer.from('{}'), 'utf8');
-        gate.append('request/wire', { id, attempt: 0, body });
       },
     },
     {

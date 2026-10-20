@@ -1,24 +1,18 @@
 import { Buffer } from 'node:buffer';
 import { describe, expect, it } from 'vitest';
-import type { ArtifactRef } from '../context/contracts.js';
 import { decodeToolText, truncationNotice, utf8Prefix } from '../text.js';
 import { boundToolText } from '../node/tools/text.js';
 
 /**
  * Direct coverage for the shared UTF-8 boundary (test finding F3): the cut
  * never splits a code point, the invalid-byte policy is the deterministic
- * non-fatal one, and the notice never conflates the model cap with the raw
- * capture.
+ * non-fatal one, and the notice never conflates the model cap with the capture.
+ * Both notice forms are pinned: the local artifact form carries a digest, the
+ * frontier form names the call and carries none, and neither claims a partial
+ * capture is complete.
  */
 
 const SHA = 'a'.repeat(64);
-
-function raw(bytes: number, complete: boolean): ArtifactRef {
-  return {
-    kind: 'c13-artifact', manifest: { seq: 1, hash: SHA },
-    sha256: SHA, bytes, encoding: 'utf8', complete,
-  };
-}
 
 describe('utf8Prefix', () => {
   it('backs off a two-byte character that straddles the bound', () => {
@@ -60,8 +54,10 @@ describe('decodeToolText', () => {
 });
 
 describe('truncationNotice', () => {
-  it('states the model cap separately from the raw capture', () => {
-    const bounded = boundToolText('a'.repeat(300), 256, raw(4096, false));
+  it('states the model cap separately from the artifact capture', () => {
+    const bounded = boundToolText('a'.repeat(300), 256, {
+      kind: 'artifact', sha256: SHA, bytes: 4096, complete: false,
+    });
     expect(bounded.startsWith('a'.repeat(256) + '\n[output truncated:')).toBe(true);
     expect(bounded).toContain('model text capped at 256 bytes');
     expect(bounded).toContain('raw artifact: 4096 captured bytes, complete: no');
@@ -70,9 +66,24 @@ describe('truncationNotice', () => {
     expect(bounded.split('\n')).toHaveLength(2);
   });
 
-  it('reports a complete capture as complete even at the same byte count', () => {
-    const notice = truncationNotice('content', 512, raw(512, true));
+  it('renders the frontier form with the call id and no artifact digest', () => {
+    const notice = truncationNotice('content', 512, {
+      kind: 'frontier', call: 'call-7', bytes: 300, complete: false,
+    });
     expect(notice).toBe(`\n[content truncated: model text capped at 512 bytes; `
+      + `frontier call: call-7, 300 captured bytes, complete: no]`);
+    expect(notice).not.toContain('raw artifact');
+    expect(notice).not.toContain('sha256');
+  });
+
+  it('reports a complete capture as complete in both forms', () => {
+    expect(truncationNotice('content', 512, {
+      kind: 'artifact', sha256: SHA, bytes: 512, complete: true,
+    })).toBe(`\n[content truncated: model text capped at 512 bytes; `
       + `raw artifact: 512 captured bytes, complete: yes; raw sha256 ${SHA}]`);
+    expect(truncationNotice('content', 512, {
+      kind: 'frontier', call: 'c1', bytes: 512, complete: true,
+    })).toBe(`\n[content truncated: model text capped at 512 bytes; `
+      + `frontier call: c1, 512 captured bytes, complete: yes]`);
   });
 });

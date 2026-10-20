@@ -4,32 +4,31 @@ import { truncationNotice, utf8Prefix } from '../text.js';
 import { isRecord } from '../util.js';
 import { filterHeaders } from '../frontier/index.js';
 import { serializeWire } from './wire.js';
-import { normalizeUsage } from './usage.js';
 import type { Frontier, FrontierErrorCode, FrontierOutcome } from '../frontier/index.js';
 import type { BoundaryGate } from '../node/gate.js';
 import type {
-  ArtifactRef, AssistantProjection, ChatMessage, FunctionCall, RequestId, RequestPlan,
-  SafeFailure,
+  AssistantProjection, ChatMessage, FunctionCall, RequestPlan, SafeFailure,
 } from '../context/contracts.js';
 import type { SerializedTransport, TransportResult } from './transport.js';
 
 /**
  * The provider adapter (T6, kernel.md §4).
  *
- * It owns the exact, bounded request path: store the immutable plan, serialize
- * the single wire, then cross the frontier — `begin` is durable and verified
- * before the transport sends, and the terminal `complete` is durable before the
- * caller proceeds or a retry is decided. Classification (`classifyNoStatus`/
- * `classifyIncomplete`/the status branch) computes that terminal at the
- * exchange; a stop arriving later rewrites only the returned `SafeFailure` and
- * the local turn, never the frontier record.
+ * It owns the exact, bounded request path: serialize the single wire, then
+ * cross the frontier — `begin` is durable and verified before the transport
+ * sends, and the terminal `complete` is durable before the caller proceeds or
+ * a retry is decided. Classification (`classifyNoStatus`/`classifyIncomplete`/
+ * the status branch) computes that terminal at the exchange; a stop arriving
+ * later rewrites only the returned `SafeFailure` and the local turn, never the
+ * frontier record.
  *
- * The local log keeps its facts as before (plan, wire, raw body, usage,
- * attempt, assistant message), captured and flushed before any decode, parse,
- * usage, assistant or tool work, so a malformed or unprojectable body is a safe
- * terminal failure after the raw fact is durable — never a fatal kernel error.
- * A flush/invariant failure raised while journaling an attempt or the
- * projection is rethrown fatally and is never converted into a
+ * The local log keeps only the semantic success fact: the assistant
+ * `projection` (carrying the frontier `call` id) is stored and journaled as
+ * `assistant/message`, flushed before the caller proceeds. The plan, wire,
+ * raw response, usage and attempt events are frontier facts now and are never
+ * journaled locally; a terminal failure records nothing local — the driver's
+ * `turn/end` carries the error. A flush/invariant failure raised while
+ * journaling the projection is rethrown fatally and is never converted into a
  * `SendResult.failure`; a frontier `begin`/`complete` failure propagates the
  * same way (nothing crossed the frontier, or the send's terminal is pending).
  *
@@ -75,7 +74,7 @@ class MalformedResponseError extends Error {
   }
 }
 
-type Projected = { readonly message: AssistantMessage; readonly usageRaw: unknown };
+type Projected = { readonly message: AssistantMessage };
 
 /**
  * Decode (fatal UTF-8), parse and project only the fields that enter the
@@ -156,7 +155,6 @@ function project(body: Uint8Array, plan: RequestPlan): Projected {
 
   return {
     message: { role: 'assistant', content: content as string | null, tool_calls: calls },
-    usageRaw: parsed['usage'],
   };
 }
 
@@ -164,18 +162,22 @@ function project(body: Uint8Array, plan: RequestPlan): Projected {
  * Bounds the model-visible assistant content to `policy.maxAssistantBytes` UTF-8
  * bytes (artifact algorithm 7) with the neutral code-point-safe cut. The raw
  * record is never altered; only the projection changes. The notice reports the
- * model-text cap separately from the raw response artifact's captured byte count
- * and completeness, never conflating the two.
+ * model-text cap separately from the frontier capture's byte count and
+ * completeness, never conflating the two.
  */
 function boundAssistant(
-  message: AssistantMessage, maxBytes: number, raw: ArtifactRef,
+  message: AssistantMessage, maxBytes: number,
+  capture: { readonly call: string; readonly bytes: number; readonly complete: boolean },
 ): { readonly message: AssistantMessage; readonly contentTruncated: boolean } {
   const content = message.content;
   if (content === null) return { message, contentTruncated: false };
   if (Buffer.byteLength(content, 'utf8') <= maxBytes) return { message, contentTruncated: false };
   const retained = utf8Prefix(content, maxBytes).text;
   return {
-    message: { ...message, content: retained + truncationNotice('content', maxBytes, raw) },
+    message: {
+      ...message,
+      content: retained + truncationNotice('content', maxBytes, { kind: 'frontier', ...capture }),
+    },
     contentTruncated: true,
   };
 }
@@ -215,20 +217,14 @@ export class ProviderAdapter {
     const id = plan.id;
     const policy = plan.policy;
 
-    // 1. Store the immutable plan, record `request/plan` once, serialize once.
-    //    The runtime owns the `MAX_CAPTURE_BYTES` capture-ceiling refusal before
-    //    `gate.store`; here a wire above the persisted `maxRequestBytes` is refused
-    //    terminally with a durable attempt and no send.
-    const storedPlan = await gate.store(plan);
-    gate.append('request/plan', { id, value: storedPlan });
+    // Serialize once. The runtime owns the `MAX_CAPTURE_BYTES` capture-ceiling
+    // refusal before this call; here a wire above the persisted
+    // `maxRequestBytes` is refused terminally before any begin, with no send and
+    // no local event — the driver's turn/end carries the error.
     const body = serializeWire(plan);
     if (body.length > policy.maxRequestBytes) {
-      return this.fail(gate, id, 0, { code: 'request-limit', status: null });
+      return { kind: 'failure', failure: { code: 'request-limit', status: null } };
     }
-
-    const bodyRef = await gate.capture(body, 'utf8');
-    gate.append('request/wire', { id, attempt: 0, body: bodyRef });
-    await gate.flush();
 
     let attempt = 0;
     /** The first begin mints the group; every retry reuses it. */
@@ -236,22 +232,11 @@ export class ProviderAdapter {
     for (;;) {
       // An already-aborted signal prevents any send (a stop/park never sends).
       if (gate.signal.aborted) {
-        return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
-      }
-      if (attempt > 0) {
-        // The next-attempt wire is journaled after the loop-top abort check.
-        // The post-append check below catches a stop that lands during the
-        // append/flush: the wire is then durable with no POST — no attempt left
-        // the process, and the send is terminal, so that wire is inert.
-        gate.append('request/wire', { id, attempt, body: bodyRef });
-        await gate.flush();
-        if (gate.signal.aborted) {
-          return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
-        }
+        return { kind: 'failure', failure: { code: 'cancelled', status: null } };
       }
 
-      // 2. Cross the frontier: the request record (and its body blob) is
-      //    durable and read-back verified before the transport sends.
+      // Cross the frontier: the request record (and its body blob) is durable
+      // and read-back verified before the transport sends.
       const facts = this.transport.facts;
       const call = await this.frontier.begin({
         method: 'POST',
@@ -265,14 +250,14 @@ export class ProviderAdapter {
       });
       group = call.group;
       // A stop that landed during `begin`: the request is closed as the
-      // cancellation it is, and no POST is sent (today's durable-wire-no-POST
-      // behavior, now with the frontier terminal it needs).
+      // cancellation it is, and no POST is sent (the durable request with no
+      // POST, now with the frontier terminal it needs).
       if (gate.signal.aborted) {
         await this.frontier.complete(call, {
           status: null, error: 'cancelled', body: new Uint8Array(),
           encoding: 'binary', complete: false,
         });
-        return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
+        return { kind: 'failure', failure: { code: 'cancelled', status: null } };
       }
 
       const posted = await this.post(body, policy, gate);
@@ -289,26 +274,20 @@ export class ProviderAdapter {
       const result = posted.result;
 
       if (result.status === null) {
-        // No status: journal the attempt only (no raw body was received).
+        // No status: the empty capture is the exchange's terminal.
         const failure = this.classifyNoStatus(result, posted.timedOut, gate);
         await this.frontier.complete(call, {
           status: null, body: new Uint8Array(), encoding: 'binary', complete: false,
           error: toFrontierCode(failure),
         });
         const retryable = failure.code === 'network' || failure.code === 'timeout';
-        const next = await this.maybeRetry(gate, id, attempt, failure, retryable, policy);
+        const next = await this.maybeRetry(gate, attempt, retryable, policy);
         if (next === 'continue') { attempt += 1; continue; }
-        if (gate.signal.aborted) return this.fail(gate, id, attempt, { code: 'cancelled', status: null });
-        return this.fail(gate, id, attempt, failure);
+        if (gate.signal.aborted) {
+          return { kind: 'failure', failure: { code: 'cancelled', status: null } };
+        }
+        return { kind: 'failure', failure };
       }
-
-      // Status known: capture the complete raw body or the partial prefix, append
-      // `response/raw` and flush BEFORE any decode/parse/usage/assistant work.
-      const rawRef = await gate.capture(result.body, 'binary', result.complete);
-      gate.append('response/raw', {
-        id, attempt, status: result.status, body: rawRef, complete: result.complete,
-      });
-      await gate.flush();
 
       if (result.complete && result.status === 200) {
         // The exchange's outcome is the 200 itself; the projection (and a
@@ -325,14 +304,18 @@ export class ProviderAdapter {
           projected = project(result.body, plan);
         } catch {
           // A body that parses but cannot be projected is a safe terminal
-          // failure after the raw fact is durable — never a fatal kernel error.
-          return this.fail(gate, id, attempt, { code: 'malformed', status: result.status });
+          // failure after the frontier terminal is durable — never a fatal
+          // kernel error, and no local event.
+          return { kind: 'failure', failure: { code: 'malformed', status: result.status } };
         }
-        const bounded = boundAssistant(projected.message, policy.maxAssistantBytes, rawRef);
+        const bounded = boundAssistant(projected.message, policy.maxAssistantBytes, {
+          call: call.call, bytes: result.body.length, complete: result.complete,
+        });
         const projection: AssistantProjection = {
-          message: bounded.message, contentTruncated: bounded.contentTruncated, raw: rawRef,
+          message: bounded.message,
+          contentTruncated: bounded.contentTruncated,
+          frontierCall: call.call,
         };
-        gate.append('request/usage', { id, attempt, value: normalizeUsage(projected.usageRaw) });
         gate.append('assistant/message', { id, value: await gate.store(projection) });
         await gate.flush();
         return { kind: 'response', projection };
@@ -357,16 +340,16 @@ export class ProviderAdapter {
       };
       await this.frontier.complete(call, outcome);
 
-      const next = await this.maybeRetry(gate, id, attempt, failure, classified.retryable, policy);
+      const next = await this.maybeRetry(gate, attempt, classified.retryable, policy);
       if (next === 'continue') { attempt += 1; continue; }
       // A stop observed before headers or during the retry delay is a boundary
       // cancellation; a stop already classified from a status-known body keeps
       // its own status (non-null in this branch), so recording never depends on
       // whether the stop landed during capture or afterwards.
       if (gate.signal.aborted && failure.code !== 'cancelled') {
-        return this.fail(gate, id, attempt, { code: 'cancelled', status: failure.status });
+        return { kind: 'failure', failure: { code: 'cancelled', status: failure.status } };
       }
-      return this.fail(gate, id, attempt, failure);
+      return { kind: 'failure', failure };
     }
   }
 
@@ -380,10 +363,9 @@ export class ProviderAdapter {
    * else is the transport's own failure (`network` when it reports none).
    *
    * This compares against the live gate signal, not a snapshot taken when the
-   * POST returned, so an abort raised while the partial prefix is being captured
-   * and flushed also wins. Both `cancelled` and `body-limit` are terminal and
-   * non-retryable, so the ordering is fixed by contract and pinned by test
-   * rather than left to chance.
+   * POST returned, so an abort raised while the body was being read also wins.
+   * Both `cancelled` and `body-limit` are terminal and non-retryable, so the
+   * ordering is fixed by contract and pinned by test rather than left to chance.
    */
   private classifyIncomplete(
     result: TransportResult, timedOut: boolean, gate: BoundaryGate,
@@ -465,19 +447,15 @@ export class ProviderAdapter {
   }
 
   /**
-   * Journals a non-terminal attempt, waits the fixed cancellable delay, and
-   * returns 'continue' to retry or 'stop' when no retry is allowed. A cancelled
-   * delay returns 'stop' without a later send; the caller journals the terminal
-   * result. The next attempt's `request/wire` is appended by the send loop,
-   * after its final abort check — never here.
+   * Waits the fixed cancellable delay and returns 'continue' to retry or
+   * 'stop' when no retry is allowed. A cancelled delay returns 'stop' without
+   * a later send. Nothing is journaled here: the terminal record belongs to the
+   * frontier, and a local attempt fact no longer exists.
    */
   private async maybeRetry(
-    gate: BoundaryGate, id: RequestId, attempt: number, failure: SafeFailure,
-    retryable: boolean, policy: RequestPlan['policy'],
+    gate: BoundaryGate, attempt: number, retryable: boolean, policy: RequestPlan['policy'],
   ): Promise<'continue' | 'stop'> {
     if (!retryable || attempt + 1 >= policy.maxAttempts) return 'stop';
-    gate.append('assistant/attempt', { id, attempt, failure, terminal: false });
-    await gate.flush();
     if (gate.signal.aborted) return 'stop';
     try {
       await this.policy.delay(policy.retryDelayMs, gate.signal);
@@ -485,14 +463,5 @@ export class ProviderAdapter {
       return 'stop';
     }
     return 'continue';
-  }
-
-  /** Journals the terminal attempt and flush, then returns a failure result. */
-  private async fail(
-    gate: BoundaryGate, id: RequestId, attempt: number, failure: SafeFailure,
-  ): Promise<SendResult> {
-    gate.append('assistant/attempt', { id, attempt, failure, terminal: true });
-    await gate.flush();
-    return { kind: 'failure', failure };
   }
 }

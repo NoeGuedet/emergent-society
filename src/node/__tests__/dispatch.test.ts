@@ -82,11 +82,7 @@ function call(id: string, name: string, args: string): FunctionCall {
 function projection(calls: FunctionCall[]): AssistantProjection {
   return {
     message: { role: 'assistant', content: null, tool_calls: calls },
-    contentTruncated: false,
-    raw: {
-      kind: 'c13-artifact', manifest: { seq: 0, hash: '0'.repeat(64) },
-      sha256: '0'.repeat(64), bytes: 0, encoding: 'utf8', complete: true,
-    },
+    contentTruncated: false, frontierCall: 'call-1',
   };
 }
 

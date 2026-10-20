@@ -234,7 +234,9 @@ describe('fatal seams', () => {
     expect(d.state).toBe('stopped');
     const events = await read(home);
     expect(events.some((e) => e.type === 'turn/start')).toBe(true);
-    expect(events.some((e) => e.type === 'request/wire')).toBe(false);
+    expect(events.some((e) => [
+      'request/plan', 'request/wire', 'response/raw', 'request/usage', 'assistant/attempt',
+    ].includes(e.type))).toBe(false);
   });
 
   it('rethrows the original handler error but journals a safe label under hooks', async () => {
@@ -404,7 +406,7 @@ function syntheticResult(call: ToolCallData) {
   return {
     turn: call.turn, request: call.request, callId: call.call.id,
     message: { role: 'tool', content: 'unknown outcome', tool_call_id: call.call.id },
-    isError: true, raw: null, failure: null, synthetic: true,
+    isError: true, raw: null, failure: null, synthetic: true, frontierCall: null,
   };
 }
 
@@ -431,7 +433,7 @@ async function makeIncompleteGroup(
       ctx.gate.append('tool/result', {
         turn: ctx.turn, request: { turn: ctx.turn, ordinal: 0 }, callId: 'call-1',
         message: { role: 'tool', content: 'done', tool_call_id: 'call-1' },
-        isError: false, raw: null, failure: null, synthetic: false,
+        isError: false, raw: null, failure: null, synthetic: false, frontierCall: null,
       });
     }
     await ctx.gate.flush();

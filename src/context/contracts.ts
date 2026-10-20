@@ -1,4 +1,5 @@
 import type { JsonValue } from '../journal/index.js';
+import type { CallId } from '../frontier/index.js';
 import type { RecordedCommit, WorldRange } from '../node/world.js';
 
 /**
@@ -143,15 +144,11 @@ export type RequestPlan = {
   readonly charter: string; readonly heading: string;
 };
 
-export type CanonicalUsage = {
-  readonly inputTotal: number | null; readonly inputUncached: number | null;
-  readonly output: number | null; readonly cacheRead: number | null;
-  readonly cacheWrite: number | null;
-};
-
 export type AssistantProjection = {
   readonly message: Extract<ChatMessage, { role: 'assistant' }>;
-  readonly contentTruncated: boolean; readonly raw: ArtifactRef;
+  readonly contentTruncated: boolean;
+  /** The successful frontier call that produced this message; never null here. */
+  readonly frontierCall: CallId;
 };
 
 export type CompactionStart = {

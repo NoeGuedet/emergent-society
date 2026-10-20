@@ -107,6 +107,7 @@ function appendSyntheticCancelled(
     turn: id.turn, request: id, callId: call.id,
     message: { role: 'tool', content: 'cancelled', tool_call_id: call.id },
     isError: true, raw: null, failure: { code: 'cancelled', status: null }, synthetic: true,
+    frontierCall: null,
   });
 }
 
@@ -117,6 +118,7 @@ function appendErrorResult(
     turn: id.turn, request: id, callId,
     message: { role: 'tool', content: `error: ${failure.code}`, tool_call_id: callId },
     isError: true, raw: null, failure, synthetic: false,
+    frontierCall: null,
   });
 }
 
@@ -127,6 +129,7 @@ function appendWaitResult(gate: BoundaryGate, id: RequestId, callId: string): vo
       role: 'tool', content: 'Waiting until a foreign world commit', tool_call_id: callId,
     },
     isError: false, raw: null, failure: null, synthetic: false,
+    frontierCall: null,
   });
 }
 
@@ -194,13 +197,17 @@ async function appendExecuteResult(
     turn: id.turn, request: id, callId,
     message: {
       role: 'tool',
-      content: raw === null ? rendered : boundToolText(rendered, maxToolResultBytes, raw),
+      content: raw === null ? rendered
+        : boundToolText(rendered, maxToolResultBytes, {
+          kind: 'artifact', sha256: raw.sha256, bytes: raw.bytes, complete: raw.complete,
+        }),
       tool_call_id: callId,
     },
     isError: executeIsError(outcome),
     raw,
     failure: executeFailure(outcome),
     synthetic: false,
+    frontierCall: null,
   });
 }
 
@@ -216,8 +223,14 @@ async function appendWebResult(
       turn: id.turn, request: id, callId,
       message: { role: 'tool', content, tool_call_id: callId },
       isError, raw, failure, synthetic: false,
+      // The web tools cross the frontier in T6; until then their results carry
+      // no frontier reference (and still capture their raw body locally).
+      frontierCall: null,
     });
   };
+  const captureOf = (raw: ArtifactRef): {
+    kind: 'artifact'; sha256: string; bytes: number; complete: boolean;
+  } => ({ kind: 'artifact', sha256: raw.sha256, bytes: raw.bytes, complete: raw.complete });
   if (!outcome.ok) {
     // No capture for an empty failure body; a kept prefix has its real complete flag.
     const raw = outcome.body.length > 0
@@ -226,7 +239,8 @@ async function appendWebResult(
       ? `error: ${outcome.failure.code}`
       : `error: ${outcome.failure.code}\nstatus: ${outcome.status}`;
     append(raw === null ? head
-      : boundToolText(`${head}\nbody:\n${decodeToolText(outcome.body)}`, maxToolResultBytes, raw),
+      : boundToolText(`${head}\nbody:\n${decodeToolText(outcome.body)}`,
+        maxToolResultBytes, captureOf(raw)),
       true, raw, outcome.failure);
     return;
   }
@@ -235,12 +249,12 @@ async function appendWebResult(
   if (rendered === null) {
     append(boundToolText(
       `error: malformed\nstatus: ${outcome.status}\nbody:\n${decodeToolText(outcome.body)}`,
-      maxToolResultBytes, raw), true, raw, { code: 'malformed', status: outcome.status });
+      maxToolResultBytes, captureOf(raw)), true, raw, { code: 'malformed', status: outcome.status });
     return;
   }
   const text = typeof rendered === 'string' ? rendered : rendered.text;
   const failed = typeof rendered === 'string' ? false : rendered.failed;
-  append(boundToolText(text, maxToolResultBytes, raw), failed, raw, null);
+  append(boundToolText(text, maxToolResultBytes, captureOf(raw)), failed, raw, null);
 }
 
 export async function dispatchCalls(

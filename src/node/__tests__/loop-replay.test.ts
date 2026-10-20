@@ -7,9 +7,9 @@ import { HeadWatcher } from '../watcher.js';
 import { createAgentRuntime, defaultAgentConfig, type AgentRuntime } from '../loop.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { loadVerifiedEvents, type VerifiedEvent, type VerifiedEvents } from '../../context/loader.js';
-import { rederivePlans } from '../../context/assembler.js';
+import { verifyPerceptions } from '../../context/__tests__/verify-perceptions.js';
 import { resolveArtifact } from '../../context/artifacts.js';
-import { serializeWire } from '../../provider/wire.js';
+import { readFrontier } from '../../frontier/__tests__/helpers.js';
 import { ProviderAdapter } from '../../provider/adapter.js';
 import type { SerializedTransport, TransportFacts, TransportResult } from '../../provider/transport.js';
 import type { AgentConfig, ArtifactRef, FunctionCall } from '../../context/contracts.js';
@@ -278,28 +278,11 @@ describe('C1.3 runtime-seeded replay', () => {
         event.type === 'turn/end' && dataOf<{ turn: number }>(event).turn === 1);
       expect(emptyCloser?.ignorable).toBe(true);
 
-      const plans = events.filter((event) => event.type === 'request/plan');
-      const wires = events.filter((event) => event.type === 'request/wire');
-      expect(plans).toHaveLength(4);
-      expect(wires).toHaveLength(4);
-      const comparisons = await rederivePlans(events, fx.world);
-      expect(comparisons).toHaveLength(4);
-      for (let index = 0; index < comparisons.length; index += 1) {
-        const comparison = comparisons[index]!;
-        const rederived = Buffer.from(serializeWire(comparison.rederived));
-        expect(rederived.equals(Buffer.from(serializeWire(comparison.recorded)))).toBe(true);
-        const wireRef = dataOf<{ body: ArtifactRef }>(wires[index]!).body;
-        expect(rederived.equals(Buffer.from(resolveArtifact(events, wireRef)))).toBe(true);
-      }
-      // The final turn's plan and wire are the > 4 MiB canonical artifacts, and the
-      // scheduled (version 2) configuration is itself a > 4 MiB captured artifact.
-      const giantWire = resolveArtifact(events, dataOf<{ body: ArtifactRef }>(wires[3]!).body);
-      expect(giantWire.length).toBeGreaterThan(4 * MiB);
-      const giantPlan = resolveArtifact(events, (() => {
-        const stored = dataOf<{ value: { kind: string; ref: ArtifactRef } }>(plans[3]!).value;
-        return stored.ref;
-      })());
-      expect(giantPlan.length).toBeGreaterThan(4 * MiB);
+      // Four successful logical requests, each with its semantic assistant fact.
+      const assistants = events.filter((event) => event.type === 'assistant/message');
+      expect(assistants).toHaveLength(4);
+      await verifyPerceptions(fx.world, events);
+      // The scheduled (version 2) configuration is itself a > 4 MiB captured artifact.
       const v2Config = events.find((event) =>
         event.type === 'system/message' && dataOf<{ version: number }>(event).version === 2);
       expect(v2Config).toBeDefined();
@@ -349,8 +332,7 @@ describe('C1.3 runtime-seeded replay', () => {
       expect(dataOf<{ synthetic: boolean }>(c9Result!).synthetic).toBe(true);
       expect(dataOf<{ message: { content: string } }>(c9Result!).message.content)
         .toBe('Outcome unknown after interruption; not re-executed');
-      const finalComparisons = await rederivePlans(finalEvents, fx.world);
-      expect(finalComparisons).toHaveLength(4);
+      await verifyPerceptions(fx.world, finalEvents);
       // The last foreign commit is still HEAD: no effect or commit was replayed.
       expect(await fx.world.headHash()).toBe(f3);
     } finally {
@@ -399,9 +381,9 @@ describe('C1.3 runtime-seeded replay', () => {
       expect(payload.phase).toBe('plan');
       expect(payload.bytes).toBeGreaterThanOrEqual(32 * MiB);
       expect(payload.limit).toBe(32 * MiB);
-      expect(events.some((event) => event.type === 'request/plan')).toBe(false);
-      expect(events.some((event) => event.type === 'request/wire')).toBe(false);
-      expect(events.some((event) => event.type === 'response/raw')).toBe(false);
+      expect(events.some((event) => [
+        'request/plan', 'request/wire', 'response/raw', 'request/usage', 'assistant/attempt',
+      ].includes(event.type))).toBe(false);
       expect(events.find((event) => event.type === 'turn/end')?.data)
         .toMatchObject({ outcome: 'error' });
       // Nothing was written or committed: the foreign commit stays HEAD.
@@ -444,18 +426,25 @@ describe('C1.3 runtime-seeded replay', () => {
       const events = await eventsOf(fx);
       // One perception, one logical request, one assistant: the retry duplicates nothing.
       expect(events.filter((event) => event.type === 'world/perception')).toHaveLength(1);
-      expect(events.filter((event) => event.type === 'request/plan')).toHaveLength(1);
-      const wires = events.filter((event) => event.type === 'request/wire');
-      expect(wires.map((event) => dataOf<{ attempt: number }>(event).attempt)).toEqual([0, 1]);
-      const raws = events.filter((event) => event.type === 'response/raw');
-      expect(raws.map((event) => dataOf<{ status: number }>(event).status)).toEqual([429, 200]);
       expect(events.filter((event) => event.type === 'assistant/message')).toHaveLength(1);
       expect(events.some((event) => event.type === 'tool/call')).toBe(false);
       expect(events.some((event) => event.type === 'tool/result')).toBe(false);
+      // The two attempts and their terminals are frontier facts: one group, two calls.
+      const frontier = await readFrontier(fx.home);
+      const requests = frontier.filter((event) => event.type === 'http/request')
+        .map((event) => event.data as unknown as { call: string; group: string; attempt: number });
+      const terminals = frontier.filter((event) => event.type === 'http/response')
+        .map((event) => event.data as unknown as { call: string; status: number });
+      expect(requests.map((request) => request.attempt)).toEqual([0, 1]);
+      expect(requests[1]!.group).toBe(requests[0]!.group);
+      expect(terminals.map((terminal) => terminal.status)).toEqual([429, 200]);
+      expect(terminals[1]!.call).toBe(requests[1]!.call);
+      const projection = (events.find((event) => event.type === 'assistant/message')!
+        .data as unknown as { value: { kind: 'inline'; value: { frontierCall: string } } }).value;
+      expect(projection.value.frontierCall).toBe(requests[1]!.call);
       expect(events.find((event) => event.type === 'turn/end')?.data)
         .toMatchObject({ outcome: 'waiting' });
-      const comparisons = await rederivePlans(events, fx.world);
-      expect(comparisons).toHaveLength(1);
+      await verifyPerceptions(fx.world, events);
     } finally {
       const current = driver;
       driver = null;

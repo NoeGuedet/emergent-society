@@ -1,19 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { Buffer } from 'node:buffer';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
-import { sha256HexOf } from '../../journal/index.js';
 import { defaultAgentConfig } from '../config.js';
-import { ArtifactMismatchError, type VerifiedEvent, type VerifiedEvents } from '../loader.js';
-import { canonicalBytes, resolveArtifact } from '../artifacts.js';
-import { assemble, rederivePlans } from '../assembler.js';
-import { ContextFold } from '../fold.js';
+import type { VerifiedEvent, VerifiedEvents } from '../loader.js';
+import { assemble } from '../assembler.js';
 import { presentWorld } from '../diff.js';
 import { serializeWire } from '../../provider/wire.js';
 import { useWorld } from '../../node/__tests__/helpers.js';
-import type { WorldRepo } from '../../node/world.js';
+import { verifyPerceptions } from './verify-perceptions.js';
 import type {
-  AgentConfig, ArtifactRef, CanonicalUsage, ChatMessage, FunctionCall, OpenTurn, ProjectionState,
-  RequestId, RequestPlan, Source, SurfaceGroup, SurfaceNode, SurfaceSnapshot, ToolSchema,
+  AgentConfig, ChatMessage, FunctionCall, OpenTurn, ProjectionState,
+  RequestId, Source, SurfaceGroup, SurfaceNode, SurfaceSnapshot, ToolSchema,
 } from '../contracts.js';
 
 /**
@@ -268,97 +265,9 @@ describe('assemble: freezing and null preservation', () => {
     const plan = assemble({ id: ID, state: makeState({ open }) });
     expect(plan.history[0]).toEqual({ role: 'assistant', content: null, tool_calls: [] });
   });
-
-  it('keeps unknown usage counters as null through the shared canonical encoder', () => {
-    const usage: CanonicalUsage = {
-      inputTotal: null, inputUncached: null, output: null, cacheRead: null, cacheWrite: null,
-    };
-    const parsed = JSON.parse(Buffer.from(canonicalBytes(usage)).toString('utf8')) as Record<string, unknown>;
-    expect(parsed).toEqual({
-      inputTotal: null, inputUncached: null, output: null, cacheRead: null, cacheWrite: null,
-    });
-    expect(Object.values(parsed).every((v) => v === null)).toBe(true);
-  });
 });
 
-describe('rederivePlans: the observed prefix is authoritative', () => {
-  const GENESIS = '0'.repeat(64);
-
-  function envelope(over: Partial<EventEnvelope> & { type: string; data: JsonValue }): EventEnvelope {
-    return { v: 0, seq: 0, time: 1, prev_hash: GENESIS, hash: GENESIS, ...over };
-  }
-
-  const verified = (event: EventEnvelope): VerifiedEvent => ({ ...event, raw: event });
-
-  it('cannot resolve a request/plan from an artifact that only appears later', async () => {
-    const H0 = 'a'.repeat(64);
-    const H1 = 'b'.repeat(64);
-    const H2 = 'c'.repeat(64);
-    const C0 = '1'.repeat(64);
-    const C1 = '2'.repeat(64);
-    const HM = 'e'.repeat(64);
-
-    const plan: RequestPlan = {
-      id: { turn: 0, ordinal: 0 }, config: { seq: 0, hash: H0 }, stateHash: 'x'.repeat(64),
-      model: 'mock-model', parameters: {}, policy: defaultAgentConfig().policy,
-      tools: [], toolsHash: 'd'.repeat(64),
-      sections: [
-        { name: 'tools', cache: 'stable', sources: [] },
-        { name: 'charter', cache: 'stable', sources: [] },
-        { name: 'heading', cache: 'stable', sources: [] },
-        { name: 'history', cache: 'advance', sources: [] },
-        { name: 'queue', cache: 'volatile', sources: [] },
-      ],
-      history: [], queue: [], charter: '', heading: '',
-    };
-    const bytes = Buffer.from(JSON.stringify(plan), 'utf8');
-    const sha = sha256HexOf(bytes);
-    const half = Math.floor(bytes.length / 2);
-    const ref: ArtifactRef = {
-      kind: 'c13-artifact', manifest: { seq: 5, hash: HM },
-      sha256: sha, bytes: bytes.length, encoding: 'utf8', complete: true,
-    };
-
-    const events: VerifiedEvents = [
-      verified(envelope({
-        type: 'system/message', seq: 0, hash: H0,
-        data: { version: 1, value: { kind: 'inline', value: defaultAgentConfig() } },
-      })),
-      verified(envelope({
-        type: 'turn/start', seq: 1, hash: H1, prev_hash: H0,
-        data: { turn: 0, trigger: 'boot', world: { from: null, to: null } },
-      })),
-      verified(envelope({
-        type: 'request/plan', seq: 2, hash: H2, prev_hash: H1,
-        data: { id: { turn: 0, ordinal: 0 }, value: { kind: 'artifact-json', ref } },
-      })),
-      verified(envelope({
-        type: 'artifact/chunk', seq: 3, hash: C0, prev_hash: H2,
-        data: { artifact: sha, index: 0, base64: bytes.subarray(0, half).toString('base64') },
-      })),
-      verified(envelope({
-        type: 'artifact/chunk', seq: 4, hash: C1, prev_hash: C0,
-        data: { artifact: sha, index: 1, base64: bytes.subarray(half).toString('base64') },
-      })),
-      verified(envelope({
-        type: 'artifact/end', seq: 5, hash: HM, prev_hash: C1,
-        data: {
-          artifact: sha, sha256: sha, bytes: bytes.length, encoding: 'utf8', complete: true,
-          parts: [{ seq: 3, hash: C0 }, { seq: 4, hash: C1 }],
-        },
-      })),
-    ];
-
-    // The artifact itself is genuinely resolvable from the whole history...
-    expect(Buffer.from(resolveArtifact(events, ref)).equals(bytes)).toBe(true);
-    // ...but the plan cites a manifest that is still in the future when it is
-    // read, so reconstruction refuses rather than trusting a later receipt.
-    const world = {} as unknown as WorldRepo;
-    await expect(rederivePlans(events, world)).rejects.toThrow(ArtifactMismatchError);
-  });
-});
-
-describe('rederivePlans: a divergence is explicit, never a promise of equality', () => {
+describe('verifyPerceptions: a divergence is explicit, never a promise of equality', () => {
   const GENESIS = '0'.repeat(64);
   const RANGE = { from: null, to: null };
   // A fresh world (unborn HEAD) makes the recorded perception independently
@@ -378,46 +287,23 @@ describe('rederivePlans: a divergence is explicit, never a promise of equality',
   const turnEvent = (): VerifiedEvent => verified(envelope(1, 'turn/start', {
     turn: 0, trigger: 'boot', world: RANGE,
   }));
-  const id: RequestId = { turn: 0, ordinal: 0 };
 
-  it.each(['world/perception', 'request/plan', 'request/wire'] as const)(
-    'refuses a chain-valid null %s payload as a typed replay error', async (type) => {
-      const { world } = fixture();
-      // Chain verification proves bytes, not shapes: these events are "verified"
-      // but carry null data. The replay's own guard must classify them before
-      // any id/value dereference, so the model sees a replay error, not a
-      // TypeError from the offline utility.
-      const events = [verified(envelope(0, type, null))];
-      let err: unknown;
-      try {
-        await rederivePlans(events, world);
-      } catch (e) {
-        err = e;
-      }
-      expect(err).toBeInstanceOf(Error);
-      expect(err).not.toBeInstanceOf(TypeError);
-      expect((err as Error).message).toContain(`replay: ${type} data at 0:`);
-      expect((err as Error).message).toContain('is not an object');
-    });
-
-  it('rejects a recorded plan rewritten to a different but valid plan', async () => {
+  it('refuses a chain-valid null world/perception payload as a typed replay error', async () => {
     const { world } = fixture();
-    const config = configEvent();
-    const turn = turnEvent();
-    // The plan genuinely rederivable from these two facts...
-    const prefix = new ContextFold();
-    await prefix.observe([config, turn]);
-    const real = assemble({ id, state: prefix.snapshot() });
-    // ...and a valid plan that differs in one field.
-    const rewritten = JSON.parse(JSON.stringify(real)) as RequestPlan;
-    (rewritten as { model: string }).model = 'another-model';
-
-    const events: VerifiedEvents = [
-      config, turn,
-      verified(envelope(2, 'request/plan', { id, value: { kind: 'inline', value: rewritten } })),
-    ];
-    await expect(rederivePlans(events, world)).rejects.toThrow(
-      /plan recorded at \d+:[0-9a-f]+ does not match the plan rederived/);
+    // Chain verification proves bytes, not shapes: this event is "verified" but
+    // carries null data. The helper's own guard must classify it before any
+    // value dereference, so the test sees a replay error, not a TypeError.
+    const events = [verified(envelope(0, 'world/perception', null))];
+    let err: unknown;
+    try {
+      await verifyPerceptions(world, events);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(TypeError);
+    expect((err as Error).message).toContain('replay: world/perception data at 0:');
+    expect((err as Error).message).toContain('is not an object');
   });
 
   it('rejects a recorded perception whose inline text differs from the re-render', async () => {
@@ -430,7 +316,7 @@ describe('rederivePlans: a divergence is explicit, never a promise of equality',
         turn: 0, range: RANGE, value: { kind: 'inline', value: recorded },
       })),
     ];
-    await expect(rederivePlans(events, world)).rejects.toThrow(
+    await expect(verifyPerceptions(world, events)).rejects.toThrow(
       /does not match the perception rederived from the world/);
   });
 
@@ -447,75 +333,7 @@ describe('rederivePlans: a divergence is explicit, never a promise of equality',
         turn: 0, range: RANGE, value: { kind: 'inline', value: recorded },
       })),
     ];
-    await expect(rederivePlans(events, world)).rejects.toThrow(
+    await expect(verifyPerceptions(world, events)).rejects.toThrow(
       /recorded Git version .* differs from the host's/);
-  });
-
-  /**
-   * One recorded turn whose wire artifact carries `wireFor(plan)`, so the same
-   * prefix can prove both the honest and the divergent wire.
-   */
-  async function recordedPipeline(
-    world: WorldRepo, wireFor: (plan: RequestPlan) => Buffer,
-  ): Promise<{ events: VerifiedEvents; body: ArtifactRef; plan: RequestPlan }> {
-    const config = configEvent();
-    const turn = turnEvent();
-    const rendered = await presentWorld(world, 'n1', RANGE, 32768, 4096);
-    const perception = verified(envelope(2, 'world/perception', {
-      turn: 0, range: RANGE, value: { kind: 'inline', value: rendered },
-    }));
-
-    // The plan assembled at the recorded moment, then captured as its wire.
-    const atPlan = new ContextFold();
-    await atPlan.observe([config, turn, perception]);
-    const plan = assemble({ id, state: atPlan.snapshot() });
-    const wireBytes = wireFor(plan);
-    const sha = sha256HexOf(wireBytes);
-    const chunk = verified(envelope(4, 'artifact/chunk', {
-      artifact: sha, index: 0, base64: wireBytes.toString('base64'),
-    }));
-    const end = verified(envelope(5, 'artifact/end', {
-      artifact: sha, sha256: sha, bytes: wireBytes.length, encoding: 'utf8', complete: true,
-      parts: [{ seq: chunk.raw.seq, hash: chunk.raw.hash }],
-    }));
-    const body: ArtifactRef = {
-      kind: 'c13-artifact', manifest: { seq: end.raw.seq, hash: end.raw.hash },
-      sha256: sha, bytes: wireBytes.length, encoding: 'utf8', complete: true,
-    };
-    return {
-      plan,
-      body,
-      events: [
-        config, turn, perception,
-        verified(envelope(3, 'request/plan', { id, value: { kind: 'inline', value: plan } })),
-        chunk, end,
-        verified(envelope(6, 'request/wire', { id, attempt: 0, body })),
-      ],
-    };
-  }
-
-  it('re-encodes the recorded wire body from the recorded plan', async () => {
-    const { world } = fixture();
-    const { events, body, plan } = await recordedPipeline(
-      world, (recorded) => Buffer.from(serializeWire(recorded)),
-    );
-
-    const comparisons = await rederivePlans(events, world);
-    expect(comparisons).toHaveLength(1);
-    // The utility itself now verifies the wire; this pins the exact bytes.
-    expect(Buffer.from(resolveArtifact(events, body)).equals(Buffer.from(serializeWire(plan))))
-      .toBe(true);
-    expect(Buffer.from(serializeWire(plan)))
-      .toEqual(Buffer.from(serializeWire(comparisons[0]!.recorded)));
-  });
-
-  it('rejects a recorded wire body that differs from the plan it carries', async () => {
-    const { world } = fixture();
-    // A chain-valid artifact, but not the recorded plan's serialized body.
-    const { events } = await recordedPipeline(
-      world, () => Buffer.from('{"tampered":true}'),
-    );
-    await expect(rederivePlans(events, world)).rejects.toThrow(
-      /wire recorded at \d+:[0-9a-f]+ \(attempt 0\) is not the recorded plan's serialized body/);
   });
 });

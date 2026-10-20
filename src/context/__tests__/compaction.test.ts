@@ -5,7 +5,6 @@ import { sha256HexOf } from '../../journal/index.js';
 import { createBoundaryGate } from '../../node/gate.js';
 import type { BoundaryGate } from '../../node/gate.js';
 import { canonicalMessagesBytes } from '../../provider/wire.js';
-import { assemble } from '../assembler.js';
 import { canonicalBytes } from '../artifacts.js';
 import { COMPACTION_NOTICE, runCompaction, selectCompaction } from '../compaction.js';
 import { defaultAgentConfig } from '../config.js';
@@ -161,15 +160,9 @@ async function pipeline(
   const t = session.gate({ phase: 'turn', turn });
   try {
     const id: RequestId = { turn, ordinal };
-    const plan = assemble({ id, state: session.fold.snapshot() });
-    t.gate.append('request/plan', { id, value: await t.gate.store(plan) });
-    const wireRef = await t.gate.capture(Buffer.from('wire-body'), 'utf8');
-    t.gate.append('request/wire', { id, attempt: 0, body: wireRef });
-    const rawRef = await t.gate.capture(Buffer.from('{"ok":true}'), 'utf8');
-    t.gate.append('response/raw', { id, attempt: 0, status: 200, body: rawRef, complete: true });
     const projection: AssistantProjection = {
       message: { role: 'assistant', content: null, tool_calls: callIds.map(call) },
-      contentTruncated: false, raw: rawRef,
+      contentTruncated: false, frontierCall: `call-${turn}-${ordinal}`,
     };
     t.gate.append('assistant/message', { id, value: await t.gate.store(projection) });
     for (let i = 0; i < callIds.length; i++) {
@@ -179,7 +172,7 @@ async function pipeline(
         t.gate.append('tool/result', {
           turn, request: id, callId: cid,
           message: { role: 'tool', content: 'r'.repeat(resultChars), tool_call_id: cid },
-          isError: false, raw: null, failure: null, synthetic: false,
+          isError: false, raw: null, failure: null, synthetic: false, frontierCall: null,
         });
       }
     }

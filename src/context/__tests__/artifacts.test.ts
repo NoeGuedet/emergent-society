@@ -375,18 +375,22 @@ describe('capture, resolveArtifact and manifest verification', () => {
     expect(err).not.toBeInstanceOf(TypeError);
   });
 
-  it('refuses response/raw whose wrapper complete flag disagrees with the body', async () => {
+  it('requires a tool/result raw artifact receipt to resolve', async () => {
     const h = await openGate();
     try {
-      const id = { turn: 0, ordinal: 0 };
-      const incomplete = await h.gate.capture(Buffer.from('{}'), 'utf8', false);
-      expect(() => h.gate.append('response/raw', {
-        id, attempt: 0, status: 200, body: incomplete, complete: true,
-      })).toThrow(/body\.complete/);
-      // The agreeing form is accepted.
-      expect(() => h.gate.append('response/raw', {
-        id, attempt: 0, status: 200, body: incomplete, complete: false,
-      })).not.toThrow();
+      const request = { turn: 0, ordinal: 0 };
+      const raw = await h.gate.capture(Buffer.from('{}'), 'utf8', false);
+      const data = (captured: ArtifactRef): { turn: number; request: { turn: number; ordinal: number };
+        callId: string; message: { role: 'tool'; content: string; tool_call_id: string };
+        isError: boolean; raw: ArtifactRef; failure: null; synthetic: boolean;
+        frontierCall: null } => ({
+        turn: 0, request, callId: 'c1',
+        message: { role: 'tool', content: 'ok', tool_call_id: 'c1' },
+        isError: false, raw: captured, failure: null, synthetic: false, frontierCall: null,
+      });
+      expect(() => h.gate.append('tool/result', data(raw))).not.toThrow();
+      const forged = { ...raw, manifest: { seq: 999, hash: 'f'.repeat(64) } };
+      expect(() => h.gate.append('tool/result', data(forged))).toThrow(/missing receipt/);
     } finally {
       h.close();
       await h.writer.close();
@@ -691,16 +695,22 @@ describe('lossless bounded artifacts under the real driver gate', () => {
     try {
       driver = await NodeDriver.open(home, 'n1', async (ctx) => {
         ref = await ctx.gate.capture(input, 'utf8');
-        ctx.gate.append('request/wire', { id: { turn: ctx.turn, ordinal: 0 }, attempt: 0, body: ref });
+        // `tool/result.raw` is the surviving local artifact reference (execute
+        // keeps its raw capture); the claim-check envelope must stay bounded.
+        ctx.gate.append('tool/result', {
+          turn: ctx.turn, request: { turn: ctx.turn, ordinal: 0 }, callId: 'c1',
+          message: { role: 'tool', content: 'ok', tool_call_id: 'c1' },
+          isError: false, raw: ref, failure: null, synthetic: false, frontierCall: null,
+        });
         await ctx.gate.flush();
         driver!.stop();
         return { outcome: 'waiting', toolCalls: false };
       }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
       await driver.run();
       const events = await readVerified(home);
-      const wire = events.find((event) => event.type === 'request/wire');
-      if (!wire) throw new Error('missing wire');
-      const stored = (wire.data as unknown as { body: ArtifactRef }).body;
+      const result = events.find((event) => event.type === 'tool/result');
+      if (!result) throw new Error('missing tool/result');
+      const stored = (result.data as unknown as { raw: ArtifactRef }).raw;
       expect(isBlobRef(stored)).toBe(false);
       expect(Buffer.from(resolveArtifact(events, stored)).equals(input)).toBe(true);
       for (const event of events) {

@@ -8,12 +8,16 @@ import { Buffer } from 'node:buffer';
  */
 
 /**
- * The artifact-reference fields the notice reads. Structural by design: this
- * neutral boundary module must not depend on the context layer's contracts.
+ * The capture a truncation notice names. Structural by design: this neutral
+ * boundary module must not depend on the context layer's contracts. The two
+ * forms render different nouns and tails — a local artifact has a digest, a
+ * frontier call has a call id and no artifact digest.
  */
-type TruncationArtifact = {
-  readonly sha256: string; readonly bytes: number; readonly complete: boolean;
-};
+export type TruncationCapture =
+  | { readonly kind: 'artifact'; readonly sha256: string;
+      readonly bytes: number; readonly complete: boolean }
+  | { readonly kind: 'frontier'; readonly call: string;
+      readonly bytes: number; readonly complete: boolean };
 
 /**
  * Non-fatal UTF-8 decoding: each invalid sequence becomes U+FFFD, the same
@@ -46,15 +50,22 @@ export function utf8Prefix(text: string, maxBytes: number): { text: string; byte
 /**
  * The model-facing truncation notice. It states the two bounds separately: the
  * model text was capped at `maxBytes` (the post-render, model-visible bound),
- * while the raw artifact has its own captured byte count and completeness. The
+ * while the capture has its own captured byte count and completeness. The
  * old "showing X of Y bytes" form conflated them and hid an incomplete capture;
  * every value here is kernel-controlled policy or manifest data, never
  * provider-controlled content, and it stays on one line.
+ *
+ * The capture's form is part of the rendering: a local artifact names its
+ * digest, a frontier call names the call and carries no artifact digest (a
+ * fixed noun would otherwise claim one for a frontier capture). Neither form
+ * claims a partial capture is complete.
  */
 export function truncationNotice(
-  kind: 'output' | 'content', maxBytes: number, raw: TruncationArtifact,
+  kind: 'output' | 'content', maxBytes: number, capture: TruncationCapture,
 ): string {
-  return `\n[${kind} truncated: model text capped at ${maxBytes} bytes; `
-    + `raw artifact: ${raw.bytes} captured bytes, complete: ${raw.complete ? 'yes' : 'no'}; `
-    + `raw sha256 ${raw.sha256}]`;
+  const captured = `${capture.bytes} captured bytes, complete: ${capture.complete ? 'yes' : 'no'}`;
+  const tail = capture.kind === 'artifact'
+    ? `raw artifact: ${captured}; raw sha256 ${capture.sha256}`
+    : `frontier call: ${capture.call}, ${captured}`;
+  return `\n[${kind} truncated: model text capped at ${maxBytes} bytes; ${tail}]`;
 }

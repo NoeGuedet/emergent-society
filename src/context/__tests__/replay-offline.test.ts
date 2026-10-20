@@ -2,18 +2,18 @@ import { describe, expect, it } from 'vitest';
 import { BlobStore, JournalWriter } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
 import { useTempHome } from '../../journal/__tests__/helpers.js';
-import { C13_EVENT_TYPES, createBoundaryRegistry, validateRequestPlan } from '../events.js';
+import { C13_EVENT_TYPES, createBoundaryRegistry } from '../events.js';
 import { createBoundaryGate } from '../../node/gate.js';
 import { ContextFold } from '../fold.js';
 import { assemble } from '../assembler.js';
-import { canonicalMessagesBytes, serializeWire } from '../../provider/wire.js';
+import { canonicalMessagesBytes } from '../../provider/wire.js';
 import { loadVerifiedEvents } from '../loader.js';
-import { canonicalBytes, resolveArtifact, resolveStored } from '../artifacts.js';
+import { canonicalBytes } from '../artifacts.js';
 import { defaultAgentConfig } from '../config.js';
 import { sha256HexOf } from '../../journal/index.js';
 import type {
-  AgentConfig, ArtifactRef, AssistantProjection, CompactionStart, FunctionCall,
-  RequestId, RequestPlan, Source, Stored, WorldPerception,
+  AgentConfig, AssistantProjection, CompactionStart, FunctionCall,
+  RequestId, Source, Stored, WorldPerception,
 } from '../contracts.js';
 
 const home = useTempHome('c13-offline-');
@@ -92,7 +92,7 @@ async function foldNow(): Promise<ContextFold> {
 }
 
 describe('C1.3 offline reconstruction (writer-backed, no runtime)', () => {
-  it('D1: giant config artifact, full wire pipeline, committed compaction, interrupted recovery', async () => {
+  it('D1: giant config artifact, semantic pipeline, committed compaction, interrupted recovery', async () => {
     const config = giantConfig();
     const session = await openSession();
     try {
@@ -111,27 +111,17 @@ describe('C1.3 offline reconstruction (writer-backed, no runtime)', () => {
       await turn0.gate.flush();
 
       const requestId: RequestId = { turn: 0, ordinal: 0 };
-      const plan = assemble({ id: requestId, state: (await foldNow()).snapshot() });
-      const storedPlan = await turn0.gate.store(plan);
-      turn0.gate.append('request/plan', { id: requestId, value: storedPlan });
-      const wireBytes = serializeWire(plan);
-      expect(wireBytes.length).toBeGreaterThan(5 * 1024 * 1024); // ~80 × 64 KiB chunks
-      const wireRef = await turn0.gate.capture(wireBytes, 'utf8');
-      turn0.gate.append('request/wire', { id: requestId, attempt: 0, body: wireRef });
-      const rawBytes = Buffer.from(JSON.stringify({ choices: [{ message: { role: 'assistant',
-        content: null, tool_calls: [call('e1', 'true'), call('e2', 'true')] } }] }));
-      const rawRef = await turn0.gate.capture(rawBytes, 'utf8');
-      turn0.gate.append('response/raw', { id: requestId, attempt: 0, status: 200, body: rawRef, complete: true });
+      const calls = [call('e1', 'true'), call('e2', 'true')];
       const projection: AssistantProjection = {
-        message: { role: 'assistant', content: null, tool_calls: [call('e1', 'true'), call('e2', 'true')] },
-        contentTruncated: false, raw: rawRef,
+        message: { role: 'assistant', content: null, tool_calls: calls },
+        contentTruncated: false, frontierCall: 'call-0',
       };
       turn0.gate.append('assistant/message', { id: requestId, value: await turn0.gate.store(projection) });
       for (const id of ['e1', 'e2']) {
         turn0.gate.append('tool/call', { turn: 0, request: requestId, call: call(id, 'true') });
         turn0.gate.append('tool/result', { turn: 0, request: requestId, callId: id,
           message: { role: 'tool', content: 'ok', tool_call_id: id }, isError: false,
-          raw: null, failure: null, synthetic: false });
+          raw: null, failure: null, synthetic: false, frontierCall: null });
       }
       session.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
       await turn0.gate.flush();
@@ -144,20 +134,14 @@ describe('C1.3 offline reconstruction (writer-backed, no runtime)', () => {
         value: { kind: 'inline', value: perception('') } });
       await turn1.gate.flush();
       const request1: RequestId = { turn: 1, ordinal: 0 };
-      const plan1 = assemble({ id: request1, state: (await foldNow()).snapshot() });
-      turn1.gate.append('request/plan', { id: request1, value: await turn1.gate.store(plan1) });
-      const wireRef1 = await turn1.gate.capture(serializeWire(plan1), 'utf8');
-      turn1.gate.append('request/wire', { id: request1, attempt: 0, body: wireRef1 });
-      const rawRef1 = await turn1.gate.capture(rawBytes, 'utf8');
-      turn1.gate.append('response/raw', { id: request1, attempt: 0, status: 200, body: rawRef1, complete: true });
       turn1.gate.append('assistant/message', { id: request1, value: await turn1.gate.store({
         message: { role: 'assistant', content: null, tool_calls: [call('e3', 'true'), call('e4', 'true')] },
-        contentTruncated: false, raw: rawRef1,
+        contentTruncated: false, frontierCall: 'call-1',
       } satisfies AssistantProjection) });
       turn1.gate.append('tool/call', { turn: 1, request: request1, call: call('e3', 'true') });
       turn1.gate.append('tool/result', { turn: 1, request: request1, callId: 'e3',
         message: { role: 'tool', content: 'ok', tool_call_id: 'e3' }, isError: false,
-        raw: null, failure: null, synthetic: false });
+        raw: null, failure: null, synthetic: false, frontierCall: null });
       turn1.gate.append('tool/call', { turn: 1, request: request1, call: call('e4', 'true') });
       await turn1.gate.flush();
     } finally {
@@ -165,18 +149,14 @@ describe('C1.3 offline reconstruction (writer-backed, no runtime)', () => {
     }
 
     const all = await loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES);
-    // The giant config and wire artifacts resolve from their raw blobs after reload.
+    // The giant config resolves from its raw blob after reload: the local log
+    // keeps the semantic facts, and a stored value stays a claim-check reference.
     const configEvent = all.find((event) => event.type === 'system/message')!;
     const storedConfig = (configEvent.data as unknown as { value: Stored<AgentConfig> }).value;
     expect(storedConfig.kind).toBe('artifact-json');
-    const wire = all.find((event) => event.type === 'request/wire')!;
-    const wireArtifact = resolveArtifact(all, (wire.data as unknown as { body: ArtifactRef }).body);
-    expect(wireArtifact.length).toBeGreaterThan(5 * 1024 * 1024);
-    // The recorded plan re-serializes byte-for-byte to the durable wire.
-    const planEvent = all.find((event) => event.type === 'request/plan')!;
-    const planValue = (planEvent.data as unknown as { value: Stored<RequestPlan> }).value;
-    const recordedPlan = resolveStored(all, planValue, validateRequestPlan);
-    expect(Buffer.from(serializeWire(recordedPlan)).equals(Buffer.from(wireArtifact))).toBe(true);
+    const assistant = all.filter((event) => event.type === 'assistant/message');
+    expect(assistant).toHaveLength(2);
+    expect((assistant[0]!.data as { id: RequestId }).id).toEqual({ turn: 0, ordinal: 0 });
 
     // Resume simulation: a synthetic interrupted closer, then a synthetic unknown result for e4.
     const resume = await openSession();
@@ -195,7 +175,8 @@ describe('C1.3 offline reconstruction (writer-backed, no runtime)', () => {
       reconcile.gate({ phase: 'ready', turn: null }).gate.append('tool/result',
         { turn: 1, request: { turn: 1, ordinal: 0 }, callId: 'e4',
           message: { role: 'tool', content: 'Outcome unknown after interruption; not re-executed',
-            tool_call_id: 'e4' }, isError: true, raw: null, failure: null, synthetic: true });
+            tool_call_id: 'e4' }, isError: true, raw: null, failure: null, synthetic: true,
+          frontierCall: null });
       await reconcile.flush();
     } finally { await reconcile.shutdown(); }
     const recovered = await foldNow();

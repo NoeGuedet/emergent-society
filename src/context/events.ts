@@ -1,16 +1,15 @@
 import type { JsonValue } from '../journal/index.js';
 import { NODE_EVENT_TYPES } from '../node/events.js';
 import type { GateScope, BoundaryRegistry } from '../node/gate.js';
+import type { CallId } from '../frontier/index.js';
 import type { WorldRange } from '../node/world.js';
 import { toJson } from './artifacts.js';
-import { validateAgentConfig, validateSeedPolicy, validateToolSchema } from './config.js';
-import { validateProviderParameters } from './parameters.js';
+import { validateAgentConfig } from './config.js';
 import { GATE_DIALECT, createValidator } from './validate.js';
 import type {
-  AgentConfig, ArtifactChunk, ArtifactManifest, ArtifactRef, AssistantProjection, CanonicalUsage,
+  AgentConfig, ArtifactChunk, ArtifactManifest, ArtifactRef, AssistantProjection,
   ChatMessage, CompactionAbort, CompactionEnd, CompactionStart, CompactionSummary, ErrorCode,
-  FunctionCall, PlanSection, RequestId, RequestPlan, SafeFailure, SeedPolicy, Source, Stored,
-  ToolSchema, WorldPerception,
+  FunctionCall, RequestId, SafeFailure, Source, Stored, WorldPerception,
 } from './contracts.js';
 
 /**
@@ -27,20 +26,15 @@ export interface ContextEventDataMap {
   'system/message': { version: number; value: Stored<AgentConfig> };
   /** `value.range` must equal `range`; the fold also ties `range` to the open turn's opening range. */
   'world/perception': { turn: number; range: WorldRange; value: Stored<WorldPerception> };
-  'request/plan': { id: RequestId; value: Stored<RequestPlan> };
   'request/refused': { id: RequestId; bytes: number; limit: number; phase: 'plan' };
-  'request/wire': { id: RequestId; attempt: number; body: ArtifactRef };
-  'response/raw': {
-    id: RequestId; attempt: number; status: number; body: ArtifactRef; complete: boolean;
-  };
-  'request/usage': { id: RequestId; attempt: number; value: CanonicalUsage };
   'assistant/message': { id: RequestId; value: Stored<AssistantProjection> };
-  'assistant/attempt': { id: RequestId; attempt: number; failure: SafeFailure; terminal: boolean };
   'tool/call': { turn: number; request: RequestId; call: FunctionCall };
   'tool/result': {
     turn: number; request: RequestId; callId: string;
     message: Extract<ChatMessage, { role: 'tool' }>; isError: boolean;
     raw: ArtifactRef | null; failure: SafeFailure | null; synthetic: boolean;
+    /** The frontier call that produced this result, when one did; never for execute/wait. */
+    frontierCall: CallId | null;
   };
   'compaction/start': CompactionStart;
   'compaction/summary': CompactionSummary;
@@ -61,9 +55,8 @@ declare module '../node/gate.js' {
 
 const REGISTERED: Record<keyof ContextEventDataMap, true> = {
   'artifact/chunk': true, 'artifact/end': true, 'system/message': true, 'world/perception': true,
-  'request/plan': true, 'request/refused': true, 'request/wire': true, 'response/raw': true,
-  'request/usage': true, 'assistant/message': true, 'assistant/attempt': true, 'tool/call': true,
-  'tool/result': true, 'compaction/start': true, 'compaction/summary': true, 'compaction/end': true,
+  'request/refused': true, 'assistant/message': true, 'tool/call': true, 'tool/result': true,
+  'compaction/start': true, 'compaction/summary': true, 'compaction/end': true,
   'compaction/abort': true,
 };
 
@@ -132,20 +125,6 @@ function artifactRef(value: unknown, where: string): ArtifactRef {
   };
 }
 
-function usage(value: unknown, where: string): CanonicalUsage {
-  const o = record(value, where);
-  onlyKeys(o, ['inputTotal', 'inputUncached', 'output', 'cacheRead', 'cacheWrite'], where);
-  const counter = (key: string): number | null =>
-    o[key] === null ? null : safeInt(o[key], `${where}.${key}`, 0);
-  return {
-    inputTotal: counter('inputTotal'),
-    inputUncached: counter('inputUncached'),
-    output: counter('output'),
-    cacheRead: counter('cacheRead'),
-    cacheWrite: counter('cacheWrite'),
-  };
-}
-
 function safeFailure(value: unknown, where: string): SafeFailure {
   const o = record(value, where);
   onlyKeys(o, ['code', 'status'], where);
@@ -157,40 +136,11 @@ function safeFailure(value: unknown, where: string): SafeFailure {
   return { code: code as ErrorCode, status };
 }
 
-function planSection(value: unknown, where: string): PlanSection {
-  const o = record(value, where);
-  onlyKeys(o, ['name', 'cache', 'sources'], where);
-  const name = o['name'];
-  if (name !== 'tools' && name !== 'charter' && name !== 'heading'
-    && name !== 'history' && name !== 'queue') {
-    fail(`${where}.name`, 'unknown section');
-  }
-  const cache = o['cache'];
-  if (cache !== 'stable' && cache !== 'advance' && cache !== 'volatile') {
-    fail(`${where}.cache`, 'unknown cache class');
-  }
-  return {
-    name,
-    cache,
-    sources: array(o['sources'], `${where}.sources`).map((s, i) => source(s, `${where}.sources[${i}]`)),
-  };
-}
-
-function toolSchema(value: unknown, where: string): ToolSchema {
-  return validateToolSchema(value, where);
-}
-
-function policy(value: unknown, where: string): SeedPolicy {
-  return validateSeedPolicy(value, where);
-}
-
-/** Validates model parameters through the one shared provider-parameter contract. */
-function parameters(value: unknown, where: string): { readonly [key: string]: JsonValue } {
-  try {
-    return validateProviderParameters(value);
-  } catch (err) {
-    return fail(where, err instanceof Error ? err.message : 'invalid parameters');
-  }
+/** A frontier call reference: a nonempty string, structurally a `CallId`. */
+function frontierCall(value: unknown, where: string): CallId {
+  const call = text(value, where);
+  if (call.length === 0) fail(where, 'must be a nonempty string');
+  return call;
 }
 
 function worldPerception(value: unknown, where: string): WorldPerception {
@@ -233,35 +183,20 @@ function worldPerception(value: unknown, where: string): WorldPerception {
 }
 
 /**
- * Validates an untrusted `RequestPlan` (the persisted plan consumers parse) and
- * returns a frozen JSON copy. Semantic re-derivation lives in the assembler; this
- * is the shape/type boundary used by `resolveStored`.
+ * Validates a resolved `AssistantProjection` (the stored payload the fold
+ * parses) and requires the frontier call that produced it: the raw artifact
+ * back-pointer is gone — the frontier journal holds the exchange.
  */
-export function validateRequestPlan(value: unknown): RequestPlan {
-  const o = record(value, 'request/plan');
-  onlyKeys(o, [
-    'id', 'config', 'stateHash', 'model', 'parameters', 'policy', 'tools', 'toolsHash',
-    'sections', 'history', 'queue', 'charter', 'heading',
-  ], 'request/plan');
-  const plan = {
-    id: requestId(o['id'], 'request/plan.id'),
-    config: source(o['config'], 'request/plan.config'),
-    stateHash: hash(o['stateHash'], 'request/plan.stateHash'),
-    model: text(o['model'], 'request/plan.model'),
-    parameters: parameters(o['parameters'], 'request/plan.parameters'),
-    policy: policy(o['policy'], 'request/plan.policy'),
-    tools: array(o['tools'], 'request/plan.tools').map((t, i) => toolSchema(t, `request/plan.tools[${i}]`)),
-    toolsHash: hash(o['toolsHash'], 'request/plan.toolsHash'),
-    sections: array(o['sections'], 'request/plan.sections').map((s, i) =>
-      planSection(s, `request/plan.sections[${i}]`)),
-    history: array(o['history'], 'request/plan.history').map((m, i) =>
-      chatMessage(m, `request/plan.history[${i}]`)),
-    queue: array(o['queue'], 'request/plan.queue').map((m, i) =>
-      chatMessage(m, `request/plan.queue[${i}]`)),
-    charter: text(o['charter'], 'request/plan.charter', false),
-    heading: text(o['heading'], 'request/plan.heading', false),
+function assistantProjection(value: unknown, where: string): AssistantProjection {
+  const o = record(value, where);
+  onlyKeys(o, ['message', 'contentTruncated', 'frontierCall'], where);
+  const message = chatMessage(o['message'], `${where}.message`);
+  if (message.role !== 'assistant') fail(`${where}.message`, 'must be assistant');
+  return {
+    message,
+    contentTruncated: bool(o['contentTruncated'], `${where}.contentTruncated`),
+    frontierCall: frontierCall(o['frontierCall'], `${where}.frontierCall`),
   };
-  return toJson(plan) as unknown as RequestPlan;
 }
 
 // --- scope and provenance helpers -------------------------------------------------
@@ -387,13 +322,6 @@ export function createBoundaryRegistry(): BoundaryRegistry {
       return toJson({ turn, range, value });
     },
 
-    'request/plan': (data: unknown, scope: GateScope): JsonValue => {
-      const { o, id } = requestScoped(data, scope, 'request/plan', ['id', 'value']);
-      const value = storedValue<RequestPlan>(
-        scope, o['value'], 'request/plan.value', validateRequestPlan);
-      return toJson({ id, value });
-    },
-
     'request/refused': (data: unknown, scope: GateScope): JsonValue => {
       const { o, id } = requestScoped(
         data, scope, 'request/refused', ['id', 'bytes', 'limit', 'phase']);
@@ -404,70 +332,13 @@ export function createBoundaryRegistry(): BoundaryRegistry {
       });
     },
 
-    'request/wire': (data: unknown, scope: GateScope): JsonValue => {
-      const { o, id } = requestScoped(data, scope, 'request/wire', ['id', 'attempt', 'body']);
-      const body = artifactRef(o['body'], 'request/wire.body');
-      receipt(scope, body.manifest, 'request/wire.body', 'artifact/end');
-      return toJson({ id, attempt: safeInt(o['attempt'], 'request/wire.attempt', 0), body });
-    },
-
-    'response/raw': (data: unknown, scope: GateScope): JsonValue => {
-      const { o, id } = requestScoped(
-        data, scope, 'response/raw', ['id', 'attempt', 'status', 'body', 'complete']);
-      const body = artifactRef(o['body'], 'response/raw.body');
-      receipt(scope, body.manifest, 'response/raw.body', 'artifact/end');
-      const complete = bool(o['complete'], 'response/raw.complete');
-      // The wrapper's completeness and its body artifact's completeness describe
-      // the same capture; a disagreement is a forged snapshot of the boundary.
-      if (body.complete !== complete) {
-        fail('response/raw', "body.complete does not equal the wrapper's complete");
-      }
-      return toJson({
-        id, attempt: safeInt(o['attempt'], 'response/raw.attempt', 0),
-        status: safeInt(o['status'], 'response/raw.status', 0),
-        body, complete,
-      });
-    },
-
-    'request/usage': (data: unknown, scope: GateScope): JsonValue => {
-      const { o, id } = requestScoped(data, scope, 'request/usage', ['id', 'attempt', 'value']);
-      return toJson({
-        id, attempt: safeInt(o['attempt'], 'request/usage.attempt', 0),
-        value: usage(o['value'], 'request/usage.value'),
-      });
-    },
-
     'assistant/message': (data: unknown, scope: GateScope): JsonValue => {
       const { o, id } = requestScoped(data, scope, 'assistant/message', ['id', 'value']);
       const value = storedValue<AssistantProjection>(
-        scope, o['value'], 'assistant/message.value', (raw) => {
-          const projection = record(raw, 'assistant/message.value.value');
-          onlyKeys(projection, ['message', 'contentTruncated', 'raw'], 'assistant/message.value.value');
-          const message = chatMessage(
-            projection['message'], 'assistant/message.value.value.message');
-          if (message.role !== 'assistant') {
-            fail('assistant/message.value.value.message', 'must be assistant');
-          }
-          const rawRef = artifactRef(projection['raw'], 'assistant/message.value.value.raw');
-          receipt(scope, rawRef.manifest, 'assistant/message.value.value.raw', 'artifact/end');
-          return {
-            message, raw: rawRef,
-            contentTruncated:
-              bool(projection['contentTruncated'], 'assistant/message.value.value.contentTruncated'),
-          };
-        },
+        scope, o['value'], 'assistant/message.value', (raw) =>
+          assistantProjection(raw, 'assistant/message.value.value'),
       );
       return toJson({ id, value });
-    },
-
-    'assistant/attempt': (data: unknown, scope: GateScope): JsonValue => {
-      const { o, id } = requestScoped(
-        data, scope, 'assistant/attempt', ['id', 'attempt', 'failure', 'terminal']);
-      return toJson({
-        id, attempt: safeInt(o['attempt'], 'assistant/attempt.attempt', 0),
-        failure: safeFailure(o['failure'], 'assistant/attempt.failure'),
-        terminal: bool(o['terminal'], 'assistant/attempt.terminal'),
-      });
     },
 
     'tool/call': (data: unknown, scope: GateScope): JsonValue => {
@@ -486,6 +357,7 @@ export function createBoundaryRegistry(): BoundaryRegistry {
       const o = record(data, 'tool/result');
       onlyKeys(o, [
         'turn', 'request', 'callId', 'message', 'isError', 'raw', 'failure', 'synthetic',
+        'frontierCall',
       ], 'tool/result');
       const synthetic = bool(o['synthetic'], 'tool/result.synthetic');
       const turn = safeInt(o['turn'], 'tool/result.turn', 0);
@@ -507,6 +379,8 @@ export function createBoundaryRegistry(): BoundaryRegistry {
         turn, request, callId: text(o['callId'], 'tool/result.callId'), message,
         isError: bool(o['isError'], 'tool/result.isError'),
         raw, failure, synthetic,
+        frontierCall: o['frontierCall'] === null
+          ? null : frontierCall(o['frontierCall'], 'tool/result.frontierCall'),
       });
     },
 

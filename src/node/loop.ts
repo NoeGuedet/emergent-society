@@ -43,6 +43,15 @@ import type { WorldRepo } from './world.js';
  * the journal and the provider transport, none of which the confined shell can
  * reach. `sandboxStatus()` reports the probed ABI/enforcement (a host fact,
  * not journaled). `mock-model` is a test fixture, not a certified provider.
+ *
+ * The local log is the node's cold-start artifact, not the truth: every
+ * kernel-mediated HTTP exchange (the provider and, from T6, the web tools)
+ * crosses the frontier journal, whose request record is durable before the send
+ * and whose terminal is durable before the caller proceeds. The local log keeps
+ * only the semantic runtime facts — turns, perceptions, assistant messages,
+ * tool calls/results, compactions, config — and carries one-directional
+ * `frontierCall` references for the cold start. `request/refused` stays local:
+ * it is the runtime's own capture-ceiling decision before any call exists.
  */
 
 /** Everything one runtime needs; each field is either a recorded policy or a trusted port. */
@@ -209,7 +218,7 @@ class Runtime implements AgentRuntime {
       gate.append('tool/result', {
         turn: unresolved.turn, request: unresolved.request, callId: unresolved.call.id,
         message: { role: 'tool', content: RECONCILE_NOTICE, tool_call_id: unresolved.call.id },
-        isError: true, raw: null, failure: null, synthetic: true,
+        isError: true, raw: null, failure: null, synthetic: true, frontierCall: null,
       });
     }
     if (this.fold.orphanCompactions().length > 0) await runCompaction(this.fold, gate);
