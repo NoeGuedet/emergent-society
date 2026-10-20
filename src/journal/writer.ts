@@ -11,7 +11,7 @@ import {
 } from './framing.js';
 import { CorruptionError, JournalError } from './errors.js';
 import { atomicWriteFile, ensureDurableDirectory, readFileOrNull, syncPath, writeAll } from './fsutil.js';
-import { nodeLayout, type Head, type JournalLayout } from './layout.js';
+import { assertLayoutNames, nodeLayout, type Head, type JournalLayout } from './layout.js';
 import { acquireLock, SessionAlreadyOwnedError, type JournalOwnership } from './lock.js';
 import { genesisState, verifyAll } from './verify.js';
 
@@ -183,10 +183,14 @@ export class JournalWriter {
    * Opens (or creates) the journal a layout names for exclusive writing.
    *
    * Same guarantees as `open`; the layout may be the frontier journal's.
+   *
+   * @throws InvalidJournalLayoutError when the layout's file names are unsafe
+   * or not pairwise distinct, before any directory or file is created.
    */
   static async openIn(
     layout: JournalLayout, opts: JournalWriterOptions = {},
   ): Promise<JournalWriter> {
+    assertLayoutNames(layout);
     await ensureDurableDirectory(layout.dir, layout.home);
     const ownership = await acquireLock(layout);
     let log: FileHandle;

@@ -45,3 +45,17 @@ export class InvalidNodeUidError extends JournalError {
     super(`invalid node uid ${JSON.stringify(uid)}: ${reason}`);
   }
 }
+
+/**
+ * A layout whose four file names are not plain, distinct names inside
+ * `layout.dir`. The names are joined onto the directory and then renamed over,
+ * so an unsafe or repeated name is a path escape or a self-replacement: `..` or
+ * a separator leaves the journal directory, `headFile === logFile` makes the
+ * head rename replace the log, and `lockFile === ownerFile` makes the owner
+ * rename replace the flocked inode. Refused before any filesystem effect.
+ */
+export class InvalidJournalLayoutError extends JournalError {
+  constructor(public readonly label: string, reason: string) {
+    super(`journal "${label}": invalid layout — ${reason}`);
+  }
+}

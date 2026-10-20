@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { BlobStore, isBlobRef, resolveBlobRef } from './blobs.js';
 import { scanBatches } from './framing.js';
 import { readFileOrNull, syncPath } from './fsutil.js';
-import { nodeLayout, parseHead, type Head, type JournalLayout } from './layout.js';
+import { assertLayoutNames, nodeLayout, parseHead, type Head, type JournalLayout } from './layout.js';
 import { acquireLock } from './lock.js';
 import { genesisState, verifyChain } from './verify.js';
 import type { EventEnvelope } from './envelope.js';
@@ -63,11 +63,13 @@ export class JournalReader {
   /**
    * Opens a reader over the journal a layout names.
    *
-   * @throws never — the log is read lazily by `events()`.
+   * @throws InvalidJournalLayoutError when the layout's file names are unsafe
+   * or not pairwise distinct; the log itself is read lazily by `events()`.
    */
   static async openIn(
     layout: JournalLayout, opts: JournalReaderOptions,
   ): Promise<JournalReader> {
+    assertLayoutNames(layout);
     return new JournalReader(
       layout, opts.knownTypes,
       opts.resolveBlobs === true ? new BlobStore(layout.home) : null,
@@ -176,8 +178,12 @@ export async function repair(home: string, nodeUid: string): Promise<{ tornBytes
 
 /**
  * The layout-explicit form of `repair`, for any journal (the frontier included).
+ *
+ * @throws InvalidJournalLayoutError when the layout's file names are unsafe or
+ * not pairwise distinct; nothing is probed or truncated before that refusal.
  */
 export async function repairIn(layout: JournalLayout): Promise<{ tornBytes: number }> {
+  assertLayoutNames(layout);
   const { dir } = layout;
   const path = join(layout.dir, layout.logFile);
   const headFile = join(layout.dir, layout.headFile);

@@ -71,12 +71,13 @@ export {
 // Layout, for callers that need to address a journal directly.
 export {
   HEAD_FILE, LOG_FILE, LOCK_FILE, NODE_UID_RE, OWNER_FILE,
-  assertNodeUid, frontierLayout, nodeDir, nodeLayout,
+  assertLayoutNames, assertNodeUid, frontierLayout, nodeDir, nodeLayout,
 } from './layout.js';
 
 // The typed error family.
 export {
-  CorruptionError, InvalidNodeUidError, JournalError, isCorruption, isRetryable,
+  CorruptionError, InvalidJournalLayoutError, InvalidNodeUidError, JournalError,
+  isCorruption, isRetryable,
 } from './errors.js';
 // The durable-write primitives are part of the contract for callers that keep
 // derived state beside a journal (the context snapshots): they must use the same

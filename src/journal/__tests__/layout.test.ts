@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { existsSync } from 'node:fs';
 import { appendFile, mkdir, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { frontierLayout, nodeLayout } from '../layout.js';
-import { InvalidNodeUidError } from '../errors.js';
+import { assertLayoutNames, frontierLayout, nodeLayout } from '../layout.js';
+import { InvalidJournalLayoutError, InvalidNodeUidError } from '../errors.js';
 import { JournalWriter, SessionAlreadyOwnedError } from '../writer.js';
 import { JournalReader, repairIn } from '../reader.js';
 import { acquireLock } from '../lock.js';
@@ -108,6 +108,37 @@ describe('journal layouts', () => {
     expect(existsSync(join(layout.dir, layout.logFile))).toBe(true);
     const r = await JournalReader.open(home(), 'n1', { knownTypes: KNOWN_TYPES });
     expect(await collect(r)).toHaveLength(1);
+  });
+
+  it('accepts the names of both production layouts', () => {
+    expect(() => assertLayoutNames(nodeLayout('/h', 'n1'))).not.toThrow();
+    expect(() => assertLayoutNames(frontierLayout('/h'))).not.toThrow();
+  });
+
+  it('refuses unsafe and duplicate names at every open path', async () => {
+    const base = frontierLayout(home());
+    const unsafe = [
+      // Escape from layout.dir, by separator or by traversal.
+      { logFile: '../escape' },
+      { headFile: '..' },
+      { lockFile: 'a/b' },
+      // A control character is not a file name a diagnostic can carry.
+      { ownerFile: 'bad\u0001name' },
+      // The head rename would replace the log.
+      { headFile: base.logFile },
+      // The owner rename would replace the flocked sidecar inode.
+      { lockFile: base.ownerFile },
+    ];
+    for (const over of unsafe) {
+      const layout = { ...base, ...over };
+      expect(() => assertLayoutNames(layout)).toThrow(InvalidJournalLayoutError);
+      await expect(JournalWriter.openIn(layout)).rejects.toBeInstanceOf(InvalidJournalLayoutError);
+      await expect(JournalReader.openIn(layout, { knownTypes: KNOWN_TYPES }))
+        .rejects.toBeInstanceOf(InvalidJournalLayoutError);
+      await expect(repairIn(layout)).rejects.toBeInstanceOf(InvalidJournalLayoutError);
+    }
+    // Refused before any filesystem effect, including the disappearance probe.
+    expect(existsSync(base.dir)).toBe(false);
   });
 
   it('names the frontier, never a node, in a lock failure', async () => {

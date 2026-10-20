@@ -1,6 +1,6 @@
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { HASH_RE } from './canon.js';
-import { InvalidNodeUidError } from './errors.js';
+import { InvalidJournalLayoutError, InvalidNodeUidError } from './errors.js';
 
 /**
  * Where a journal lives, in one place. The on-disk layout is an interface of
@@ -77,7 +77,7 @@ const FRONTIER_OWNER_FILE = 'journal.v0.owner';
 const FRONTIER_HEAD_FILE = 'journal.v0.head';
 
 /**
- * `nodes/<uid>/` — the node's journal directory, inside the cell home. The uid
+ * `nodes/<uid>/` — the node's local-log directory, inside the cell home. The uid
  * is validated here, before the join, so no caller can address a path outside
  * `home/nodes/`.
  */
@@ -110,6 +110,48 @@ export function frontierLayout(home: string): JournalLayout {
     lockFile: FRONTIER_LOCK_FILE,
     ownerFile: FRONTIER_OWNER_FILE,
   };
+}
+
+/**
+ * One safe file name: a plain, non-empty segment that stays inside
+ * `layout.dir` and carries no control character. Deliberately the same
+ * predicate shape the lock applies to its two names; it stays local because
+ * the layout module must not depend on the lock at runtime.
+ */
+function isSafeFileName(name: unknown): name is string {
+  return typeof name === 'string' && basename(name) === name
+    && name !== '' && name !== '.' && name !== '..'
+    && !/[\u0000-\u001f\u007f]/.test(name);
+}
+
+const LAYOUT_FILE_FIELDS = ['logFile', 'headFile', 'lockFile', 'ownerFile'] as const;
+
+/**
+ * Refuses a layout whose four file names are unsafe or not pairwise distinct.
+ *
+ * The names are joined onto `dir` and later renamed over: a separator or `..`
+ * escapes the journal directory, `headFile === logFile` lets the head rename
+ * replace the log, and `lockFile === ownerFile` lets the owner rename replace
+ * the flocked sidecar inode. Every open path validates before its first
+ * filesystem effect, so a hand-built layout (types are not runtime-checked)
+ * cannot reach a journal.
+ *
+ * @throws InvalidJournalLayoutError naming the first offending field.
+ */
+export function assertLayoutNames(layout: JournalLayout): void {
+  for (const field of LAYOUT_FILE_FIELDS) {
+    if (!isSafeFileName(layout[field])) {
+      throw new InvalidJournalLayoutError(
+        layout.label, `${field} ${JSON.stringify(layout[field])} is not a plain file name`,
+      );
+    }
+  }
+  const names = LAYOUT_FILE_FIELDS.map((field) => layout[field]);
+  if (new Set(names).size !== names.length) {
+    throw new InvalidJournalLayoutError(
+      layout.label, 'the log, head, lock and owner file names must be pairwise distinct',
+    );
+  }
 }
 
 /**
