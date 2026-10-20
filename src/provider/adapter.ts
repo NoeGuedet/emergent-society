@@ -24,10 +24,11 @@ import type { SerializedTransport, TransportResult } from './transport.js';
  *
  * The local log keeps only the semantic success fact: the assistant
  * `projection` (carrying the frontier `call` id) is stored and journaled as
- * `assistant/message`, flushed before the caller proceeds. The plan, wire,
- * raw response, usage and attempt events are frontier facts now and are never
- * journaled locally; a terminal failure records nothing local — the driver's
- * `turn/end` carries the error. A flush/invariant failure raised while
+ * `assistant/message`, flushed before the caller proceeds. Nothing else is
+ * journaled locally: the plan is never journaled anywhere (its serialized bytes
+ * are the request body), and the wire, raw response, usage and attempt facts
+ * belong to the frontier. A terminal failure records nothing local — the
+ * driver's `turn/end` carries the error. A flush/invariant failure raised while
  * journaling the projection is rethrown fatally and is never converted into a
  * `SendResult.failure`; a frontier `begin`/`complete` failure propagates the
  * same way (nothing crossed the frontier, or the send's terminal is pending).

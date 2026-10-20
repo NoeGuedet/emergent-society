@@ -1,15 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { Buffer } from 'node:buffer';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
+import { sha256HexOf } from '../../journal/index.js';
 import { defaultAgentConfig } from '../config.js';
+import { ArtifactMismatchError } from '../loader.js';
 import type { VerifiedEvent, VerifiedEvents } from '../loader.js';
+import { resolveArtifact } from '../artifacts.js';
 import { assemble } from '../assembler.js';
 import { presentWorld } from '../diff.js';
 import { serializeWire } from '../../provider/wire.js';
 import { useWorld } from '../../node/__tests__/helpers.js';
 import { verifyPerceptions } from './verify-perceptions.js';
 import type {
-  AgentConfig, ChatMessage, FunctionCall, OpenTurn, ProjectionState,
+  AgentConfig, ArtifactRef, ChatMessage, FunctionCall, OpenTurn, ProjectionState,
   RequestId, Source, SurfaceGroup, SurfaceNode, SurfaceSnapshot, ToolSchema,
 } from '../contracts.js';
 
@@ -304,6 +307,45 @@ describe('verifyPerceptions: a divergence is explicit, never a promise of equali
     expect(err).not.toBeInstanceOf(TypeError);
     expect((err as Error).message).toContain('replay: world/perception data at 0:');
     expect((err as Error).message).toContain('is not an object');
+  });
+
+  it('resolves a stored perception only from the observed prefix', async () => {
+    const { world } = fixture();
+    const bytes = Buffer.from(JSON.stringify({ recorded: true }), 'utf8');
+    const sha = sha256HexOf(bytes);
+    const half = Math.floor(bytes.length / 2);
+    const ref: ArtifactRef = {
+      kind: 'c13-artifact', manifest: { seq: 3, hash: hashFor(3) },
+      sha256: sha, bytes: bytes.length, encoding: 'utf8', complete: true,
+    };
+    const events: VerifiedEvents = [
+      verified(envelope(0, 'world/perception', {
+        turn: 0, range: RANGE, value: { kind: 'artifact-json', ref },
+      })),
+      verified(envelope(1, 'artifact/chunk', {
+        artifact: sha, index: 0, base64: bytes.subarray(0, half).toString('base64'),
+      })),
+      verified(envelope(2, 'artifact/chunk', {
+        artifact: sha, index: 1, base64: bytes.subarray(half).toString('base64'),
+      })),
+      verified(envelope(3, 'artifact/end', {
+        artifact: sha, sha256: sha, bytes: bytes.length, encoding: 'utf8', complete: true,
+        parts: [{ seq: 1, hash: hashFor(1) }, { seq: 2, hash: hashFor(2) }],
+      })),
+    ];
+
+    // The artifact is genuinely resolvable from the whole history...
+    expect(Buffer.from(resolveArtifact(events, ref)).equals(bytes)).toBe(true);
+    // ...but the perception cites a manifest that is still in the future when it
+    // is read, so the helper refuses rather than trusting a later receipt.
+    let err: unknown;
+    try {
+      await verifyPerceptions(world, events);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ArtifactMismatchError);
+    expect((err as ArtifactMismatchError).field).toBe('manifest');
   });
 
   it('rejects a recorded perception whose inline text differs from the re-render', async () => {

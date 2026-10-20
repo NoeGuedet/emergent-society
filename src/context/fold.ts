@@ -25,9 +25,9 @@ import { Surface } from './surface.js';
  * no network and no effect; re-observing an identical `(seq,hash)` is idempotent,
  * a changed hash or a gap is a kernel invariant failure.
  *
- * The boundary gate enforces shape and scope; request sequencing (a plan before
- * a wire, a wire before a response, a call before a result) and the artifact-json
- * inner-value equalities the gate cannot see are the fold's responsibility.
+ * The boundary gate enforces shape and scope; in-turn sequencing (a call before
+ * its result) and the artifact-json inner-value equalities the gate cannot see
+ * are the fold's responsibility.
  */
 
 type AssistantMessage = Extract<ChatMessage, { role: 'assistant' }>;

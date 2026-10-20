@@ -108,7 +108,7 @@ async function foldOf(path: string): Promise<ContextFold> {
  * frontier facts.
  */
 async function pipeline(
-  s: Session, turn: number, _cfg: Source,
+  s: Session, turn: number,
   opts: { perceptionText?: string; calls?: FunctionCall[] },
 ): Promise<{ id: RequestId; gate: BoundaryGate }> {
   s.lifecycle('turn/start', { turn, trigger: 'boot', world: { from: null, to: null } });
@@ -137,16 +137,16 @@ describe('fold: two turns, committed history and an ignorable turn', () => {
   it('promotes the first dialogue and both perceptions, omitting the ignorable assistant', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
+      await startConfig(s);
 
-      const t0 = await pipeline(s, 0, cfg, { perceptionText: 'first evidence', calls: [call('c1'), call('c2')] });
+      const t0 = await pipeline(s, 0, { perceptionText: 'first evidence', calls: [call('c1'), call('c2')] });
       t0.gate.append('tool/result', result(t0.id, 0, 'c1') as never);
       t0.gate.append('tool/result', result(t0.id, 0, 'c2') as never);
       await t0.gate.flush();
       s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
       await s.writer.flush();
 
-      const t1 = await pipeline(s, 1, cfg, { perceptionText: 'second evidence', calls: [] });
+      const t1 = await pipeline(s, 1, { perceptionText: 'second evidence', calls: [] });
       await t1.gate.flush();
       const live = await foldOf(home());
       expect(live.snapshot().open?.perception?.messages[0]).toEqual(
@@ -186,8 +186,8 @@ describe('fold: dialogue promotion from the slimmed vocabulary alone', () => {
   it('folds one perception and one dialogue from assistant/message + tool/* only', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
-      const t = await pipeline(s, 0, cfg, { perceptionText: 'evidence', calls: [call('c1')] });
+      await startConfig(s);
+      const t = await pipeline(s, 0, { perceptionText: 'evidence', calls: [call('c1')] });
       t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
       await t.gate.flush();
       s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
@@ -209,8 +209,8 @@ describe('fold: dialogue promotion from the slimmed vocabulary alone', () => {
   it('never writes a retired vocabulary type into the local log', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
-      const t = await pipeline(s, 0, cfg, { perceptionText: 'evidence', calls: [call('c1')] });
+      await startConfig(s);
+      const t = await pipeline(s, 0, { perceptionText: 'evidence', calls: [call('c1')] });
       t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
       await t.gate.flush();
       s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
@@ -231,8 +231,8 @@ describe('fold: dialogue promotion from the slimmed vocabulary alone', () => {
   it('consumes the queue at the first assistant/message, before the closer', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
-      const t = await pipeline(s, 0, cfg, { perceptionText: 'evidence', calls: [] });
+      await startConfig(s);
+      const t = await pipeline(s, 0, { perceptionText: 'evidence', calls: [] });
       await t.gate.flush();
 
       const mid = await foldOf(home());
@@ -342,8 +342,8 @@ describe('fold: provenance and sequencing rejections', () => {
   it('rejects a duplicate result for one call', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
-      const t = await pipeline(s, 0, cfg, { calls: [call('c1')] });
+      await startConfig(s);
+      const t = await pipeline(s, 0, { calls: [call('c1')] });
       t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
       t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
       await t.gate.flush();
@@ -356,8 +356,8 @@ describe('fold: provenance and sequencing rejections', () => {
   it('rejects a forged recovery result id at ready', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
-      const t = await pipeline(s, 0, cfg, { calls: [call('c1'), call('c2')] });
+      await startConfig(s);
+      const t = await pipeline(s, 0, { calls: [call('c1'), call('c2')] });
       t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
       await t.gate.flush();
       s.lifecycle('turn/end', { turn: 0, outcome: 'interrupted', synthetic: true });
@@ -380,8 +380,8 @@ describe('fold: compaction applies only after a verified end', () => {
   it('leaves the surface unchanged until end, then replaces and reports no orphan', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
-      const t0 = await pipeline(s, 0, cfg, { perceptionText: 'external evidence '.repeat(20), calls: [] });
+      await startConfig(s);
+      const t0 = await pipeline(s, 0, { perceptionText: 'external evidence '.repeat(20), calls: [] });
       await t0.gate.flush();
       s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' }, { ignorable: true });
       await s.writer.flush();
@@ -432,8 +432,8 @@ describe('fold: compaction applies only after a verified end', () => {
   it('rejects a durable end whose replacement is not strictly smaller than the shadow', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
-      const t0 = await pipeline(s, 0, cfg, { perceptionText: 'external evidence', calls: [] });
+      await startConfig(s);
+      const t0 = await pipeline(s, 0, { perceptionText: 'external evidence', calls: [] });
       await t0.gate.flush();
       s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' }, { ignorable: true });
       await s.writer.flush();
@@ -476,11 +476,11 @@ describe('fold: compaction summary above the claim-check threshold', () => {
   it('resolves and applies a summary stored as a claim-check reference, durably on replay', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
+      await startConfig(s);
       // A real shadow well above the ~20 KiB summary and far below the 4 MiB gate
       // ceiling, so the strict-smaller rule holds on a genuine span.
       const shadowText = 'external evidence '.repeat(1400);
-      const t0 = await pipeline(s, 0, cfg, { perceptionText: shadowText, calls: [] });
+      const t0 = await pipeline(s, 0, { perceptionText: shadowText, calls: [] });
       await t0.gate.flush();
       s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' }, { ignorable: true });
       await s.writer.flush();
@@ -753,7 +753,8 @@ describe('fold: compaction and refusal sequencing invariants', () => {
       s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
       const gate = s.gate('turn', 0).gate;
       gate.append('compaction/summary', {
-        id: 'e'.repeat(64), message: { role: 'user', content: 'x' }, sources: [cfg], replacementBytes: 1,
+        id: 'e'.repeat(64), message: { role: 'user', content: 'x' },
+        sources: [cfg], replacementBytes: 1,
       });
       await gate.flush();
       await expect(foldOf(home())).rejects.toThrow(/start|matching/);
@@ -820,8 +821,8 @@ describe('fold: acknowledgement is filtered by turn on the live path only', () =
   it('returns null for a live perception-less turn and keeps the prior proof for resume', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
-      const t0 = await pipeline(s, 0, cfg, { perceptionText: 'first evidence' });
+      await startConfig(s);
+      const t0 = await pipeline(s, 0, { perceptionText: 'first evidence' });
       await t0.gate.flush();
       const live = await foldOf(home());
       expect(live.acknowledgedWorld(0)?.turn).toBe(0);
@@ -988,8 +989,8 @@ describe('fold: forged chain-valid payloads fail as typed invariants', () => {
   it('rejects a tool/result whose message is null', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
-      const t = await pipeline(s, 0, cfg, { calls: [call('c1')] });
+      await startConfig(s);
+      const t = await pipeline(s, 0, { calls: [call('c1')] });
       await t.gate.flush();
       rawAppend(s, 'tool/result', {
         turn: 0, request: t.id, callId: 'c1', message: null,
@@ -1117,7 +1118,7 @@ describe('fold: an invariant never leaves the cached surface half-changed', () =
    * call has no result, leaving a durable state an ordinary closer would promote
    * from an unbalanced dialogue.
    */
-  async function unbalancedTurn(s: Session, _cfg: Source): Promise<ContextFold> {
+  async function unbalancedTurn(s: Session): Promise<ContextFold> {
     const fold = new ContextFold();
     const syncTo = async (): Promise<void> => {
       await fold.observe(await loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES));
@@ -1144,8 +1145,8 @@ describe('fold: an invariant never leaves the cached surface half-changed', () =
   it('refuses an unbalanced dialogue under a successful closer before appending', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
-      const fold = await unbalancedTurn(s, cfg);
+      await startConfig(s);
+      const fold = await unbalancedTurn(s);
       const before = fold.snapshot().surface;
       expect(before?.nodes).toHaveLength(1);
 
@@ -1163,8 +1164,8 @@ describe('fold: an invariant never leaves the cached surface half-changed', () =
   it('fail-stops after a fatal invariant and refuses re-delivery onto partial state', async () => {
     const s = await openSession(home());
     try {
-      const cfg = await startConfig(s);
-      const fold = await unbalancedTurn(s, cfg);
+      await startConfig(s);
+      const fold = await unbalancedTurn(s);
       const before = fold.snapshot().surface;
 
       s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
@@ -1212,7 +1213,7 @@ describe('fold: request-sequencing invariants fail closed', () => {
 
   /** One assistant message, with tool/call receipts controlled by the caller. */
   async function announced(
-    s: Session, _cfg: Source, calls: FunctionCall[], receipts: boolean,
+    s: Session, calls: FunctionCall[], receipts: boolean,
   ): Promise<{ id: RequestId; gate: BoundaryGate }> {
     const gate = beginTurn(s);
     gate.append('world/perception', {
@@ -1249,8 +1250,8 @@ describe('fold: request-sequencing invariants fail closed', () => {
     {
       name: 'duplicate assistant/message for a request',
       pattern: /duplicate assistant\/message for a request/,
-      run: async (s, cfg) => {
-        const t = await announced(s, cfg, [], false);
+      run: async (s) => {
+        const t = await announced(s, [], false);
         t.gate.append('assistant/message', {
           id: t.id, value: await t.gate.store(projection([])),
         });
@@ -1259,16 +1260,16 @@ describe('fold: request-sequencing invariants fail closed', () => {
     {
       name: 'tool/call was not advertised',
       pattern: /tool\/call c2 was not advertised/,
-      run: async (s, cfg) => {
-        const t = await pipeline(s, 0, cfg, { calls: [call('c1')] });
+      run: async (s) => {
+        const t = await pipeline(s, 0, { calls: [call('c1')] });
         t.gate.append('tool/call', { turn: 0, request: t.id, call: call('c2') });
       },
     },
     {
       name: 'tool/call arguments disagree with the advertised call',
       pattern: /tool\/call c1 disagrees with the advertised call/,
-      run: async (s, cfg) => {
-        const t = await pipeline(s, 0, cfg, { calls: [call('c1')] });
+      run: async (s) => {
+        const t = await pipeline(s, 0, { calls: [call('c1')] });
         t.gate.append('tool/call', {
           turn: 0, request: t.id,
           call: { id: 'c1', type: 'function', function: { name: 'execute', arguments: '{"cmd":"x"}' } },
@@ -1278,8 +1279,8 @@ describe('fold: request-sequencing invariants fail closed', () => {
     {
       name: 'duplicate tool/result for a call',
       pattern: /duplicate tool\/result for c1/,
-      run: async (s, cfg) => {
-        const t = await pipeline(s, 0, cfg, { calls: [call('c1')] });
+      run: async (s) => {
+        const t = await pipeline(s, 0, { calls: [call('c1')] });
         t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
         t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
       },
@@ -1287,8 +1288,8 @@ describe('fold: request-sequencing invariants fail closed', () => {
     {
       name: 'tool/result without a preceding tool/call',
       pattern: /tool\/result without a preceding tool\/call/,
-      run: async (s, cfg) => {
-        const t = await announced(s, cfg, [call('c1')], false);
+      run: async (s) => {
+        const t = await announced(s, [call('c1')], false);
         t.gate.append('tool/result', result(t.id, 0, 'c1') as never);
       },
     },
@@ -1368,8 +1369,8 @@ describe('fold: request-sequencing invariants fail closed', () => {
     {
       name: 'tool/result is not an advertised call in-turn',
       pattern: /tool\/result c2 is not an advertised call/,
-      run: async (s, cfg) => {
-        const t = await announced(s, cfg, [call('c1')], true);
+      run: async (s) => {
+        const t = await announced(s, [call('c1')], true);
         t.gate.append('tool/result', result(t.id, 0, 'c2') as never);
       },
     },
