@@ -11,7 +11,11 @@ import type {
 } from '../../frontier/index.js';
 import { BlobStore, canonicalizeJson } from '../../journal/index.js';
 import type { EventEnvelope } from '../../journal/index.js';
-import { TavilyWebTools, renderExtract, renderSearch, webRequestBody, webToolsFromProviders } from '../tools/web.js';
+import {
+  TavilyWebTools, frontierOutcome, renderExtract, renderSearch, webRequestBody,
+  webToolsFromProviders,
+} from '../tools/web.js';
+import type { Exchange } from '../tools/web.js';
 import type { ProviderEntry } from '../tools/providers.js';
 
 const KEY = 'tvly-test-never-log';
@@ -41,8 +45,14 @@ type Request = { readonly path: string; readonly method: string;
   readonly contentType: string | undefined; readonly authorization: string | undefined;
   readonly body: Buffer };
 
+/**
+ * `onRequest` fires once the request is fully received but before the answer is
+ * written — the deterministic moment a caller can abort an in-flight exchange
+ * with the request definitely sent and the response still pending.
+ */
 async function serve(
   answer: (req: Request, res: ServerResponse) => void,
+  onRequest?: () => void,
 ): Promise<{ baseUrl: string; requests: Request[] }> {
   const requests: Request[] = [];
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -55,6 +65,7 @@ async function serve(
         contentType: req.headers['content-type'],
         authorization: req.headers.authorization, body: Buffer.concat(chunks) };
       requests.push(record);
+      onRequest?.();
       answer(record, res);
     });
   });
@@ -242,18 +253,57 @@ describe('TavilyWebTools', () => {
     });
   });
 
-  it('gate cancellation wins over the timeout', async () => {
-    const { baseUrl } = await serve(() => { /* never answers */ });
+  it('gate cancellation wins over the timeout, with the request already sent', async () => {
+    let arrived!: () => void;
+    const sent = new Promise<void>((resolve) => { arrived = resolve; });
+    const { baseUrl, requests } = await serve(
+      () => { /* never answers */ },
+      () => arrived(),
+    );
     const controller = new AbortController();
     const pending = (await tools(entry(baseUrl, { timeoutMs: 60000 })))
       .search('q', undefined, controller.signal);
+    // The abort lands after the server received the request and while the
+    // response is still pending: no longer the already-aborted or during-begin
+    // windows, so fetch itself was in flight.
+    await sent;
     controller.abort();
-    await expect(pending).resolves.toMatchObject({ ok: false,
-      failure: { code: 'cancelled', status: null } });
+    await expect(pending).resolves.toMatchObject({ ok: false, status: null,
+      complete: false, failure: { code: 'cancelled', status: null } });
+    expect(requests).toHaveLength(1);
     const [response] = responsesOf(await log());
     expect(response).toMatchObject({
       status: null, body: { complete: false }, error: { code: 'cancelled' },
     });
+  });
+
+  it('gate cancellation during the body read keeps the status and the prefix', async () => {
+    const PREFIX = '{"results":[';
+    let flushed!: () => void;
+    const headersSent = new Promise<void>((resolve) => { flushed = resolve; });
+    const { baseUrl, requests } = await serve((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      // Headers and a prefix reach the kernel; the response never ends, so the
+      // client is blocked mid-read when the caller aborts.
+      res.write(PREFIX, () => flushed());
+    });
+    const controller = new AbortController();
+    const pending = (await tools(entry(baseUrl, { timeoutMs: 60000 })))
+      .search('q', undefined, controller.signal);
+    await headersSent;
+    // The write callback proves the bytes reached the socket; one turn of the
+    // loop later the client has resolved the headers and started reading.
+    await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
+    controller.abort();
+    const outcome = await pending;
+    expect(outcome).toMatchObject({ ok: false, status: 200, complete: false,
+      failure: { code: 'cancelled', status: 200 } });
+    expect(requests).toHaveLength(1);
+    const [response] = responsesOf(await log());
+    expect(response).toMatchObject({
+      status: 200, body: { complete: false }, error: { code: 'cancelled' },
+    });
+    expect((await bodyOf(response!.body)).toString('utf8')).toBe(PREFIX);
   });
 
   it('a pre-aborted gate signal cancels with no request and no frontier event', async () => {
@@ -423,6 +473,64 @@ describe('TavilyWebTools', () => {
       .toThrow(FrontierValidationError);
     expect(() => new TavilyWebTools(bad, gate)).toThrow(FrontierValidationError);
     expect(await log()).toHaveLength(0);
+  });
+
+  it('a plain-http non-loopback baseUrl is a construction error', async () => {
+    // Direct construction must not put the key on the wire in cleartext either;
+    // the loopback escape hatch stays open.
+    const gate = (await frontier()).gate;
+    const insecure = entry('http://api.example');
+    expect(() => new TavilyWebTools(insecure, gate))
+      .toThrow(FrontierValidationError);
+    expect(() => webToolsFromProviders({ tavily: insecure }, gate)).toThrow(/https/);
+    expect(() => new TavilyWebTools(entry('http://127.0.0.1:1'), gate)).not.toThrow();
+  });
+});
+
+describe('frontierOutcome', () => {
+  const body = Buffer.from('{"results":[]}', 'utf8');
+  const headers = { 'content-type': 'application/json', 'set-cookie': 'secret' };
+  const cases: ReadonlyArray<{
+    readonly name: string;
+    readonly exchange: Exchange;
+    readonly status: number | null;
+    readonly complete: boolean;
+    readonly error: string | undefined;
+  }> = [
+    {
+      name: 'a stop observed after a whole 200 body records the exchange success',
+      exchange: { ok: false, failure: { code: 'cancelled', status: 200 },
+        status: 200, body, complete: true, headers },
+      status: 200, complete: true, error: undefined,
+    },
+    {
+      name: 'a stop observed after a whole non-200 body records the exchange error',
+      exchange: { ok: false, failure: { code: 'cancelled', status: 429 },
+        status: 429, body, complete: true, headers },
+      status: 429, complete: true, error: 'http',
+    },
+    {
+      name: 'a stop mid-read keeps the cancellation',
+      exchange: { ok: false, failure: { code: 'cancelled', status: 200 },
+        status: 200, body, complete: false, headers },
+      status: 200, complete: false, error: 'cancelled',
+    },
+    {
+      name: 'a bounded capture keeps body-limit',
+      exchange: { ok: false, failure: { code: 'body-limit', status: 200 },
+        status: 200, body, complete: false, headers },
+      status: 200, complete: false, error: 'body-limit',
+    },
+  ];
+  it.each(cases)('$name', ({ exchange, status, complete, error }) => {
+    expect(frontierOutcome(exchange)).toEqual({
+      status,
+      headers: { 'content-type': 'application/json' },
+      body,
+      encoding: 'binary',
+      complete,
+      ...(error === undefined ? {} : { error }),
+    });
   });
 });
 

@@ -1,11 +1,13 @@
 import { Buffer } from 'node:buffer';
 import type { SafeFailure } from '../../context/contracts.js';
-import { filterHeaders, validateFrontierUrl } from '../../frontier/index.js';
+import {
+  FrontierValidationError, filterHeaders, validateFrontierUrl,
+} from '../../frontier/index.js';
 import type {
   CallId, Frontier, FrontierErrorCode, FrontierOutcome,
 } from '../../frontier/index.js';
 import { readBoundedBody } from '../../net/bounded-body.js';
-import { isRecord } from '../../util.js';
+import { isLoopback, isRecord } from '../../util.js';
 import { decodeToolText } from './text.js';
 import type { ProviderEntry, ProviderRegistry } from './providers.js';
 
@@ -20,7 +22,8 @@ import type { ProviderEntry, ProviderRegistry } from './providers.js';
  * a journaled header, URL, body or id (the journaled credential id is the
  * registry key, never the value). One residual is accepted for the experiment
  * phase and stated plainly: a provider response body is journaled verbatim, so
- * a hostile provider could reflect the credential back into the frontier.
+ * a hostile provider could reflect the credential back into the frontier — and,
+ * as before, into the model-visible local result text.
  *
  * No streaming to the model and no retry: a failure is an agent-visible
  * classified outcome. `WebOutcome` never carries request URLs, error objects or
@@ -48,7 +51,12 @@ export interface WebTools {
 const CREDENTIAL_ID = 'tavily';
 /** The one request header this client sets besides the authorization value. */
 const REQUEST_HEADERS: Readonly<Record<string, string>> = { 'content-type': 'application/json' };
-const EMPTY = new Uint8Array();
+
+/** The argument shape both the port and the request-body helper share. */
+type WebArgs =
+  | { readonly kind: 'web_search'; readonly query: string;
+      readonly maxResults: number | undefined }
+  | { readonly kind: 'web_fetch'; readonly url: string };
 
 /**
  * The one place a Tavily request body is built, shared with the acceptance
@@ -56,12 +64,7 @@ const EMPTY = new Uint8Array();
  * arguments). The `maxResults` clamp lives here; the object form is not a
  * second public surface — the `WebTools` port keeps its positional signatures.
  */
-export function webRequestBody(
-  args: { readonly kind: 'web_search'; readonly query: string;
-          readonly maxResults: number | undefined }
-      | { readonly kind: 'web_fetch'; readonly url: string },
-  entry: ProviderEntry,
-): Uint8Array {
+export function webRequestBody(args: WebArgs, entry: ProviderEntry): Uint8Array {
   const payload = args.kind === 'web_search'
     ? { query: args.query,
         max_results: Math.min(args.maxResults ?? entry.maxResults, entry.maxResults),
@@ -85,7 +88,7 @@ function failureOutcome(
 }
 
 /** The exchange's pure outcome, before the frontier reference is attached. */
-type Exchange =
+export type Exchange =
   | { readonly ok: true; readonly status: number; readonly body: Uint8Array;
       readonly headers: Record<string, string> }
   | { readonly ok: false; readonly failure: SafeFailure; readonly status: number | null;
@@ -106,7 +109,7 @@ function failureExchange(
  * only the caller-visible failure is the cancellation. An incomplete capture can
  * never claim completeness, so it keeps its code.
  */
-function frontierOutcome(exchange: Exchange): FrontierOutcome {
+export function frontierOutcome(exchange: Exchange): FrontierOutcome {
   const headers = filterHeaders(exchange.headers, 'response');
   if (exchange.ok) {
     return { status: exchange.status, headers, body: exchange.body,
@@ -134,13 +137,35 @@ function toFrontierCode(failure: SafeFailure): FrontierErrorCode {
   }
 }
 
+/**
+ * The provenance rule both credential-bearing clients apply: `https:` unless the
+ * host is loopback, so a direct construction cannot put the key on the wire in
+ * cleartext. `loadProviders` applies the same rule to a configured base URL.
+ */
+function validateBaseUrl(baseUrl: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new FrontierValidationError('invalid web tools base URL: not a URL');
+  }
+  if (parsed.protocol !== 'https:'
+    && !(parsed.protocol === 'http:' && isLoopback(parsed.hostname))) {
+    throw new FrontierValidationError(
+      'invalid web tools base URL: must be https unless it is a loopback host',
+    );
+  }
+}
+
 export class TavilyWebTools implements WebTools {
   private readonly urls: { readonly search: string; readonly extract: string };
 
   constructor(private readonly entry: ProviderEntry, private readonly frontier: Frontier) {
-    // The two URLs this client will journal are validated once, at construction,
-    // with the same predicate `begin` applies — so a misconfigured base URL
-    // fails loudly here and never becomes a per-call begin failure.
+    // The base URL and the two URLs this client will journal are validated once,
+    // at construction: the https rule, then the same frontier predicate `begin`
+    // applies — so a misconfigured base URL fails loudly here and never becomes
+    // a per-call begin failure.
+    validateBaseUrl(entry.baseUrl);
     this.urls = {
       search: validateFrontierUrl(`${entry.baseUrl}/search`),
       extract: validateFrontierUrl(`${entry.baseUrl}/extract`),
@@ -155,21 +180,17 @@ export class TavilyWebTools implements WebTools {
     return this.call({ kind: 'web_fetch', url }, this.urls.extract, signal);
   }
 
-  private async call(
-    args: { readonly kind: 'web_search'; readonly query: string;
-            readonly maxResults: number | undefined }
-        | { readonly kind: 'web_fetch'; readonly url: string },
-    url: string, signal: AbortSignal,
-  ): Promise<WebOutcome> {
+  private async call(args: WebArgs, url: string, signal: AbortSignal): Promise<WebOutcome> {
     const body = webRequestBody(args, this.entry);
     const controller = new AbortController();
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, this.entry.timeoutMs);
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const onGate = (): void => { controller.abort(); };
     try {
       // No call exists for an already-stopped caller: no begin, no event.
       if (signal.aborted) {
-        return failureOutcome({ code: 'cancelled', status: null }, null, EMPTY, false, null);
+        return failureOutcome(
+          { code: 'cancelled', status: null }, null, new Uint8Array(), false, null);
       }
 
       // Durable and read-back verified before the send; a failure here throws
@@ -186,11 +207,15 @@ export class TavilyWebTools implements WebTools {
       // cancellation it is, and no POST is sent.
       if (signal.aborted) {
         await this.frontier.complete(call, {
-          status: null, error: 'cancelled', body: EMPTY, encoding: 'binary', complete: false,
+          status: null, error: 'cancelled', body: new Uint8Array(),
+          encoding: 'binary', complete: false,
         });
-        return failureOutcome({ code: 'cancelled', status: null }, null, EMPTY, false, call.call);
+        return failureOutcome(
+          { code: 'cancelled', status: null }, null, new Uint8Array(), false, call.call);
       }
 
+      // The caller's timeout bounds the exchange, not the durable journaling.
+      timer = setTimeout(() => { timedOut = true; controller.abort(); }, this.entry.timeoutMs);
       signal.addEventListener('abort', onGate, { once: true });
       // Close the narrow window between the check above and the listener.
       if (signal.aborted) controller.abort();
@@ -205,7 +230,7 @@ export class TavilyWebTools implements WebTools {
         : { ok: false, failure: exchange.failure, status: exchange.status,
             body: exchange.body, complete: exchange.complete, frontierCall: call.call };
     } finally {
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
       signal.removeEventListener('abort', onGate);
     }
   }
@@ -234,7 +259,7 @@ export class TavilyWebTools implements WebTools {
         gateAborted() ? { code: 'cancelled', status: null }
           : timedOut() ? { code: 'timeout', status: null }
           : { code: 'network', status: null },
-        null, EMPTY, false, {});
+        null, new Uint8Array(), false, {});
     }
     const status = response.status;
     const headers = Object.fromEntries(response.headers);
