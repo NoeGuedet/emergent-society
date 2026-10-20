@@ -32,9 +32,10 @@ import { isRecord } from '../util.js';
  * refusal happens before any blob or event exists.
  *
  * The schema primitives (`record`, `onlyKeys`, `text`, `bool`, `safeInt`,
- * `array`) repeat the C1.3 validator idiom rather than importing it: the
- * frontier sits below the context layer and must not depend on it. The
- * duplication is bounded to those six; anything shape-specific lives here once.
+ * `array`, `hash`) repeat the C1.3 validator idiom rather than importing it:
+ * the frontier sits below the context layer and must not depend on it. The
+ * duplication is bounded to those seven; anything shape-specific lives here
+ * once.
  *
  * Every refusal throws `FrontierValidationError`. Nothing here reads a clock or
  * touches the filesystem: a payload either validates to its frozen data form or
@@ -579,10 +580,12 @@ const TRUNCATION_MARK_LENGTH = codePoints(HEADER_TRUNCATION_MARK);
 /**
  * Lowercases names, keeps the direction's allowlist, and truncates values to
  * `HEADER_VALUE_LIMIT` code points with the mark included, so a provider can
- * never make `complete` throw through a header. The cut is by code point, never
- * a UTF-16 unit, so a truncated value is always well-formed Unicode and the
- * canonical writer never refuses it. On a case collision after lowercasing, the
- * last value wins.
+ * never make `complete` throw through a header. Each value is first made
+ * well-formed (`toWellFormed`), because the canonical writer refuses lone
+ * surrogates outright: a raw header value carrying one would otherwise pass
+ * this filter and die at append. The cut is then by code point, never a UTF-16
+ * unit, so a truncated value is always valid Unicode. On a case collision after
+ * lowercasing, the last value wins.
  */
 export function filterHeaders(
   headers: Readonly<Record<string, string>>, direction: 'request' | 'response',
@@ -594,9 +597,10 @@ export function filterHeaders(
   for (const [rawName, value] of Object.entries(headers)) {
     const name = rawName.toLowerCase();
     if (!allowed.has(name)) continue;
-    const points = Array.from(value);
+    const normalized = value.toWellFormed();
+    const points = Array.from(normalized);
     out[name] = points.length <= HEADER_VALUE_LIMIT
-      ? value
+      ? normalized
       : points.slice(0, HEADER_VALUE_LIMIT - TRUNCATION_MARK_LENGTH).join('')
         + HEADER_TRUNCATION_MARK;
   }

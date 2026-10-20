@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CLAIM_CHECK_THRESHOLD, canonicalizeJson, type JsonValue } from '../../journal/index.js';
+import { CLAIM_CHECK_THRESHOLD, canonicalizeJson } from '../../journal/index.js';
 import {
   FRONTIER_EVENT_TYPES, FRONTIER_MAX_BODY_BYTES, FRONTIER_MAX_CREDENTIAL_ID,
   FRONTIER_MAX_CREDENTIALS, FRONTIER_MAX_URL_BYTES, FRONTIER_REQUEST_HEADERS,
@@ -42,6 +42,18 @@ const RESPONSE: Record<string, unknown> = {
   error: null,
 };
 
+// The exact RFC 8785 forms the two fixtures canonicalize to: keys sorted, no
+// whitespace by construction. A renamed or added field cannot follow silently.
+const REQUEST_CANONICAL = `{"attempt":0,"body":{"bytes":3,"complete":true,"encoding":"utf8",`
+  + `"sha256":"${SHA}"},"call":"${CALL}","credentials":[{"id":"llm","where":"authorization"}],`
+  + `"group":"${GROUP}","headers":{"accept":"application/json","content-type":"application/json"},`
+  + `"method":"POST","url":"https://api.example.com/v1/messages","world_head":"${WORLD_HEAD}"}`;
+
+const RESPONSE_CANONICAL = `{"body":{"bytes":12,"complete":true,"encoding":"binary",`
+  + `"sha256":"${'c'.repeat(64)}"},"call":"${CALL}","error":null,`
+  + `"headers":{"content-type":"application/json","x-request-id":"req_1"},`
+  + `"status":200,"timing":{"durationMs":42}}`;
+
 function request(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { ...REQUEST, ...overrides };
 }
@@ -77,13 +89,13 @@ describe('golden vectors', () => {
     const out = validateFrontierEvent('http/request', REQUEST);
     expect(out).toEqual(REQUEST);
     expect(out).not.toBe(REQUEST);
-    expect(canonicalizeJson(out)).toBe(canonicalizeJson(REQUEST as unknown as JsonValue));
+    expect(canonicalizeJson(out)).toBe(REQUEST_CANONICAL);
   });
 
   it('validates http/response to its frozen data form', () => {
     const out = validateFrontierEvent('http/response', RESPONSE);
     expect(out).toEqual(RESPONSE);
-    expect(canonicalizeJson(out)).toBe(canonicalizeJson(RESPONSE as unknown as JsonValue));
+    expect(canonicalizeJson(out)).toBe(RESPONSE_CANONICAL);
   });
 
   it('validates http/incomplete to its exact canonical form', () => {
@@ -226,6 +238,20 @@ describe('filterHeaders', () => {
     expect((allAstral as string).isWellFormed()).toBe(true);
   });
 
+  it('normalizes lone surrogates before measuring, so its output is well-formed', () => {
+    const lone = filterHeaders({ 'content-type': '\uD800' }, 'request')['content-type'] as string;
+    expect(lone).toBe('\uFFFD');
+    expect(lone.isWellFormed()).toBe(true);
+
+    const loneLow = filterHeaders({ 'content-type': 'a\uDC00b' }, 'request')['content-type'];
+    expect(loneLow).toBe('a\uFFFDb');
+
+    const many = filterHeaders({ 'content-type': '\uD800'.repeat(200) }, 'request')['content-type'];
+    expect((many as string).isWellFormed()).toBe(true);
+    expect(Array.from(many as string)).toHaveLength(HEADER_VALUE_LIMIT);
+    expect(many).toBe(`${'\uFFFD'.repeat(116)}${HEADER_TRUNCATION_MARK}`);
+  });
+
   it('produces only payloads the validators accept, in both directions', () => {
     const values = [
       '',
@@ -235,6 +261,9 @@ describe('filterHeaders', () => {
       '😀'.repeat(300),
       `${'a'.repeat(115)}😀${'b'.repeat(20)}`,
       '\u0001'.repeat(500),
+      '\uD800',
+      'a\uDC00b',
+      '\uD800'.repeat(200),
     ];
     for (const name of FRONTIER_REQUEST_HEADERS) {
       for (const value of values) {
@@ -265,6 +294,7 @@ describe('http/request refusals', () => {
   });
 
   it('refuses an unknown key even when everything else is valid', () => {
+    refusal(() => validateFrontierEvent('http/request', request({ stray: true })));
     expect(() => validateFrontierEvent('http/request', request({ stray: true })))
       .toThrow(/unexpected key "stray"/);
   });
