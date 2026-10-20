@@ -97,7 +97,7 @@ export interface NodeDriverOptions extends JournalWriterOptions {
   /**
    * The event types this driver's replay understands, defaulting to its own
    * `NODE_EVENT_TYPES`. Later checkpoints boot a driver with their types unioned
-   * in, so a journal written by a richer node still resumes here. With hooks, a
+   * in, so a local log written by a richer node still resumes here. With hooks, a
    * supplied set must cover both `NODE_EVENT_TYPES` and every type in the
    * registry; a set missing either is refused before the writer is opened.
    */
@@ -336,9 +336,9 @@ export class NodeDriver {
             this.stopReason = kernelFault ? 'driver-error' : 'handler-error';
             throw err;
           }
-          // The world is committed before the closer is journaled, so the closer
-          // can carry the hash that joins the journal to the world's history
-          // (kernel.md §3, §5.2).
+          // The world is committed before the closer is written, so the closer
+          // can carry the hash that joins the node's local log to the world's
+          // history (kernel.md §3, §5.2).
           const commit = await this.commitWorld(this.turn);
           const toolCalls = this.hooks !== undefined ? this.turnToolCalls > 0 : result.toolCalls;
           if (result.outcome === 'error') {
@@ -365,8 +365,8 @@ export class NodeDriver {
           // The closer is durable and observed per event, never left to the
           // write-behind window (kernel.md §3): a crash right after it would
           // otherwise orphan the world commit — a hash in the world's history that
-          // the journal, the only record of which turn produced it, does not
-          // reference.
+          // the node's local log, the only record of which turn produced it, does
+          // not reference.
           await this.flushObservations();
           await this.checkpoint();
           this.endTurnGate();

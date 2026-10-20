@@ -39,8 +39,8 @@ export class ArtifactMismatchError extends Error {
 }
 
 /**
- * Reads a node's journal raw, verifies the whole chain, and resolves every
- * claim-check reference through the journal's verified read: a flagged
+ * Reads a node's local log raw, verifies the whole chain, and resolves every
+ * claim-check reference through the local log's verified read: a flagged
  * truncated reference, a digest or length mismatch, or a non-JSON body is a
  * typed corruption error. A missing blob file is wrapped in
  * `BlobIntegrityError` rather than surfacing a raw ENOENT; any other read

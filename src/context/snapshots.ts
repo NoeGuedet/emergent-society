@@ -16,11 +16,11 @@ import type { VerifiedEvents } from './loader.js';
  * Disposable projection checkpoints (kernel.md §3, §4).
  *
  * A checkpoint is a typed, defensively frozen `ProjectionState` written beside a
- * node's journal at `nodes/<uid>/snapshots/<seq>.json`, where `<seq>` is the
+ * node's local log at `nodes/<uid>/snapshots/<seq>.json`, where `<seq>` is the
  * verified `(seq, hash)` the state was folded at. It is an accelerator hint and
  * nothing more: C1.3 never uses a checkpoint to skip chain verification or the
  * full fold, so a missing, stale, malformed or forged file is a `null` — never a
- * fatal error and never a substitute for the journal. Snapshot acceleration with
+ * fatal error and never a substitute for the local log. Snapshot acceleration with
  * a complete fold inventory is C1.6.
  *
  * Writing is best effort (any exception is `false`). A snapshot is validated

@@ -54,12 +54,12 @@ Cut order if reducing: I5, I2, I1, I4, never I3. Each instinct has a known **cou
 
 **Raw** tools, the LLM does everything — no business-value tools, which would encode a theory of what the system should do, i.e. pre-wiring through the tooling. The same paradigm is confirmed by the evolution of DeepSeek Harness, whose minimal preset exposes a single tool (persistent shell; commit `63795eaa`).
 
-| Tool | Semantics | Frontier |
+| Tool | Semantics | At the frontier |
 |---|---|---|
 | `speak` | speech channel toward the human — agent zero alone (`direction.md` §1) | — |
-| `execute` | current: **persistent PTY shell** (C1.4b) **confined by Landlock** (C1.4c) — it reads its world, its per-node scratch leaf and the explicit system read set, and writes only its world, that scratch leaf and the granted writable devices, with egress open by decision; the kernel commits the world at the end of each turn, author = node uid (→ practical `undo` = a files-only revert, kernel-side: the shell cannot read the world's git history) | inside |
-| `web_search` / `web_fetch` | read-only web access (no world write): the transport is a POST to the **kernel-mediated provider** (Tavily) — **delivered, C1.4a**; since C1.4d the invocation crosses the frontier (request durable before the send, terminal durable before the result) | almost inside (stateless emission), a frontier exchange |
-| `extend` | **the Cordis gate in a single tool**: `inspect` (read-only catalogue of the runtime, generated from the source) / `define` (immutable Package, no effect) / `run` / `stop` (reversible) / `undefine` (irreversible) | the gate |
+| `execute` | current: **persistent PTY shell** (C1.4b) **confined by Landlock** (C1.4c) — it reads its world, its per-node scratch leaf and the explicit system read set, and writes only its world, that scratch leaf and the granted writable devices, with egress open by decision; the kernel commits the world at the end of each turn, author = node uid (→ practical `undo` = a files-only revert, kernel-side: the shell cannot read the world's git history) | not a frontier fact — the invocation and its result are local-log facts, and its egress is unmediated |
+| `web_search` / `web_fetch` | read-only web access (no world write): the transport is a POST to the **kernel-mediated provider** (Tavily) — **delivered, C1.4a**; since C1.4d the invocation crosses the frontier (request durable before the send, terminal durable before the result) | a frontier exchange — request durable before the send, terminal before the result |
+| `extend` | **the Cordis gate in a single tool**: `inspect` (read-only catalogue of the runtime, generated from the source) / `define` (immutable Package, no effect) / `run` / `stop` (reversible) / `undefine` (irreversible) | no frontier vocabulary — a local/world fact, crossing the mutation gate |
 
 Five effective tools, the empirical cap (~5) respected.
 
