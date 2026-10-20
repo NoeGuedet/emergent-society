@@ -32,10 +32,13 @@ function fail(code, reason) {
 
 // The guard is the security boundary: the lock and owner names arrive as argv
 // here, and the parent cannot protect the sidecar path (`flock` opens its
-// target before this process parses argv). One safe path segment, nothing else.
+// target before this process parses argv). One safe path segment, nothing else:
+// no separator or traversal, and no NUL/control character (which a diagnostic
+// cannot carry and which a shell-facing record must never name).
 function isSafeFileName(name) {
   return typeof name === 'string' && basename(name) === name
-    && name !== '' && name !== '.' && name !== '..';
+    && name !== '' && name !== '.' && name !== '..'
+    && !/[\u0000-\u001f\u007f]/.test(name);
 }
 
 function parseArgv(argv) {

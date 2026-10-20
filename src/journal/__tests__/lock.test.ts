@@ -423,7 +423,7 @@ describe('ownership guard failure', () => {
     expect(await ownerExists(layout)).toBe(false);
   });
 
-  it('refuses a separator or dot-dot in the guard file names', async () => {
+  it('refuses a separator, dot-dot, or control character in the guard file names', async () => {
     const layout = await prepareLayout();
     const helper = fileURLToPath(new URL('../lock-guard.mjs', import.meta.url));
     const token = 'a'.repeat(32);
@@ -434,6 +434,30 @@ describe('ownership guard failure', () => {
     expect(status('../escape', layout.ownerFile)).toBe(12);
     expect(status(layout.lockFile, '..')).toBe(12);
     expect(status(layout.lockFile, 'a/b')).toBe(12);
+    // A control character is not a name a diagnostic can safely carry. NUL
+    // cannot cross `spawn`, so the guard's argv check is exercised with a
+    // printable-control neighbor.
+    expect(status('lock\u0001name', layout.ownerFile)).toBe(12);
+    expect(status(layout.lockFile, 'owner\nname')).toBe(12);
+    expect(await ownerExists(layout)).toBe(false);
+  });
+
+  it('refuses a control character in either name with the typed error', async () => {
+    const layout = await prepareLayout();
+    // NUL is the case that currently escapes `basename` and reaches `spawn`,
+    // whose raw TypeError is not the ownership layer's typed refusal.
+    for (const bad of [
+      { lockFile: 'lock\u0000name' },
+      { ownerFile: 'owner\u0001name' },
+    ]) {
+      const guard = new LockGuard({ ...layout, ...bad });
+      const guarded = await guard.run('acquire', await identity()).catch((e: unknown) => e);
+      expect(guarded).toBeInstanceOf(JournalLockUnavailableError);
+      expect(guarded).not.toBeInstanceOf(TypeError);
+      const acquired = await acquireLock({ ...layout, ...bad }).catch((e: unknown) => e);
+      expect(acquired).toBeInstanceOf(JournalLockUnavailableError);
+      expect(acquired).not.toBeInstanceOf(TypeError);
+    }
     expect(await ownerExists(layout)).toBe(false);
   });
 

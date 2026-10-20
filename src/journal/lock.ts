@@ -107,14 +107,17 @@ const FLOCK_STARTUP_EXITS = new Set([1, 64, 66, 69]);
 class UnknownGuardOutcomeError extends JournalLockUnavailableError {}
 
 /**
- * One safe file name: no separator, no traversal, no empty name. The guard
- * applies exactly the same predicate to the names it receives, but the parent
- * applies it first: `/usr/bin/flock` opens its target before the guard parses
- * argv, so guard-side validation alone cannot protect the sidecar path.
+ * One safe file name: no separator, no traversal, no empty name, and no NUL or
+ * control character (which `spawn` would reject with a raw TypeError, or the
+ * filesystem would carry into a diagnostic). The guard applies exactly the same
+ * predicate to the names it receives, but the parent applies it first:
+ * `/usr/bin/flock` opens its target before the guard parses argv, so guard-side
+ * validation alone cannot protect the sidecar path.
  */
 function isSafeFileName(name: string): boolean {
   return typeof name === 'string' && basename(name) === name
-    && name !== '' && name !== '.' && name !== '..';
+    && name !== '' && name !== '.' && name !== '..'
+    && !/[\u0000-\u001f\u007f]/.test(name);
 }
 
 /**
