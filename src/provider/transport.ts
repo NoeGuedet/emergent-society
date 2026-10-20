@@ -1,5 +1,7 @@
 import type { SafeFailure } from '../context/contracts.js';
-import { FrontierValidationError, validateFrontierUrl } from '../frontier/events.js';
+import {
+  FRONTIER_MAX_CREDENTIAL_ID, FrontierValidationError, validateFrontierUrl,
+} from '../frontier/events.js';
 import { readBoundedBody } from '../net/bounded-body.js';
 
 /**
@@ -14,9 +16,10 @@ import { readBoundedBody } from '../net/bounded-body.js';
  *
  * The port carries the wire facts the adapter cannot otherwise see: the exact
  * endpoint URL, the non-secret request headers and the credential id (never the
- * value). The endpoint is validated once, at construction, by the frontier's
- * own URL predicate plus the https-except-loopback rule, so `begin` can never
- * discover a URL problem the constructor missed.
+ * value). The endpoint and the credential id are validated once, at
+ * construction — the endpoint by the frontier's own URL predicate plus the
+ * https-except-loopback rule, the id against the gate's own bound — so `begin`
+ * can never discover a problem the constructor missed.
  *
  * Before headers a failure yields `status: null`, an empty body and a safe
  * failure. At a known status the response is streamed bounded by `maxBytes`:
@@ -96,6 +99,25 @@ function validateEndpoint(endpoint: string): string {
   return url;
 }
 
+/**
+ * Validates the journaled credential id once, at construction, against the same
+ * bound the gate applies at `begin` (code points, not UTF-16 units). A bad id
+ * must fail loudly here rather than refuse every send it touches.
+ */
+function validateCredentialId(id: string): string {
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new FrontierValidationError(
+      'invalid transport credential id: expected a nonempty string',
+    );
+  }
+  if (Array.from(id).length > FRONTIER_MAX_CREDENTIAL_ID) {
+    throw new FrontierValidationError(
+      `invalid transport credential id: expected at most ${FRONTIER_MAX_CREDENTIAL_ID} characters`,
+    );
+  }
+  return id;
+}
+
 export class OpenAITransport implements SerializedTransport {
   readonly facts: TransportFacts;
 
@@ -103,7 +125,7 @@ export class OpenAITransport implements SerializedTransport {
     this.facts = {
       url: validateEndpoint(config.endpoint),
       headers: REQUEST_HEADERS,
-      credentialId: config.credentialId ?? 'llm',
+      credentialId: validateCredentialId(config.credentialId ?? 'llm'),
     };
   }
 

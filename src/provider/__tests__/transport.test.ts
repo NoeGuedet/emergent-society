@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { Buffer } from 'node:buffer';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { FrontierValidationError } from '../../frontier/index.js';
+import { FRONTIER_MAX_CREDENTIAL_ID, FrontierValidationError } from '../../frontier/index.js';
 import { OpenAITransport } from '../transport.js';
 
 // A file-level restore for the one global `fetch` patch below, so an aborted
@@ -171,6 +171,27 @@ describe('OpenAITransport: the facts the frontier journals', () => {
         endpoint: `http://${loopback}/v1/chat/completions`, key: 'k',
       })).not.toThrow();
     }
+  });
+
+  it.each([
+    ['an empty id', ''],
+    ['an over-long id', 'x'.repeat(FRONTIER_MAX_CREDENTIAL_ID + 1)],
+  ])('refuses %s at construction', (_name, credentialId) => {
+    expect(() => new OpenAITransport({
+      endpoint: 'https://api.example.com/v1/chat/completions', key: 'k', credentialId,
+    })).toThrow(FrontierValidationError);
+  });
+
+  it('measures the credential id bound in code points', () => {
+    const endpoint = 'https://api.example.com/v1/chat/completions';
+    // 64 astral characters are 128 UTF-16 units: exactly the bound is accepted,
+    // one code point more is refused.
+    expect(() => new OpenAITransport({
+      endpoint, key: 'k', credentialId: '✨'.repeat(FRONTIER_MAX_CREDENTIAL_ID),
+    })).not.toThrow();
+    expect(() => new OpenAITransport({
+      endpoint, key: 'k', credentialId: '✨'.repeat(FRONTIER_MAX_CREDENTIAL_ID + 1),
+    })).toThrow(FrontierValidationError);
   });
 });
 
