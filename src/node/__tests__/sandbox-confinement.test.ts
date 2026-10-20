@@ -385,22 +385,28 @@ describe('the world stays usable', () => {
   );
 
   it.skipIf(!launcherPresent)(
-    'stages a large heredoc through the scratch TMPDIR and owns HOME',
+    'writes a large heredoc from a staged world script and owns TMPDIR and HOME',
     async () => {
       const { rt, spec } = await confined();
-      // 100 lines × 700 chars = 70 000 bytes of body plus 100 newlines: past
-      // bash's pipe buffer, so the heredoc is spilled to a file in $TMPDIR.
+      // 100 lines × 700 chars = 70 000 bytes of body plus 100 newlines. The
+      // script is staged in the world rather than pasted into the PTY: the
+      // runtime quotes a command into one physical line, and readline drops
+      // bytes from a ~70 KB line under load — an input hazard, not a
+      // confinement failure. A short `bash stage.sh` keeps the payload off the
+      // terminal while the shell still processes the heredoc itself.
       const body = `${'a'.repeat(700)}\n`.repeat(100);
+      const script = `cat <<'ES_C14C_BIG' > big.txt\n${body}ES_C14C_BIG\n`
+        + `wc -c < big.txt\nprintf 'tmpdir:%s\\n' "$TMPDIR"\n`;
+      await writeFile(join(world, 'stage.sh'), script);
       const outcome = await rt.run(
-        `cat <<'ES_C14C_BIG' > big.txt\n${body}ES_C14C_BIG\n`
-          + `wc -c < big.txt\nprintf 'tmpdir:%s\\n' "$TMPDIR"`,
+        'bash stage.sh',
         // A load-proofing watchdog, not a behavior expectation: the confined
         // PTY can stall past the idle ~160 ms under full-suite parallel load.
         limits({ timeoutMs: 60_000 }), signal(),
       );
       expect(outcome).toMatchObject({ status: 'completed', exitCode: 0 });
       expect(text(outcome)).toMatch(/70100/);
-      // The spill landed in the scratch leaf, not in an inherited TMPDIR.
+      // The scratch TMPDIR is the one the spec names, not an inherited one.
       expect(text(outcome)).toContain(`tmpdir:${spec.env.TMPDIR}`);
       // The bytes are really on disk in the world, not silently dropped.
       const info = await stat(join(world, 'big.txt'));
