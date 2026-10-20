@@ -26,9 +26,10 @@ import { commitAs } from './helpers.js';
  * cell home, its gate injected into every mediator (the provider adapter and the
  * web tools), and its lock held until the host closes it at shutdown. Two
  * runtimes with different uids can share the home — the local writer's lock is
- * per `(home, uid)` — and therefore share the one frontier chain, whose total
- * order is the append order. The host, not the runtime, owns the lifecycle:
- * closing releases the writer lock so a new process can take the frontier.
+ * per `(home, uid)` — and, because the host injects the one gate, share the one
+ * frontier chain, whose total order is the append order. The host, not the
+ * runtime, owns the lifecycle: closing releases the writer lock so a new process
+ * can take the frontier.
  */
 
 const LLM_KEY = 'llm-key-never-logged';
@@ -114,14 +115,14 @@ describe('the composition root', () => {
         res.end(JSON.stringify(body));
       });
     });
-    await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve); });
-    const address = server.address();
-    if (address === null || typeof address === 'string') throw new Error('missing TCP address');
-    const base = `http://127.0.0.1:${address.port}`;
-
     let journal: FrontierJournal | null = null;
     let reopened: FrontierJournal | null = null;
     try {
+      await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve); });
+      const address = server.address();
+      if (address === null || typeof address === 'string') throw new Error('missing TCP address');
+      const base = `http://127.0.0.1:${address.port}`;
+
       // The host's composition: the credential store, one frontier per home,
       // the gate handed to every mediator.
       await writeFile(join(home, 'providers.json'), JSON.stringify({ tavily: {
@@ -198,6 +199,9 @@ describe('the composition root', () => {
       const events = await readFrontier(home);
       // Every call opened and closed before the next one: the shared chain's
       // total order is the append order, and it carries both nodes' exchanges.
+      // One unbroken sequence from 0 makes the single-chain claim visible;
+      // `readFrontier` itself reads through the journal's verifying reader.
+      expect(events.map((event) => event.seq)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
       expect(events.map((event) => event.type)).toEqual([
         'http/request', 'http/response',
         'http/request', 'http/response',
@@ -227,8 +231,8 @@ describe('the composition root', () => {
         worldHead: () => world.headHash(), now: Date.now,
       });
     } finally {
-      // Teardown order is the contract: close the frontier before removing the
-      // home (and never remove a home whose writer lock is still held).
+      // Teardown closes any open frontier before removing the home; a close
+      // failure is ignored so cleanup still runs.
       if (reopened !== null) await reopened.close().catch(() => {});
       if (journal !== null) await journal.close().catch(() => {});
       await closeServer(server);

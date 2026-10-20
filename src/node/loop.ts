@@ -23,7 +23,7 @@ import type { WebTools } from './tools/web.js';
 import type { WorldRepo } from './world.js';
 
 /**
- * The C1.3 agent runtime (T9): the trusted kernel handler and hook bundle that
+ * The C1.3 agent runtime: the trusted kernel handler and hook bundle that
  * turn the driver's turn ritual into real model requests and tool effects.
  *
  * It owns a `ContextFold`, presents one recorded world perception per turn,
@@ -96,7 +96,7 @@ export interface AgentRuntime {
   sandboxStatus(): SandboxStatus | null;
 }
 
-// `defaultAgentConfig`/`validateAgentConfig` live in `src/context/config.ts` (T1)
+// `defaultAgentConfig`/`validateAgentConfig` live in `src/context/config.ts`
 // and are re-exported here for runtime consumers; they are never redefined.
 export { defaultAgentConfig, validateAgentConfig };
 
