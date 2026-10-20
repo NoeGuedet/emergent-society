@@ -45,13 +45,19 @@ import type { WorldRepo } from './world.js';
  * not journaled). `mock-model` is a test fixture, not a certified provider.
  *
  * The local log is the node's cold-start artifact, not the truth: every
- * kernel-mediated HTTP exchange (the provider and, from T6, the web tools)
- * crosses the frontier journal, whose request record is durable before the send
+ * kernel-mediated HTTP exchange (the provider and the web tools) crosses the
+ * frontier journal, whose request record is durable before the send
  * and whose terminal is durable before the caller proceeds. The local log keeps
  * only the semantic runtime facts — turns, perceptions, assistant messages,
  * tool calls/results, compactions, config — and carries one-directional
  * `frontierCall` references for the cold start. `request/refused` stays local:
  * it is the runtime's own capture-ceiling decision before any call exists.
+ *
+ * The frontier journal is not the runtime's resource: the host opens one per
+ * cell home, injects its gate into the adapter and the web tools, and closes it
+ * at shutdown. So two runtimes on the same home (different uids — the local
+ * writer's lock is per `(home, uid)`) share one frontier chain, while the
+ * runtime itself neither opens nor closes it.
  */
 
 /** Everything one runtime needs; each field is either a recorded policy or a trusted port. */
