@@ -4,7 +4,7 @@ The reference document for the project is [`docs/vision.md`](docs/vision.md), wh
 
 ## The project in one sentence
 
-A **perpetual** system of LLM agents that follows a **direction** (not a finite objective) co-negotiated by chat between a human and an **agent zero**, whose structure **emerges** (nothing organizational is coded), on a minimal async event-driven kernel with an append-only journal. Intended contribution (a survey-scoped hypothesis, not an established result): the triangle *perpetual × emergent × co-negotiated direction* appears unoccupied in the corpus surveyed here, with the measurement instrument that goes with it.
+A **perpetual** system of LLM agents that follows a **direction** (not a finite objective) co-negotiated by chat between a human and an **agent zero**, whose structure **emerges** (nothing organizational is coded), on a minimal async event-driven kernel with an append-only frontier journal. Intended contribution (a survey-scoped hypothesis, not an established result): the triangle *perpetual × emergent × co-negotiated direction* appears unoccupied in the corpus surveyed here, with the measurement instrument that goes with it.
 
 ## Current state
 
@@ -20,7 +20,7 @@ Implementation phase. The design is settled and C1 is underway: the journal modu
 
 A checkpoint is reached when its criterion is demonstrated on a running system, not when its parts are coded.
 
-- **C1 — minimal kernel + agent zero + chat + a readable projection of the journal.** *Criterion: we can see everything the agent does, and we can talk to it.*
+- **C1 — minimal kernel + agent zero + chat + a readable projection of the frontier journal.** *Criterion: we can see everything the agent does, and we can talk to it.*
 - **C2 — agent zero hot-extends the system on its own initiative** (it installs a module, the module persists, the system survives a restart). *Criterion: reversibility demonstrated — clean unload.*
 - **C3 — `spawn` + direction.** *Criterion: at comparable budget per unit of time, the organization maintains a coherent trajectory where a solo agent drifts or collapses.*
 
