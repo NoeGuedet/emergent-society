@@ -1,4 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { Buffer } from 'node:buffer';
+import { writeFile } from 'node:fs/promises';
+import { createServer, type Server } from 'node:http';
+import { join } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
 import { BlobStore, JournalWriter } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
 import { useTempHome } from '../../journal/__tests__/helpers.js';
@@ -6,17 +10,31 @@ import { C13_EVENT_TYPES, createBoundaryRegistry } from '../events.js';
 import { createBoundaryGate } from '../../node/gate.js';
 import { ContextFold } from '../fold.js';
 import { assemble } from '../assembler.js';
-import { canonicalMessagesBytes } from '../../provider/wire.js';
+import { canonicalMessagesBytes, serializeWire } from '../../provider/wire.js';
 import { loadVerifiedEvents } from '../loader.js';
-import { canonicalBytes } from '../artifacts.js';
+import { canonicalBytes, resolveStored } from '../artifacts.js';
 import { defaultAgentConfig } from '../config.js';
 import { sha256HexOf } from '../../journal/index.js';
+import { readFrontier } from '../../frontier/__tests__/helpers.js';
+import type { HttpRequest, HttpResponse } from '../../frontier/index.js';
+import { ProviderAdapter } from '../../provider/adapter.js';
+import type {
+  SerializedTransport, TransportFacts, TransportResult,
+} from '../../provider/transport.js';
+import { NodeDriver } from '../../node/driver.js';
+import { createAgentRuntime } from '../../node/loop.js';
+import { DEFAULT_TERMINAL_ENV } from '../../node/tools/terminal.js';
+import { loadProviders } from '../../node/tools/providers.js';
+import { webRequestBody, webToolsFromProviders } from '../../node/tools/web.js';
+import { commitAs, useWorld } from '../../node/__tests__/helpers.js';
+import { verifyPerceptions } from './verify-perceptions.js';
 import type {
   AgentConfig, AssistantProjection, CompactionStart, FunctionCall,
   RequestId, Source, Stored, WorldPerception,
 } from '../contracts.js';
 
 const home = useTempHome('c13-offline-');
+const joinFixture = useWorld('c14d-join-');
 
 /** Structural receipt source: works for both EventEnvelope and VerifiedEvent. */
 const source = (event: { seq: number; hash: string }): Source => ({ seq: event.seq, hash: event.hash });
@@ -220,5 +238,291 @@ describe('C1.3 offline reconstruction (writer-backed, no runtime)', () => {
     expect(nodes[2]?.group.messages[0]?.content).toBe('Older committed context was removed.');
     expect(nodes[3]?.group.kind).toBe('dialogue');
     expect(rebuilt.snapshot().recovery).toEqual([]);
+  }, 30000);
+});
+
+// --- C1.4d T8.10: the local → frontier join ----------------------------------------
+
+const JOIN_FACTS: TransportFacts = {
+  url: 'https://test.invalid/v1/chat/completions',
+  headers: { 'content-type': 'application/json' },
+  credentialId: 'test',
+};
+
+/** A transport answering from a queue; no HTTP, so the run is fully deterministic. */
+class ScriptedTransport implements SerializedTransport {
+  readonly facts: TransportFacts = JOIN_FACTS;
+  readonly sends: Uint8Array[] = [];
+
+  constructor(private readonly replies: readonly TransportResult[]) {}
+
+  async post(body: Uint8Array): Promise<TransportResult> {
+    this.sends.push(body);
+    const reply = this.replies[this.sends.length - 1];
+    if (reply === undefined) throw new Error('scripted transport exhausted');
+    return reply;
+  }
+}
+
+function okReply(content: string | null, calls: readonly FunctionCall[] = []): TransportResult {
+  return {
+    status: 200, headers: {}, complete: true, failure: null,
+    body: Buffer.from(JSON.stringify({ choices: [{ message: {
+      role: 'assistant', content,
+      ...(calls.length === 0 ? {} : { tool_calls: calls }),
+    } }] })),
+  };
+}
+
+function webSearch(id: string, query: string): FunctionCall {
+  return {
+    id, type: 'function',
+    function: { name: 'web_search', arguments: JSON.stringify({ query }) },
+  };
+}
+
+const JOIN_SEARCH_RESPONSE = JSON.stringify({
+  request_id: 'req-join',
+  results: [{
+    title: 'Emergence', url: 'https://example.com/emergence',
+    content: 'complex systems arising from simple rules',
+  }],
+});
+
+async function closeServer(server: Server): Promise<void> {
+  server.closeAllConnections();
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => { if (error) reject(error); else resolve(); });
+  });
+}
+
+/**
+ * The local → frontier join, in the two scoped halves the plan names. A real
+ * runtime performs the exchanges (a scripted LLM transport, so the wire bytes
+ * are captured exactly, and a loopback Tavily server); the joins are then
+ * recomputed **offline** from the two durable artifacts — no network, no
+ * re-execution.
+ *
+ * - *LLM*: for every local `assistant/message`, its `frontierCall` resolves to a
+ *   terminal `http/response`; every attempt of its group carries the same body;
+ *   and that body equals `serializeWire(assemble({ id, state }))` recomputed from
+ *   the local fold state captured just before the `assistant/message` event is
+ *   folded. The fold is stepped event by event and snapshotted only at those
+ *   points; `serializeWire` ignores the request id, so the join needs no
+ *   per-request id mapping. Requests are discriminated by URL.
+ * - *Web*: for every web `tool/result.frontierCall`, the request body equals
+ *   `webRequestBody(args, entry)` recomputed from the recorded `tool/call`
+ *   arguments and the fixture's registry entry.
+ * - Plus `verifyPerceptions(world, events)`: the perception fidelity proof.
+ *
+ * Scoped honestly: an **LLM** call whose attempts all failed has no local anchor
+ * by design (only a success produces an `assistant/message`), so it is checked
+ * for group/attempt integrity only. A **web** call's failure *is* anchored
+ * locally (`dispatch` journals a `tool/result` for every `WebOutcome`), so the
+ * web join covers successes and failures alike.
+ */
+describe('C1.4d T8.10: the local → frontier join', () => {
+  it('recomputes every request body from the local fold and joins it to a terminal', async () => {
+    const fx = joinFixture();
+    await commitAs(fx.world, 'human', { 'direction.txt': 'join the two logs\n' });
+
+    const tavilyBodies: Buffer[] = [];
+    const tavily = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        tavilyBodies.push(Buffer.concat(chunks));
+        res.setHeader('content-type', 'application/json');
+        res.end(JOIN_SEARCH_RESPONSE);
+      });
+    });
+    await new Promise<void>((resolve) => { tavily.listen(0, '127.0.0.1', resolve); });
+    const address = tavily.address();
+    if (address === null || typeof address === 'string') throw new Error('missing TCP address');
+    const tavilyUrl = `http://127.0.0.1:${address.port}`;
+
+    const transport = new ScriptedTransport([
+      // A retryable failure, then the tool-calling answer: one group, two attempts.
+      { status: 429, headers: {}, complete: true, failure: null, body: new Uint8Array() },
+      okReply(null, [webSearch('w1', 'emergent societies')]),
+      okReply('done'),
+    ]);
+    const base = defaultAgentConfig();
+    const config: AgentConfig = {
+      ...base, policy: { ...base.policy, maxAttempts: 2, retryDelayMs: 1 },
+    };
+    let driver: NodeDriver | null = null;
+    let running: Promise<void> | null = null;
+    try {
+      await writeFile(join(fx.home, 'providers.json'), JSON.stringify({ tavily: {
+        key: 'tvly-join-never-logged', baseUrl: tavilyUrl, timeoutMs: 5000,
+      } }), 'utf8');
+      const journal = await fx.frontier();
+      const webTools = webToolsFromProviders(await loadProviders(fx.home), journal.gate);
+      if (webTools === undefined) throw new Error('tavily registry entry missing');
+
+      const runtime = createAgentRuntime({
+        home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
+        terminal: { env: DEFAULT_TERMINAL_ENV },
+        adapter: new ProviderAdapter(transport, {
+          delay: (ms, signal) => new Promise<void>((resolve, reject) => {
+            if (signal.aborted) { reject(new Error('cancelled')); return; }
+            let timer: NodeJS.Timeout | undefined;
+            const onAbort = (): void => {
+              if (timer !== undefined) clearTimeout(timer);
+              reject(new Error('cancelled'));
+            };
+            timer = setTimeout(() => {
+              signal.removeEventListener('abort', onAbort);
+              resolve();
+            }, ms);
+            signal.addEventListener('abort', onAbort, { once: true });
+          }),
+          schedule: (ms, callback) => {
+            const timer = setTimeout(callback, ms);
+            return () => { clearTimeout(timer); };
+          },
+        }, journal.gate),
+        webTools,
+      });
+      driver = await NodeDriver.open(fx.home, 'n1', runtime.handler, fx.world, {
+        knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
+      });
+      running = driver.run();
+      await vi.waitFor(() => expect(driver!.state).toBe('waiting'), { timeout: 15000 });
+      driver.stop();
+      await running;
+      running = null;
+      driver = null;
+
+      // The exchanges happened: three LLM sends (retry included) and one web call.
+      expect(transport.sends).toHaveLength(3);
+      expect(tavilyBodies).toHaveLength(1);
+
+      const events = await loadVerifiedEvents(fx.home, 'n1', C13_EVENT_TYPES);
+      const frontier = await readFrontier(fx.home);
+      const requests = frontier.filter((event) => event.type === 'http/request')
+        .map((event) => event.data as unknown as HttpRequest);
+      const terminals = frontier.filter((event) => event.type === 'http/response')
+        .map((event) => event.data as unknown as HttpResponse);
+      const requestsByCall = new Map(requests.map((request) => [request.call, request]));
+      const terminalsByCall = new Map(terminals.map((terminal) => [terminal.call, terminal]));
+      const blobs = new BlobStore(fx.home);
+      expect(terminals).toHaveLength(requests.length);
+
+      // The default LLM endpoint is the scripted transport's fact; the web URL is
+      // the fixture's. Requests are discriminated by URL.
+      const llmUrl = JOIN_FACTS.url;
+      const llmRequests = requests.filter((request) => request.url === llmUrl);
+      const webRequests = requests.filter((request) => request.url === `${tavilyUrl}/search`);
+      expect(llmRequests).toHaveLength(3);
+      expect(webRequests).toHaveLength(1);
+
+      // --- the LLM half: fold-stepped snapshots and exact wire recomputation ---
+      const fold = new ContextFold();
+      const joins: { id: RequestId; call: string }[] = [];
+      for (const event of events) {
+        if (event.type === 'assistant/message') {
+          const state = fold.snapshot();
+          const data = event.data as unknown as {
+            id: RequestId; value: Stored<AssistantProjection>;
+          };
+          const projection = resolveStored(events, data.value,
+            (value) => value as AssistantProjection);
+          joins.push({ id: data.id, call: projection.frontierCall });
+
+          const terminal = terminalsByCall.get(projection.frontierCall);
+          expect(terminal).toBeDefined();
+          expect(terminal).toMatchObject({
+            status: 200, error: null, body: { complete: true },
+          });
+          const request = requestsByCall.get(projection.frontierCall);
+          expect(request).toBeDefined();
+          expect(request!.url).toBe(llmUrl);
+
+          // Group integrity: contiguous attempts of one logical operation, and
+          // every attempt reuses the exact bytes (one content-addressed blob).
+          const attempts = requests.filter((candidate) =>
+            candidate.group === request!.group);
+          expect(attempts.map((attempt) => attempt.attempt))
+            .toEqual(attempts.map((_attempt, index) => index));
+          expect(new Set(attempts.map((attempt) => attempt.body.sha256)).size).toBe(1);
+
+          // The plan↔wire proof, recomputed from the folded local state only.
+          const wire = Buffer.from(serializeWire(assemble({ id: data.id, state })));
+          const durable = Buffer.from(await blobs.get(request!.body.sha256));
+          expect(durable.equals(wire)).toBe(true);
+          expect(request!.body.sha256).toBe(sha256HexOf(wire));
+          expect(request!.body.bytes).toBe(wire.length);
+        }
+        await fold.observe([event]);
+      }
+      expect(joins.map((join) => join.id)).toEqual([
+        { turn: 0, ordinal: 0 }, { turn: 0, ordinal: 1 },
+      ]);
+      // The first logical request really was retried: one group, two attempts.
+      const first = requestsByCall.get(joins[0]!.call)!;
+      const retried = requests.filter((request) => request.group === first.group);
+      expect(retried).toHaveLength(2);
+      expect(terminalsByCall.get(retried[0]!.call)!.status).toBe(429);
+      expect(terminalsByCall.get(retried[1]!.call)!.status).toBe(200);
+
+      // --- the web half: the body recomputed from the recorded call arguments ---
+      const registry = await loadProviders(fx.home);
+      const entry = registry.tavily;
+      if (entry === undefined) throw new Error('tavily registry entry missing');
+      const callsByKey = new Map<string, FunctionCall>();
+      for (const event of events) {
+        if (event.type !== 'tool/call') continue;
+        const data = event.data as unknown as {
+          request: RequestId; call: FunctionCall;
+        };
+        callsByKey.set(
+          `${data.request.turn}:${data.request.ordinal}:${data.call.id}`, data.call);
+      }
+      let webJoins = 0;
+      for (const event of events) {
+        if (event.type !== 'tool/result') continue;
+        const data = event.data as unknown as {
+          request: RequestId; callId: string; frontierCall: string | null;
+        };
+        if (data.frontierCall === null) continue;
+        const recorded = callsByKey.get(
+          `${data.request.turn}:${data.request.ordinal}:${data.callId}`);
+        expect(recorded).toBeDefined();
+        const parsed = JSON.parse(recorded!.function.arguments) as Record<string, unknown>;
+        const args = recorded!.function.name === 'web_search'
+          ? { kind: 'web_search' as const, query: parsed['query'] as string,
+              maxResults: parsed['max_results'] as number | undefined }
+          : { kind: 'web_fetch' as const, url: parsed['url'] as string };
+        const request = requestsByCall.get(data.frontierCall);
+        expect(request).toBeDefined();
+        expect(request!.url).toBe(`${tavilyUrl}/search`);
+        expect(request!.credentials).toEqual([{ id: 'tavily', where: 'authorization' }]);
+        const wire = Buffer.from(webRequestBody(args, entry));
+        const durable = Buffer.from(await blobs.get(request!.body.sha256));
+        expect(durable.equals(wire)).toBe(true);
+        expect(request!.body.sha256).toBe(sha256HexOf(wire));
+        // The bytes the provider actually received are those durable bytes.
+        expect(durable.equals(tavilyBodies[webJoins]!)).toBe(true);
+        webJoins += 1;
+      }
+      expect(webJoins).toBe(1);
+
+      // --- the perception half the retired rederivation carried ---
+      await verifyPerceptions(fx.world, events);
+    } finally {
+      const current = driver;
+      driver = null;
+      if (current !== null) {
+        current.stop();
+        const pending = running as Promise<void> | null;
+        if (pending !== null) await pending.catch(() => { /* the assertion stands */ });
+        else if (current.state === 'booting' || current.state === 'active') {
+          await current.run().catch(() => { /* the assertion stands */ });
+        }
+      }
+      await closeServer(tavily);
+    }
   }, 30000);
 });
