@@ -90,7 +90,7 @@ export function nodeLayout(home: string, nodeUid: string): JournalLayout {
   const uid = assertNodeUid(nodeUid);
   return {
     home,
-    dir: join(home, 'nodes', uid),
+    dir: nodeDir(home, uid),
     label: uid,
     logFile: LOG_FILE,
     headFile: HEAD_FILE,

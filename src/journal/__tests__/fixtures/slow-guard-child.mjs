@@ -8,14 +8,12 @@ import { join } from 'node:path';
 
 // Invoked with the guard's own argv:
 //   acquire <dir> <pid> <startedAt> <token> --lock <name> --owner <name>
-const [, dir, , , , , , ownerFlag, ownerFile] = process.argv.slice(2);
-const ownerPath = join(dir, ownerFlag === '--owner' ? ownerFile : '');
+const [, dir, , , , , , , ownerFile] = process.argv.slice(2);
+const ownerPath = join(dir, ownerFile);
 
 setTimeout(() => {
-  try {
-    writeFileSync(ownerPath, JSON.stringify({
-      pid: process.pid, startedAt: null, token: 'f'.repeat(32),
-    }));
-  } catch { /* the test cleans up */ }
+  writeFileSync(ownerPath, JSON.stringify({
+    pid: process.pid, startedAt: null, token: 'f'.repeat(32),
+  }));
   process.exit(0);
 }, 3000);

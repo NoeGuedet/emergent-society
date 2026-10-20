@@ -113,7 +113,8 @@ class UnknownGuardOutcomeError extends JournalLockUnavailableError {}
  * argv, so guard-side validation alone cannot protect the sidecar path.
  */
 function isSafeFileName(name: string): boolean {
-  return basename(name) === name && name !== '' && name !== '.' && name !== '..';
+  return typeof name === 'string' && basename(name) === name
+    && name !== '' && name !== '.' && name !== '..';
 }
 
 /**

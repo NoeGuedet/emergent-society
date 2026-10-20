@@ -165,18 +165,35 @@ describe('journal ownership', () => {
     expect(await readdir(layout.dir)).toEqual([layout.lockFile]);
   });
 
-  it('pre-creates the flock sidecar 0600 and keeps its inode across release and re-acquire', async () => {
+  it('pre-creates a fresh flock sidecar with the journal mode 0600', async () => {
     const layout = await prepareLayout();
     const sidecar = lockPathOf(layout);
-    const first = await acquireLock(layout);
+    const owner = await acquireLock(layout);
     const created = await stat(sidecar);
     expect(created.isFile()).toBe(true);
     expect(created.mode & 0o777).toBe(0o600);
+    await owner.release();
+  });
+
+  it('never re-modes an existing sidecar and keeps its inode across acquire and re-acquire', async () => {
+    const layout = await prepareLayout();
+    const sidecar = lockPathOf(layout);
+    // The umask can only clear bits from writeFile's mode; pin the literal mode
+    // the test asserts, independent of the caller's environment.
+    await writeFile(sidecar, 'legacy', { mode: 0o644 });
+    await chmod(sidecar, 0o644);
+    const planted = await stat(sidecar);
+    expect(planted.mode & 0o777).toBe(0o644);
+    const first = await acquireLock(layout);
+    const acquired = await stat(sidecar);
+    expect(acquired.isFile()).toBe(true);
+    expect(acquired.ino).toBe(planted.ino);
+    expect(acquired.mode & 0o777).toBe(0o644);
     await first.release();
     const second = await acquireLock(layout);
     const again = await stat(sidecar);
-    expect(again.ino).toBe(created.ino);
-    expect(again.mode & 0o777).toBe(0o600);
+    expect(again.ino).toBe(planted.ino);
+    expect(again.mode & 0o777).toBe(0o644);
     await second.release();
   });
 });
@@ -424,7 +441,14 @@ describe('ownership guard failure', () => {
     const layout = await prepareLayout();
     const spy = vi.spyOn(guardLauncher, 'spawn');
     try {
-      for (const bad of [{ lockFile: '..' }, { lockFile: 'a/b' }, { ownerFile: '../escape' }]) {
+      // A non-string name must reach the typed refusal, not `basename`'s
+      // ERR_INVALID_ARG_TYPE: a hand-built layout is not type-checked at runtime.
+      const badNames = [
+        { lockFile: '..' }, { lockFile: 'a/b' }, { ownerFile: '../escape' },
+        { lockFile: 42 as unknown as string },
+        { ownerFile: null as unknown as string },
+      ];
+      for (const bad of badNames) {
         const guard = new LockGuard({ ...layout, ...bad });
         const err = await guard.run('acquire', await identity()).catch((e: unknown) => e);
         expect(err).toBeInstanceOf(JournalLockUnavailableError);
