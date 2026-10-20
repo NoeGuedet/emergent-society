@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process';
+import { Buffer } from 'node:buffer';
+import { createServer, type Server } from 'node:http';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -7,6 +9,7 @@ import { collectEvents } from '../../journal/__tests__/helpers.js';
 import type { EventEnvelope } from '../../journal/index.js';
 import { openTestFrontier } from '../../frontier/__tests__/helpers.js';
 import type { FrontierJournal } from '../../frontier/index.js';
+import type { ProviderPolicy } from '../../provider/adapter.js';
 import { NODE_EVENT_TYPES } from '../events.js';
 import { HeadWatcher } from '../watcher.js';
 import { WorldRepo, gitEnv } from '../world.js';
@@ -14,8 +17,9 @@ import { WorldRepo, gitEnv } from '../world.js';
 /**
  * Scaffolding shared by the node suites: a temp root holding one node home and
  * one world repo, torn down afterwards, plus the git-side helpers a test needs
- * to act as a second writer (another node, or the human), and the cell's
- * frontier journal the adapter must cross.
+ * to act as a second writer (another node, or the human), the cell's frontier
+ * journal the adapter must cross, and the loopback-server/clock fixtures the
+ * HTTP-crossing suites share.
  */
 
 export interface WorldFixture {
@@ -170,3 +174,99 @@ export async function committedContent(world: WorldRepo, rel: string): Promise<s
 export function readNode(home: string, uid = 'n1'): Promise<EventEnvelope[]> {
   return collectEvents(home, NODE_EVENT_TYPES, uid);
 }
+
+// --- the loopback-server and timing fixtures --------------------------------------
+
+/** One request a fixture loopback server received. */
+export type RecordedRequest = {
+  readonly url: string;
+  readonly body: Buffer;
+  readonly authorization: string | undefined;
+};
+
+/**
+ * A loopback server answering one JSON body per request. The responder runs
+ * before the response is written, so a test can assert receipt-time facts (the
+ * frontier harness's proof 2 does exactly that). A responder throw is recorded
+ * in `failures`, not swallowed; the response degrades to a 500 so the run still
+ * settles and the test can report the failure.
+ */
+export type LoopServer = {
+  readonly url: string;
+  readonly requests: RecordedRequest[];
+  readonly failures: unknown[];
+  close(): Promise<void>;
+};
+
+/** Stops a fixture server, closing live connections first so no socket hangs. */
+export function closeServer(server: Server): Promise<void> {
+  server.closeAllConnections();
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => { if (error) reject(error); else resolve(); });
+  });
+}
+
+/** Starts a loopback JSON server on an ephemeral port. */
+export async function serveJson(
+  respond: (
+    request: RecordedRequest, index: number,
+  ) => { status?: number; body: string } | Promise<{ status?: number; body: string }>,
+): Promise<LoopServer> {
+  const requests: RecordedRequest[] = [];
+  const failures: unknown[] = [];
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      void (async () => {
+        const request = {
+          url: req.url ?? '',
+          body: Buffer.concat(chunks),
+          authorization: req.headers.authorization,
+        };
+        const index = requests.length;
+        requests.push(request);
+        try {
+          const reply = await respond(request, index);
+          res.statusCode = reply.status ?? 200;
+          res.setHeader('content-type', 'application/json');
+          res.end(reply.body);
+        } catch (err) {
+          failures.push(err);
+          res.statusCode = 500;
+          res.end('{}');
+        }
+      })();
+    });
+  });
+  await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('missing TCP address');
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    requests,
+    failures,
+    close: () => closeServer(server),
+  };
+}
+
+/** The adapter's timing port: real timers, no sleeps beyond a retry delay. */
+export const providerPolicy: ProviderPolicy = {
+  delay: (ms, signal) => new Promise<void>((resolve, reject) => {
+    if (signal.aborted) { reject(new Error('cancelled')); return; }
+    let timer: NodeJS.Timeout | undefined;
+    const onAbort = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      reject(new Error('cancelled'));
+    };
+    timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  }),
+  schedule: (ms, callback) => {
+    const timer = setTimeout(callback, ms);
+    return () => { clearTimeout(timer); };
+  },
+};

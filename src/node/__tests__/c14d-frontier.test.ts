@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { existsSync } from 'node:fs';
-import { createServer, type Server } from 'node:http';
+import { createServer } from 'node:http';
 import {
   lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile,
 } from 'node:fs/promises';
@@ -21,7 +21,7 @@ import {
   type Frontier, type FrontierJournal, type FrontierRequestInput,
   type HttpRequest, type HttpResponse,
 } from '../../frontier/index.js';
-import { ProviderAdapter, type ProviderPolicy } from '../../provider/adapter.js';
+import { ProviderAdapter } from '../../provider/adapter.js';
 import {
   OpenAITransport,
   type SerializedTransport, type TransportFacts, type TransportResult,
@@ -39,7 +39,9 @@ import { DEFAULT_TERMINAL_ENV, PtyTerminalRuntime } from '../tools/terminal.js';
 import type { WebTools } from '../tools/web.js';
 import { webToolsFromProviders } from '../tools/web.js';
 import { WorldRepo } from '../world.js';
-import { commitAs, useWorld } from './helpers.js';
+import {
+  closeServer, commitAs, providerPolicy, serveJson, useWorld, type LoopServer,
+} from './helpers.js';
 
 /**
  * The C1.4d acceptance harness: frontier completeness, proven (plan §8, T8).
@@ -51,8 +53,8 @@ import { commitAs, useWorld } from './helpers.js';
  * without the machinery it names.
  *
  *  1. one mediated path (static scan, stated as a regression guard);
- *  2. no send without a durable, read-back-verified request (both call sites,
- *     positive and, through T4's flush seam, negative);
+ *  2. no send without a durable request (both call sites, positive and,
+ *     through T4's flush seam, negative);
  *  3. no visibility without a durable terminal (a `Frontier` whose `complete`
  *     rejects propagates fatally and no projection happens);
  *  4. a crash between the two halves leaves one honest, idempotent orphan;
@@ -82,7 +84,7 @@ const fixture = useWorld('c14d-frontier-');
 const LLM_KEY = 'llm-key-never-logged';
 const TAVILY_KEY = 'tvly-acceptance-never-logged';
 /** Unique enough that no journal byte can contain it by accident. */
-const FRONTIER_CANARY = 'ES_C14D_FRONTIER_CANARY_4a7d1c9e';
+const STORE_CANARY = 'ES_C14D_STORE_CANARY_4a7d1c9e';
 
 const TEST_FACTS: TransportFacts = {
   url: 'https://test.invalid/v1/chat/completions',
@@ -121,97 +123,6 @@ function assistantReply(
     }),
   } }] });
 }
-
-function closeServer(server: Server): Promise<void> {
-  server.closeAllConnections();
-  return new Promise<void>((resolve, reject) => {
-    server.close((error) => { if (error) reject(error); else resolve(); });
-  });
-}
-
-/** One request a fixture loopback server received. */
-type RecordedRequest = {
-  readonly url: string;
-  readonly body: Buffer;
-  readonly authorization: string | undefined;
-};
-
-/**
- * A loopback server answering one JSON body per request. The responder runs
- * before the response is written, so a test can assert receipt-time facts (the
- * web half of proof 2 does exactly that). A responder throw is recorded, not
- * swallowed; the response degrades to a 500 so the run still settles.
- */
-type LoopServer = {
-  readonly url: string;
-  readonly requests: RecordedRequest[];
-  readonly failures: unknown[];
-  close(): Promise<void>;
-};
-
-async function serveJson(
-  respond: (
-    request: RecordedRequest, index: number,
-  ) => { status?: number; body: string } | Promise<{ status?: number; body: string }>,
-): Promise<LoopServer> {
-  const requests: RecordedRequest[] = [];
-  const failures: unknown[] = [];
-  const server = createServer((req, res) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => {
-      void (async () => {
-        const request = {
-          url: req.url ?? '',
-          body: Buffer.concat(chunks),
-          authorization: req.headers.authorization,
-        };
-        const index = requests.length;
-        requests.push(request);
-        try {
-          const reply = await respond(request, index);
-          res.statusCode = reply.status ?? 200;
-          res.setHeader('content-type', 'application/json');
-          res.end(reply.body);
-        } catch (err) {
-          failures.push(err);
-          res.statusCode = 500;
-          res.end('{}');
-        }
-      })();
-    });
-  });
-  await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve); });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('missing TCP address');
-  return {
-    url: `http://127.0.0.1:${address.port}`,
-    requests,
-    failures,
-    close: () => closeServer(server),
-  };
-}
-
-/** The adapter's timing port: real timers, no sleeps beyond the retry delay. */
-const providerPolicy: ProviderPolicy = {
-  delay: (ms, signal) => new Promise<void>((resolve, reject) => {
-    if (signal.aborted) { reject(new Error('cancelled')); return; }
-    let timer: NodeJS.Timeout | undefined;
-    const onAbort = (): void => {
-      if (timer !== undefined) clearTimeout(timer);
-      reject(new Error('cancelled'));
-    };
-    timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    signal.addEventListener('abort', onAbort, { once: true });
-  }),
-  schedule: (ms, callback) => {
-    const timer = setTimeout(callback, ms);
-    return () => { clearTimeout(timer); };
-  },
-};
 
 /** The default configuration with retry/timeout knobs a test can settle fast. */
 function testConfig(over: Partial<AgentConfig['policy']> = {}): AgentConfig {
@@ -503,6 +414,20 @@ describe('proof 1: one mediated path (a regression guard on kernel sources)', ()
         .toEqual({ needle: banned, files: [] });
     }
 
+    // Bare specifiers too: `from 'http'` and `require('net')` are the same
+    // module as `node:http`/`node:net`, and a regression must not slip through
+    // by omitting the prefix.
+    for (const bare of ['http', 'https', 'net', 'tls', 'http2', 'dgram']) {
+      for (const needle of [
+        `from '${bare}'`, `from "${bare}"`,
+        `require('${bare}')`, `require("${bare}")`,
+        `import('${bare}')`, `import("${bare}")`,
+      ]) {
+        expect({ needle, files: containing(sources, needle) })
+          .toEqual({ needle, files: [] });
+      }
+    }
+
     // Exactly three legitimate kernel sites; a fourth fails the proof.
     expect(containing(sources, 'child' + '_process')).toEqual([
       'journal/lock.ts', 'node/tools/sandbox.ts', 'node/world.ts',
@@ -526,7 +451,7 @@ describe('proof 1: one mediated path (a regression guard on kernel sources)', ()
 // --- proof 2 -----------------------------------------------------------------------
 
 describe('proof 2: no send without a durable request', () => {
-  it('the LLM transport finds the exact posted bytes already durable and verified', async () => {
+  it('the LLM transport finds the exact posted bytes already durable', async () => {
     const { home, world } = fixture();
     const seeded = await commitAs(world, 'human', { 'direction.txt': 'durable first\n' });
     const checks: string[] = [];
@@ -587,7 +512,7 @@ describe('proof 2: no send without a durable request', () => {
     }
   }, 20000);
 
-  it('the Tavily handler finds the request durable and verified at receipt', async () => {
+  it('the Tavily handler finds the request durable at receipt', async () => {
     const root = await mkdtemp(join(tmpdir(), 'c14d-proof2-web-'));
     const home = join(root, 'home');
     await mkdir(home, { recursive: true });
@@ -967,7 +892,7 @@ describe('proof 7: the frontier is unreadable from the confined shell', () => {
       const world = join(root, 'world');
       await mkdir(home, { recursive: true });
       await mkdir(world, { recursive: true });
-      await writeFile(join(home, 'providers.json'), `${FRONTIER_CANARY}\n`, { mode: 0o644 });
+      await writeFile(join(home, 'providers.json'), `${STORE_CANARY}\n`, { mode: 0o644 });
       // A populated frontier: one complete exchange, then closed and durable.
       const journal = await openTestFrontier(home);
       const call = await journal.gate.begin({
@@ -979,46 +904,54 @@ describe('proof 7: the frontier is unreadable from the confined shell', () => {
       });
       await journal.gate.complete(call, {
         status: 200, headers: { 'content-type': 'application/json' },
-        body: Buffer.from(FRONTIER_CANARY, 'utf8'), encoding: 'utf8', complete: true,
+        body: Buffer.from('{"ok":true}', 'utf8'), encoding: 'utf8', complete: true,
       });
       await journal.close();
       const layout = frontierLayout(home);
       const logFile = join(layout.dir, layout.logFile);
       const before = await readFile(logFile);
       const probePath = join(layout.dir, 'probe');
+      const limits = { timeoutMs: 5000, killGraceMs: 100, maxCaptureBytes: 1024 * 1024 };
 
       let runtime: PtyTerminalRuntime | null = null;
       try {
         const spec = await buildSandboxSpec({ world, home, uid: 'n1' });
         runtime = new PtyTerminalRuntime(world, DEFAULT_TERMINAL_ENV, spec);
-        const outcome = await runtime.run(
-          `cat '${logFile}'; echo "read-status:$?"; `
-            + `cat ../home/frontier/${layout.logFile}; echo "relative-status:$?"; `
-            + `printf x >> '${logFile}'; echo "append-status:$?"; `
-            + `touch '${probePath}'; echo "create-status:$?"; `
-            + `cat ../home/providers.json; echo "store-status:$?"; `
-            + 'printf ok > ./world-probe.txt; echo "world-status:$?"',
-          { timeoutMs: 5000, killGraceMs: 100, maxCaptureBytes: 1024 * 1024 },
-          new AbortController().signal,
-        );
-        expect(outcome.status).toBe('completed');
-        const out = Buffer.from(outcome.output).toString('utf8');
-        // Four denials on the frontier (read, relative read, append, create) and
-        // one on the credential store; the shell itself is alive.
-        expect(out.match(/Permission denied/g)?.length).toBe(5);
-        for (const name of ['read', 'relative', 'append', 'create', 'store']) {
-          expect(out).toMatch(new RegExp(`${name}-status:[1-9]\\d*`));
+        // Each probe is its own command, so the denial is asserted per command
+        // rather than as a count over one concatenated script.
+        const probes: readonly { readonly name: string; readonly command: string }[] = [
+          { name: 'read', command: `cat '${logFile}'` },
+          { name: 'relative-read', command: `cat ../home/frontier/${layout.logFile}` },
+          { name: 'append', command: `printf x >> '${logFile}'` },
+          { name: 'create', command: `touch '${probePath}'` },
+          { name: 'store', command: 'cat ../home/providers.json' },
+        ];
+        for (const probe of probes) {
+          const outcome = await runtime.run(
+            probe.command, limits, new AbortController().signal);
+          const out = Buffer.from(outcome.output).toString('utf8');
+          expect({ probe: probe.name, status: outcome.status })
+            .toEqual({ probe: probe.name, status: 'completed' });
+          expect({ probe: probe.name, denied: /Permission denied/.test(out) })
+            .toEqual({ probe: probe.name, denied: true });
+          expect({ probe: probe.name, failed: outcome.exitCode !== 0 })
+            .toEqual({ probe: probe.name, failed: true });
+          // The plaintext store's bytes never reach the shell (the frontier log
+          // is zstd-framed, so its bytes are not a plaintext canary).
+          if (probe.name === 'store') expect(out).not.toContain(STORE_CANARY);
         }
-        expect(out).toMatch(/world-status:0/);
-        expect(out).not.toContain(FRONTIER_CANARY);
+        // The shell itself is alive: a world write succeeds.
+        const control = await runtime.run(
+          'printf ok > ./world-probe.txt', limits, new AbortController().signal);
+        expect(control).toMatchObject({ status: 'completed', exitCode: 0 });
+        expect(await readFile(join(world, 'world-probe.txt'), 'utf8')).toBe('ok');
         // Nothing landed: the log is byte-identical and no probe file exists.
         expect((await readFile(logFile)).equals(before)).toBe(true);
         await expect(lstat(probePath)).rejects.toMatchObject({ code: 'ENOENT' });
-        expect(await readFile(join(world, 'world-probe.txt'), 'utf8')).toBe('ok');
         // The unconfined kernel still reads its own frontier and store.
         expect((await readFile(logFile)).equals(before)).toBe(true);
         expect(await readFile(join(home, 'providers.json'), 'utf8'))
-          .toBe(`${FRONTIER_CANARY}\n`);
+          .toBe(`${STORE_CANARY}\n`);
       } finally {
         if (runtime !== null) await runtime.dispose(100);
         await journal.close().catch(() => {});
@@ -1191,15 +1124,22 @@ describe('proof 9: agnosticism', () => {
 
 // --- proof 11 ----------------------------------------------------------------------
 
-/** A transport that answers from a queue; `throwIfCalled` proves a boot sends nothing. */
+/**
+ * A transport that answers from a queue. `calls` counts invocations at the very
+ * top — before the offline guard — so a regression that sends during boot is
+ * visible even though the adapter swallows the throw; `throwIfCalled` keeps the
+ * old hard failure.
+ */
 class QueueTransport implements SerializedTransport {
   readonly facts: TransportFacts = TEST_FACTS;
   readonly sends: Uint8Array[] = [];
+  calls = 0;
   throwIfCalled = false;
 
   constructor(private readonly replies: readonly TransportResult[]) {}
 
   async post(body: Uint8Array): Promise<TransportResult> {
+    this.calls += 1;
     if (this.throwIfCalled) throw new Error('offline boot sent a request');
     this.sends.push(body);
     const reply = this.replies[this.sends.length - 1];
@@ -1255,9 +1195,11 @@ describe('proof 11: cold start off the slimmed log', () => {
         knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0,
       });
       restarted = { driver, runtime };
-      // open() rebuilt offline: no send, and the journaled config wins over the
-      // deliberately different initial one.
+      // open() rebuilt offline: no send — counted at entry, before the throw the
+      // adapter would swallow — and no frontier crossing either.
+      expect(offline.calls).toBe(0);
       expect(offline.sends).toHaveLength(0);
+      expect(requestsOf(await frontierOf(home))).toHaveLength(1);
       const rebuilt = runtime.snapshot();
       // The rebuilt fold is the same semantic state; only the watermark moved
       // (the resume appended `node/boot`, which the next fold observed).
@@ -1266,6 +1208,13 @@ describe('proof 11: cold start off the slimmed log', () => {
       expect(rebuilt.open).toEqual(before.open);
       expect(rebuilt.pendingCompactions).toEqual(before.pendingCompactions);
       expect(rebuilt.recovery).toEqual([]);
+      // The omission is explicit: the watermark is the last observed event (the
+      // resume's `node/boot`), strictly past the pre-stop one.
+      const after = await nodeEvents(home);
+      const last = after[after.length - 1]!;
+      expect(rebuilt.watermark).toEqual({ seq: last.raw.seq, hash: last.raw.hash });
+      if (before.watermark === null) throw new Error('the first boot left no watermark');
+      expect(rebuilt.watermark!.seq).toBeGreaterThan(before.watermark.seq);
       // The journaled charter won: the differing initial config never applied.
       expect(rebuilt.config?.value.charter).toBe(before.config?.value.charter);
       expect(rebuilt.config?.value.charter).not.toBe(differing.charter);

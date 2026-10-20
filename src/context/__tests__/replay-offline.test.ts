@@ -1,6 +1,5 @@
 import { Buffer } from 'node:buffer';
 import { writeFile } from 'node:fs/promises';
-import { createServer, type Server } from 'node:http';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { BlobStore, JournalWriter } from '../../journal/index.js';
@@ -26,7 +25,9 @@ import { createAgentRuntime } from '../../node/loop.js';
 import { DEFAULT_TERMINAL_ENV } from '../../node/tools/terminal.js';
 import { loadProviders } from '../../node/tools/providers.js';
 import { webRequestBody, webToolsFromProviders } from '../../node/tools/web.js';
-import { commitAs, useWorld } from '../../node/__tests__/helpers.js';
+import {
+  commitAs, providerPolicy, serveJson, useWorld,
+} from '../../node/__tests__/helpers.js';
 import { verifyPerceptions } from './verify-perceptions.js';
 import type {
   AgentConfig, AssistantProjection, CompactionStart, FunctionCall,
@@ -289,13 +290,6 @@ const JOIN_SEARCH_RESPONSE = JSON.stringify({
   }],
 });
 
-async function closeServer(server: Server): Promise<void> {
-  server.closeAllConnections();
-  await new Promise<void>((resolve, reject) => {
-    server.close((error) => { if (error) reject(error); else resolve(); });
-  });
-}
-
 /**
  * The local → frontier join, in the two scoped halves the plan names. A real
  * runtime performs the exchanges (a scripted LLM transport, so the wire bytes
@@ -317,35 +311,28 @@ async function closeServer(server: Server): Promise<void> {
  *
  * Scoped honestly: an **LLM** call whose attempts all failed has no local anchor
  * by design (only a success produces an `assistant/message`), so it is checked
- * for group/attempt integrity only. A **web** call's failure *is* anchored
- * locally (`dispatch` journals a `tool/result` for every `WebOutcome`), so the
- * web join covers successes and failures alike.
+ * for group/attempt integrity only — the second logical request below fails
+ * twice and exercises exactly that branch. A **web** call's failure *is*
+ * anchored locally (`dispatch` journals a `tool/result` for every `WebOutcome`),
+ * so the web join covers successes and failures alike.
  */
 describe('C1.4d T8.10: the local → frontier join', () => {
   it('recomputes every request body from the local fold and joins it to a terminal', async () => {
     const fx = joinFixture();
     await commitAs(fx.world, 'human', { 'direction.txt': 'join the two logs\n' });
 
-    const tavilyBodies: Buffer[] = [];
-    const tavily = createServer((req, res) => {
-      const chunks: Buffer[] = [];
-      req.on('data', (chunk: Buffer) => chunks.push(chunk));
-      req.on('end', () => {
-        tavilyBodies.push(Buffer.concat(chunks));
-        res.setHeader('content-type', 'application/json');
-        res.end(JOIN_SEARCH_RESPONSE);
-      });
-    });
-    await new Promise<void>((resolve) => { tavily.listen(0, '127.0.0.1', resolve); });
-    const address = tavily.address();
-    if (address === null || typeof address === 'string') throw new Error('missing TCP address');
-    const tavilyUrl = `http://127.0.0.1:${address.port}`;
+    // The loopback provider; its recorded bodies are compared with the durable
+    // frontier bytes below.
+    const tavily = await serveJson(() => ({ body: JOIN_SEARCH_RESPONSE }));
+    const tavilyUrl = tavily.url;
 
     const transport = new ScriptedTransport([
       // A retryable failure, then the tool-calling answer: one group, two attempts.
       { status: 429, headers: {}, complete: true, failure: null, body: new Uint8Array() },
       okReply(null, [webSearch('w1', 'emergent societies')]),
-      okReply('done'),
+      // The second logical request fails both attempts: no local anchor, by design.
+      { status: 500, headers: {}, complete: true, failure: null, body: new Uint8Array() },
+      { status: 500, headers: {}, complete: true, failure: null, body: new Uint8Array() },
     ]);
     const base = defaultAgentConfig();
     const config: AgentConfig = {
@@ -364,25 +351,7 @@ describe('C1.4d T8.10: the local → frontier join', () => {
       const runtime = createAgentRuntime({
         home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
         terminal: { env: DEFAULT_TERMINAL_ENV },
-        adapter: new ProviderAdapter(transport, {
-          delay: (ms, signal) => new Promise<void>((resolve, reject) => {
-            if (signal.aborted) { reject(new Error('cancelled')); return; }
-            let timer: NodeJS.Timeout | undefined;
-            const onAbort = (): void => {
-              if (timer !== undefined) clearTimeout(timer);
-              reject(new Error('cancelled'));
-            };
-            timer = setTimeout(() => {
-              signal.removeEventListener('abort', onAbort);
-              resolve();
-            }, ms);
-            signal.addEventListener('abort', onAbort, { once: true });
-          }),
-          schedule: (ms, callback) => {
-            const timer = setTimeout(callback, ms);
-            return () => { clearTimeout(timer); };
-          },
-        }, journal.gate),
+        adapter: new ProviderAdapter(transport, providerPolicy, journal.gate),
         webTools,
       });
       driver = await NodeDriver.open(fx.home, 'n1', runtime.handler, fx.world, {
@@ -395,9 +364,10 @@ describe('C1.4d T8.10: the local → frontier join', () => {
       running = null;
       driver = null;
 
-      // The exchanges happened: three LLM sends (retry included) and one web call.
-      expect(transport.sends).toHaveLength(3);
-      expect(tavilyBodies).toHaveLength(1);
+      // The exchanges happened: four LLM sends (a retry and a failed pair) and
+      // one web call.
+      expect(transport.sends).toHaveLength(4);
+      expect(tavily.requests).toHaveLength(1);
 
       const events = await loadVerifiedEvents(fx.home, 'n1', C13_EVENT_TYPES);
       const frontier = await readFrontier(fx.home);
@@ -415,7 +385,7 @@ describe('C1.4d T8.10: the local → frontier join', () => {
       const llmUrl = JOIN_FACTS.url;
       const llmRequests = requests.filter((request) => request.url === llmUrl);
       const webRequests = requests.filter((request) => request.url === `${tavilyUrl}/search`);
-      expect(llmRequests).toHaveLength(3);
+      expect(llmRequests).toHaveLength(4);
       expect(webRequests).toHaveLength(1);
 
       // --- the LLM half: fold-stepped snapshots and exact wire recomputation ---
@@ -457,15 +427,43 @@ describe('C1.4d T8.10: the local → frontier join', () => {
         }
         await fold.observe([event]);
       }
-      expect(joins.map((join) => join.id)).toEqual([
-        { turn: 0, ordinal: 0 }, { turn: 0, ordinal: 1 },
-      ]);
+      expect(joins.map((join) => join.id)).toEqual([{ turn: 0, ordinal: 0 }]);
       // The first logical request really was retried: one group, two attempts.
       const first = requestsByCall.get(joins[0]!.call)!;
       const retried = requests.filter((request) => request.group === first.group);
       expect(retried).toHaveLength(2);
       expect(terminalsByCall.get(retried[0]!.call)!.status).toBe(429);
       expect(terminalsByCall.get(retried[1]!.call)!.status).toBe(200);
+
+      // The second logical request failed both attempts: a frontier-only fact.
+      // It carries no local anchor by design, so the join checks its group and
+      // attempt integrity and that no assistant message claims it.
+      const referenced = new Set(joins.map((join) => join.call));
+      const groups = new Map<string, HttpRequest[]>();
+      for (const request of llmRequests) {
+        const group = groups.get(request.group);
+        if (group === undefined) groups.set(request.group, [request]);
+        else group.push(request);
+      }
+      const unanchored = [...groups.values()].filter((attempts) =>
+        attempts.every((request) => !referenced.has(request.call)));
+      expect(unanchored).toHaveLength(1);
+      const failedAttempts = unanchored[0]!;
+      expect(failedAttempts.map((request) => request.attempt)).toEqual([0, 1]);
+      expect(new Set(failedAttempts.map((request) => request.body.sha256)).size).toBe(1);
+      for (const request of failedAttempts) {
+        expect(terminalsByCall.get(request.call)).toMatchObject({
+          status: 500, error: { code: 'http' },
+        });
+      }
+      for (const event of events) {
+        if (event.type !== 'assistant/message') continue;
+        const data = event.data as unknown as { value: Stored<AssistantProjection> };
+        const projection = resolveStored(events, data.value,
+          (value) => value as AssistantProjection);
+        expect(failedAttempts.some((request) => request.call === projection.frontierCall))
+          .toBe(false);
+      }
 
       // --- the web half: the body recomputed from the recorded call arguments ---
       const registry = await loadProviders(fx.home);
@@ -504,7 +502,7 @@ describe('C1.4d T8.10: the local → frontier join', () => {
         expect(durable.equals(wire)).toBe(true);
         expect(request!.body.sha256).toBe(sha256HexOf(wire));
         // The bytes the provider actually received are those durable bytes.
-        expect(durable.equals(tavilyBodies[webJoins]!)).toBe(true);
+        expect(durable.equals(tavily.requests[webJoins]!.body)).toBe(true);
         webJoins += 1;
       }
       expect(webJoins).toBe(1);
@@ -522,7 +520,7 @@ describe('C1.4d T8.10: the local → frontier join', () => {
           await current.run().catch(() => { /* the assertion stands */ });
         }
       }
-      await closeServer(tavily);
+      await tavily.close();
     }
   }, 30000);
 });
