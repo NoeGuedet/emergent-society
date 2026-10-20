@@ -95,13 +95,13 @@ class Gate implements Frontier {
     const input = validateBeginInput(raw);
     if (input.body.byteLength > FRONTIER_MAX_BODY_BYTES) {
       throw new FrontierValidationError(
-        `begin input: body exceeds the ${FRONTIER_MAX_BODY_BYTES}-byte frontier ceiling`,
+        `invalid begin input: body exceeds the ${FRONTIER_MAX_BODY_BYTES}-byte frontier ceiling`,
       );
     }
 
     const call = randomUUID();
     const group = input.group ?? randomUUID();
-    const attempt = input.attempt ?? 0;
+    const attempt = input.attempt;
     this.assertAttempt(group, attempt);
     const startedAt = this.now();
 
@@ -169,8 +169,11 @@ class Gate implements Frontier {
     await this.blobs.put(bytes);
     this.writer.append('http/response', validated);
     await this.writer.flush();
-    await this.verifyBlob(body);
+    // The terminal is durable: retire the call now, so a later retry is
+    // refused as unknown instead of appending a duplicate terminal that boot
+    // reconciliation would read as corruption.
     this.started.delete(call.call);
+    await this.verifyBlob(body);
   }
 
   /** The shared read-back: digest and exact byte length through the trusted read. */
@@ -182,29 +185,25 @@ class Gate implements Frontier {
   }
 
   /**
-   * The retry rules against a *present* entry: attempt 0 on a known group, a
-   * repeated (or out-of-order) attempt, and a skipped attempt are refusals. A
-   * supplied group with no entry is accepted at any attempt — eviction degrades
-   * the check fail-open, never into a refusal. An omitted group is minted
-   * fresh, so the map can never be consulted for it.
+   * The retry rule against a *present* entry is one step forward: the attempt
+   * must be exactly `last + 1`. A repeat, an out-of-order attempt and attempt 0
+   * on a known group all fall under `attempt <= last`; a jump past `last + 1`
+   * is a skip. A supplied group with no entry is accepted at any attempt —
+   * eviction degrades the check fail-open, never into a refusal. An omitted
+   * group is minted fresh, so the map can never be consulted for it.
    */
   private assertAttempt(group: CallId, attempt: number): void {
     const last = this.groups.get(group);
     if (last === undefined) return;
-    if (attempt === 0) {
-      throw new FrontierValidationError(
-        `begin input: attempt 0 on the already-known group ${JSON.stringify(group)}`,
-      );
-    }
     if (attempt <= last) {
       throw new FrontierValidationError(
-        `begin input: attempt ${attempt} repeats or precedes the last attempt ${last} `
+        `invalid begin input: attempt ${attempt} does not follow the last attempt ${last} `
         + `of group ${JSON.stringify(group)}`,
       );
     }
     if (attempt > last + 1) {
       throw new FrontierValidationError(
-        `begin input: attempt ${attempt} skips past the next attempt ${last + 1} `
+        `invalid begin input: attempt ${attempt} skips past the next attempt ${last + 1} `
         + `of group ${JSON.stringify(group)}`,
       );
     }

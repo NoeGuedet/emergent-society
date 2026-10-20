@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  BlobStore, JournalWriter, SessionAlreadyOwnedError, isCorruption, readVerifiedBlob,
-  sha256HexOf, type JsonValue,
+  BlobStore, JournalWriter, SessionAlreadyOwnedError, isCorruption, isRetryable,
+  readVerifiedBlob, sha256HexOf, type JsonValue,
 } from '../../journal/index.js';
 import { injectBlobPut } from '../../journal/__tests__/helpers.js';
 import {
@@ -121,6 +121,16 @@ describe('begin', () => {
       .rejects.toThrow(FrontierValidationError);
     expect(await readFrontier(home())).toHaveLength(0);
     expect(await countBlobs(home())).toBe(0);
+    await journal.close();
+  });
+
+  it('classifies a validation refusal as a journal refusal, not corruption or retryable', async () => {
+    const journal = await openTestFrontier(home());
+    const err = await journal.gate.begin(beginInput({ url: `${URL}?key=secret` }))
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(FrontierValidationError);
+    expect(isCorruption(err)).toBe(false);
+    expect(isRetryable(err)).toBe(false);
     await journal.close();
   });
 
@@ -303,6 +313,19 @@ describe('complete', () => {
     await journal.close();
   });
 
+  it('refuses a complete for a call whose terminal is already durable', async () => {
+    const journal = await openTestFrontier(home());
+    const call = await journal.gate.begin(beginInput());
+    await journal.gate.complete(call, outcome());
+    // The call is retired as soon as its terminal is durable, so a retry is an
+    // unknown call rather than a duplicate terminal in the log.
+    await expect(journal.gate.complete(call, outcome()))
+      .rejects.toBeInstanceOf(FrontierUnknownCallError);
+    expect((await readFrontier(home())).map((event) => event.type))
+      .toEqual(['http/request', 'http/response']);
+    await journal.close();
+  });
+
   it('refuses a complete for a call that began in a previous process', async () => {
     const first = await openTestFrontier(home());
     const call = await first.gate.begin(beginInput());
@@ -373,8 +396,13 @@ describe('begin failure paths', () => {
   it('leaves no retry entry after a blob write failure', async () => {
     const journal = await openTestFrontier(home());
     injectBlobPut({ failAt: 1 });
+    const appendSpy = vi.spyOn(JournalWriter.prototype, 'append');
     await expect(journal.gate.begin(beginInput({ group: 'g', attempt: 0 })))
       .rejects.toThrow('injected blob write failure');
+    // §5.3 step 3: no event may exist to reference a blob that was never
+    // written, so the append is never even reached (it is in-memory, which is
+    // why an empty log alone would not prove the ordering).
+    expect(appendSpy).not.toHaveBeenCalled();
     vi.restoreAllMocks();
     expect(await readFrontier(home())).toHaveLength(0);
     const call = await journal.gate.begin(beginInput({ group: 'g', attempt: 0 }));
@@ -389,8 +417,21 @@ describe('begin failure paths', () => {
     await expect(journal.gate.begin(beginInput({ group: 'g', attempt: 0 })))
       .rejects.toThrow('injected flush failure');
     vi.restoreAllMocks();
-    const call = await journal.gate.begin(beginInput({ group: 'g', attempt: 0 }));
-    expect(call.group).toBe('g');
+    const retry = await journal.gate.begin(beginInput({ group: 'g', attempt: 0 }));
+    expect(retry.group).toBe('g');
+
+    // The retry's flush made the failed begin's event durable with it. That
+    // event still has no timing entry, so a terminal for it is refused as
+    // unknown — proving the failed begin never entered the timing map.
+    const requests = (await readFrontier(home()))
+      .filter((event) => event.type === 'http/request')
+      .map(requestOf);
+    expect(requests).toHaveLength(2);
+    const failed = requests.find((event) => event.call !== retry.call);
+    expect(failed).toBeDefined();
+    await expect(journal.gate.complete(
+      { call: failed!.call, group: failed!.group }, outcome(),
+    )).rejects.toBeInstanceOf(FrontierUnknownCallError);
     await journal.close();
   });
 

@@ -1,5 +1,5 @@
 import {
-  CLAIM_CHECK_THRESHOLD, HASH_RE, canonicalizeJson, copyJsonValue, type JsonValue,
+  CLAIM_CHECK_THRESHOLD, HASH_RE, JournalError, canonicalizeJson, copyJsonValue, type JsonValue,
 } from '../journal/index.js';
 import { isRecord } from '../util.js';
 
@@ -129,15 +129,12 @@ export type FrontierOutcome = {
 
 /**
  * A payload that will not be journaled. It is a caller/shape refusal, not
- * damage to the log, so it is not part of the journal's corruption family: the
- * gate stops the exchange before anything crosses the frontier.
+ * damage to the log: the gate stops the exchange before anything crosses the
+ * frontier. It extends the journal's `JournalError` so the shared predicates
+ * classify it as a journal refusal — never corruption, never a retryable
+ * environment fault.
  */
-export class FrontierValidationError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) {
-    super(message, options);
-    this.name = 'FrontierValidationError';
-  }
-}
+export class FrontierValidationError extends JournalError {}
 
 /**
  * The largest request body the gate will journal (and therefore send). It
@@ -517,12 +514,21 @@ export function validateFrontierEvent(type: string, data: unknown): JsonValue {
 // --- the input validators ---------------------------------------------------------
 
 /**
+ * The validated begin input. `attempt` is materialized here (default 0), so a
+ * consumer never carries a second default; `group` stays absent for a fresh
+ * logical operation, which the gate mints.
+ */
+export type ValidatedBeginInput = Omit<FrontierRequestInput, 'attempt'> & {
+  readonly attempt: number;
+};
+
+/**
  * Validates what a producer hands `begin`. `world_head` is refused here because
  * the gate stamps it: an input cannot claim a world state the kernel did not
  * observe. An `attempt` above zero requires its `group` — a retry with no
  * group would be a fresh logical operation wearing an attempt number.
  */
-export function validateBeginInput(input: unknown): FrontierRequestInput {
+export function validateBeginInput(input: unknown): ValidatedBeginInput {
   const where = 'begin input';
   const o = record(input, where);
   onlyKeys(o, [
