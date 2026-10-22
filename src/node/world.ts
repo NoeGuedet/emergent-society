@@ -1,14 +1,13 @@
-import { lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { lstat, mkdir, readdir, realpath } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { assertNodeUid } from '../journal/index.js';
-import { utf8Prefix } from '../text.js';
 import {
   GitCommandError, WorldHeadError, WorldNotARepoError, WorldReconciliationError,
 } from './errors.js';
+import { renderDiff } from './world-diff.js';
 import {
-  FIELD, MAX_GIT_STDERR_BYTES, assertHash, commitExists, emptyTree, hashLength, isAncestor,
-  isFullHex, readHead, runGit, runGitWithStdin, spawnGit, treeOf, type WorldIo,
+  FIELD, commitExists, emptyTree, hashLength, isAncestor, isFullHex, readHead, runGit,
+  runGitWithStdin, treeOf, type WorldIo,
 } from './world-git.js';
 import {
   commitsIn as traverseCommitsIn, commitsSince as listCommitsSince,
@@ -19,7 +18,7 @@ import {
   verifyGitDirTrust,
 } from './world-trust.js';
 import type {
-  BoundedText, CommitRange, DiffCapture, ObjectFormat, WorldCommitInfo, WorldRange,
+  CommitRange, DiffCapture, ObjectFormat, WorldCommitInfo, WorldRange,
 } from './world-types.js';
 
 export { gitEnv } from './world-git.js';
@@ -43,8 +42,9 @@ export type { WorldCommitInfo, WorldRange, DiffCapture, RecordedCommit, CommitRa
  * layer — the controlled environment, the output bound and the spawn lifecycle
  * — lives in `world-git.ts`; the path safeguards and the three trust layers
  * `open` runs live in `world-trust.ts`; the history reads — the wake range, the
- * author scan, the bounded traversal — live in `world-history.ts`; this module
- * owns the repository's policy and is the façade over all three.
+ * author scan, the bounded traversal — live in `world-history.ts`; the hermetic
+ * patch renderer lives in `world-diff.ts`; this module owns the repository's
+ * policy and is the façade over all four.
  *
  * The git directory lives *outside* the world (`<home>/world.git` in
  * production): confinement makes the world agent-writable, and a writable git
@@ -75,29 +75,6 @@ const COMMIT_RETRY_MS = 25;
  * matching commit and so choose one of several.
  */
 const MAX_RECONCILE_SCAN = 4096;
-
-/**
- * The hermetic diff flag set (T4 step 5). `-c` are git global options and must
- * precede the subcommand; `-O/dev/null` is itself a diff option and must follow
- * it — the plan's prose lists it first, but git 2.43.0 rejects `-O` before the
- * subcommand ("unknown option"), so it is placed after `diff`, which is the only
- * position git accepts. The flag set is otherwise exactly the contract's.
- */
-const HERMETIC_CONFIG: readonly string[] = [
-  '-c', 'core.attributesFile=/dev/null',
-  '-c', 'color.ui=false',
-  '-c', 'core.quotePath=true',
-  '-c', 'diff.algorithm=myers',
-  '-c', 'diff.renames=false',
-  '-c', 'diff.submodule=short',
-  '-c', 'diff.interHunkContext=0',
-];
-
-const HERMETIC_DIFF_ARGS: readonly string[] = [
-  'diff', '-O/dev/null', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames',
-  '--no-indent-heuristic', '--full-index', '--unified=3', '--inter-hunk-context=0',
-  '--ignore-submodules=none', '--src-prefix=a/', '--dst-prefix=b/',
-];
 
 /** What git says when another process holds the index or the ref, or when a branch compare-and-swap loses its race. */
 const LOCK_CONTENTION = /index\.lock|cannot lock ref|Another git process seems to be running/i;
@@ -143,11 +120,11 @@ export class WorldRepo {
   private static readonly commitQueues = new Map<string, Promise<unknown>>();
 
   /**
-   * What `world-git.ts` and `world-history.ts` need from this repository: its
-   * paths, the pair and defense-in-depth `-c`s every call carries, and the three
-   * policy seams. `head` and `nothingStaged` are bound to this object's methods
-   * deliberately — a test double replaces those on the prototype, and every free
-   * function's HEAD read and staged-nothing question must stay observable there.
+   * What the `world-*` siblings need from this repository: its paths, the pair
+   * and defense-in-depth `-c`s every call carries, and the three policy seams.
+   * `head` and `nothingStaged` are bound to this object's methods deliberately —
+   * a test double replaces those on the prototype, and every free function's
+   * HEAD read and staged-nothing question must stay observable there.
    */
   private readonly io: WorldIo;
 
@@ -355,144 +332,7 @@ export class WorldRepo {
    * U+FFFD replacement.
    */
   async diff(range: WorldRange, maxBytes: number): Promise<DiffCapture> {
-    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
-      throw new Error(`maxBytes must be a positive integer, got ${maxBytes}`);
-    }
-    if (range.from !== null) await assertHash(this.io, 'from', range.from);
-    if (range.to !== null) await assertHash(this.io, 'to', range.to);
-
-    if (range.to === null) return { text: '', truncated: false, bytesRetained: 0 };
-    if (range.from !== null && range.from === range.to) {
-      return { text: '', truncated: false, bytesRetained: 0 };
-    }
-
-    const toTree = await treeOf(this.io, range.to);
-    const fromTree = range.from === null
-      ? await emptyTree(this.io)
-      : (await commitExists(this.io, range.from)
-        ? await treeOf(this.io, range.from)
-        : await emptyTree(this.io));
-
-    const scratch = await this.openScratchView();
-    let result: BoundedText | undefined;
-    let failed = false;
-    let failure: unknown;
-    try {
-      const env: Record<string, string> = {
-        GIT_CONFIG_NOSYSTEM: '1',
-        GIT_CONFIG_GLOBAL: '/dev/null',
-        GIT_ATTR_NOSYSTEM: '1',
-        LC_ALL: 'C',
-        GIT_ATTR_SOURCE: range.to,
-      };
-      const args = [`--git-dir=${scratch}`, ...HERMETIC_CONFIG, ...HERMETIC_DIFF_ARGS, fromTree, toTree, '--'];
-      result = await this.streamDiff(args, env, maxBytes);
-    } catch (err) {
-      failed = true;
-      failure = err;
-    }
-    // The scratch view is always removed, but a render failure outranks a
-    // cleanup failure so the original git error is never masked by `rm`.
-    try {
-      await rm(scratch, { recursive: true, force: true });
-    } catch (err) {
-      if (!failed) {
-        failed = true;
-        failure = err;
-      }
-    }
-    if (failed) throw failure;
-    return result!;
-  }
-
-  /**
-   * Creates the isolated bare metadata view: a temporary GIT_DIR whose
-   * `objects/info/alternates` points at the world's object database (shared, no
-   * repository copy), with no `info/attributes` and an empty config. A failure
-   * here rejects, so the renderer never silently falls back to the world.
-   */
-  private async openScratchView(): Promise<string> {
-    const scratch = await mkdtemp(join(tmpdir(), 'c13-render-'));
-    await mkdir(join(scratch, 'objects', 'info'), { recursive: true });
-    await mkdir(join(scratch, 'refs'), { recursive: true });
-    await writeFile(join(scratch, 'objects', 'info', 'alternates'), `${join(this.gitDir, 'objects')}\n`);
-    // The scratch git dir is explicit (`--git-dir=`), so git derives the object
-    // format from *its* config, not the world's. An empty config means "sha1"
-    // and rejects a sha256 world's 64-hex ids, so the scratch view declares the
-    // world's own format (validated by `format()`; no other setting is read).
-    const format = await this.io.format();
-    await writeFile(join(scratch, 'config'), format === 'sha256'
-      ? '[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n'
-      : '');
-    await writeFile(join(scratch, 'HEAD'), 'ref: refs/heads/main\n');
-    return scratch;
-  }
-
-  /**
-   * Streams one hermetic diff to at most `maxBytes` decoded UTF-8 bytes. Invalid
-   * bytes become deterministic U+FFFD; hitting the cap kills the child and is
-   * the only accepted truncation, while any other nonzero exit or signal is an
-   * error. stderr is bounded and never the payload.
-   *
-   * The scratch view is this call's sole git dir (`--git-dir=`), so the pair is
-   * deliberately absent here: git's last-wins rule would let a `--git-dir` after
-   * the scratch one mask it. Only the two defense-in-depth overrides are
-   * prepended.
-   */
-  private streamDiff(
-    args: readonly string[], env: Record<string, string>, maxBytes: number,
-  ): Promise<BoundedText> {
-    return new Promise<BoundedText>((resolvePromise, rejectPromise) => {
-      const child = spawnGit([
-        '-c', 'log.showSignature=false', '-c', 'core.hooksPath=/dev/null', ...args,
-      ], { cwd: this.path, env });
-      const decoder = new TextDecoder('utf-8');
-      let text = '';
-      let bytes = 0;
-      let truncated = false;
-      let capped = false;
-      let stderr = Buffer.alloc(0);
-
-      child.stdout.on('data', (chunk: Buffer) => {
-        if (capped) return;
-        const decoded = decoder.decode(chunk, { stream: true });
-        const prefix = utf8Prefix(decoded, maxBytes - bytes);
-        text += prefix.text;
-        bytes += prefix.bytes;
-        if (prefix.text.length < decoded.length) {
-          capped = true;
-          truncated = true;
-          child.kill('SIGKILL');
-        }
-      });
-      child.stderr.on('data', (chunk: Buffer) => {
-        const room = MAX_GIT_STDERR_BYTES - stderr.length;
-        if (room > 0) stderr = Buffer.concat([stderr, chunk.subarray(0, room)]);
-      });
-      child.on('error', (err) => {
-        if (!capped) rejectPromise(new GitCommandError(args, null, String(err)));
-      });
-      child.on('close', (code, signal) => {
-        if (capped) {
-          resolvePromise({ text, truncated: true, bytesRetained: bytes });
-          return;
-        }
-        // Flush the streaming decoder: a truncated input sequence becomes its
-        // deterministic U+FFFD, and the tail is bounded like the rest.
-        const tail = decoder.decode();
-        if (tail !== '') {
-          const prefix = utf8Prefix(tail, maxBytes - bytes);
-          text += prefix.text;
-          bytes += prefix.bytes;
-          if (prefix.text.length < tail.length) truncated = true;
-        }
-        if (signal !== null || code !== 0) {
-          rejectPromise(new GitCommandError(args, code ?? null, stderr.toString('utf8')));
-          return;
-        }
-        resolvePromise({ text, truncated, bytesRetained: bytes });
-      });
-    });
+    return renderDiff(this.io, range, maxBytes);
   }
 
   /**
