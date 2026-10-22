@@ -7,8 +7,13 @@ import {
   GitCommandError, WorldHeadError, WorldNotARepoError, WorldReconciliationError,
 } from './errors.js';
 import {
-  FIELD, MAX_GIT_STDERR_BYTES, hashLength, isFullHex, runGit, runGitWithStdin, spawnGit,
+  FIELD, MAX_GIT_STDERR_BYTES, assertHash, commitExists, emptyTree, hashLength, isAncestor,
+  isFullHex, readHead, runGit, runGitWithStdin, spawnGit, treeOf, type WorldIo,
 } from './world-git.js';
+import {
+  commitsIn as traverseCommitsIn, commitsSince as listCommitsSince,
+  firstParent as firstParentOf, hasForeignCommit as detectForeignCommit, readGitVersion,
+} from './world-history.js';
 import {
   assertDedicated, assertExternalGitDir, canonicalWorldPath, lstatOrNull, migrationNote,
   verifyGitDirTrust,
@@ -37,7 +42,9 @@ export type { WorldCommitInfo, WorldRange, DiffCapture, RecordedCommit, CommitRa
  * `git` is the only implementation of git whose behavior is a fact. The process
  * layer — the controlled environment, the output bound and the spawn lifecycle
  * — lives in `world-git.ts`; the path safeguards and the three trust layers
- * `open` runs live in `world-trust.ts`; this module owns the repository's policy.
+ * `open` runs live in `world-trust.ts`; the history reads — the wake range, the
+ * author scan, the bounded traversal — live in `world-history.ts`; this module
+ * owns the repository's policy and is the façade over all three.
  *
  * The git directory lives *outside* the world (`<home>/world.git` in
  * production): confinement makes the world agent-writable, and a writable git
@@ -46,8 +53,7 @@ export type { WorldCommitInfo, WorldRange, DiffCapture, RecordedCommit, CommitRa
  * external pair and the git dir's trust inputs on every start.
  */
 
-/** The `git log` format the parser reads: hash, author name, subject. */
-const LOG_FORMAT = `--format=%H${FIELD}%an`;
+/** The `git log` format the reconciliation parser reads: hash, author name, subject. */
 const RECONCILE_FORMAT = `--format=%H${FIELD}%an${FIELD}%s`;
 
 /**
@@ -69,14 +75,6 @@ const COMMIT_RETRY_MS = 25;
  * matching commit and so choose one of several.
  */
 const MAX_RECONCILE_SCAN = 4096;
-
-/**
- * The longest author record the wake scan will hold while waiting for its
- * terminator. A uid is at most 128 characters, so a longer record cannot be
- * this node's author: it is answered as foreign rather than buffered without
- * bound.
- */
-const MAX_AUTHOR_RECORD_CHARS = 4096;
 
 /**
  * The hermetic diff flag set (T4 step 5). `-c` are git global options and must
@@ -107,12 +105,6 @@ const LOCK_CONTENTION = /index\.lock|cannot lock ref|Another git process seems t
 const delay = (ms: number): Promise<void> => new Promise((resolvePromise) => {
   setTimeout(resolvePromise, ms);
 });
-
-/** Parses one `LOG_FORMAT` line. */
-function parseCommit(line: string): WorldCommitInfo {
-  const [hash = '', author = ''] = line.split(FIELD);
-  return { hash, author };
-}
 
 /**
  * The git identity of a node's commit: name and email both carry the uid, so
@@ -150,10 +142,38 @@ export class WorldRepo {
    */
   private static readonly commitQueues = new Map<string, Promise<unknown>>();
 
-  /** The repo's object format, read once: hash validity depends on it (T4 step 1). */
-  private objectFormat: ObjectFormat | null = null;
+  /**
+   * What `world-git.ts` and `world-history.ts` need from this repository: its
+   * paths, the pair and defense-in-depth `-c`s every call carries, and the three
+   * policy seams. `head` and `nothingStaged` are bound to this object's methods
+   * deliberately — a test double replaces those on the prototype, and every free
+   * function's HEAD read and staged-nothing question must stay observable there.
+   */
+  private readonly io: WorldIo;
 
-  private constructor(readonly path: string, readonly gitDir: string) {}
+  private constructor(readonly path: string, readonly gitDir: string) {
+    // Built in the body, never as a field initializer: an initializer runs before
+    // the parameter properties are assigned, so `path`/`gitDir` would be unset
+    // (TS2729).
+    let cachedFormat: ObjectFormat | null = null;
+    this.io = {
+      path: this.path,
+      gitDir: this.gitDir,
+      baseArgs: () => this.gitBaseArgs(),
+      head: () => this.headHash(),
+      nothingStaged: () => this.nothingStaged(),
+      git: (args, env) => this.git(args, env),
+      gitWithStdin: (args, input) => this.gitWithStdin(args, input),
+      // Only the resolved format is memoized: a failed `rev-parse` must be
+      // retried by the next call, so a rejection is never cached.
+      format: async () => {
+        if (cachedFormat !== null) return cachedFormat;
+        const out = (await this.git(['rev-parse', '--show-object-format'])).trim();
+        cachedFormat = out === 'sha256' ? 'sha256' : 'sha1';
+        return cachedFormat;
+      },
+    };
+  }
 
   /**
    * Opens the world repository rooted at `dir`, with its kernel-owned git dir.
@@ -264,7 +284,7 @@ export class WorldRepo {
   }
 
   /** Runs one git command feeding `input` on stdin, with the same prefix. */
-  private async gitWithStdin(args: readonly string[], input: Buffer): Promise<string> {
+  private async gitWithStdin(args: readonly string[], input: Uint8Array): Promise<string> {
     return runGitWithStdin(this.path, [...this.gitBaseArgs(), ...args], input);
   }
 
@@ -275,178 +295,27 @@ export class WorldRepo {
    * @throws GitCommandError when git itself fails.
    */
   async headHash(): Promise<string | null> {
-    try {
-      return (await this.git(['rev-parse', '--verify', '--quiet', 'HEAD'])).trim();
-    } catch (err) {
-      // `--quiet` makes the unborn-branch failure an exit 1 with no message:
-      // the one git failure here that is a fact about the world, not a fault.
-      if (err instanceof GitCommandError && err.exitCode === 1) return null;
-      throw err;
-    }
+    return readHead(this.io);
   }
 
   /**
-   * The commits HEAD carries that `from` does not, oldest first. `from` null
-   * means the whole history — the perception of a node that has never looked.
-   *
-   * A range is also the wake unit: several commits landing before a node looks
-   * again are one list, hence one wake (§5.2).
-   *
-   * HEAD can move *backward* behind the watermark: a peer force-resets the
-   * branch to an ancestor. Then HEAD !== `from` while `from..HEAD` is empty, and
-   * an empty range is not "no movement" — the node cannot prove it has seen this
-   * history either, so it is given all of it. The ancestor test runs only for an
-   * empty range; a non-empty one is ordinary forward movement.
+   * The commits HEAD carries that `from` does not, oldest first; `from` null is
+   * the whole history — the perception of a node that has never looked
+   * (`world-history.ts` for the watermark physics).
    */
   async commitsSince(from: string | null): Promise<WorldCommitInfo[]> {
-    const head = await this.headHash();
-    // No HEAD, or HEAD unmoved: the range is empty without asking git for it.
-    if (head === null || head === from) return [];
-    try {
-      const out = await this.git(['log', LOG_FORMAT, from === null ? 'HEAD' : `${from}..HEAD`]);
-      const commits = out.split('\n').filter((line) => line !== '').map(parseCommit).reverse();
-      if (commits.length === 0 && from !== null && (await this.isAncestor(head, from))) {
-        return this.commitsSince(null);
-      }
-      return commits;
-    } catch (err) {
-      // The watermark is not a reachable object any more (a rewritten history,
-      // a gc). The node cannot prove it has seen the current history, so it is
-      // given all of it: a spurious wake costs a turn, a missed commit costs a
-      // fact, and the two are not symmetric.
-      if (from !== null && err instanceof GitCommandError) return this.commitsSince(null);
-      throw err;
-    }
+    return listCommitsSince(this.io, from);
   }
 
   /**
    * Whether HEAD carries a commit `from` does not that someone other than
    * `author` wrote — the wake predicate's whole question (kernel.md §5.2),
-   * answered without materializing the range.
-   *
-   * The author stream is read line by line and the child is stopped at the first
-   * foreign author, so memory is bounded by one line however long the history
-   * is: a fresh node joining a large world, or an unreachable watermark, cannot
-   * overflow the exec bound and park forever on a swallowed failure.
-   *
-   * Watermark physics mirrors `commitsSince`: an unmoved HEAD is no movement; a
-   * watermark git can no longer resolve is unprovable, so the whole history is
-   * scanned; a non-zero exit after the first read retries the whole history; and
-   * an empty range under a moved HEAD is checked for a backward reset (HEAD an
-   * ancestor of the watermark), which is likewise scanned in full.
+   * answered without materializing the range (`world-history.ts`).
    *
    * @throws GitCommandError when git fails and there is no watermark to blame.
    */
   async hasForeignCommit(from: string | null, author: string): Promise<boolean> {
-    const head = await this.headHash();
-    if (head === null || head === from) return false;
-    try {
-      const scan = await this.foreignAuthorIn(
-        from === null ? ['HEAD'] : [`${from}..HEAD`], author);
-      if (scan === 'foreign') return true;
-      // An empty `head !== from` range cannot be forward movement: HEAD may have
-      // moved backward behind the watermark (a peer's force-reset). The node
-      // cannot prove what it has seen, so the whole history answers instead.
-      if (from !== null && scan === 'empty' && (await this.isAncestor(head, from))) {
-        return (await this.foreignAuthorIn(['HEAD'], author)) === 'foreign';
-      }
-      return false;
-    } catch (err) {
-      if (from !== null && err instanceof GitCommandError) return this.hasForeignCommit(null, author);
-      throw err;
-    }
-  }
-
-  /**
-   * Whether `spec`'s history holds an author other than `author`, from the
-   * streamed `git log --format=format:%an%x00`. At most one partial record and
-   * bounded stderr are held, and the child is killed as soon as a foreign record
-   * is seen. The stream is not a bounded render of history: it is an existence
-   * test, so stopping early is the answer, not a truncation. `empty`
-   * distinguishes an empty range from one whose commits are all the node's own.
-   *
-   * The record separator is NUL, not LF, so a commit with an empty author is a
-   * record of its own: an unprovable author is classified foreign (a spurious
-   * wake costs a turn; a missed commit costs a fact), exactly as `commitsSince`
-   * reports the empty author as `''` and the wake predicate refuses it.
-   */
-  private foreignAuthorIn(
-    spec: readonly string[], author: string,
-  ): Promise<'foreign' | 'empty' | 'self-only'> {
-    const args = [...this.gitBaseArgs(), 'log', '--format=format:%an%x00', ...spec];
-    return new Promise<'foreign' | 'empty' | 'self-only'>((resolvePromise, reject) => {
-      const child = spawnGit(args, { cwd: this.path });
-      child.stdout.setEncoding('utf8');
-      child.stderr.setEncoding('utf8');
-      let partial = '';
-      let stderr = '';
-      let seen = false;
-      let settled = false;
-      const settle = (
-        failure: GitCommandError | null, answer: 'foreign' | 'empty' | 'self-only',
-      ): void => {
-        if (settled) return;
-        settled = true;
-        if (failure !== null) reject(failure);
-        else resolvePromise(answer);
-      };
-      const foreign = (record: string): boolean => {
-        // `format:` separates records with LF; the record itself carries none.
-        const name = record.startsWith('\n') ? record.slice(1) : record;
-        // An empty author cannot be proven to be this node: foreign.
-        return name === '' || name !== author;
-      };
-      child.stdout.on('data', (chunk: string) => {
-        if (settled) return;
-        partial += chunk;
-        let end = partial.indexOf('\0');
-        while (end !== -1) {
-          const record = partial.slice(0, end);
-          partial = partial.slice(end + 1);
-          seen = true;
-          if (foreign(record)) {
-            child.kill();
-            settle(null, 'foreign');
-            return;
-          }
-          end = partial.indexOf('\0');
-        }
-        // An unterminated record past the bound cannot be a uid: answer foreign
-        // rather than hold an unbounded identity in memory.
-        if (partial.length > MAX_AUTHOR_RECORD_CHARS) {
-          child.kill();
-          settle(null, 'foreign');
-        }
-      });
-      child.stderr.on('data', (chunk: string) => {
-        const room = MAX_GIT_STDERR_BYTES - stderr.length;
-        if (room > 0) stderr += chunk.slice(0, room);
-      });
-      child.on('error', (err) => settle(new GitCommandError(args, null, String(err)), 'empty'));
-      child.on('close', (code) => {
-        if (settled) return;
-        // A trailing record without its separator is only possible from a
-        // truncated stream; classify it the same conservative way.
-        if (partial !== '') {
-          seen = true;
-          if (foreign(partial)) {
-            settle(null, 'foreign');
-            return;
-          }
-        }
-        if (code === 0) settle(null, seen ? 'self-only' : 'empty');
-        else settle(new GitCommandError(args, code, stderr), 'empty');
-      });
-    });
-  }
-
-  /** The repository's object format, read from git once and cached. */
-  private async format(): Promise<ObjectFormat> {
-    if (this.objectFormat === null) {
-      const out = (await this.git(['rev-parse', '--show-object-format'])).trim();
-      this.objectFormat = out === 'sha256' ? 'sha256' : 'sha1';
-    }
-    return this.objectFormat;
+    return detectForeignCommit(this.io, from, author);
   }
 
   /**
@@ -455,73 +324,12 @@ export class WorldRepo {
    * than promising byte equality across arbitrary versions (T4 step 2).
    */
   async gitVersion(): Promise<string> {
-    return (await this.git(['--version'])).replace(/\r?\n$/, '');
+    return readGitVersion(this.io);
   }
 
   /** The first parent of `commit`, or null for a root. Merge patches use it (T4 step 3). */
   async firstParent(commit: string): Promise<string | null> {
-    const out = (await this.git(['show', '-s', '--format=%P', commit])).trim();
-    const first = out.split(' ')[0] ?? '';
-    return first === '' ? null : first;
-  }
-
-  /** Refuses a hash that is not full hex in the repository's object format. */
-  private async assertHash(value: string, where: 'from' | 'to'): Promise<void> {
-    if (!isFullHex(await this.format(), value)) {
-      throw new Error(`invalid ${where} hash: ${value}`);
-    }
-  }
-
-  /** Verifies `commit` names a commit; a missing object propagates the git failure (T4 step 1). */
-  private async verifyCommit(commit: string): Promise<void> {
-    await this.git(['rev-parse', '--verify', '--quiet', `${commit}^{commit}`]);
-  }
-
-  /** Whether `commit` exists as a commit: the only "missing" signal is git's exit 1. */
-  private async commitExists(commit: string): Promise<boolean> {
-    try {
-      await this.verifyCommit(commit);
-      return true;
-    } catch (err) {
-      // Exit 1 is git's "unknown revision"; anything else (EIO/EACCES/spawn) is
-      // an environment failure and must not be mistaken for a missing object.
-      if (err instanceof GitCommandError && err.exitCode === 1) return false;
-      throw err;
-    }
-  }
-
-  /** Whether `from` is an ancestor of `to`; exits 0/1 carry the answer, else fail. */
-  private async isAncestor(from: string, to: string): Promise<boolean> {
-    try {
-      await this.git(['merge-base', '--is-ancestor', from, to]);
-      return true;
-    } catch (err) {
-      if (err instanceof GitCommandError && err.exitCode === 1) return false;
-      throw err;
-    }
-  }
-
-  /** The empty-tree object hash, generated from empty stdin; never a hardcoded SHA-1. */
-  private async emptyTree(): Promise<string> {
-    return (await this.gitWithStdin(['hash-object', '-t', 'tree', '--stdin'], Buffer.alloc(0))).trim();
-  }
-
-  /** The tree object of a commit; a missing object propagates the git failure. */
-  private async treeOf(commit: string): Promise<string> {
-    return (await this.git(['rev-parse', '--verify', '--quiet', `${commit}^{tree}`])).trim();
-  }
-
-  /** Author names for a batch of hashes, keyed by full hash. */
-  private async authorsOf(hashes: readonly string[]): Promise<Map<string, string>> {
-    const map = new Map<string, string>();
-    if (hashes.length === 0) return map;
-    const out = await this.git(['log', '--no-walk=unsorted', LOG_FORMAT, ...hashes]);
-    for (const line of out.split('\n')) {
-      if (line === '') continue;
-      const commit = parseCommit(line);
-      map.set(commit.hash, commit.author);
-    }
-    return map;
+    return firstParentOf(this.io, commit);
   }
 
   /**
@@ -532,40 +340,7 @@ export class WorldRepo {
    * outcomes do — git environment failures propagate.
    */
   async commitsIn(range: WorldRange, maxCommits: number): Promise<CommitRange> {
-    if (!Number.isSafeInteger(maxCommits) || maxCommits < 1 || maxCommits > 4096) {
-      throw new Error(`maxCommits must be an integer in [1, 4096], got ${maxCommits}`);
-    }
-    if (range.from !== null) await this.assertHash(range.from, 'from');
-    if (range.to !== null) await this.assertHash(range.to, 'to');
-
-    if (range.to === null) {
-      return { commits: [], effectiveFrom: null, fallback: 'none', listTruncated: false };
-    }
-    if (range.from !== null && range.from === range.to) {
-      return { commits: [], effectiveFrom: range.from, fallback: 'none', listTruncated: false };
-    }
-    await this.verifyCommit(range.to);
-
-    let base: string | null = range.from;
-    let fallback: 'none' | 'unreachable-from' = 'none';
-    if (range.from !== null) {
-      if (!(await this.commitExists(range.from)) || !(await this.isAncestor(range.from, range.to))) {
-        base = null;
-        fallback = 'unreachable-from';
-      }
-    }
-
-    const spec = base === null ? range.to : `${base}..${range.to}`;
-    const out = await this.git(['rev-list', '--topo-order', `--max-count=${maxCommits + 1}`, spec]);
-    const newest = out.split('\n').filter((line) => line !== '');
-    const listTruncated = newest.length > maxCommits;
-    // rev-list is newest-first; the extra oldest commit is dropped and the rest
-    // reversed to oldest-first deterministic topology.
-    const selectedNewest = listTruncated ? newest.slice(0, maxCommits) : newest;
-    const selectedOldest = [...selectedNewest].reverse();
-    const authors = await this.authorsOf(selectedOldest);
-    const commits = selectedOldest.map((hash) => ({ hash, author: authors.get(hash) ?? '' }));
-    return { commits, effectiveFrom: base, fallback, listTruncated };
+    return traverseCommitsIn(this.io, range, maxCommits);
   }
 
   /**
@@ -583,18 +358,20 @@ export class WorldRepo {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
       throw new Error(`maxBytes must be a positive integer, got ${maxBytes}`);
     }
-    if (range.from !== null) await this.assertHash(range.from, 'from');
-    if (range.to !== null) await this.assertHash(range.to, 'to');
+    if (range.from !== null) await assertHash(this.io, 'from', range.from);
+    if (range.to !== null) await assertHash(this.io, 'to', range.to);
 
     if (range.to === null) return { text: '', truncated: false, bytesRetained: 0 };
     if (range.from !== null && range.from === range.to) {
       return { text: '', truncated: false, bytesRetained: 0 };
     }
 
-    const toTree = await this.treeOf(range.to);
+    const toTree = await treeOf(this.io, range.to);
     const fromTree = range.from === null
-      ? await this.emptyTree()
-      : (await this.commitExists(range.from) ? await this.treeOf(range.from) : await this.emptyTree());
+      ? await emptyTree(this.io)
+      : (await commitExists(this.io, range.from)
+        ? await treeOf(this.io, range.from)
+        : await emptyTree(this.io));
 
     const scratch = await this.openScratchView();
     let result: BoundedText | undefined;
@@ -643,7 +420,7 @@ export class WorldRepo {
     // format from *its* config, not the world's. An empty config means "sha1"
     // and rejects a sha256 world's 64-hex ids, so the scratch view declares the
     // world's own format (validated by `format()`; no other setting is read).
-    const format = await this.format();
+    const format = await this.io.format();
     await writeFile(join(scratch, 'config'), format === 'sha256'
       ? '[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n'
       : '');
@@ -783,11 +560,11 @@ export class WorldRepo {
       return [];
     }
     if (base !== null) {
-      if (!isFullHex(await this.format(), base)) {
+      if (!isFullHex(await this.io.format(), base)) {
         throw new WorldReconciliationError(
           `interrupted turn ${turn}: base ${JSON.stringify(base)} is not a full commit id`);
       }
-      if (!(await this.commitExists(base)) || !(await this.isAncestor(base, head))) {
+      if (!(await commitExists(this.io, base)) || !(await isAncestor(this.io, base, head))) {
         throw new WorldReconciliationError(
           `interrupted turn ${turn}: base ${base} is not an ancestor of HEAD`);
       }
@@ -877,7 +654,9 @@ export class WorldRepo {
     // The net-change guard: a tree identical to the parent's would be an empty
     // commit — a wake for every other node with no fact behind it (§5.4). The
     // empty tree stands in for an unborn branch's parent.
-    const parentTree = before === null ? await this.emptyTree() : await this.treeOf(before);
+    const parentTree = before === null
+      ? await emptyTree(this.io)
+      : await treeOf(this.io, before);
     if (tree === parentTree) return null;
     // The commit object is created whether or not the branch can move; a
     // compare-and-swap loss leaves it unreferenced, and the retry makes a fresh
@@ -988,7 +767,7 @@ export class WorldRepo {
     if (current !== headRef) {
       throw new WorldHeadError(`HEAD switched from ${headRef} to ${current} during a commit`);
     }
-    const expected = before ?? '0'.repeat(hashLength(await this.format()));
+    const expected = before ?? '0'.repeat(hashLength(await this.io.format()));
     await this.git(['update-ref', headRef, commit, expected]);
   }
 
