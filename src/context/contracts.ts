@@ -73,6 +73,12 @@ export type SafeFailure = { readonly code: ErrorCode; readonly status: number | 
  * codes can describe an exchange: `malformed` (a 200 whose projection fails)
  * and `request-limit` never reach a terminal, so mapping one is a programmer
  * error and throws instead of inventing a code.
+ *
+ * The two producers that cross the frontier — the provider adapter
+ * (`src/provider/adapter.ts`) and the web tools (`src/node/tools/web.ts`) —
+ * share this one narrowing rather than each keeping its own: a failure the
+ * frontier vocabulary cannot name is a programmer error for both, and one table
+ * means neither can invent a code the other would refuse.
  */
 export function toFrontierCode(failure: SafeFailure): FrontierErrorCode {
   switch (failure.code) {
