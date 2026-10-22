@@ -1,10 +1,12 @@
 /**
- * The neutral shared predicates every layer parses with.
+ * The neutral shared primitives every layer parses and waits with.
  *
  * The context validators, the provider adapters and the tool dispatchers all need
- * the same non-throwing "plain JSON object" test. Keeping it below all of them
- * avoids a provider → context import (which would invert the layering) while
- * still leaving exactly one definition.
+ * the same non-throwing "plain JSON object" test, and the layers above need one
+ * sleep primitive, one no-op callback and one wall-clock read instead of a local
+ * copy per module. Keeping them below every layer avoids a provider → context
+ * import (which would invert the layering) while still leaving exactly one
+ * definition.
  */
 
 /** True for a non-null, non-array object — the shape every JSON parser narrows to. */
@@ -25,4 +27,17 @@ export function isLoopback(hostname: string): boolean {
   const octets = host.split('.');
   return octets.length === 4 && octets[0] === '127'
     && octets.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
+/** A timer promise: the one sleep primitive (terminal kill grace, commit retry). */
+export function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+/** A no-op callback: a `.then` sink that swallows either branch by design. */
+export const NOOP = (): void => {};
+
+/** The kernel's wall clock, in epoch milliseconds — one seam for every time read. */
+export function systemClock(): number {
+  return Date.now();
 }
