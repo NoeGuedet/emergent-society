@@ -114,11 +114,12 @@ export function frontierLayout(home: string): JournalLayout {
 
 /**
  * One safe file name: a plain, non-empty segment that stays inside
- * `layout.dir` and carries no control character. Deliberately the same
- * predicate shape the lock applies to its two names; it stays local because
- * the layout module must not depend on the lock at runtime.
+ * `layout.dir` and carries no control character. This is the canonical copy
+ * the lock adopts for its two names, so the runtime direction is lock →
+ * layout — which keeps the invariant that the layout module never depends on
+ * the lock.
  */
-function isSafeFileName(name: unknown): name is string {
+export function isSafeFileName(name: unknown): name is string {
   return typeof name === 'string' && basename(name) === name
     && name !== '' && name !== '.' && name !== '..'
     && !/[\u0000-\u001f\u007f]/.test(name);

@@ -5,7 +5,7 @@ import {
 } from '../journal/index.js';
 import { toJson } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
-import { surfaceHeading, surfaceRevision } from './groups.js';
+import { SAME, surfaceHeading, surfaceRevision } from './groups.js';
 import { SNAPSHOT_DIALECT, createValidator } from './validate.js';
 import type {
   AgentConfig, OpenTurn, ProjectionState, RecoveryGroup, Source, SurfaceGroup, SurfaceSnapshot,
@@ -83,10 +83,6 @@ function surfaceGroup(value: unknown, where: string): SurfaceGroup {
   };
 }
 
-function sameSource(a: Source, b: Source): boolean {
-  return a.seq === b.seq && a.hash === b.hash;
-}
-
 function surfaceSnapshot(value: unknown, where: string): SurfaceSnapshot {
   const o = record(value, where);
   onlyKeys(o, ['heading', 'nodes', 'revision'], where);
@@ -115,10 +111,10 @@ function surfaceSnapshot(value: unknown, where: string): SurfaceSnapshot {
   }
   const head = nodes[0]!;
   if (head.group.kind !== 'heading') fail(`${where}.nodes[0].group.kind`, "expected 'heading'");
-  if (!sameSource(head.group.id, heading.source)) {
+  if (!SAME(head.group.id, heading.source)) {
     fail(`${where}.nodes[0].group.id`, 'does not equal the heading source');
   }
-  if (!head.group.sources.some((entry) => sameSource(entry, heading.source))) {
+  if (!head.group.sources.some((entry) => SAME(entry, heading.source))) {
     fail(`${where}.nodes[0].group.sources`, 'does not contain the heading source');
   }
   const first = head.group.messages[0];
@@ -129,7 +125,7 @@ function surfaceSnapshot(value: unknown, where: string): SurfaceSnapshot {
   const groups = nodes.map((node) => node.group);
   const derivedHeading = surfaceHeading(groups);
   if (derivedHeading.text !== heading.text
-    || !sameSource(derivedHeading.source, heading.source)) {
+    || !SAME(derivedHeading.source, heading.source)) {
     fail(`${where}.heading`, 'does not match the heading pin');
   }
   // The revision is the shared groups.ts formula, not a local copy: the writer

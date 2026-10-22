@@ -1,9 +1,10 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { open, readFile } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JournalError } from './errors.js';
+import { isSafeFileName } from './layout.js';
 import type { JournalLayout } from './layout.js';
 
 /**
@@ -107,23 +108,16 @@ const FLOCK_STARTUP_EXITS = new Set([1, 64, 66, 69]);
 class UnknownGuardOutcomeError extends JournalLockUnavailableError {}
 
 /**
- * One safe file name: no separator, no traversal, no empty name, and no NUL or
- * control character (which `spawn` would reject with a raw TypeError, or the
- * filesystem would carry into a diagnostic). The guard applies exactly the same
- * predicate to the names it receives, but the parent applies it first:
- * `/usr/bin/flock` opens its target before the guard parses argv, so guard-side
- * validation alone cannot protect the sidecar path.
- */
-function isSafeFileName(name: string): boolean {
-  return typeof name === 'string' && basename(name) === name
-    && name !== '' && name !== '.' && name !== '..'
-    && !/[\u0000-\u001f\u007f]/.test(name);
-}
-
-/**
  * Refuses a layout whose lock or owner name is not a plain file name. Applied
  * before either name is used, by the parent's sidecar pre-creation as well as
  * by the guard's argv build.
+ *
+ * The predicate is `layout.ts`'s `isSafeFileName`: no separator, no traversal,
+ * no empty name, and no NUL or control character (which `spawn` would reject
+ * with a raw TypeError, or the filesystem would carry into a diagnostic). The
+ * guard applies the same rule to the names it receives, but the parent applies
+ * it first: `/usr/bin/flock` opens its target before the guard parses argv, so
+ * guard-side validation alone cannot protect the sidecar path.
  */
 function assertSafeNames(layout: JournalLayout): void {
   if (!isSafeFileName(layout.lockFile)) {
