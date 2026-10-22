@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { KernelError } from '../errors.js';
 import { toJson } from '../context/artifacts.js';
 import { toFrontierCode } from '../context/contracts.js';
 import { truncationNotice, utf8Prefix } from '../text.js';
@@ -69,10 +70,9 @@ function nonEmptyString(value: unknown): string | null {
 }
 
 /** Thrown by the pure projection step; the adapter classifies it as `malformed`. */
-class MalformedResponseError extends Error {
+class MalformedResponseError extends KernelError {
   constructor(message: string) {
     super(message);
-    this.name = 'MalformedResponseError';
   }
 }
 

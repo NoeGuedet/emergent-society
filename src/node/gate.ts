@@ -7,6 +7,7 @@ import type {
   ArtifactChunk, ArtifactManifest, ArtifactRef, Source, Stored,
 } from '../context/contracts.js';
 import type { VerifiedEvent, VerifiedEvents } from '../context/loader.js';
+import { NodeError } from './errors.js';
 import type { TurnContext } from './driver.js';
 import type { WorldRange } from './world.js';
 
@@ -20,7 +21,8 @@ import type { WorldRange } from './world.js';
  * claim-check reference is read back and digest/size-verified before any effect.
  *
  * The node→context edge is type-only (`VerifiedEvent(s)` above), erased at
- * runtime, so this module's runtime graph pulls in only the journal.
+ * runtime, so this module's runtime graph pulls in only the journal and the
+ * node error base (`./errors.ts`).
  * `BlobIntegrityError` is the journal's own corruption kind, so this gate and
  * `src/context/loader.ts` name one error without a node→context value edge.
  */
@@ -43,10 +45,9 @@ export type BoundaryRegistry = {
   readonly [K in BoundaryType]: (data: unknown, scope: GateScope) => JsonValue;
 };
 
-export class GateClosedError extends Error {
+export class GateClosedError extends NodeError {
   constructor() {
     super('boundary gate is closed');
-    this.name = 'GateClosedError';
   }
 }
 

@@ -3,6 +3,7 @@ import { lstat, mkdir, realpath } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertNodeUid } from '../../journal/layout.js';
+import { NodeError } from '../errors.js';
 import { realpathOrSelf } from '../world.js';
 
 /**
@@ -41,9 +42,7 @@ export type SandboxStatus =
   | { readonly mode: 'landlock'; readonly abi: number; readonly enforcement: 'full' | 'partial' };
 
 /** The message always carries the bounded launcher stderr/builder detail. */
-export class SandboxUnavailableError extends Error {
-  override readonly name = 'SandboxUnavailableError';
-}
+export class SandboxUnavailableError extends NodeError {}
 
 type GrantFlag = '--ro' | '--rox' | '--rw';
 

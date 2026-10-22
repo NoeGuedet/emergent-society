@@ -1,3 +1,4 @@
+import { KernelError } from '../errors.js';
 import type { EventEnvelope } from '../journal/index.js';
 import { canonicalMessagesBytes } from '../provider/wire.js';
 import type { GateScope } from '../node/gate.js';
@@ -20,10 +21,9 @@ import type {
  * real receipt: `append`/`replace` resolve each claimed source through `lookup`,
  * they do not trust a shape.
  */
-export class SurfacePolicyError extends Error {
+export class SurfacePolicyError extends KernelError {
   constructor(message: string) {
     super(message);
-    this.name = 'SurfacePolicyError';
   }
 }
 

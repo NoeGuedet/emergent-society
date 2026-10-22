@@ -1,23 +1,23 @@
+import { KernelError } from '../errors.js';
+
 /**
- * The journal's typed error surface: one base, so callers can catch the whole
- * family and read `name` off `new.target` instead of repeating it in every
- * constructor, plus the two predicates that tell an operator what to do next.
+ * The journal's typed error surface: one base under the kernel root, so callers
+ * can catch the whole family, plus the two predicates that tell an operator what
+ * to do next. `name` is assigned once, by `KernelError`, from `new.target`.
  *
  * Corruptions and environment failures call for opposite responses — inspect
  * versus retry — so `isCorruption`/`isRetryable` make that decision explicit at
  * the call site rather than leaving it to a chain of `instanceof` checks.
  */
-export abstract class JournalError extends Error {
+export abstract class JournalError extends KernelError {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
-    this.name = new.target.name;
   }
 }
 
 /**
  * Damage to the log's contents. A shared base rather than a list of classes at
- * the predicate, so a new corruption kind is covered by construction and this
- * module stays free of imports.
+ * the predicate, so a new corruption kind is covered by construction.
  */
 export abstract class CorruptionError extends JournalError {}
 

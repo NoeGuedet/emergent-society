@@ -1,3 +1,4 @@
+import { KernelError } from '../errors.js';
 import {
   BlobIntegrityError, BlobStore, JournalReader, isBlobRef, resolveBlobRef,
 } from '../journal/index.js';
@@ -27,14 +28,13 @@ export { BlobIntegrityError };
  * verified body could not be decoded as the JSON its `Stored` consumer expects
  * (`field: 'json'`). A typed refusal, distinct from a read or programming error.
  */
-export class ArtifactMismatchError extends Error {
+export class ArtifactMismatchError extends KernelError {
   constructor(
     public readonly field: 'manifest' | 'sha256' | 'bytes' | 'encoding' | 'complete' | 'json',
   ) {
     super(field === 'json'
       ? 'artifact body is not JSON'
       : 'artifact reference does not match its manifest');
-    this.name = 'ArtifactMismatchError';
   }
 }
 

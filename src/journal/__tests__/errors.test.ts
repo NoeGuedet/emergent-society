@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { KernelError } from '../../errors.js';
 import { JournalError, isCorruption, isRetryable } from '../errors.js';
 import { CorruptFrameError } from '../framing.js';
 import { ChainBreakError } from '../verify.js';
@@ -29,6 +30,7 @@ describe('the error family', () => {
       expect(e).toBeInstanceOf(JournalError);
       expect(e).toBeInstanceOf(Error);
     }
+    expect(new JournalClosedError()).toBeInstanceOf(KernelError);
   });
 
   it('classifies corruption as inspect-before-retry', () => {

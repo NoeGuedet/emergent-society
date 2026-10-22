@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   GitCommandError, NodeError, NodeStateError, UnsafeWorldPathError, WorldNotARepoError,
 } from '../errors.js';
+import { GateClosedError } from '../gate.js';
 
 describe('the node error family', () => {
   it('names itself off new.target', () => {
@@ -15,6 +16,7 @@ describe('the node error family', () => {
     expect(new NodeStateError()).toBeInstanceOf(NodeError);
     expect(new UnsafeWorldPathError('/')).toBeInstanceOf(NodeError);
     expect(new GitCommandError(['a'], null, '')).toBeInstanceOf(Error);
+    expect(new GateClosedError()).toBeInstanceOf(NodeError);
   });
 
   it('carries the offending value', () => {

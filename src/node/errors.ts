@@ -1,8 +1,12 @@
-/** The node module's typed errors, mirroring src/journal/errors.ts. */
-export abstract class NodeError extends Error {
-  constructor(message?: string) {
-    super(message);
-    this.name = new.target.name;
+import { KernelError } from '../errors.js';
+
+/**
+ * The node module's typed errors. Like `src/journal/errors.ts`, this family roots
+ * at `KernelError` (src/errors.ts), which assigns `name` from `new.target`.
+ */
+export abstract class NodeError extends KernelError {
+  constructor(message?: string, options?: { cause?: unknown }) {
+    super(message, options);
   }
 }
 
@@ -41,9 +45,10 @@ export class GitCommandError extends NodeError {
     public readonly args: readonly string[],
     public readonly exitCode: number | null,
     public readonly stderr: string,
+    options?: { cause?: unknown },
   ) {
     const exit = exitCode !== null ? ` (exit ${exitCode})` : '';
-    super(`git ${args.join(' ')} failed${exit}: ${stderr.trim()}`);
+    super(`git ${args.join(' ')} failed${exit}: ${stderr.trim()}`, options);
   }
 }
 

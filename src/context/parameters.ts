@@ -1,3 +1,4 @@
+import { KernelError } from '../errors.js';
 import type { JsonValue } from '../journal/index.js';
 import { toJson } from './artifacts.js';
 
@@ -20,10 +21,9 @@ import { toJson } from './artifacts.js';
 export type ProviderParameters = { readonly [key: string]: JsonValue };
 
 /** A typed parameter refusal; `key` names the offending key, or null for a non-object root. */
-export class ParameterError extends Error {
+export class ParameterError extends KernelError {
   constructor(readonly key: string | null, message: string) {
     super(message);
-    this.name = 'ParameterError';
   }
 }
 
