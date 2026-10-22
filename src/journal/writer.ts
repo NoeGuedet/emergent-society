@@ -113,9 +113,9 @@ interface Watermark {
 export interface JournalWriterOptions {
   /**
    * The clock; defaults to the shared `systemClock` in `util.ts`, so the
-   * journal's only wall-clock read is that one seam. Everything else takes
-   * time through an injected `now()`, so C1.2's kernel clock can replace it
-   * wholesale.
+   * writer's only wall-clock read is that one seam. Everything else in the
+   * writer takes time through an injected `now()`, so C1.2's kernel clock can
+   * replace it wholesale.
    */
   now?: () => number;
   /** Write-behind window; defaults to `DEFAULT_BATCH_WINDOW_MS`. */

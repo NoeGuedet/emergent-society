@@ -2,7 +2,8 @@ import { lstat, mkdir, realpath } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { WorldNotARepoError } from './errors.js';
 import {
-  commitAll as commitWorkingTree, commitQueues, commitsForTurn as findTurnCommits, nothingStaged,
+  commitAll as commitWorkingTree, commitQueues, commitsForTurn as findTurnCommits,
+  nothingStaged as stagedNothing,
 } from './world-commit.js';
 import { renderDiff } from './world-diff.js';
 import { readHead, runGit, runGitWithStdin, type WorldIo } from './world-git.js';
@@ -33,17 +34,18 @@ export type { WorldCommitInfo, WorldRange, DiffCapture, RecordedCommit, CommitRa
  * means a turn-end commit can carry a peer's in-flight writes as well as its
  * own (§5.2).
  *
- * The git CLI is driven as an external process rather than through a library:
- * the commit is a mechanism the kernel must be able to audit byte for byte, and
- * `git` is the only implementation of git whose behavior is a fact. The process
- * layer — the controlled environment, the output bound and the spawn lifecycle
- * — lives in `world-git.ts`; the path safeguards and the three trust layers
- * `open` runs live in `world-trust.ts`; the history reads — the wake range, the
- * author scan, the bounded traversal — live in `world-history.ts`; the hermetic
- * patch renderer lives in `world-diff.ts`; the commit machinery — staging, the
- * plumbing commit, the queue and the reconciliation search — lives in
- * `world-commit.ts`; this module owns the repository's policy and is the façade
- * over all five.
+ * The git CLI is driven as an external process, never through a library:
+ * `world-git.ts`'s header owns the rationale (the commit must be auditable byte
+ * for byte), and the process layer — the controlled environment, the output
+ * bound and the spawn lifecycle — lives there. The path safeguards and the
+ * three trust layers `open` runs live in `world-trust.ts`;
+ * the history reads — the wake range, the author scan, the bounded traversal —
+ * live in `world-history.ts`; the hermetic patch renderer lives in
+ * `world-diff.ts`; the commit machinery — staging, the plumbing commit, the
+ * queue and the reconciliation search — lives in `world-commit.ts`; the shared
+ * data shapes live in `world-types.ts`; this module owns the repository's policy
+ * and is the façade over all six (the five behavioural siblings plus the data
+ * shapes in `world-types.ts`).
  *
  * The git directory lives *outside* the world (`<home>/world.git` in
  * production): confinement makes the world agent-writable, and a writable git
@@ -217,7 +219,7 @@ export class WorldRepo {
    * binds to it, and the prototype is what a test double spies on.
    */
   private async nothingStaged(): Promise<boolean> {
-    return nothingStaged(this.io);
+    return stagedNothing(this.io);
   }
 
   /**
@@ -250,42 +252,22 @@ export class WorldRepo {
     return detectForeignCommit(this.io, from, author);
   }
 
-  /**
-   * The exact stdout of `git --version`, trailing line ending trimmed. Recorded
-   * in every perception so replay can reject a differing exact version rather
-   * than promising byte equality across arbitrary versions (T4 step 2).
-   */
+  /** See `readGitVersion`. */
   async gitVersion(): Promise<string> {
     return readGitVersion(this.io);
   }
 
-  /** The first parent of `commit`, or null for a root. Merge patches use it (T4 step 3). */
+  /** See `firstParent`. */
   async firstParent(commit: string): Promise<string | null> {
     return firstParentOf(this.io, commit);
   }
 
-  /**
-   * A bounded, verified traversal of `range` (T4 step 1–3): the newest
-   * `maxCommits` commits from oldest-first topology, the verified traversal base
-   * and the reason a fallback happened. A `from` that is missing or not an
-   * ancestor of `to` falls back to full history; only those two explicit
-   * outcomes do — git environment failures propagate.
-   */
+  /** See `commitsIn`. */
   async commitsIn(range: WorldRange, maxCommits: number): Promise<CommitRange> {
     return traverseCommitsIn(this.io, range, maxCommits);
   }
 
-  /**
-   * The bounded, hermetic patch of one range (T4 step 4–6): a `from-tree →
-   * to-tree` diff run against an isolated bare metadata view whose object
-   * database is the world's, with the exact flag/env policy that removes the
-   * working-tree attributes, `.git/info/attributes`, repo-local diff drivers
-   * and host `diff.orderFile` as inputs. A `null`/missing `from` uses the empty
-   * tree; a missing `to` rejects. The renderer fails closed: any failure to
-   * build the view or run git rejects rather than falling back to the working
-   * tree. Emission is capped at `maxBytes` decoded bytes with deterministic
-   * U+FFFD replacement.
-   */
+  /** See `renderDiff`. */
   async diff(range: WorldRange, maxBytes: number): Promise<DiffCapture> {
     return renderDiff(this.io, range, maxBytes);
   }

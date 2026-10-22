@@ -17,7 +17,8 @@ import type { WorldCommitInfo } from './world-types.js';
  * paths, its `-c` overrides and its policy seams — so a commit can be exercised
  * against a double without constructing a repository. The process layer is
  * `world-git.ts`, which also holds the revision primitives this module is built
- * from; the repository that owns the policy and the trust checks is `world.ts`.
+ * from; the repository that owns the policy is `world.ts` (whose open runs the
+ * trust checks from `world-trust.ts`).
  *
  * Every HEAD read goes through `io.head()` and the staged-nothing question
  * through `io.nothingStaged()`: those are the repository's seams (and the

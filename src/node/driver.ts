@@ -43,9 +43,9 @@ function checkedKnownTypes(
 // The turn vocabulary lives in events.ts (single home). `TurnTrigger` is
 // re-exported here because the driver's own exported types name it — the
 // `TurnContext.trigger` field — and its consumers import it from this module.
-// `ShutdownReason` and `TurnEndOutcome` are named from their home instead
-// (`./events.js` here, and `index.ts` re-exports both), so no consumer needs
-// the driver module as a second path to them.
+// `ShutdownReason` is imported from `./events.js` here; `index.ts` re-exports
+// both it and `TurnEndOutcome`, so no consumer needs the driver module as a
+// second path to them.
 export type { TurnTrigger } from './events.js';
 
 /**

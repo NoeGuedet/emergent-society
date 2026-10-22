@@ -6,7 +6,12 @@ import type { ObjectFormat } from './world-types.js';
  * The git process layer: one controlled environment, one output bound, one
  * spawn lifecycle. The policy that decides *which* commands the kernel runs
  * stays with the repository (`world.ts`); this module only decides how a `git`
- * child is started and how its failure is reported.
+ * child is started and how its failure is reported. Alongside the spawn
+ * primitives it hosts the io-level revision primitives (`readHead`,
+ * `commitExists`, `isAncestor`, `treeOf`, `emptyTree`, `assertHash`,
+ * `verifyCommit`, `hashLength`, `isFullHex`) so the higher-level siblings share
+ * one implementation rather than importing one another for them: they encode
+ * the *meaning* of a git exit status, not the choice of command.
  *
  * The git CLI is driven through `child_process` rather than a library: the
  * commit is a mechanism the kernel must be able to audit byte for byte, and

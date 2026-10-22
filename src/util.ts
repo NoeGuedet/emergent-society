@@ -37,7 +37,12 @@ export function delay(ms: number): Promise<void> {
 /** A no-op callback: a `.then` sink that swallows either branch by design. */
 export const NOOP = (): void => {};
 
-/** The kernel's wall clock, in epoch milliseconds — one seam for every time read. */
+/**
+ * The default wall clock, in epoch milliseconds: the kernel's shared `now`, and
+ * the default for modules that take an injectable clock. It is not the only time
+ * read — code without an injected clock (the terminal runtime, the journal lock
+ * guard) calls `Date.now()` itself.
+ */
 export function systemClock(): number {
   return Date.now();
 }

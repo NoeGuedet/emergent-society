@@ -22,7 +22,7 @@ import type { CommitRange, WorldCommitInfo, WorldRange } from './world-types.js'
  * — inside `readHead`, which calls `io.git` — recurse.
  */
 
-/** The `git log` format the parser reads: hash, author name, subject. */
+/** The `git log` format the parser reads: hash, author name. */
 const LOG_FORMAT = `--format=%H${FIELD}%an`;
 
 /**
