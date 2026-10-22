@@ -1,6 +1,5 @@
+import { NOOP } from '../util.js';
 import type { WorldRepo } from './world.js';
-
-const NOOP = (): void => {};
 
 /**
  * HEAD is re-read at this cadence while at least one node is parked on the

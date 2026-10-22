@@ -1,6 +1,7 @@
 import { open as openFile, truncate } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
+import { systemClock } from '../util.js';
 import { canonicalJsonForm, sha256HexOf, type JsonValue } from './canon.js';
 import { GENESIS_HASH, makeEvent, eventLine, type EventDataFor, type EventEnvelope } from './envelope.js';
 import {
@@ -107,13 +108,15 @@ interface Watermark {
 }
 
 /**
- * The only wall-clock read in src/journal/. Everything else takes time through
- * an injected `now()`, so C1.2's kernel clock can replace it wholesale.
+ * Options for `JournalWriter.open` and `JournalWriter.openIn`.
  */
-const systemClock = (): number => Date.now();
-
-/** Options for `JournalWriter.open` and `JournalWriter.openIn`. */
 export interface JournalWriterOptions {
+  /**
+   * The clock; defaults to the shared `systemClock` in `util.ts`, so the
+   * journal's only wall-clock read is that one seam. Everything else takes
+   * time through an injected `now()`, so C1.2's kernel clock can replace it
+   * wholesale.
+   */
   now?: () => number;
   /** Write-behind window; defaults to `DEFAULT_BATCH_WINDOW_MS`. */
   batchWindowMs?: number;

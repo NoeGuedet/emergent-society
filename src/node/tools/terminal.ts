@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { constants as osConstants } from 'node:os';
 import * as pty from '@lydell/node-pty';
+import { delay } from '../../util.js';
 import { stdinWaitPids, sessionTtyTarget } from './proc.js';
 import { probeSandbox } from './sandbox.js';
 import type { SandboxSpec, SandboxStatus } from './sandbox.js';
@@ -151,10 +152,6 @@ function quoteForBash(value: string): string {
     .replaceAll("'", "\\'")
     .replaceAll('\r', '\\r')
     .replaceAll('\n', '\\n')}'`;
-}
-
-function pause(ms: number): Promise<void> {
-  return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
 /**
@@ -461,11 +458,11 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     if (session === null || session.exited !== null) return;
     try { session.proc.kill('SIGTERM'); } catch { /* already gone */ }
     const deadline = Date.now() + killGraceMs;
-    while (session.exited === null && Date.now() < deadline) await pause(POLL_MS);
+    while (session.exited === null && Date.now() < deadline) await delay(POLL_MS);
     if (session.exited === null) {
       try { session.proc.kill('SIGKILL'); } catch { /* already gone */ }
       const hard = Date.now() + killGraceMs;
-      while (session.exited === null && Date.now() < hard) await pause(POLL_MS);
+      while (session.exited === null && Date.now() < hard) await delay(POLL_MS);
     }
   }
 
@@ -487,7 +484,7 @@ export class PtyTerminalRuntime implements TerminalRuntime {
     session: Session,
   ): Promise<{ readonly code: number | null; readonly signal: string | null }> {
     const deadline = Date.now() + EXIT_REPORT_GRACE_MS;
-    while (session.exited === null && Date.now() < deadline) await pause(POLL_MS);
+    while (session.exited === null && Date.now() < deadline) await delay(POLL_MS);
     session.exited ??= { code: null, signal: null };
     return session.exited;
   }
@@ -513,7 +510,7 @@ export class PtyTerminalRuntime implements TerminalRuntime {
         || Date.now() >= deadline) {
         return;
       }
-      await pause(POLL_MS);
+      await delay(POLL_MS);
     }
   }
 
@@ -655,7 +652,7 @@ export class PtyTerminalRuntime implements TerminalRuntime {
       let probes = 0;
       let lastProbeAt = 0;
       for (;;) {
-        await pause(POLL_MS);
+        await delay(POLL_MS);
         if (slot.capture.exitCode !== null) {
           return settle('completed', slot.capture.exitCode, null, false);
         }

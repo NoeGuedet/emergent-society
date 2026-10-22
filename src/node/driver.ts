@@ -3,6 +3,7 @@ import {
   isBlobRef, readVerifiedBlob, repair,
   type EventDataFor, type EventEnvelope, type JsonValue, type JournalWriterOptions,
 } from '../journal/index.js';
+import { systemClock } from '../util.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
 import { NodeStateError, WorldReconciliationError, GitCommandError } from './errors.js';
 import { WakeLatch } from './latch.js';
@@ -17,13 +18,6 @@ import { HeadWatcher } from './watcher.js';
 import type { WorldRange, WorldRepo } from './world.js';
 
 export type NodeState = 'booting' | 'active' | 'waiting' | 'stopping' | 'stopped';
-
-/**
- * The driver's default clock, mirroring the journal's own `systemClock`: the
- * driver resolves it once, so every turn heals the same `now` the caller
- * injected (or the wall clock when none was given).
- */
-const systemClock = (): number => Date.now();
 
 /**
  * The replay vocabulary a hooks bundle must be able to read: the node's own
@@ -153,7 +147,12 @@ export class NodeDriver {
   private stopReason: ShutdownReason = 'stop-requested';
   private readonly latch = new WakeLatch();
   private readonly watcher: HeadWatcher;
-  /** Resolved once in the constructor, like the writer's `systemClock`. */
+  /**
+   * The injected `now`, or the shared `systemClock` in `util.ts` — the same
+   * clock the journal writer defaults to. Resolved once here, so every turn
+   * heals the same `now` the caller injected (or the wall clock when none was
+   * given).
+   */
   private readonly now: () => number;
   private readonly home: string;
   private readonly hooks: DriverHooks | undefined;
