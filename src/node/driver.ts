@@ -882,8 +882,9 @@ export class NodeDriver {
    * because `commitWorld` stages everything (`git add --all`), a peer's dirty
    * files are swept in with the node's own — commit-granular attribution, the
    * accepted behavior of the zero-candidate path. Exactly one candidate is
-   * named as-is and stages nothing. A bounded-out search, an unreachable base
-   * or more than one match is refused by `commitsForTurn`.
+   * named as-is and stages nothing. A bounded-out search and an unreachable
+   * base are refused by `commitsForTurn`; more than one match is returned by it
+   * and refused here.
    */
   private async reconcileInterrupted(turn: number, base: string | null): Promise<string | null> {
     const candidates = await this.world.commitsForTurn(base, this.uid, turn);
