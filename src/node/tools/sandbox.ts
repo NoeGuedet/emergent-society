@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { lstat, mkdir, realpath } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { assertNodeUid } from '../../journal/layout.js';
+import { assertNodeUid } from '../../journal/index.js';
 import { NodeError } from '../errors.js';
 import { realpathOrSelf } from '../world.js';
 

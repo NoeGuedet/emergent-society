@@ -40,11 +40,13 @@ function checkedKnownTypes(
   return provided;
 }
 
-// The turn/shutdown vocabulary lives in events.ts (single home); re-exported
-// here for consumers of the driver's own signatures. The public surface
-// (`index.ts`) names it from that home too, since `stop()` takes a
-// ShutdownReason and a closer takes a TurnEndOutcome.
-export type { ShutdownReason, TurnEndOutcome, TurnTrigger } from './events.js';
+// The turn vocabulary lives in events.ts (single home). `TurnTrigger` is
+// re-exported here because the driver's own exported types name it — the
+// `TurnContext.trigger` field — and its consumers import it from this module.
+// `ShutdownReason` and `TurnEndOutcome` are named from their home instead
+// (`./events.js` here, and `index.ts` re-exports both), so no consumer needs
+// the driver module as a second path to them.
+export type { TurnTrigger } from './events.js';
 
 /**
  * What the handler reports back. The driver decides what the turn *meant*: it

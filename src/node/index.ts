@@ -23,9 +23,11 @@ export {
 export {
   NODE_EVENT_TYPES, type ShutdownReason, type TurnEndOutcome, type TurnTrigger,
 } from './events.js';
-// The hook seam's types are public; the gate factory and the writer are not.
+// The hook seam's types are public — including the scope a hook is handed and
+// the registry it is dispatched from; the gate factory and the writer are not.
 export type {
-  BoundaryGate, DurableWatermark, DriverHooks, WorldAcknowledgement,
+  BoundaryGate, BoundaryRegistry, DurableWatermark, DriverHooks, GateScope,
+  WorldAcknowledgement,
 } from './gate.js';
 // The C1.3 runtime's public surface: the factory plus its instance and option
 // types. Provider components stay direct imports (no re-export here), and the

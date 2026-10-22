@@ -96,9 +96,11 @@ export interface AgentRuntime {
   sandboxStatus(): SandboxStatus | null;
 }
 
-// `defaultAgentConfig`/`validateAgentConfig` live in `src/context/config.ts`
-// and are re-exported here for runtime consumers; they are never redefined.
-export { defaultAgentConfig, validateAgentConfig };
+// `defaultAgentConfig` lives in `src/context/config.ts` and is re-exported here
+// for runtime consumers; it is never redefined. `validateAgentConfig` is an
+// implementation detail of this module (the runtime validates its own config),
+// so it is imported and used, never re-exported.
+export { defaultAgentConfig };
 
 /** Stop-time kill grace when no config was ever journaled (pre-ready stop). */
 const FALLBACK_KILL_GRACE_MS = 200;

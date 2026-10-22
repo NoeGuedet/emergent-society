@@ -71,7 +71,7 @@ export class BlobIntegrityError extends CorruptionError {
  * prefix of a payload whose original is unrecoverable, so every verified read
  * must reject it rather than serve the prefix as whole (kernel.md §3).
  */
-export function assertBlobRefReadable(ref: BlobRef): void {
+function assertBlobRefReadable(ref: BlobRef): void {
   if (ref.truncated === true) throw new TruncatedBlobError(ref.blob, ref.size);
 }
 
@@ -81,7 +81,7 @@ export function assertBlobRefReadable(ref: BlobRef): void {
  * re-checked by the store's raw `get`, so every verified read routes through
  * here; a mismatch is source corruption, not a retryable environment failure.
  */
-export function assertBlobBytes(ref: BlobRef, bytes: Buffer): void {
+function assertBlobBytes(ref: BlobRef, bytes: Buffer): void {
   if (bytes.length !== ref.size || sha256HexOf(bytes) !== ref.blob) {
     throw new BlobIntegrityError(ref.blob, ref.size, bytes.length);
   }
@@ -93,7 +93,7 @@ export function assertBlobBytes(ref: BlobRef, bytes: Buffer): void {
  * A body that is not JSON is reported as `BlobIntegrityError`, never a raw
  * `SyntaxError`, so a caller classifies exactly one corruption kind.
  */
-export function parseBlobJson(ref: BlobRef, bytes: Buffer): JsonValue {
+function parseBlobJson(ref: BlobRef, bytes: Buffer): JsonValue {
   assertBlobRefReadable(ref);
   assertBlobBytes(ref, bytes);
   try {
@@ -150,7 +150,7 @@ export async function resolveBlobRef(
  * problem, and is rethrown unchanged so it keeps its truthful type and cause and
  * is never reclassified as corruption by the verified-read path.
  */
-export function throwBlobReadError(ref: BlobRef, err: unknown): never {
+function throwBlobReadError(ref: BlobRef, err: unknown): never {
   if (isErrno(err, 'ENOENT')) throw new BlobIntegrityError(ref.blob, ref.size, 0);
   throw err;
 }

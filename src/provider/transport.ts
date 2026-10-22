@@ -1,7 +1,7 @@
 import type { SafeFailure } from '../context/contracts.js';
 import {
   FRONTIER_MAX_CREDENTIAL_ID, FrontierValidationError, validateFrontierUrl,
-} from '../frontier/events.js';
+} from '../frontier/index.js';
 import { readBoundedBody } from '../net/bounded-body.js';
 import { isLoopback } from '../util.js';
 
