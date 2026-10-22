@@ -1,5 +1,5 @@
 import type { JsonValue } from '../journal/index.js';
-import type { CallId } from '../frontier/index.js';
+import type { CallId, FrontierErrorCode } from '../frontier/index.js';
 import type { RecordedCommit, WorldRange } from '../node/world.js';
 
 /**
@@ -67,6 +67,25 @@ export type ErrorCode = 'http' | 'network' | 'timeout' | 'cancelled'
   | 'spawn' | 'signal' | 'output-limit' | 'request-limit';
 
 export type SafeFailure = { readonly code: ErrorCode; readonly status: number | null };
+
+/**
+ * Maps a `SafeFailure` to the frontier terminal's error code. Only the wire
+ * codes can describe an exchange: `malformed` (a 200 whose projection fails)
+ * and `request-limit` never reach a terminal, so mapping one is a programmer
+ * error and throws instead of inventing a code.
+ */
+export function toFrontierCode(failure: SafeFailure): FrontierErrorCode {
+  switch (failure.code) {
+    case 'http':
+    case 'network':
+    case 'timeout':
+    case 'cancelled':
+    case 'body-limit':
+      return failure.code;
+    default:
+      throw new Error(`no frontier code for failure ${JSON.stringify(failure.code)}`);
+  }
+}
 
 /** The recorded runtime policy; every numeric limit is the effective one, expanded before journaling. */
 export type SeedPolicy = {

@@ -1,10 +1,11 @@
 import { Buffer } from 'node:buffer';
 import { toJson } from '../context/artifacts.js';
+import { toFrontierCode } from '../context/contracts.js';
 import { truncationNotice, utf8Prefix } from '../text.js';
 import { isRecord } from '../util.js';
 import { filterHeaders } from '../frontier/index.js';
 import { serializeWire } from './wire.js';
-import type { Frontier, FrontierErrorCode, FrontierOutcome } from '../frontier/index.js';
+import type { Frontier, FrontierOutcome } from '../frontier/index.js';
 import type { BoundaryGate } from '../node/gate.js';
 import type {
   AssistantProjection, ChatMessage, FunctionCall, RequestPlan, SafeFailure,
@@ -181,25 +182,6 @@ function boundAssistant(
     },
     contentTruncated: true,
   };
-}
-
-/**
- * Maps a `SafeFailure` to the frontier terminal's error code. Only the wire
- * codes can describe an exchange: `malformed` (a 200 whose projection fails)
- * and `request-limit` never reach a terminal, so mapping one is a programmer
- * error and throws instead of inventing a code.
- */
-function toFrontierCode(failure: SafeFailure): FrontierErrorCode {
-  switch (failure.code) {
-    case 'http':
-    case 'network':
-    case 'timeout':
-    case 'cancelled':
-    case 'body-limit':
-      return failure.code;
-    default:
-      throw new Error(`no frontier code for failure ${JSON.stringify(failure.code)}`);
-  }
 }
 
 /** One `post` outcome: an exchange result, or the pre-send machinery marker. */

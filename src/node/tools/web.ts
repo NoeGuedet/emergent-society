@@ -1,10 +1,11 @@
 import { Buffer } from 'node:buffer';
+import { toFrontierCode } from '../../context/contracts.js';
 import type { SafeFailure } from '../../context/contracts.js';
 import {
   FrontierValidationError, filterHeaders, validateFrontierUrl,
 } from '../../frontier/index.js';
 import type {
-  CallId, Frontier, FrontierErrorCode, FrontierOutcome,
+  CallId, Frontier, FrontierOutcome,
 } from '../../frontier/index.js';
 import { readBoundedBody } from '../../net/bounded-body.js';
 import { isLoopback, isRecord } from '../../util.js';
@@ -125,16 +126,6 @@ export function frontierOutcome(exchange: Exchange): FrontierOutcome {
   }
   return { status: exchange.status, headers, body: exchange.body,
     encoding: 'binary', complete: exchange.complete, error: code };
-}
-
-/** The web side's own narrowing: only the wire codes can reach a terminal. */
-function toFrontierCode(failure: SafeFailure): FrontierErrorCode {
-  switch (failure.code) {
-    case 'http': case 'network': case 'timeout': case 'cancelled': case 'body-limit':
-      return failure.code;
-    default:
-      throw new Error(`no frontier code for failure ${JSON.stringify(failure.code)}`);
-  }
 }
 
 /**
