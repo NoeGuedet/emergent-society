@@ -430,7 +430,7 @@ describe('proof 1: one mediated path (a regression guard on kernel sources)', ()
 
     // Exactly three legitimate kernel sites; a fourth fails the proof.
     expect(containing(sources, 'child' + '_process')).toEqual([
-      'journal/lock.ts', 'node/tools/sandbox.ts', 'node/world.ts',
+      'journal/lock.ts', 'node/tools/sandbox.ts', 'node/world-git.ts',
     ]);
   });
 

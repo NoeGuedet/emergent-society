@@ -1,4 +1,3 @@
-import { execFile, spawn } from 'node:child_process';
 import type { Stats } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
@@ -9,6 +8,15 @@ import {
   GitCommandError, UnsafeWorldPathError, WorldHeadError, WorldNotARepoError,
   WorldReconciliationError,
 } from './errors.js';
+import {
+  FIELD, MAX_GIT_STDERR_BYTES, hashLength, isFullHex, runGit, runGitWithStdin, spawnGit,
+} from './world-git.js';
+import type {
+  BoundedText, CommitRange, DiffCapture, ObjectFormat, WorldCommitInfo, WorldRange,
+} from './world-types.js';
+
+export { gitEnv } from './world-git.js';
+export type { WorldCommitInfo, WorldRange, DiffCapture, RecordedCommit, CommitRange } from './world-types.js';
 
 /**
  * The world is one git repository (kernel.md §7): the only communication
@@ -21,9 +29,11 @@ import {
  * means a turn-end commit can carry a peer's in-flight writes as well as its
  * own (§5.2).
  *
- * The git CLI is driven through `child_process` rather than a library: the
- * commit is a mechanism the kernel must be able to audit byte for byte, and
- * `git` is the only implementation of git whose behavior is a fact.
+ * The git CLI is driven as an external process rather than through a library:
+ * the commit is a mechanism the kernel must be able to audit byte for byte, and
+ * `git` is the only implementation of git whose behavior is a fact. The process
+ * layer — the controlled environment, the output bound and the spawn lifecycle
+ * — lives in `world-git.ts`; this module owns the repository's policy.
  *
  * The git directory lives *outside* the world (`<home>/world.git` in
  * production): confinement makes the world agent-writable, and a writable git
@@ -32,19 +42,9 @@ import {
  * external pair and the git dir's trust inputs on every start.
  */
 
-/** Git's field separator inside a `--format` line: a control character no uid or hash carries. */
-const FIELD = '\x1f';
-
 /** The `git log` format the parser reads: hash, author name, subject. */
 const LOG_FORMAT = `--format=%H${FIELD}%an`;
 const RECONCILE_FORMAT = `--format=%H${FIELD}%an${FIELD}%s`;
-
-/**
- * Output bound for every git call. It is a refusal, not a truncation: the child
- * is killed when the bound is passed, so a `git log` over a long history fails
- * loudly rather than parsing as a short-but-complete one.
- */
-const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 /**
  * Commit attempts before a lock that will not free — or a branch that will not
@@ -66,9 +66,6 @@ const COMMIT_RETRY_MS = 25;
  */
 const MAX_RECONCILE_SCAN = 4096;
 
-/** stderr kept from a failed bounded render: a diagnostic, never the payload (§T4). */
-const MAX_GIT_STDERR_BYTES = 8 * 1024;
-
 /**
  * The longest author record the wake scan will hold while waiting for its
  * terminator. A uid is at most 128 characters, so a longer record cannot be
@@ -76,65 +73,6 @@ const MAX_GIT_STDERR_BYTES = 8 * 1024;
  * bound.
  */
 const MAX_AUTHOR_RECORD_CHARS = 4096;
-
-/**
- * The git context variables the kernel strips from every call. Each one lets an
- * inherited environment point git at a different repository, index, object store
- * or namespace — the difference between committing the world and committing
- * somewhere the kernel was never asked to touch. Two of them are config-injection
- * channels that need no file at all: `GIT_CONFIG_COUNT` with its
- * `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` entries, and `GIT_CONFIG_PARAMETERS`
- * (a shell-quoted `-c` list). Either can set `core.*` — a clean filter, an
- * fsmonitor, hooks — which git would then run unlogged.
- */
-const GIT_ENV_STRIP: readonly string[] = [
-  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
-  'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
-  'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM',
-  'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
-  // A replace ref lets `.git/refs/replace/*` project a forged commit in place
-  // of the physical one; this variable would redirect where git looks for them.
-  'GIT_REPLACE_REF_BASE',
-];
-
-/**
- * The controlled environment for every kernel git invocation. The redirecting
- * and config-injecting variables above are removed, system and global config are
- * neutralized, and the rest of the environment (PATH, locale — git needs both)
- * is inherited. A caller with an explicit policy (the hermetic diff renderer)
- * passes overrides, which win. Replace refs are neutralized as well, so the
- * kernel reads physical committed facts rather than a `refs/replace` projection
- * — intentionally, since a projection is not a durable fact of the world.
- * Lazy fetching is disabled outright: a promisor configuration plus one missing
- * object is enough to make ordinary plumbing run a configured transport helper,
- * i.e. arbitrary code as the kernel; with this variable git fails closed
- * ("bad tree object") instead of fetching. This is the single place that
- * decides a kernel git environment: the process environment is read, never
- * mutated. Exported so test fixtures acting as a second writer use the same
- * controlled environment the kernel does.
- */
-export function gitEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of GIT_ENV_STRIP) delete env[key];
-  for (const key of Object.keys(env)) {
-    // `GIT_CONFIG_COUNT` names a list; its entries are `GIT_CONFIG_KEY_<n>` and
-    // `GIT_CONFIG_VALUE_<n>`, so they are removed by prefix, whatever the count.
-    if (key.startsWith('GIT_CONFIG_KEY_') || key.startsWith('GIT_CONFIG_VALUE_')) delete env[key];
-  }
-  return {
-    ...env,
-    GIT_CONFIG_NOSYSTEM: '1',
-    GIT_CONFIG_GLOBAL: '/dev/null',
-    // The kernel reads physical committed objects only: a `refs/replace` entry
-    // is a projection, and every read command (log, rev-list, first-parent,
-    // reconciliation, diff) must see the real author and subject.
-    GIT_NO_REPLACE_OBJECTS: '1',
-    // Defense in depth under the open-time refusal of promisor/partial-clone
-    // configuration: a missing object must fail closed, never fetch.
-    GIT_NO_LAZY_FETCH: '1',
-    ...overrides,
-  };
-}
 
 /**
  * `realpath`, or the input unchanged when the path does not exist. Only `ENOENT`
@@ -382,129 +320,8 @@ const HERMETIC_DIFF_ARGS: readonly string[] = [
   '--ignore-submodules=none', '--src-prefix=a/', '--dst-prefix=b/',
 ];
 
-/** The object formats git may use; a hash's hex length is the discriminator. */
-type ObjectFormat = 'sha1' | 'sha256';
-
-/** One bounded render result: the emitted UTF-8 text, whether it stopped early, its byte length. */
-interface BoundedText {
-  readonly text: string;
-  readonly truncated: boolean;
-  readonly bytesRetained: number;
-}
-
-/** Full-hex validation, sized to the repository's object format (T4 step 1). */
-function hashLength(format: ObjectFormat): number {
-  return format === 'sha256' ? 64 : 40;
-}
-
-function isFullHex(value: string, length: number): boolean {
-  return value.length === length && /^[0-9a-f]+$/.test(value);
-}
-
 /** What git says when another process holds the index or the ref, or when a branch compare-and-swap loses its race. */
 const LOCK_CONTENTION = /index\.lock|cannot lock ref|Another git process seems to be running/i;
-
-/** One commit of the world's history, as the wake predicate and the journal need it. */
-export interface WorldCommitInfo {
-  readonly hash: string;
-  /** The commit's author name — the uid of the node whose turn produced it. */
-  readonly author: string;
-}
-
-/**
- * A range of the world's history: `from` is a node's wake watermark (the last
- * commit it has seen; null before it has ever perceived the world), `to` is
- * HEAD. It is what the journal records about a turn's perception and what the
- * C1.3 assembler turns into the diff a wake presents (kernel.md §4, §5.2).
- *
- * A type alias rather than an interface, deliberately: this shape is journaled
- * in `turn/start` data, and only a type alias is assignable to the `JsonValue`
- * index signature the envelope requires.
- */
-export type WorldRange = {
-  readonly from: string | null;
-  readonly to: string | null;
-};
-
-/**
- * A bounded rendering of a world range (T4). `bytesRetained` counts the emitted
- * UTF-8 bytes of `text` after decoding/replacement, including headers and
- * notices — not an input byte count; `truncated` is true when emission stopped
- * before the whole bounded range was rendered. Type aliases, not interfaces:
- * these are journaled in `world/perception` and the envelope's `JsonValue`
- * constraint only admits alias-shaped object types.
- */
-export type DiffCapture = {
-  readonly text: string;
-  readonly truncated: boolean;
-  readonly bytesRetained: number;
-};
-
-/** One recorded commit of a bounded range, as the perception records it. */
-export type RecordedCommit = {
-  readonly hash: string;
-  readonly author: string;
-};
-
-/**
- * A bounded, verified traversal of the world's history (T4). `effectiveFrom` is
- * the requested `from` when reachable, else `null`; `listTruncated` records that
- * older commits were omitted rather than claiming a complete history.
- */
-export type CommitRange = {
-  readonly commits: RecordedCommit[];
-  readonly effectiveFrom: string | null;
-  readonly fallback: 'none' | 'unreachable-from';
-  readonly listTruncated: boolean;
-};
-
-/**
- * Runs one git command with `dir` as its working directory and returns stdout.
- *
- * @throws GitCommandError on any non-zero exit or spawn failure, carrying the
- * exit code and stderr so a caller can tell a policy failure (an unborn branch,
- * a staged-nothing index) from an environment one.
- */
-async function runGit(dir: string, args: readonly string[], env?: Record<string, string>): Promise<string> {
-  return new Promise<string>((resolvePromise, reject) => {
-    execFile(
-      'git', [...args],
-      {
-        cwd: dir,
-        env: gitEnv(env),
-        maxBuffer: MAX_GIT_OUTPUT_BYTES,
-        windowsHide: true,
-      },
-      (err, stdout, stderr) => {
-        if (err !== null) {
-          const code = (err as { code?: number | string }).code;
-          reject(new GitCommandError(args, typeof code === 'number' ? code : null, stderr));
-          return;
-        }
-        resolvePromise(stdout);
-      },
-    );
-  });
-}
-
-/** Runs one git command feeding `input` on stdin and returns stdout (T4 empty-tree hash). */
-async function runGitWithStdin(dir: string, args: readonly string[], input: Buffer): Promise<string> {
-  return new Promise<string>((resolvePromise, reject) => {
-    const child = spawn('git', [...args], { cwd: dir, env: gitEnv(), windowsHide: true });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
-    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
-    child.on('error', (err) => reject(new GitCommandError(args, null, String(err))));
-    child.on('close', (code) => {
-      if (code === 0) resolvePromise(stdout);
-      else reject(new GitCommandError(args, code, stderr));
-    });
-    child.stdin.end(input);
-  });
-}
 
 const delay = (ms: number): Promise<void> => new Promise((resolvePromise) => {
   setTimeout(resolvePromise, ms);
@@ -885,7 +702,7 @@ export class WorldRepo {
   ): Promise<'foreign' | 'empty' | 'self-only'> {
     const args = [...this.gitBaseArgs(), 'log', '--format=format:%an%x00', ...spec];
     return new Promise<'foreign' | 'empty' | 'self-only'>((resolvePromise, reject) => {
-      const child = spawn('git', args, { cwd: this.path, env: gitEnv(), windowsHide: true });
+      const child = spawnGit(args, { cwd: this.path });
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
       let partial = '';
@@ -977,7 +794,7 @@ export class WorldRepo {
 
   /** Refuses a hash that is not full hex in the repository's object format. */
   private async assertHash(value: string, where: 'from' | 'to'): Promise<void> {
-    if (!isFullHex(value, hashLength(await this.format()))) {
+    if (!isFullHex(await this.format(), value)) {
       throw new Error(`invalid ${where} hash: ${value}`);
     }
   }
@@ -1176,11 +993,9 @@ export class WorldRepo {
     args: readonly string[], env: Record<string, string>, maxBytes: number,
   ): Promise<BoundedText> {
     return new Promise<BoundedText>((resolvePromise, rejectPromise) => {
-      const child = spawn('git', [
+      const child = spawnGit([
         '-c', 'log.showSignature=false', '-c', 'core.hooksPath=/dev/null', ...args,
-      ], {
-        cwd: this.path, env: gitEnv(env), windowsHide: true,
-      });
+      ], { cwd: this.path, env });
       const decoder = new TextDecoder('utf-8');
       let text = '';
       let bytes = 0;
@@ -1295,7 +1110,7 @@ export class WorldRepo {
       return [];
     }
     if (base !== null) {
-      if (!isFullHex(base, hashLength(await this.format()))) {
+      if (!isFullHex(await this.format(), base)) {
         throw new WorldReconciliationError(
           `interrupted turn ${turn}: base ${JSON.stringify(base)} is not a full commit id`);
       }
