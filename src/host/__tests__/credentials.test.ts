@@ -69,9 +69,10 @@ it('refuses a symlink, a directory, a missing file, an owner-unreadable file and
     await rm(join(home, 'providers.json'), { recursive: true });
     await expect(assertCredentialStore(home)).rejects.toThrow(/missing .*providers\.json/);
     await expect(assertCredentialStore(home)).rejects.toThrow(/0600/);
+    await expect(assertCredentialStore(home)).rejects.toThrow(/and an llm entry/);
     await writeStore(home, 0o600);
     await chmod(join(home, 'providers.json'), 0o200);
-    await expect(assertCredentialStore(home)).rejects.toThrow(/owner-read|chmod 600/);
+    await expect(assertCredentialStore(home)).rejects.toThrow(/owner-readable/);
     await rm(join(home, 'providers.json'));
     await writeFile(join(home, 'providers.json'), JSON.stringify({ tavily: { key: 't' } }),
       { mode: 0o600 });

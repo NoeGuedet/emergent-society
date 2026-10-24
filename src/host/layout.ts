@@ -1,5 +1,5 @@
 import type { Stats } from 'node:fs';
-import { chmod, lstat, mkdir, realpath } from 'node:fs/promises';
+import { chmod, lstat, mkdir, realpath, stat } from 'node:fs/promises';
 import {
   dirname, isAbsolute, join, resolve, sep,
 } from 'node:path';
@@ -69,6 +69,22 @@ function worldPaths(home: string): { readonly world: string; readonly gitDir: st
 async function lstatOrNull(path: string): Promise<Stats | null> {
   try {
     return await lstat(path);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    throw err;
+  }
+}
+
+/**
+ * `stat`, with "absent" as `null` instead of a throw. The world pair is checked
+ * with this, not `lstat`: `WorldRepo.open` resolves both paths with `realpath`,
+ * so a symlinked `world/` or `world.git/` is a pair it accepts, and the layout
+ * check must not refuse what the repository open accepts.
+ */
+async function statOrNull(path: string): Promise<Stats | null> {
+  try {
+    return await stat(path);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ENOTDIR') return null;
@@ -157,11 +173,17 @@ export async function assertHomeOutsideCheckout(home: string): Promise<void> {
   }
 }
 
-/** Refuses a home whose world pair is missing or not a pair of directories. */
+/**
+ * Refuses a home whose world pair is missing or not a pair of directories.
+ *
+ * The pair is probed with `stat`, so a symlinked `world/`/`world.git/` that
+ * `WorldRepo.open` resolves is accepted here too; only a missing or
+ * non-directory target is refused.
+ */
 export async function assertCellLayout(home: string): Promise<void> {
   const { world, gitDir } = worldPaths(home);
   const [worldEntry, gitEntry] = await Promise.all([
-    lstatOrNull(world), lstatOrNull(gitDir),
+    statOrNull(world), statOrNull(gitDir),
   ]);
   if (worldEntry?.isDirectory() !== true || gitEntry?.isDirectory() !== true) {
     throw new HostConfigError('cell layout is not initialized; run init');

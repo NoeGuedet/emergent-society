@@ -34,6 +34,33 @@ it('initHome creates 0700, is idempotent, and never creates providers.json', asy
   await expect(assertCellLayout(home)).resolves.toBeUndefined();
 });
 
+it('initHome overrides a permissive umask when it creates the home', async () => {
+  home = await mkdtemp(join(tmpdir(), 'es-home-'));
+  const target = join(home, 'cell');
+  const previous = process.umask(0o022);
+  try {
+    expect((await initHome(target)).created).toBe(true);
+  } finally {
+    process.umask(previous);
+  }
+  expect((await stat(target)).mode & 0o077).toBe(0);
+  await expect(assertCellLayout(target)).resolves.toBeUndefined();
+});
+
+it('assertCellLayout follows a symlinked world pair exactly as WorldRepo.open does', async () => {
+  home = await mkdtemp(join(tmpdir(), 'es-home-'));
+  const pair = join(home, 'pair');
+  expect((await initHome(pair)).created).toBe(true);
+  // The cell names its pair at the canonical paths; the pair itself lives one
+  // level down, so both names are symlinks that `WorldRepo.open` follows.
+  await symlink(join(pair, 'world'), join(home, 'world'));
+  await symlink(join(pair, 'world.git'), join(home, 'world.git'));
+  await expect(assertCellLayout(home)).resolves.toBeUndefined();
+  // The same pair through the repository's own open path: the idempotent
+  // branch must agree with the layout check, not contradict it.
+  await expect(initHome(home)).resolves.toEqual({ created: false });
+});
+
 it('refuses a partial layout and a home inside the checkout', async () => {
   home = await mkdtemp(join(tmpdir(), 'es-home-'));
   await mkdir(join(home, 'world'), { recursive: true });
@@ -49,7 +76,10 @@ it('refuses a partial layout and a home inside the checkout', async () => {
 it('refuses a pre-existing permissive or foreign home and a non-directory', async () => {
   home = await mkdtemp(join(tmpdir(), 'es-home-'));
   await chmod(home, 0o755);
+  // Both the bare check and `init`'s existing-home branch refuse it: a
+  // permissive home is never silently repaired.
   await expect(assertHomePermissions(home)).rejects.toThrow(/chmod 700/);
+  await expect(initHome(home)).rejects.toThrow(/chmod 700/);
   await chmod(home, 0o700);
   await expect(assertHomePermissions(home)).resolves.toBeUndefined();
   const uid = process.getuid?.();

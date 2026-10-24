@@ -170,6 +170,8 @@ describe('loadProviders', () => {
       expect(String(err)).toMatch(/invalid providers\.json: llm(\.|:)/);
       expect(String(err)).not.toContain('SECRET-LLM-KEY');
       expect(String(err)).not.toContain('99999');
+      expect(String(err)).not.toContain('example.test');
+      expect(String(err)).not.toContain('not a url');
     }
   });
 });

@@ -55,7 +55,7 @@ export async function assertCredentialStore(home: string): Promise<void> {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       throw new HostConfigError(
-        `missing ${path}; create it with mode 0600, owner read-write only`,
+        `missing ${path}; create it with mode 0600 and an llm entry`,
       );
     }
     throw err;
