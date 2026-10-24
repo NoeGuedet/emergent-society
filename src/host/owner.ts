@@ -30,9 +30,13 @@ import {
  * absent/malformed before — is discarded. Anything else is restored, and the
  * owner path is never unlinked after a lost race.
  *
- * Two residuals are disclosed rather than papered over. The `rename` in a
- * reclaim or release opens a sub-millisecond window in which `pause` and
- * `status` observe `absent`; that is the price of doing this without a second
+ * Two residuals are disclosed rather than papered over. A reclaim or release
+ * moves `host.json` aside and only then links a record back, so between those
+ * two steps `pause` and `status` observe `absent`. That window is short in the
+ * normal case but not bounded to a sub-millisecond instant, and if the process
+ * dies inside it the record stays at the claim path and the absence becomes
+ * durable — recovery from the claim is manual, exactly like the documented
+ * stale-record remedy. This is the price of doing the CAS without a second
  * lock. And `requestPause` has an unavoidable PID-reuse window between its
  * `readOwner` and its `process.kill`: the recorded `/proc` start time makes that
  * a same-instant race, not a guarantee, and the plan claims no absolute
@@ -449,8 +453,9 @@ async function moveOwnerTo(from: string, to: string): Promise<boolean> {
 }
 
 /**
- * Unlinks a moved claim. ENOENT is success; a directory or a refusal surfaces
- * as `HostConfigError`, never a raw errno.
+ * Unlinks a moved claim. ENOENT is success; `EISDIR` and `EPERM` are mapped to
+ * `HostConfigError` because they mean the claim is not a removable regular
+ * file. Any other failure propagates as observed rather than being re-labelled.
  */
 async function discardClaim(path: string): Promise<void> {
   try {
@@ -494,9 +499,13 @@ function appearedRefusal(home: string): HostAlreadyRunningError {
  *
  * `host.json` is moved aside and re-classified. Our token unlinks it; another
  * live or unverifiable record is restored (and the claim unlinked on success),
- * so a swapped-in record survives; a stale record or garbage is unlinked; an
- * absent path is already success. Idempotent, and a failed restore leaves the
- * claim rather than deleting a live owner's record.
+ * so a swapped-in record survives; a stale record or a malformed regular file is
+ * unlinked; an absent path is already success. A non-regular moved record — a
+ * link, a directory, or a path `lstat` cannot inspect — is refused with
+ * `HostConfigError` and left at the claim path, exactly as the reclaim CAS
+ * refuses it: this protocol unlinks only what it can prove is a removable
+ * regular file. Idempotent, and a failed restore leaves the claim rather than
+ * deleting a live owner's record.
  */
 async function releaseRecord(
   home: string,
@@ -511,6 +520,12 @@ async function releaseRecord(
     case 'absent':
       return;
     case 'non-regular':
+      // The same rule as the reclaim CAS: a link or directory this protocol
+      // did not create is moved but never unlinked. The refusal names the claim
+      // and leaves it there for the operator.
+      throw new HostConfigError(
+        `host.json is not a removable regular file; moved to ${claim}`,
+      );
     case 'invalid':
       await discardClaim(claim);
       return;

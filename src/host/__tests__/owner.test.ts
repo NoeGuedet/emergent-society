@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import {
-  mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile,
+  lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -31,9 +31,9 @@ function startOf(pid: number): Promise<number | null> {
   return processStartTime(pid);
 }
 
-/** Writes a complete, valid record with the caller's overrides, mode 0600. */
-async function writeOwner(partial: Partial<OwnerJson>): Promise<void> {
-  const record: OwnerJson = {
+/** A complete, valid record with the caller's overrides. */
+async function ownerJson(partial: Partial<OwnerJson> = {}): Promise<OwnerJson> {
+  return {
     v: 1,
     pid: process.pid,
     startTime: await startOf(process.pid),
@@ -43,7 +43,13 @@ async function writeOwner(partial: Partial<OwnerJson>): Promise<void> {
     startedAt: Date.now(),
     ...partial,
   };
-  await writeFile(join(home, 'host.json'), JSON.stringify(record), { mode: 0o600 });
+}
+
+/** Writes a complete, valid record to `host.json`, mode 0600. */
+async function writeOwner(partial: Partial<OwnerJson>): Promise<void> {
+  await writeFile(join(home, 'host.json'), JSON.stringify(await ownerJson(partial)), {
+    mode: 0o600,
+  });
 }
 
 /** A pid the OS has already reaped, so its liveness probe is a plain miss. */
@@ -128,10 +134,14 @@ it('treats a null startTime or an unreadable /proc as unverified and refuses to 
 
 it('refuses a symlink and a directory at host.json; the link target is untouched', async () => {
   const target = join(home, 'target');
-  await writeFile(target, 'safe');
+  // The target is a valid, live owner record: if `readOwner` followed the link
+  // it would read `live`, so `stale(record: null)` below is the proof that the
+  // `lstat` refusal fires before any read.
+  const live = JSON.stringify(await ownerJson());
+  await writeFile(target, live, { mode: 0o600 });
   await symlink(target, join(home, 'host.json'));
   expect(await readOwner(home)).toEqual({ kind: 'stale', record: null });
-  expect(await readFile(target, 'utf8')).toBe('safe');
+  expect(await readFile(target, 'utf8')).toBe(live);
   await rm(join(home, 'host.json'));
   await mkdir(join(home, 'host.json'));
   expect(await readOwner(home)).toEqual({ kind: 'stale', record: null });
@@ -143,6 +153,30 @@ it('release does not delete another token\'s record', async () => {
   await writeFile(join(home, 'host.json'), JSON.stringify(other), { mode: 0o600 });
   await h.release();
   expect((await readOwner(home)).kind).toBe('live');
+});
+
+it('release refuses a moved non-regular record and leaves its target untouched', async () => {
+  const h = await acquireOwner(home, { uid: 'node-0', command: 'start' });
+  const target = join(home, 'live-record');
+  const live = JSON.stringify(await ownerJson({ token: 'b'.repeat(32) }));
+  await writeFile(target, live, { mode: 0o600 });
+  await rm(join(home, 'host.json'));
+  await symlink(target, join(home, 'host.json'));
+  const err = await h.release().catch((e: unknown) => e);
+  // Reclaim and release apply the same rule: a record this protocol did not
+  // create is moved but never unlinked, and the refusal names the claim.
+  expect(err).toBeInstanceOf(HostConfigError);
+  expect(String(err)).toMatch(/not a removable regular file/);
+  expect(await readFile(target, 'utf8')).toBe(live);
+  const claims = (await readdir(home)).filter((n) => n.startsWith('.host.release.'));
+  expect(claims).toHaveLength(1);
+  const claim = join(home, claims[0] as string);
+  expect((await lstat(claim)).isSymbolicLink()).toBe(true);
+  // The moved link is the only owner-path record left; `host.json` stays absent
+  // until the operator removes the claim, which is the disclosed consequence of
+  // refusing rather than unlinking.
+  expect((await readOwner(home)).kind).toBe('absent');
+  expect(String(err)).toContain(claim);
 });
 
 it('delivers SIGTERM and waits for the child to exit', async () => {
