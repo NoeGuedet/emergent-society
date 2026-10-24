@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, expect, it, vi } from 'vitest';
+import { WorldRepo } from '../../node/world.js';
 import {
   assertCellLayout, assertHomeOutsideCheckout, assertHomePermissions, cellPaths, initHome,
 } from '../layout.js';
@@ -34,17 +35,23 @@ it('initHome creates 0700, is idempotent, and never creates providers.json', asy
   await expect(assertCellLayout(home)).resolves.toBeUndefined();
 });
 
-it('initHome overrides a permissive umask when it creates the home', async () => {
+it('initHome creates the home 0700 even under a restrictive umask', async () => {
   home = await mkdtemp(join(tmpdir(), 'es-home-'));
   const target = join(home, 'cell');
-  const previous = process.umask(0o022);
+  // 0o700 masks every owner bit `mkdir` would apply, so the home reaches 0700
+  // only through the explicit `chmod` in `initHome`. The world pair is stubbed
+  // because the same mask would also strip the permissions of the `world/`
+  // that `WorldRepo.init` creates — the repository's own creation path is
+  // covered by the node's suite, and this test is about the home's mode.
+  const init = vi.spyOn(WorldRepo, 'init').mockResolvedValue({} as unknown as WorldRepo);
+  const previous = process.umask(0o700);
   try {
     expect((await initHome(target)).created).toBe(true);
   } finally {
     process.umask(previous);
+    init.mockRestore();
   }
-  expect((await stat(target)).mode & 0o077).toBe(0);
-  await expect(assertCellLayout(target)).resolves.toBeUndefined();
+  expect((await stat(target)).mode & 0o777).toBe(0o700);
 });
 
 it('assertCellLayout follows a symlinked world pair exactly as WorldRepo.open does', async () => {
