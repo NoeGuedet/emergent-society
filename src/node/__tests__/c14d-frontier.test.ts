@@ -437,13 +437,13 @@ describe('proof 1: one mediated path (a regression guard on kernel sources)', ()
   it('sees each frontier consumer only at its definition and documented home', async () => {
     const sources = await kernelSources();
     expect(containing(sources, 'OpenAI' + 'Transport')).toEqual([
-      'provider/transport.ts',
+      'host/host.ts', 'provider/transport.ts',
     ]);
     expect(containing(sources, 'webToolsFrom' + 'Providers')).toEqual([
-      'node/tools/providers.ts', 'node/tools/web.ts',
+      'host/host.ts', 'node/tools/providers.ts', 'node/tools/web.ts',
     ]);
     expect(containing(sources, 'openFrontier' + 'Journal')).toEqual([
-      'frontier/index.ts', 'frontier/journal.ts',
+      'frontier/index.ts', 'frontier/journal.ts', 'host/host.ts',
     ]);
   });
 });
