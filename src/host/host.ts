@@ -1,6 +1,12 @@
-import { C13_EVENT_TYPES } from '../context/events.js';
+import { lstat } from 'node:fs/promises';
+import { join } from 'node:path';
+import { defaultAgentConfig, validateAgentConfig } from '../context/config.js';
 import type { AgentConfig } from '../context/contracts.js';
+import { C13_EVENT_TYPES } from '../context/events.js';
+import { ContextFold } from '../context/fold.js';
+import { loadVerifiedEvents } from '../context/loader.js';
 import { openFrontierJournal, type FrontierJournal } from '../frontier/index.js';
+import { nodeLayout } from '../journal/index.js';
 import type { ProviderRegistry } from '../node/tools/providers.js';
 import { DEFAULT_TERMINAL_ENV } from '../node/tools/terminal.js';
 import { webToolsFromProviders } from '../node/tools/web.js';
@@ -12,8 +18,13 @@ import { ProviderAdapter } from '../provider/adapter.js';
 import { systemProviderPolicy } from '../provider/policy.js';
 import { OpenAITransport } from '../provider/transport.js';
 import type { LlmCredential } from './credentials.js';
-import { cellPaths } from './layout.js';
+import { llmCredentialFrom, loadProviderStore } from './credentials.js';
+import { HostConfigError } from './errors.js';
+import {
+  assertCellLayout, assertHomeOutsideCheckout, assertHomePermissions, cellPaths,
+} from './layout.js';
 import type { HostLog } from './observe.js';
+import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
 
 /**
  * The composition root: one cell, composed in one place and in one order.
@@ -178,4 +189,259 @@ export function wrapHandler(handler: TurnHandler, log: HostLog): TurnHandler {
     }
     return result;
   };
+}
+
+/** What one host run was asked to do; every field is the CLI's validated value. */
+export type HostOptions = {
+  readonly home: string; readonly uid: string; readonly command: HostCommand;
+  readonly model?: string; readonly heading?: string;
+  readonly sandbox: false | { readonly launcherPath?: string };
+  readonly pollMs?: number; readonly log: HostLog;
+};
+
+/** The host's process-level seams; absent fields mean the production behavior. */
+export type HostDeps = {
+  readonly installSignals?: boolean; readonly keepAlive?: boolean;
+  readonly compose?: (options: CellOptions) => Promise<Cell>;
+  readonly now?: () => number;
+  readonly proc?: ProcessHandlersTarget;
+};
+
+/** A running host: one idempotent stop and one promise that never rejects. */
+export type HostHandle = { stop(): void; readonly done: Promise<number> };
+
+/** What a signal or an unhandled rejection asks the lifetime to do. */
+export type ProcessHandlers = { onStop(): void; onUnhandled(error: unknown): void };
+
+/**
+ * The slice of `process` the handlers need. It is a seam, not a second
+ * implementation: production passes the real `process`, and a test passes an
+ * `EventEmitter` to emit the events without touching the test runner's own.
+ */
+export type ProcessHandlersTarget = {
+  on(event: string, listener: (...args: unknown[]) => void): unknown;
+  off(event: string, listener: (...args: unknown[]) => void): unknown;
+};
+
+/**
+ * Installs `SIGINT`/`SIGTERM` and `unhandledRejection` on `proc`, returning an
+ * idempotent detach.
+ *
+ * A signal is a stop request, not an exit: the lifetime closes its cell before
+ * the process ends, and a second signal is a no-op at the lifetime's own flag.
+ * The rejection listener forwards the reason (first argument) only; the promise
+ * itself is not inspected.
+ */
+export function attachProcessHandlers(
+  handlers: ProcessHandlers,
+  proc: ProcessHandlersTarget = process,
+): () => void {
+  const onSignal = (): void => { handlers.onStop(); };
+  const onRejection = (...args: unknown[]): void => { handlers.onUnhandled(args[0]); };
+  proc.on('SIGINT', onSignal);
+  proc.on('SIGTERM', onSignal);
+  proc.on('unhandledRejection', onRejection);
+  let detached = false;
+  return (): void => {
+    if (detached) return;
+    detached = true;
+    proc.off('SIGINT', onSignal);
+    proc.off('SIGTERM', onSignal);
+    proc.off('unhandledRejection', onRejection);
+  };
+}
+
+/** What the cell's local log says about its configuration. */
+type CellConfigState = {
+  readonly hasLog: boolean; readonly config: AgentConfig | null;
+};
+
+/**
+ * The per-uid config fold the gate is built on (§3.5).
+ *
+ * A missing log is "nothing journaled yet"; a present one is folded exactly as
+ * the context layer folds it, so the gate and the ready phase cannot disagree
+ * about which config the cell holds. A corrupt or unreadable log is a
+ * `HostConfigError` naming the file — the operator's only route from here is to
+ * inspect (or delete) it, and `start` must not silently write a second config
+ * on top of an unreadable history. The `lstat` itself is left raw: an `EACCES`
+ * on the home is a failure of the environment, not a configuration refusal.
+ */
+async function readCellConfig(home: string, uid: string): Promise<CellConfigState> {
+  const layout = nodeLayout(home, uid);
+  const logPath = join(layout.dir, layout.logFile);
+  try {
+    await lstat(logPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { hasLog: false, config: null };
+    }
+    throw err;
+  }
+  try {
+    const events = await loadVerifiedEvents(home, uid, C13_EVENT_TYPES);
+    const fold = new ContextFold();
+    await fold.observe(events);
+    return { hasLog: true, config: fold.snapshot().config?.value ?? null };
+  } catch (err) {
+    throw new HostConfigError(
+      `cell log is unreadable or corrupt: ${logPath}; inspect it`, { cause: err },
+    );
+  }
+}
+
+/**
+ * The start/resume gate, pinned by §3.5.
+ *
+ * `start` supplies a config only into a cell that has none; a log with a
+ * durable `node/boot` but no `system/message` is the recoverable crash window
+ * and is allowed. `resume` never supplies one — a `--model`/`--heading` on a
+ * resume is refused rather than ignored, so an operator who expects their flags
+ * to win is told the journaled config wins.
+ */
+async function resolveInitialConfig(options: HostOptions): Promise<AgentConfig> {
+  const { home, uid, command, model, heading } = options;
+  const state = await readCellConfig(home, uid);
+  if (command === 'start') {
+    if (model === undefined || model === '') throw new HostConfigError('start requires a model');
+    if (model === 'mock-model') throw new HostConfigError('start refuses the mock model');
+    if (heading === undefined || heading === '') {
+      throw new HostConfigError('start requires a heading');
+    }
+    if (state.config !== null) {
+      throw new HostConfigError('cell already has a journaled configuration; use resume');
+    }
+    return validateAgentConfig({ ...defaultAgentConfig(), model, heading });
+  }
+  if (model !== undefined || heading !== undefined) {
+    throw new HostConfigError('resume takes no --model or --heading; the journaled config wins');
+  }
+  if (!state.hasLog || state.config === null) {
+    throw new HostConfigError('no journaled configuration; use start');
+  }
+  return state.config;
+}
+
+/** The bounded error label: a name, never a message and never a payload. */
+function errorName(err: unknown): string {
+  return err instanceof Error && err.name !== '' ? err.name : 'Error';
+}
+
+/**
+ * Starts one host and returns its handle; the lifetime runs in `done`.
+ *
+ * Signal handling and the keepalive are installed **synchronously**, before the
+ * first await, because a SIGINT that arrives while the first home check is in
+ * flight must still stop the host that is about to exist. Everything after that
+ * runs in the plan's order: the home checks, the config gate (a pure fold with
+ * no lock, so a refused start never creates and removes an owner record), the
+ * owner, the credential read, then the composition. The owner precedes the
+ * credential read and compose so `pause` can target a booting host.
+ *
+ * A stop that arrives before the cell exists is remembered, not lost: after
+ * composition the driver is stopped before `run()`, which replays the
+ * `node/boot` the driver already wrote and journals `node/shutdown` with no
+ * turn. That is the same path a signal during boot takes, so one flag covers
+ * both.
+ *
+ * The `finally` is the single exit. It closes the cell (guarded — a refused or
+ * failed close is a `1`), releases the owner (guarded — release can reject on a
+ * moved or non-regular record, and a host that failed to clean up must not
+ * escape with success), clears the keepalive, detaches the handlers, and emits
+ * `host/stop` exactly once with the final code. `faulted` — an unhandled
+ * rejection — outranks a clean run: the host still takes the graceful path, but
+ * it exits `1`.
+ *
+ * `HostConfigError` maps to `2` (a refused configuration), everything else to
+ * `1`; `UsageError` is a CLI-only error and never reaches here. The lifetime
+ * never calls `process.exit` and never rejects `done`: the caller owns the
+ * process exit, and a host that cannot start is a resolved code, not a throw.
+ */
+export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle {
+  const { home, uid, command, sandbox, pollMs, log } = options;
+  let stopRequested = false;
+  let faulted = false;
+  let cell: Cell | null = null;
+  let owner: OwnerHandle | null = null;
+  let clearKeepAlive: (() => void) | null = null;
+  let detach: (() => void) | null = null;
+
+  const stop = (): void => {
+    if (stopRequested) return;
+    stopRequested = true;
+    cell?.driver.stop('stop-requested');
+  };
+  const onUnhandled = (err: unknown): void => {
+    faulted = true;
+    log.emit('host/unhandled-rejection', { error: errorName(err) });
+    stop();
+  };
+
+  if (deps.installSignals !== false) {
+    detach = attachProcessHandlers({ onStop: stop, onUnhandled }, deps.proc);
+  }
+  if (deps.keepAlive !== false) {
+    // A ref'd timer holds the event loop while the driver is parked between
+    // turns: a parked host must stay a running process, not look exited.
+    const timer = setInterval(() => {}, 60_000);
+    clearKeepAlive = (): void => { clearInterval(timer); };
+  }
+
+  // The body maps every failure and guards every cleanup step, so the trailing
+  // catch is unreachable defense-in-depth: `done` is contractually total.
+  const done = (async (): Promise<number> => {
+    let code = 0;
+    try {
+      await assertHomeOutsideCheckout(home);
+      await assertHomePermissions(home);
+      await assertCellLayout(home);
+      const config = await resolveInitialConfig(options);
+      owner = await acquireOwner(home, {
+        uid, command, ...(deps.now !== undefined ? { now: deps.now } : {}),
+      });
+      const providers = await loadProviderStore(home);
+      const credential = llmCredentialFrom(providers);
+      cell = await (deps.compose ?? composeCell)({
+        home, uid, config, credential, providers, sandbox, log,
+        ...(pollMs !== undefined ? { pollMs } : {}),
+      });
+      log.emit('host/boot', {
+        home, uid, command, model: cell.config.model,
+        webTools: cell.webTools ? 'tavily' : 'off',
+        sandbox: sandbox === false ? 'off' : 'landlock',
+      });
+      if (stopRequested) cell.driver.stop('stop-requested');
+      await cell.driver.run();
+    } catch (err) {
+      code = err instanceof HostConfigError ? 2 : 1;
+      log.emit('host/error', {
+        error: errorName(err),
+        ...(err instanceof HostConfigError ? { message: err.message } : {}),
+      });
+    } finally {
+      // Both cleanup steps can reject, and neither may replace the code the
+      // failure itself earned: a host that cannot close its cell or release its
+      // owner has still failed, but the journal is the record of why.
+      if (cell !== null) {
+        try {
+          await cell.close();
+        } catch {
+          code = 1;
+        }
+      }
+      if (owner !== null) {
+        try {
+          await owner.release();
+        } catch {
+          code = 1;
+        }
+      }
+      clearKeepAlive?.();
+      detach?.();
+      log.emit('host/stop', { code: faulted ? 1 : code });
+    }
+    return faulted ? 1 : code;
+  })().catch(() => 1);
+
+  return { stop, done };
 }
