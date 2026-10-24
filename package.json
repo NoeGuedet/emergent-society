@@ -11,7 +11,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "build": "node scripts/build.mjs",
-    "build:native": "node scripts/build-native.mjs"
+    "build:native": "node scripts/build-native.mjs",
+    "start": "node dist/host/main.js"
   },
   "dependencies": {
     "@lydell/node-pty": "1.2.0-beta.15",

@@ -31,6 +31,9 @@ it('copies the guard and verifies the dist invariants behaviorally', async () =>
     await rm(join(out, 'journal', 'lock-guard.mjs'));
     await expect(verifyDist(out)).rejects.toThrow(/lock-guard\.mjs/);
     await copyRuntimeAssets(fixture, out);
+    await rm(join(out, 'host', 'main.js'));
+    await expect(verifyDist(out)).rejects.toThrow(/missing dist\/host\/main\.js/);
+    await writeFile(join(out, 'host', 'main.js'), '// main\n');
     await mkdir(join(out, 'native'), { recursive: true });
     await expect(verifyDist(out)).rejects.toThrow(/dist\/native/);
   } finally {

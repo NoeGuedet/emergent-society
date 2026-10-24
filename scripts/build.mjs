@@ -13,7 +13,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const dist = join(root, 'dist');
 const scriptPath = fileURLToPath(import.meta.url);
 const launcherRel = join('native', 'es-landlock', 'es-landlock');
-const required = ['journal/lock.js', 'journal/lock-guard.mjs', 'node/tools/sandbox.js'];
+const required = ['journal/lock.js', 'journal/lock-guard.mjs', 'node/tools/sandbox.js', 'host/main.js'];
 
 const toPosix = (path) => path.split(sep).join('/');
 
