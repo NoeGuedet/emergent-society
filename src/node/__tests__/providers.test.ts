@@ -133,4 +133,43 @@ describe('loadProviders', () => {
     expect(Object.isFrozen(registry)).toBe(true);
     expect(Object.isFrozen(registry.tavily)).toBe(true);
   });
+
+  it('accepts a valid llm entry beside tavily, frozen and without defaults', async () => {
+    await write({
+      llm: { key: 'llm-test', endpoint: 'https://api.example.test/v1/chat/completions' },
+      tavily: { key: 'tvly-test' },
+    });
+    const registry = await loadProviders(home);
+    expect(registry.llm).toEqual({
+      key: 'llm-test', endpoint: 'https://api.example.test/v1/chat/completions',
+    });
+    expect(Object.isFrozen(registry.llm)).toBe(true);
+    expect(registry.tavily).toBeDefined();
+  });
+
+  it('accepts an llm-only store with a loopback http endpoint', async () => {
+    await write({ llm: { key: 'k', endpoint: 'http://127.0.0.1:1234/v1/chat/completions' } });
+    await expect(loadProviders(home)).resolves.toMatchObject({ llm: { key: 'k' } });
+  });
+
+  it('refuses llm shape errors by position without echoing values', async () => {
+    const tooLong = `https://h/${'a'.repeat(4097)}`;
+    for (const llm of [null, 'x', [], {}, { key: 'x' }, { endpoint: 'https://h/v1/x' },
+      { key: '', endpoint: 'https://h/v1/x' }, { key: 7, endpoint: 'https://h/v1/x' },
+      { key: 'x', endpoint: 7 },
+      { key: 'x', endpoint: 'https://h/v1/x?q=1' },
+      { key: 'x', endpoint: 'https://u:p@h/v1/x' },
+      { key: 'x', endpoint: 'https://SECRET-LLM-KEY@h/v1/x' },
+      { key: 'x', endpoint: 'http://example.test/v1/x' },
+      { key: 'x', endpoint: 'https://h:99999/v1/x' },
+      { key: 'x', endpoint: tooLong },
+      { key: 'SECRET-LLM-KEY', endpoint: 'not a url' },
+      { key: 'x', endpoint: 'https://h/v1/x', extra: 1 }]) {
+      await write({ llm });
+      const err = await loadProviders(home).catch((e: unknown) => e);
+      expect(String(err)).toMatch(/invalid providers\.json: llm(\.|:)/);
+      expect(String(err)).not.toContain('SECRET-LLM-KEY');
+      expect(String(err)).not.toContain('99999');
+    }
+  });
 });
