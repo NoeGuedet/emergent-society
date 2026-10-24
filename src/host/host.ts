@@ -35,15 +35,18 @@ import type { HostLog } from './observe.js';
  * it fails, and nothing after a successful open can throw before the cell is
  * returned (`Cell.close` is the only later transition).
  *
- * `Cell.close` is the lifetime's single exit. It is idempotent and refuses a
- * cell whose driver has not settled: `active`/`waiting`/`stopping` means the
- * caller did not await `run()`, and closing the frontier under a live turn
- * would cut the very journal the turn is writing. A `booting` cell is stopped
- * and awaited here — `NodeDriver.open` has already journaled `node/boot`, so
- * `run()` writes an empty `node/shutdown` and releases the local writer. The
- * `closed` flag is set only after `frontier.close()` resolves, so a refusal or
- * a failed close leaves the cell closable by the caller's own
- * `stop(); await run(); close()` sequence.
+ * `Cell.close` is the lifetime's single exit. Its callers share one in-flight
+ * outcome: concurrent calls await the same promise, so a booting cell is
+ * stopped, run and settled exactly once even when a host tears down from two
+ * paths. It refuses a cell whose driver has not settled —
+ * `active`/`waiting`/`stopping` means the caller did not await `run()`, and
+ * closing the frontier under a live turn would cut the very journal the turn is
+ * writing. That refusal is not sticky: a rejected close clears the in-flight
+ * promise, so the caller's own `stop(); await run(); close()` still closes the
+ * cell. A `booting` cell is stopped and awaited here — `NodeDriver.open` has
+ * already journaled `node/boot`, so `run()` writes an empty `node/shutdown` and
+ * releases the local writer — and the frontier is closed before the shared
+ * promise resolves, so a resolved close always means the home is unlocked.
  *
  * `wrapHandler` is the driver-to-log seam: it never changes a turn's result, it
  * only records the bounded facts the operator reads (turn, trigger, outcome,
@@ -110,9 +113,8 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
     // The ready phase has already folded the journal during `open`, so a resume
     // reports the config the journal holds, not the one this call supplied.
     const effective = runtime.snapshot().config?.value ?? config;
-    let closed = false;
-    const close = async (): Promise<void> => {
-      if (closed) return;
+    let closing: Promise<void> | null = null;
+    const closeOnce = async (): Promise<void> => {
       if (driver.state === 'booting') {
         driver.stop();
         await driver.run();
@@ -122,7 +124,17 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
         );
       }
       await frontier.close();
-      closed = true;
+    };
+    // One in-flight close for every caller. A rejection clears the memo, so a
+    // refused close leaves the cell closable by `stop(); await run(); close()`.
+    const close = (): Promise<void> => {
+      if (closing === null) {
+        closing = closeOnce().catch((err: unknown) => {
+          closing = null;
+          throw err;
+        });
+      }
+      return closing;
     };
     return {
       world, frontier, runtime, driver, config: effective,

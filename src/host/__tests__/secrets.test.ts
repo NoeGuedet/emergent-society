@@ -7,11 +7,11 @@ import { loadVerifiedEvents } from '../../context/loader.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { JournalReader, frontierLayout, type EventEnvelope } from '../../journal/index.js';
 import { FRONTIER_EVENT_TYPES } from '../../frontier/index.js';
-import { WorldRepo } from '../../node/world.js';
+import { WorldRepo, gitEnv } from '../../node/world.js';
 import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
 import { serveJson } from '../../node/__tests__/helpers.js';
 import { createHostLog } from '../observe.js';
-import { composeCell } from '../host.js';
+import { composeCell, type Cell } from '../host.js';
 
 /**
  * The composed cell's secret hygiene: one real turn against a loopback fake
@@ -33,18 +33,42 @@ const config = validateAgentConfig({
 });
 
 let home = '';
+/** The one cell this case composed, settled by teardown even after a failure. */
+let cell: Cell | null = null;
+/** Its driver run, awaited by teardown so a live cell is never closed under a turn. */
+let run: Promise<void> | null = null;
 
 afterEach(async () => {
-  if (home !== '') {
-    await rm(home, { recursive: true, force: true });
-    home = '';
+  let clean = true;
+  if (cell !== null) {
+    cell.driver.stop('stop-requested');
+    if (run !== null) {
+      try {
+        await run;
+      } catch {
+        clean = false;
+      }
+    }
+    try {
+      await cell.close();
+    } catch {
+      clean = false;
+    }
   }
+  // A home is removed only once the cell's writers released it: a failed
+  // teardown leaves it in place for inspection instead of deleting it under a
+  // live journal.
+  if (home !== '' && clean) await rm(home, { recursive: true, force: true });
+  home = '';
+  cell = null;
+  run = null;
 });
 
 /** One git invocation addressed by absolute pair paths, never a cwd-relative pair. */
 function git(gitDir: string, world: string, args: readonly string[]): string {
   return execFileSync('git', ['--git-dir', gitDir, '--work-tree', world, ...args], {
     encoding: 'utf8',
+    env: gitEnv(),
   });
 }
 
@@ -71,11 +95,12 @@ it('journals no byte of the model key outside the authorization header it wrote'
     '--message', 'seed',
   ], {
     encoding: 'utf8',
-    env: {
-      ...process.env,
+    // The kernel's controlled environment, not the ambient one: a host
+    // GIT_DIR/global config must not reach this fixture any more than production.
+    env: gitEnv({
       GIT_AUTHOR_NAME: 'human', GIT_AUTHOR_EMAIL: 'human@world.local',
       GIT_COMMITTER_NAME: 'human', GIT_COMMITTER_EMAIL: 'human@world.local',
-    },
+    }),
   });
 
   const script = [
@@ -92,12 +117,17 @@ it('journals no byte of the model key outside the authorization header it wrote'
   const credential = { endpoint: `${server.url}/v1/chat/completions`,
     key: LLM_KEY, credentialId: 'llm' as const };
   try {
-    const cell = await composeCell({
+    const composed = await composeCell({
       home, uid: 'node-0', config, credential, providers: {}, sandbox: false, pollMs: 0, log,
     });
-    const run = cell.driver.run();
-    await vi.waitFor(() => expect(cell.driver.state).toBe('waiting'), { timeout: 10_000 });
-    cell.driver.stop('stop-requested'); await run; await cell.close();
+    cell = composed;
+    const done = composed.driver.run();
+    run = done;
+    // An unawaited failure must not surface as an unhandled rejection; teardown
+    // still awaits (and sees) the original promise.
+    void done.catch(() => {});
+    await vi.waitFor(() => expect(composed.driver.state).toBe('waiting'), { timeout: 10_000 });
+    composed.driver.stop('stop-requested'); await done; await composed.close();
 
     // 1. Every resolved local event, both the payload and its raw envelope.
     const events = await loadVerifiedEvents(home, 'node-0', C13_EVENT_TYPES);

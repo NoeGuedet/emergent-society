@@ -13,8 +13,10 @@
  * complete line and a caller-supplied sink receives exactly one terminated
  * line. A field named `event` cannot override the event name: the name is
  * merged last. A write failure and a non-serializable payload are swallowed —
- * diagnostics are never the failure they describe — and an invalid event name
- * is replaced by `host/log-error` rather than thrown.
+ * both serialization and the write sit inside the same guard — so diagnostics
+ * are never the failure they describe. An invalid event name is replaced by
+ * `host/log-error` rather than thrown, and that substituted event's own `error`
+ * field counts against the same absolute 11-field cap.
  *
  * Strings are truncated to 200 code points first and then stripped of C0/C1
  * controls and the two line separators, so a host-authored path or message can
@@ -67,18 +69,21 @@ export function createHostLog(
       const valid = typeof event === 'string' && EVENT_NAME_RE.test(event);
       const name = valid ? event : LOG_ERROR_EVENT;
       const kept: Record<string, LogValue> = {};
+      // The cap is absolute: the substituted event's own `error` field counts
+      // against the same 11, so an invalid name can never widen the line.
+      const capacity = valid ? MAX_FIELDS : MAX_FIELDS - 1;
       if (fields !== undefined) {
-        for (const key of Object.keys(fields).slice(0, MAX_FIELDS)) {
+        for (const key of Object.keys(fields).slice(0, capacity)) {
           const value = fields[key];
           if (isLogValue(value)) kept[key] = boundedValue(value);
         }
       }
       if (!valid) kept['error'] = 'invalid-event';
-      // `event` is merged last: a caller field of that name is overwritten,
-      // never able to rename the line it appears on.
-      const line = `${JSON.stringify({ ...kept, event: name })}\n`;
       try {
-        write(line);
+        // `event` is merged last: a caller field of that name is overwritten,
+        // never able to rename the line it appears on. Serialization, the line
+        // terminator and the write all sit inside this guard.
+        write(`${JSON.stringify({ ...kept, event: name })}\n`);
       } catch {
         // A diagnostic is not the failure it describes.
       }

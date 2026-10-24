@@ -19,7 +19,9 @@ import { C13_EVENT_TYPES } from '../../context/events.js';
 import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
 import type { BoundaryGate, TurnContext } from '../../node/index.js';
 import { createHostLog } from '../observe.js';
-import { composeCell, wrapHandler } from '../host.js';
+import {
+  composeCell, wrapHandler, type Cell, type CellOptions,
+} from '../host.js';
 
 /**
  * The composition root's acceptance: one cell, one real turn, and every
@@ -29,6 +31,12 @@ import { composeCell, wrapHandler } from '../host.js';
  * (`sandbox: false`) in every case but the Landlock one, which is skipped when
  * the launcher is absent. Each case owns its temp home, its own world pair and
  * its own script, so no case can pass on another's journal.
+ *
+ * Teardown is written for a failing test as much as a passing one: every cell
+ * this case composed is stopped, its driver run awaited and its frontier
+ * closed in `afterEach`, and the home is removed only when all of that settled.
+ * A cell whose run cannot settle therefore leaves its home in place for
+ * inspection instead of having the directory deleted under a live writer.
  */
 
 const projectRoot = fileURLToPath(new URL('../../..', import.meta.url));
@@ -50,16 +58,44 @@ const message = (r: Reply) => r.tool !== undefined ? toolCall(r.tool.name, r.too
   : { role: 'assistant', content: r.content ?? 'idle' };
 const reply = (r: Reply) => ({ body: JSON.stringify({ choices: [{ message: message(r) }] }) });
 
-/** Every journal this test opened; torn down before the home is removed. */
+/** Every cell this case composed, in composition order. */
+const cells: Cell[] = [];
+/** Every driver run this case started, so teardown awaits the live one. */
+const runs: Promise<void>[] = [];
+/** Every second frontier journal this case opened; torn down before the home. */
 const journals: { close(): Promise<void> }[] = [];
 let home = '';
 
 afterEach(async () => {
-  for (const journal of journals.splice(0)) await journal.close().catch(() => {});
-  if (home !== '') {
-    await rm(home, { recursive: true, force: true });
-    home = '';
+  const composed = cells.splice(0);
+  for (const cell of composed) cell.driver.stop('stop-requested');
+  let clean = true;
+  for (const run of runs.splice(0)) {
+    try {
+      await run;
+    } catch {
+      clean = false;
+    }
   }
+  for (const cell of composed) {
+    try {
+      await cell.close();
+    } catch {
+      clean = false;
+    }
+  }
+  for (const journal of journals.splice(0)) {
+    try {
+      await journal.close();
+    } catch {
+      clean = false;
+    }
+  }
+  // Remove the home only once every writer released it: a failed teardown
+  // leaves the journal behind for the failure to be inspected, never deletes a
+  // live home out from under its writers.
+  if (home !== '' && clean) await rm(home, { recursive: true, force: true });
+  home = '';
 });
 
 /** This case's home, world pair and the human seed commit every case opens on. */
@@ -69,6 +105,23 @@ async function setup(): Promise<{ home: string; world: WorldRepo; seed: string }
   HeadWatcher.for(world, 0);
   const seed = await commitAs(world, 'human', { 'seed.txt': 'seed\n' }, 'seed');
   return { home, world, seed };
+}
+
+/** Composes through the real root and registers the cell for teardown. */
+async function compose(options: CellOptions): Promise<Cell> {
+  const cell = await composeCell(options);
+  cells.push(cell);
+  return cell;
+}
+
+/** Starts the driver's run and registers the promise for teardown. */
+function start(cell: Cell): Promise<void> {
+  const run = cell.driver.run();
+  // A failure the test has not awaited yet must not surface as an unhandled
+  // rejection; teardown still awaits (and sees) the original promise.
+  void run.catch(() => {});
+  runs.push(run);
+  return run;
 }
 
 /** Opens a second frontier journal over this cell's home and tracks it for teardown. */
@@ -109,11 +162,11 @@ it('composes one cell and runs one real turn end to end', async () => {
   const credential = { endpoint: `${server.url}/v1/chat/completions`,
     key: 'sentinel-llm-key', credentialId: 'llm' as const };
   try {
-    const cell = await composeCell({
+    const cell = await compose({
       home, uid: 'node-0', config, credential, providers: {}, sandbox: false, pollMs: 0, log,
     });
     expect(frontierLayout(home).dir).toBe(join(home, 'frontier'));
-    const run = cell.driver.run();
+    const run = start(cell);
     await vi.waitFor(() => expect(cell.driver.state).toBe('waiting'), { timeout: 10_000 });
     cell.driver.stop('stop-requested'); await run; await cell.close();
 
@@ -181,7 +234,38 @@ it('composes one cell and runs one real turn end to end', async () => {
   }
 }, 30_000);
 
-it('close refuses while the cell is live and leaves both writers held', async () => {
+it('close is concurrency-safe on a booting cell and runs the driver exactly once', async () => {
+  const { home } = await setup();
+  const server = await serveJson(() => reply({ content: 'idle' }));
+  const lines: string[] = []; const log = createHostLog((l) => lines.push(l));
+  const credential = { endpoint: `${server.url}/v1/chat/completions`,
+    key: 'sentinel-llm-key', credentialId: 'llm' as const };
+  try {
+    const cell = await compose({
+      home, uid: 'node-0', config, credential, providers: {}, sandbox: false, pollMs: 0, log,
+    });
+    // Two concurrent closes share one in-flight outcome: the cell is stopped,
+    // run and settled once, not twice.
+    const outcomes = await Promise.allSettled([cell.close(), cell.close()]);
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(['fulfilled', 'fulfilled']);
+    expect(cell.driver.state).toBe('stopped');
+
+    const events = await readLocal(home);
+    expect(events.filter((event) => event.type === 'node/boot')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'node/shutdown')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'turn/start')).toHaveLength(0);
+    // No turn was ever opened, so no model request was made either.
+    expect(server.requests).toEqual([]);
+    // The frontier was released once, after the driver stopped.
+    const reopened = await openFrontier(home);
+    expect(reopened).toBeDefined();
+    await expect(cell.close()).resolves.toBeUndefined();
+  } finally {
+    await server.close();
+  }
+}, 30_000);
+
+it('close shares one rejection across concurrent callers and still closes after the stop', async () => {
   const { home } = await setup();
   const script: Reply[] = [{ cmd: "printf 'hi\\n' > first.txt" }, { content: 'done' }];
   const server = await serveJson((_req, i) => reply(script[i] ?? { content: 'idle' }));
@@ -189,18 +273,26 @@ it('close refuses while the cell is live and leaves both writers held', async ()
   const credential = { endpoint: `${server.url}/v1/chat/completions`,
     key: 'sentinel-llm-key', credentialId: 'llm' as const };
   try {
-    const cell = await composeCell({
+    const cell = await compose({
       home, uid: 'node-0', config, credential, providers: {}, sandbox: false, pollMs: 0, log,
     });
-    const run = cell.driver.run();
+    const run = start(cell);
     await vi.waitFor(() => expect(cell.driver.state).toBe('waiting'), { timeout: 10_000 });
-    await expect(cell.close()).rejects.toBeInstanceOf(NodeStateError);
-    // Both writers are still held: the local one by the driver, the frontier one
-    // by the cell. The rejection comes from the fresh open's lock acquisition.
+    // Concurrent callers observe one refusal, not one each: the frontier is
+    // still open and the driver is still live.
+    const outcomes = await Promise.allSettled([cell.close(), cell.close()]);
+    const rejected = outcomes.filter(
+      (outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected',
+    );
+    expect(rejected).toHaveLength(2);
+    expect(rejected.every((outcome) => outcome.reason instanceof NodeStateError)).toBe(true);
+    expect(rejected[0]!.reason).toBe(rejected[1]!.reason);
     await expect(openFrontierJournal(home, { worldHead: async () => null, now: Date.now }))
       .rejects.toBeInstanceOf(SessionAlreadyOwnedError);
+
+    // The refusal is not sticky: the same cell closes once the caller settles it.
     cell.driver.stop('stop-requested'); await run;
-    await cell.close();
+    await expect(cell.close()).resolves.toBeUndefined();
     const reopened = await openFrontier(home);
     expect(reopened).toBeDefined();
   } finally {
@@ -218,20 +310,20 @@ it('resumes on the journaled config and writes the system message exactly once',
   const credential = { endpoint: `${server.url}/v1/chat/completions`,
     key: 'sentinel-llm-key', credentialId: 'llm' as const };
   try {
-    const first = await composeCell({
+    const first = await compose({
       home, uid: 'node-0', config, credential, providers: {}, sandbox: false, pollMs: 0, log,
     });
-    const firstRun = first.driver.run();
+    const firstRun = start(first);
     await vi.waitFor(() => expect(first.driver.state).toBe('waiting'), { timeout: 10_000 });
     first.driver.stop('stop-requested'); await firstRun; await first.close();
 
     // A different model on the second compose must not replace the journaled one.
-    const second = await composeCell({
+    const second = await compose({
       home, uid: 'node-0', config: { ...config, model: 'different-model' },
       credential, providers: {}, sandbox: false, pollMs: 0, log,
     });
     expect(second.config.model).toBe('first-light-test');
-    const secondRun = second.driver.run();
+    const secondRun = start(second);
     await vi.waitFor(() => expect(second.driver.state).toBe('waiting'), { timeout: 10_000 });
     second.driver.stop('stop-requested'); await secondRun; await second.close();
 
@@ -270,11 +362,11 @@ it('offers web tools when the registry has a tavily entry, and journals the sear
     },
   };
   try {
-    const cell = await composeCell({
+    const cell = await compose({
       home, uid: 'node-0', config, credential, providers, sandbox: false, pollMs: 0, log,
     });
     expect(cell.webTools).toBe(true);
-    const run = cell.driver.run();
+    const run = start(cell);
     await vi.waitFor(() => expect(cell.driver.state).toBe('waiting'), { timeout: 10_000 });
     cell.driver.stop('stop-requested'); await run; await cell.close();
 
@@ -307,7 +399,7 @@ it('releases the frontier when the transport refuses the endpoint before a drive
   const credential = { endpoint: 'http://example.test/v1/chat/completions',
     key: 'sentinel-llm-key', credentialId: 'llm' as const };
   try {
-    await expect(composeCell({
+    await expect(compose({
       home, uid: 'node-0', config, credential, providers: {}, sandbox: false, pollMs: 0, log,
     })).rejects.toBeInstanceOf(FrontierValidationError);
     const reopened = await openFrontier(home);
@@ -325,7 +417,7 @@ it('releases the frontier when the local writer is already owned', async () => {
     key: 'sentinel-llm-key', credentialId: 'llm' as const };
   const writer = await JournalWriter.open(home, 'node-0', {});
   try {
-    await expect(composeCell({
+    await expect(compose({
       home, uid: 'node-0', config, credential, providers: {}, sandbox: false, pollMs: 0, log,
     })).rejects.toBeInstanceOf(SessionAlreadyOwnedError);
     const reopened = await openFrontier(home);
@@ -337,21 +429,31 @@ it('releases the frontier when the local writer is already owned', async () => {
 }, 30_000);
 
 it.skipIf(!launcherPresent)('runs the first turn under Landlock', async () => {
-  const { home } = await setup();
+  const { home, world } = await setup();
   const script: Reply[] = [{ cmd: "printf 'confined\\n' > confined.txt" }, { content: 'done' }];
   const server = await serveJson((_req, i) => reply(script[i] ?? { content: 'idle' }));
   const lines: string[] = []; const log = createHostLog((l) => lines.push(l));
   const credential = { endpoint: `${server.url}/v1/chat/completions`,
     key: 'sentinel-llm-key', credentialId: 'llm' as const };
   try {
-    const cell = await composeCell({
+    const cell = await compose({
       home, uid: 'node-0', config, credential, providers: {}, sandbox: {}, pollMs: 0, log,
     });
-    const run = cell.driver.run();
+    const run = start(cell);
     await vi.waitFor(() => expect(cell.driver.state).toBe('waiting'), { timeout: 10_000 });
     cell.driver.stop('stop-requested'); await run; await cell.close();
     expect(cell.runtime.sandboxStatus()).not.toBeNull();
     expect(cell.runtime.sandboxStatus()).toMatchObject({ mode: 'landlock' });
+
+    // The confined shell did the work: the command succeeded, the file holds
+    // what it wrote, and the result the model saw is a success, not a denial.
+    expect(await readFile(join(world.path, 'confined.txt'), 'utf8')).toBe('confined\n');
+    const results = (await readLocal(home)).filter((event) => event.type === 'tool/result')
+      .map((event) => event.data as unknown as
+        { readonly isError: boolean; readonly message: { readonly content: string } });
+    expect(results).toHaveLength(1);
+    expect(results[0]!.isError).toBe(false);
+    expect(results[0]!.message.content).toContain('exit: 0');
   } finally {
     await server.close();
   }
