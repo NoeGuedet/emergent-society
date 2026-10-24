@@ -10,6 +10,7 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
     "build:native": "node scripts/build-native.mjs"
   },
   "dependencies": {

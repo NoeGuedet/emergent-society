@@ -6,5 +6,8 @@ node_modules/
 # Implementation plans are local working documents, not published docs
 docs/plans/
 
+# Production build output (produced by `npm run build`)
+/dist/
+
 # Built native launcher (compiled locally by `npm run build:native`)
 /native/es-landlock/es-landlock
