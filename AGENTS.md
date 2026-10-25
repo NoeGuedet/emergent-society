@@ -2,6 +2,8 @@
 
 > **Note**: This document defines the **roles**, **responsibilities**, and **workflows** for agents (human and sub-agents) working on `emergent-society`. It enforces **SOTA practices**, **iterative audits**, and **sequential task execution** to achieve **high-quality outcomes**. All code, commits, documentation, and communication must be in **English**.
 
+> **Mechanism status (2026-10-25).** This repo currently has: no pre-commit hooks, no CI/CD, no branch protection, no lint/format tooling, and no skills implementation (`src/skills/` and `src/cli/skills.ts` do not exist; §5 is target design). `npm run test:first-light` and `scripts/first-light-smoke.mjs` arrive with T9; `src/host/status.ts` with T8. Enforcement columns naming a hook, a pipeline, or a §5 skill are the *planned* mechanism; today they mean manual review + audit.
+
 ---
 
 ## **1. Core Principles**
@@ -13,7 +15,7 @@
 | **Sequential Work**     | One task at a time. Focus on **quality over speed**.                                            | Task queue + atomic commits.               |
 | **Agent Swarms**        | Delegate long-running tasks (research, implementation, audit) to sub-agents.                   | Sub-agent workflows (see §3).             |
 | **Iterative Audit**     | Plan → Audit → Implement → Audit → Correct → Repeat until zero issues.                          | Audit checklist + sub-agent swarms.       |
-| **English Only**        | All code, commits, documentation, and communication must be in English.                        | Pre-commit hooks + review.                |
+| **English Only**        | All code, commits, documentation, and communication must be in English.                        | Manual review + audit (no hooks installed). |
 
 ---
 
@@ -36,7 +38,7 @@
    - Give the green light for merging.
 
 **Example**:
-- You approve the [T8 (`status`) plan](#) before the **Main Agent** proceeds with implementation.
+- You approve the T8 (`status`) plan before the **Main Agent** proceeds with implementation.
 - You arbitrate whether a technical choice (e.g., Landlock vs. seccomp) aligns with the project’s vision.
 
 ---
@@ -54,11 +56,11 @@
      - Implementation steps.
      - Risks and mitigations.
      - Audit checklist.
-   - Example: [Plan for T8 (`status`)](#).
+   - Example: Plan for T8 (`status`).
 2. **Delegation**:
    - Launch **sub-agents** for:
      - **SOTA research** (e.g., "Best practices for `status` in 2026").
-     - **Implementation** (e.g., code `src/host/status.ts`).
+     - **Implementation** (e.g., T8 will add `src/host/status.ts` — it does not exist yet).
      - **Audit** (e.g., verify code compliance with invariants).
 3. **Verification**:
    - Validate sub-agent deliverables before submitting them to you.
@@ -86,11 +88,11 @@
 | **SOTA Researcher**    | Perform web research to validate technical choices.                                                  | `web_search`, `web_fetch`.              |
 | **Implementer**        | Write code, tests, and documentation for a specific task.                                            | TypeScript, Vitest, Git.                |
 | **Code Auditor**       | Audit plans and code for compliance with invariants, SOTA, and quality standards.                   | Custom audit scripts.                   |
-| **Tester**             | Execute tests and validate edge cases.                                                              | Vitest, `first-light-smoke.mjs`.        |
+| **Tester**             | Execute tests and validate edge cases.                                                              | Vitest (`first-light-smoke.mjs` arrives with T9). |
 
 **Examples**:
 1. **SOTA Researcher**:
-   - Task: "Research best practices for read-only filesystem inspection in Node.js 2026."
+   - Task: "Research best practices for read-only filesystem inspection in Node.js 24."
    - Output: Markdown report with findings and recommendations.
 2. **Implementer**:
    - Task: "Implement the `status` command as described in the plan."
@@ -111,12 +113,12 @@
    - A **SOTA Researcher** sub-agent performs `web_search` + `web_fetch` and produces a report.
    - Example prompt:
      ```bash
-     subagent --description "SOTA Research for T8 (status)" --prompt "Research best practices for implementing a read-only `status` command in Node.js 2026, including optimal Git commands, Landlock sandboxing, and security considerations for immutable journals and filesystems. Provide a markdown report with findings and recommendations."
+     subagent --description "SOTA Research for T8 (status)" --prompt "Research best practices for implementing a read-only `status` command in Node.js 24, including optimal Git commands, Landlock sandboxing, and security considerations for immutable journals and filesystems. Provide a markdown report with findings and recommendations."
      ```
 
 3. **Planning**:
    - The **Main Agent** drafts a **detailed plan** (markdown) based on SOTA research.
-   - Example: [Plan for T8 (`status`)](#).
+   - Example: Plan for T8 (`status`).
 
 4. **Plan Audit**:
    - A **Code Auditor** sub-agent reviews the plan for:
@@ -156,37 +158,40 @@
 ---
 
 ## **4. Invariants (Non-Negotiable)**
+
+> Enforcement below is aspirational where it names a hook, a pipeline, or a §5 skill (see the mechanism-status note at the top).
+
 ### **4.1. Security**
 | Invariant               | Description                                                                                     | Enforcement Mechanism                     |
 |-------------------------|-------------------------------------------------------------------------------------------------|--------------------------------------------|
 | **Landlock**            | All tools must run in a Landlock sandbox (fail-closed).                                         | `verify-sandbox` skill + audit.            |
 | **Secrets**             | Never expose credentials in logs, journals, or the world.                                      | `verify-secrets` skill + audit.            |
-| **Permissions**         | `providers.json` must be `0600` and owned by the same UID as the process.                       | Pre-commit hook + audit.                   |
+| **Permissions**         | `providers.json` must be `0600` and owned by the same UID as the process.                       | Manual review + audit (no hooks installed). |
 | **Frontier Journal**    | Format v0 is frozen. Never modify the journal schema.                                           | `verify-frontier` skill + audit.           |
 
 ### **4.2. Testing**
 | Invariant               | Description                                                                                     | Enforcement Mechanism                     |
 |-------------------------|-------------------------------------------------------------------------------------------------|--------------------------------------------|
-| **Test Coverage**       | 100% coverage for critical paths (e.g., `status`, `pause/resume`).                              | `verify-tests` skill + audit.              |
-| **Baseline**            | Never delete or weaken an existing test. Baseline: **78 test files / 1,348 tests**.            | Pre-commit hook + audit.                   |
-| **Smoke Tests**         | Run `npm run test:first-light` before pushing.                                                  | CI/CD pipeline.                            |
+| **Test Coverage**       | Target: full coverage of critical paths (e.g., `status`, `pause/resume`; no coverage tooling installed yet). | `verify-tests` skill (planned) + audit.   |
+| **Baseline**            | Never delete or weaken an existing test. Baseline: **78 test files / 1,348 tests** (verified 2026-10-25). | Manual review + audit (no hooks installed). |
+| **Smoke Tests**         | Run `npm run typecheck && npm test` and `npm run build` before pushing; `npm run test:first-light` arrives with T9. | Manual gate (no CI exists). |
 
 ### **4.3. Git Discipline**
 | Invariant               | Description                                                                                     | Enforcement Mechanism                     |
 |-------------------------|-------------------------------------------------------------------------------------------------|--------------------------------------------|
-| **Atomic Commits**      | One task = one commit. Use Conventional Commits (e.g., `feat(host): add status command`).       | Pre-commit hook + audit.                   |
-| **Protected Files**     | Never modify `src/node/world.ts` without approval.                                              | Pre-commit hook + audit.                   |
-| **No Direct Pushes**    | Always use pull requests and code reviews.                                                      | Branch protection rules.                   |
+| **Atomic Commits**      | One task = one commit. Use Conventional Commits (e.g., `feat(host): add status command`).       | Manual review + audit (no hooks installed). |
+| **Protected Files**     | Never modify `src/node/world.ts` without approval.                                              | Manual review + audit (no hooks installed). |
+| **No Direct Pushes**    | Aspirational for multi-author. Today: single-author repo; push `main` directly only after the full gate passes. | Manual gate (no branch protection yet). |
 
 ---
 
-## **5. Skills (Automated Tasks)**
+## **5. Skills (Planned — none implemented yet)**
 ### **5.1. When to Use Skills**
 - **Automate repetitive tasks** (e.g., testing, security checks, documentation updates).
 - **Enforce invariants** (e.g., `verify-secrets`, `verify-sandbox`).
 - **Standardize workflows** (e.g., `verify-tests`, `build-hermetic`).
 
-### **5.2. List of Skills**
+### **5.2. Planned Skills (target design)**
 | Skill               | Description                                                                                     | Usage Example                          |
 |---------------------|-------------------------------------------------------------------------------------------------|----------------------------------------|
 | `verify-tests`      | Runs `npm run typecheck` and `npm test`. Ensures 100% coverage for critical paths.              | `verify-tests --workspace .`           |
@@ -198,12 +203,12 @@
 | `review-code`       | Verifies code invariants and commit messages.                                                   | `review-code --workspace .`            |
 | `format-code`       | Applies linting and formatting to the codebase.                                                 | `format-code --workspace .`            |
 
-### **5.3. Skill Implementation**
-- **Location**: `src/skills/<skill-name>.ts`.
+### **5.3. Planned Skill Implementation**
+- **Location (planned)**: `src/skills/<skill-name>.ts` — the directory does not exist yet.
 - **Interface**: Typed inputs/outputs (e.g., `Input`, `Output`).
-- **CLI**: Exposed via `src/cli/skills.ts`.
+- **CLI (planned)**: `src/cli/skills.ts` — does not exist yet; today's CLI is `src/host/cli.ts` (`init`/`start`/`resume`/`pause`).
 
-#### **Example: `verify-tests`**
+#### **Example: `verify-tests`** *(illustrative sketch — not implemented; `execa` is not a dependency — package.json has exactly 2 runtime deps)*
 ```typescript
 // src/skills/verify-tests.ts
 import { execa } from "execa";
@@ -253,12 +258,12 @@ function parseTestCount(stdout: string): number {
 - **Sub-Agent (SOTA Researcher)**:
   - Prompt:
     ```bash
-    subagent --description "SOTA Research for T8 (status)" --prompt "Research best practices for implementing a read-only `status` command in Node.js 2026, including optimal Git commands, Landlock sandboxing, and security considerations for immutable journals and filesystems. Provide a markdown report with findings and recommendations."
+    subagent --description "SOTA Research for T8 (status)" --prompt "Research best practices for implementing a read-only `status` command in Node.js 24, including optimal Git commands, Landlock sandboxing, and security considerations for immutable journals and filesystems. Provide a markdown report with findings and recommendations."
     ```
   - Output: Markdown report with findings and recommendations.
 
 ### **Step 2: Planning**
-- **Main Agent**: Draft a [detailed plan for T8 (`status`)](#).
+- **Main Agent**: Draft a detailed plan for T8 (`status`).
 
 ### **Step 3: Plan Audit**
 - **Sub-Agent (Code Auditor)**:
