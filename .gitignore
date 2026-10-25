@@ -11,3 +11,6 @@ docs/plans/
 
 # Built native launcher (compiled locally by `npm run build:native`)
 /native/es-landlock/es-landlock
+
+# Local Vitest artifacts (e.g. JSON reporter output)
+/.vitest/
