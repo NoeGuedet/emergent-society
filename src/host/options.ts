@@ -21,9 +21,9 @@ import { UsageError } from './errors.js';
  * whether a journaled config exists is the host gate's decision (also exit `2`,
  * but after a real fold), not argv parsing's.
  *
- * `USAGE` names the four commands this task implements, the exit codes, and
- * the seven §3.9 disclosures, so `--help` is honest about what a stop, a resume
- * and a pause actually guarantee. Task 8 adds `status` and replaces the text.
+ * `USAGE` names the five commands, the exit codes, and the seven §3.9
+ * disclosures, so `--help` is honest about what a stop, a resume, a pause and
+ * a status actually guarantee.
  */
 
 /** The uid a host uses when the operator does not pass `--uid`. */
@@ -37,7 +37,7 @@ const DEFAULT_UID = 'node-0';
  */
 type OptionValues = Readonly<Record<string, unknown>>;
 
-/** The command line this task accepts; `status` belongs to Task 8. */
+/** The command line the first-light host accepts. */
 export type HostCliCommand =
   | { readonly command: 'help' }
   | { readonly command: 'init'; readonly home: string }
@@ -49,14 +49,16 @@ export type HostCliCommand =
       readonly command: 'resume'; readonly home: string; readonly uid: string;
       readonly noSandbox: boolean;
     }
-  | { readonly command: 'pause'; readonly home: string };
+  | { readonly command: 'pause'; readonly home: string }
+  | { readonly command: 'status'; readonly home: string; readonly json: boolean };
 
-/** The four-command help text, its exit codes and the seven disclosures. */
+/** The five-command help text, its exit codes and the seven disclosures. */
 export const USAGE = `Usage:
   node dist/host/main.js init   --home <abs-dir>
   node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--uid node-0] [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> [--uid node-0] [--no-sandbox]
   node dist/host/main.js pause  --home <abs-dir>
+  node dist/host/main.js status --home <abs-dir> [--json]
 
 Exit codes: 0 ok, 1 runtime failure, 2 usage/config/no running host, 3 pause delivered, host still stopping.
 The LLM key lives only in <home>/providers.json (mode 0600); it is never accepted on argv or in the environment.
@@ -164,11 +166,23 @@ function parsePause(args: readonly string[]): HostCliCommand {
 }
 
 /**
+ * No `--uid`/`--model` here: status reports on the whole home, not on one
+ * node's configuration, so both are an unknown-flag refusal.
+ */
+function parseStatus(args: readonly string[]): HostCliCommand {
+  const values = parseStrict(args, {
+    home: { type: 'string' },
+    json: { type: 'boolean' },
+  });
+  return { command: 'status', home: homeOf(values, 'status'), json: values['json'] === true };
+}
+
+/**
  * Parses the command line after `node dist/host/main.js`.
  *
  * Help is resolved before the subcommand is sliced: an empty argv, `--help` or
  * `-h` is the help command, because printing usage must not require a valid
- * command line. Any other leading token must be one of the four commands.
+ * command line. Any other leading token must be one of the five commands.
  *
  * @throws UsageError for an unknown command, an unknown or missing flag, a
  * relative home, a malformed uid, or an empty `--model`/`--heading`.
@@ -182,6 +196,7 @@ export function parseHostCommand(argv: readonly string[]): HostCliCommand {
     case 'start': return parseStart(rest);
     case 'resume': return parseResume(rest);
     case 'pause': return parsePause(rest);
+    case 'status': return parseStatus(rest);
     default: throw new UsageError(`unknown command: ${name}`);
   }
 }

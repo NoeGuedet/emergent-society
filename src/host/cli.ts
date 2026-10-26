@@ -6,34 +6,38 @@ import { initHome } from './layout.js';
 import { createHostLog, type HostLog } from './observe.js';
 import { parseHostCommand, USAGE, type HostCliCommand } from './options.js';
 import { requestPause, type PauseOutcome } from './owner.js';
+import { formatStatus, readStatus, type StatusReport } from './status.js';
 
 /**
  * The dispatch between argv and the host: one exit code, two sinks, no policy.
  *
  * This module owns the command-line contract an operator and a shell script
- * see: `0` for success, `1` for a runtime failure, `2` for a usage or
- * configuration refusal (and for "no running host"), `3` for a pause that was
- * delivered while the host was still stopping. Every refusal is printed once,
- * on stderr, and a usage error prints the whole `USAGE` text exactly once so
- * the operator never has to guess which flag was missing.
+ * see: `0` for success, `1` for a runtime failure (or a `status` report that
+ * was produced but is degraded), `2` for a usage or configuration refusal
+ * (and for "no running host"), `3` for a pause that was delivered while the
+ * host was still stopping. Every refusal is printed once, on stderr, and a
+ * usage error prints the whole `USAGE` text exactly once so the operator
+ * never has to guess which flag was missing.
  *
- * The seams exist so the mapping is testable without a process, a signal or a
- * network: `startHost` returns a handle instead of owning the process, the log
- * takes the CLI's own stderr sink, and `requestPause` is substitutable. `runCli`
- * resolves each default exactly once at entry, so a `deps` object with no
- * fields is the production behavior — including `process.stdout`/`stderr`.
+ * The seams exist so the mapping is testable without a process, a signal or
+ * a network: `startHost` returns a handle instead of owning the process, the
+ * log takes the CLI's own stderr sink, and `requestPause`/`readStatus` are
+ * substitutable. `runCli` resolves each default exactly once at entry, so a
+ * `deps` object with no fields is the production behavior — including
+ * `process.stdout`/`stderr`.
  *
  * A refused `start`/`resume` is not caught here: `startHost` never rejects
  * `done`, it resolves the code the host already journaled, so the lifetime's
  * own mapping (`HostConfigError` → 2, everything else → 1) is the one the
- * shell sees. `init` and `pause` are one-shot calls with no lifetime, so their
- * failures are mapped here.
+ * shell sees. `init`, `pause` and `status` are one-shot calls with no
+ * lifetime, so their failures are mapped here.
  */
 
 /** The two operator sinks; production defaults write to `process`. */
 export type CliDeps = {
   readonly startHost?: (options: HostOptions) => HostHandle;
   readonly requestPause?: (home: string) => Promise<PauseOutcome>;
+  readonly readStatus?: (home: string) => Promise<StatusReport>;
   readonly stdout?: (text: string) => void;
   readonly stderr?: (text: string) => void;
   readonly createLog?: (write: (line: string) => void) => HostLog;
@@ -43,6 +47,9 @@ type Sink = (text: string) => void;
 
 /** The two commands that run a host lifetime. */
 type HostRun = Extract<HostCliCommand, { readonly command: 'start' | 'resume' }>;
+
+/** The one read-only command. */
+type StatusRun = Extract<HostCliCommand, { readonly command: 'status' }>;
 
 /** The bounded failure label: a kernel refusal's message, otherwise a name. */
 function failureOf(error: unknown): string {
@@ -143,6 +150,33 @@ async function runPause(home: string, deps: CliDeps, out: Sink, err: Sink): Prom
 }
 
 /**
+ * `status`: one read-only report, printed before the exit code it earns.
+ *
+ * The report is the authority and the exit code the coarse signal (the
+ * systemctl precedent): a degraded report — a frontier or world failure
+ * already folded into it — is still printed in full, then the command returns
+ * `1`. `--json` is the machine mode, one `JSON.stringify(report)` line with
+ * the error names included; the human lines never print one. A missing or
+ * non-directory home is a `HostConfigError` (`2`); any other throw is a
+ * runtime failure (`1`) with a bounded label.
+ */
+async function runStatus(
+  command: StatusRun,
+  deps: CliDeps,
+  out: Sink,
+  err: Sink,
+): Promise<number> {
+  try {
+    const report = await (deps.readStatus ?? readStatus)(command.home);
+    out(command.json ? `${JSON.stringify(report)}\n` : `${formatStatus(report)}\n`);
+    return report.frontier.error !== null || report.world.error !== null ? 1 : 0;
+  } catch (error) {
+    err(`error: ${failureOf(error)}\n`);
+    return error instanceof HostConfigError ? 2 : 1;
+  }
+}
+
+/**
  * Runs one command line and resolves the process exit code.
  *
  * Usage is resolved first because a malformed command line still has to be able
@@ -171,5 +205,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps = {}): Promi
       return await runHost(command, deps, err);
     case 'pause':
       return await runPause(command.home, deps, out, err);
+    case 'status':
+      return await runStatus(command, deps, out, err);
   }
 }

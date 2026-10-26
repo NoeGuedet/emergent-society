@@ -122,3 +122,48 @@ it('returns 2 for usage errors, prints usage once, and prints KernelError messag
   expect(await runCli(['pause', '--home', '/x'], failing)).toBe(1);
   expect(stderr.join('')).toContain('killed');
 });
+
+it('dispatches status: the report prints first, then the exit code it earns', async () => {
+  const report = {
+    home: '/x',
+    host: { state: 'idle' as const },
+    frontier: {
+      present: false, count: 0, lastHash: null, counts: {}, openCalls: 0,
+      lastRequest: null, lastResponse: null, error: null,
+    },
+    world: { present: false, head: null, error: null },
+  };
+  const clean = { ...deps, readStatus: async () => report };
+  expect(await runCli(['status', '--home', '/x', '--json'], clean)).toBe(0);
+  expect(stdout.join('')).toBe(`${JSON.stringify(report)}\n`);
+  stdout.length = 0;
+  const degraded = {
+    ...report,
+    frontier: { ...report.frontier, error: 'ChainBreakError' },
+  };
+  const failing = { ...deps, readStatus: async () => degraded };
+  expect(await runCli(['status', '--home', '/x'], failing)).toBe(1);
+  expect(stdout.join('')).toBe(
+    'home: /x\n'
+    + 'host: idle\n'
+    + 'frontier: 0 events last=null http/request=0 http/response=0 http/incomplete=0 open=0\n'
+    + 'world: absent\n',
+  );
+  // The human lines never print an error name; the exit code is the signal.
+  expect(stdout.join('')).not.toContain('ChainBreakError');
+});
+
+it('maps status failures: a missing home to 2, any other throw to 1 with a bounded label', async () => {
+  expect(await runCli(['status', '--home', join(home, 'nope')], deps)).toBe(2);
+  expect(stderr.join('')).toContain('error:');
+  stderr.length = 0;
+  const failing = {
+    ...deps,
+    readStatus: async (): Promise<never> => {
+      throw new Error('raw failure detail');
+    },
+  };
+  expect(await runCli(['status', '--home', '/x'], failing)).toBe(1);
+  expect(stderr.join('')).toContain('error: Error');
+  expect(stderr.join('')).not.toContain('raw failure detail');
+});

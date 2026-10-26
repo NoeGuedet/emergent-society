@@ -46,7 +46,19 @@ it('rejects a relative home, a missing flag, an unknown flag and an invalid uid 
   }
 });
 
-it('USAGE lists the four commands, the exit codes and the seven disclosures', () => {
+it('parses status with --json and refuses the flags it does not own', () => {
+  expect(parseHostCommand(['status', '--home', '/x', '--json'])).toEqual({
+    command: 'status', home: '/x', json: true,
+  });
+  for (const argv of [
+    ['status', '--home', '/x', '--uid', 'node-0'],
+    ['status', '--home', '/x', '--model', 'm'],
+  ]) {
+    expect(() => parseHostCommand(argv)).toThrow(UsageError);
+  }
+});
+
+it('USAGE lists the five commands, the exit codes and the seven disclosures', () => {
   for (const s of [
     'init', 'start', 'resume', 'pause', 'Exit codes: 0', 'interrupts in-flight',
     'partial world writes', 'fresh PTY', 'not re-executed', 'one turn',
@@ -54,5 +66,7 @@ it('USAGE lists the four commands, the exit codes and the seven disclosures', ()
   ]) {
     expect(USAGE).toContain(s);
   }
+  expect(USAGE).toContain('status --home');
+  expect(USAGE).toContain('--json');
   expect(USAGE).not.toContain('SECRET');
 });
