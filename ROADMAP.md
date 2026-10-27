@@ -4,7 +4,7 @@ References: [Vision](docs/vision.md) — what the project is; [Architecture](doc
 
 ## Current state
 
-**Implemented and tested.** The C1.1–C1.4 lots: journal module, node driver, context and provider boundary, web tools, persistent terminal, Landlock confinement, frontier journal. The host layer: the five-command CLI (`init`, `start`, `resume`, `pause`, `status`), the first-light smoke (scenarios A–E), the live wrapper.
+**Implemented and tested.** The C1.1–C1.4 lots: journal module, node driver, context and provider boundary, web tools, persistent terminal, Landlock confinement, frontier journal. The host layer: the five-command CLI (`init`, `start`, `resume`, `pause`, `status`), the first-light smoke (scenarios A–E), the live wrapper. The live path is verified against a real model: boot, live-model turns with tool calls, park, wake on a foreign commit, reply in the world, graceful stop — every frontier exchange journaled, zero errors.
 
 **Specified, not implemented.** C1.5 `extend` (the Package layer); C1.6 agent zero, human chat, `speak`, the disposable SQLite index and projections, the daemon and cockpit; C1.7 the escalating kill switch. The full placeholder↔endpoint credential broker remains a documented target.
 

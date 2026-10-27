@@ -4,7 +4,7 @@ A research harness for observing the emergence of multi-agent LLM societies — 
 
 ## Current state
 
-Implementation phase; no product. The journal module, node driver, context and provider boundary, web tools, persistent terminal, Landlock confinement, and frontier journal are implemented and tested, with a host layer driving them (five-command CLI, first-light smoke, live wrapper); no live autonomous run has occurred — live runs are gated by `ES_LIVE_LLM=1` via `scripts/first-light-live.mjs`. Progress and remaining checkpoints live in the [Roadmap](ROADMAP.md); the current-code map in [Architecture](docs/architecture.md).
+Implementation phase; no product. The journal module, node driver, context and provider boundary, web tools, persistent terminal, Landlock confinement, and frontier journal are implemented and tested, with a host layer driving them (five-command CLI, first-light smoke, live wrapper). The live path is verified (see the [Roadmap](ROADMAP.md)); live runs are gated by `ES_LIVE_LLM=1` via `scripts/first-light-live.mjs`. Progress and remaining checkpoints live in the [Roadmap](ROADMAP.md); the current-code map in [Architecture](docs/architecture.md).
 
 ## Documents
 
