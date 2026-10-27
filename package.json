@@ -12,6 +12,8 @@
     "typecheck": "tsc --noEmit",
     "build": "node scripts/build.mjs",
     "build:native": "node scripts/build-native.mjs",
+    "test:first-light": "npm run build && node scripts/first-light-smoke.mjs",
+    "live:first-light": "node scripts/first-light-live.mjs",
     "start": "node dist/host/main.js"
   },
   "dependencies": {
