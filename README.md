@@ -24,6 +24,7 @@ Implementation phase; no product. The journal module, node driver, context and p
 | [Exploration/exploitation](docs/research/exploration-exploitation-metrics.md) | Metric catalogue |
 | [Value–adaptation coupling](docs/research/value-adaptation-coupling.md) | Adaptation vs drift |
 | [Monitoring architecture](docs/research/monitoring-architecture.md) | Observation pipeline |
+| [First light](docs/first-light.md) | Founding run record |
 
 ## Environment
 
