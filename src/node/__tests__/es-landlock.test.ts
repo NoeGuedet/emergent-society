@@ -1,4 +1,4 @@
-import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from 'node:child_process';
+import { spawn, spawnSync, type SpawnSyncOptionsWithStringEncoding } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -518,6 +518,97 @@ suite('es-landlock launcher', () => {
         expect(fds).toHaveLength(4);
         expect(fds.slice(0, 3)).toEqual([0, 1, 2]);
         expect(fds[3]).toBeGreaterThanOrEqual(3);
+      },
+      TEST_TIMEOUT_MS,
+    );
+  });
+
+  // kernel.md, "Sandbox and shell": the launcher sets PR_SET_PDEATHSIG(SIGKILL)
+  // before the in-place execve, so a confined program can never outlive the
+  // process that spawned it. PDEATHSIG attributes to the *spawning* process's
+  // death, so the test spawns through an intermediary parent (python) and
+  // kills that, never itself.
+  describe('parent-death signal', () => {
+    const REAP_POLL_INTERVAL_MS = 50;
+    const REAP_DEADLINE_MS = 10_000;
+
+    // The intermediary: spawn the launcher-wrapped sleeper as its own child,
+    // publish the child pid, then outlive it. Its SIGKILL is the trigger.
+    const intermediaryScript = [
+      'import subprocess, sys, time',
+      'launcher = sys.argv[1]',
+      'p = subprocess.Popen('
+      + "[launcher, '--rox', '/usr', '--', '/bin/sh', '-c', 'sleep 30'])",
+      'print(p.pid, flush=True)',
+      'time.sleep(30)',
+    ].join('\n');
+
+    function isAlive(pid: number): boolean {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err) {
+        // EPERM means the process exists but is owned by another uid (alive).
+        return (err as NodeJS.ErrnoException).code === 'EPERM';
+      }
+    }
+
+    async function pollUntilReaped(pid: number): Promise<boolean> {
+      const deadline = Date.now() + REAP_DEADLINE_MS;
+      for (;;) {
+        if (!isAlive(pid)) return true;
+        if (Date.now() > deadline) return false;
+        await new Promise((resolve) => setTimeout(resolve, REAP_POLL_INTERVAL_MS));
+      }
+    }
+
+    it(
+      'kills the confined program when its spawning parent dies',
+      async () => {
+        const intermediary = spawn(PYTHON, ['-c', intermediaryScript, binary], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let grandchildPid = 0;
+        try {
+          const pidLine = await new Promise<string>((resolve, reject) => {
+            let buffer = '';
+            const timer = setTimeout(
+              () => reject(new Error('the intermediary printed no pid')),
+              COMMAND_TIMEOUT_MS,
+            );
+            intermediary.stdout!.setEncoding('utf8');
+            intermediary.stdout!.on('data', (chunk: string) => {
+              buffer += chunk;
+              const newline = buffer.indexOf('\n');
+              if (newline >= 0) {
+                clearTimeout(timer);
+                resolve(buffer.slice(0, newline));
+              }
+            });
+            intermediary.once('error', reject);
+          });
+          grandchildPid = Number(pidLine.trim());
+          expect(Number.isInteger(grandchildPid)).toBe(true);
+          expect(grandchildPid).toBeGreaterThan(1);
+
+          // The confined sleeper is alive under its intermediary parent.
+          expect(isAlive(grandchildPid)).toBe(true);
+
+          // The trigger: the spawning parent's death, not the test's.
+          process.kill(intermediary.pid!, 'SIGKILL');
+
+          // Bounded ESRCH poll; the deadline is generous and no timing is
+          // ever asserted (kernel.md scope honesty: the prctl→getppid window
+          // residual is documented, never tested).
+          const reaped = await pollUntilReaped(grandchildPid);
+          expect(reaped).toBe(true);
+        } finally {
+          // Best-effort cleanup so a RED run never leaks sleepers.
+          try { process.kill(intermediary.pid!, 'SIGKILL'); } catch { /* already dead */ }
+          if (grandchildPid > 1) {
+            try { process.kill(grandchildPid, 'SIGKILL'); } catch { /* already dead */ }
+          }
+        }
       },
       TEST_TIMEOUT_MS,
     );

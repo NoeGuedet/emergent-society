@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/landlock.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -349,6 +350,7 @@ static void run_probe(const char *deny_path, const char **rw_dirs,
 
 int main(int argc, char **argv)
 {
+	pid_t spawner = getppid();
 	struct grant *grants = NULL;
 	size_t grant_count = 0;
 	struct opened_grant *opened = NULL;
@@ -510,6 +512,20 @@ int main(int argc, char **argv)
 		run_probe(probe_deny_path, probe_rw, probe_rw_count, abi, parent);
 		return 0;
 	}
+
+	/*
+	 * A confined program must not outlive the process that spawned this
+	 * launcher. The parent pid captured at entry plus one re-check after the
+	 * prctl closes the entry→prctl race: a parent that died in between can
+	 * never deliver the signal, so the child exits instead of running as an
+	 * orphan. PR_SET_PDEATHSIG survives the in-place execve below (it is
+	 * cleared only by credential-changing binaries; none run here). The
+	 * undetected window is fork→execve→entry — the documented residual.
+	 */
+	if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0)
+		die_errno("pdeathsig");
+	if (getppid() != spawner)
+		_exit(0);
 
 	execve(argv[prog_index], &argv[prog_index], environ);
 	die_errno("exec");
