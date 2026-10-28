@@ -7,6 +7,7 @@ import type {
   ArtifactChunk, ArtifactManifest, ArtifactRef, Source, Stored,
 } from '../context/contracts.js';
 import type { VerifiedEvent, VerifiedEvents } from '../context/loader.js';
+import { eventIgnorableDefault } from '../context/events.js';
 import { NodeError } from './errors.js';
 import type { TurnContext } from './driver.js';
 import type { WorldRange } from './world.js';
@@ -21,8 +22,10 @@ import type { WorldRange } from './world.js';
  * claim-check reference is read back and digest/size-verified before any effect.
  *
  * The node→context edge is type-only (`VerifiedEvent(s)` above), erased at
- * runtime, so this module's runtime graph pulls in only the journal and the
- * node error base (`./errors.ts`).
+ * runtime, save one value import: the per-type ignorable default whose one
+ * home is the context vocabulary (`context/events.ts`, the `REGISTERED`
+ * table) — so this module's runtime graph pulls in the journal, the node
+ * error base (`./errors.ts`) and that table.
  * `BlobIntegrityError` is the journal's own corruption kind, so this gate and
  * `src/context/loader.ts` name one error without a node→context value edge.
  */
@@ -76,8 +79,15 @@ export type WorldAcknowledgement = {
 };
 
 export type GateCallbacks = {
-  /** Writer-backed append; the gate validates through the registry first. */
-  readonly append: (type: string, data: JsonValue) => EventEnvelope;
+  /**
+   * Writer-backed append; the gate validates through the registry first, then
+   * forwards the per-type ignorable default (the envelope flag's one home is
+   * the context vocabulary's `REGISTERED` table) — the flag travels with the
+   * event, the caller never chooses it.
+   */
+  readonly append: (
+    type: string, data: JsonValue, opts?: { ignorable?: boolean },
+  ) => EventEnvelope;
   readonly flush: () => Promise<void>;
   /** Receipt lookup over the journal inventory, including pending receipts. */
   readonly lookup: (source: Source) => EventEnvelope | null;
@@ -171,7 +181,9 @@ class Gate implements BoundaryGate {
     }
     const validated = validator(data, this.scope);
     this.preflight(validated);
-    const envelope = this.callbacks.append(type, validated);
+    const envelope = this.callbacks.append(
+      type, validated, { ignorable: eventIgnorableDefault(type) },
+    );
     this.pending.push(envelope);
     return { seq: envelope.seq, hash: envelope.hash };
   }

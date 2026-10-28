@@ -69,7 +69,8 @@ function surfaceGroup(value: unknown, where: string): SurfaceGroup {
   const o = record(value, where);
   onlyKeys(o, ['id', 'kind', 'turn', 'messages', 'sources'], where);
   const kind = o['kind'];
-  if (kind !== 'heading' && kind !== 'perception' && kind !== 'dialogue' && kind !== 'summary') {
+  if (kind !== 'heading' && kind !== 'perception' && kind !== 'dialogue' && kind !== 'summary'
+    && kind !== 'package') {
     return fail(`${where}.kind`, 'unknown group kind');
   }
   return {

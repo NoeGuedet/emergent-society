@@ -16,7 +16,7 @@ import { C13_EVENT_TYPES, createBoundaryRegistry } from '../events.js';
 import { defaultAgentConfig } from '../config.js';
 import { ContextFold } from '../fold.js';
 import { SurfacePolicyError } from '../surface.js';
-import { ArtifactMismatchError, loadVerifiedEvents } from '../loader.js';
+import { ArtifactMismatchError, loadVerifiedEvents, rawEnvelopes } from '../loader.js';
 import type { VerifiedEvent } from '../loader.js';
 import { canonicalBytes } from '../artifacts.js';
 import type {
@@ -69,7 +69,7 @@ async function openSession(path: string): Promise<Session> {
   const lookup = (source: Source): EventEnvelope | null =>
     receipts.get(`${source.seq}:${source.hash}`) ?? null;
   const callbacks: GateCallbacks = {
-    append: (type, data) => record(writer.append(type, data as never)),
+    append: (type, data, opts) => record(writer.append(type, data as never, opts)),
     flush: () => writer.flush(),
     lookup,
     readBlob: (hash) => new BlobStore(path).get(hash),
@@ -1469,5 +1469,128 @@ describe('fold: observation identity fails closed', () => {
     await fold.observe([boot(0)]);
     await fold.observe([boot(0), boot(1)]);
     expect(fold.verifiedEvents().map((event) => event.raw.seq)).toEqual([0, 1]);
+  });
+});
+
+
+// The C1.5 package vocabulary through the fold (kernel.md, the local-log
+// sections): each package event is one closed, single-message surface group,
+// appended at event time; the events are ignorable, so an older reader skips
+// them; a package event before any config is a fold invariant, not a skip.
+describe('fold: package events (the C1.5 vocabulary)', () => {
+  const id = 'a'.repeat(64);
+  const runId = 'b'.repeat(32);
+
+  it('surfaces each package event as its own single-message group, in journal order', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      const ready = s.gate('ready', null).gate;
+      ready.append('package/define', {
+        id, name: 'grep_world', purpose: 'search the world', sourceBytes: 120,
+      });
+      ready.append('package/run', { id, runId, sandbox: 'landlock' });
+      await ready.flush();
+      await s.writer.flush();
+
+      const fold = await foldOf(home());
+      const nodes = fold.snapshot().surface?.nodes ?? [];
+      expect(nodes.map((node) => node.group.kind))
+        .toEqual(['heading', 'package', 'package']);
+      const define = nodes[1]?.group;
+      expect(define?.messages).toHaveLength(1);
+      expect(define?.messages[0]).toMatchObject({ role: 'user' });
+      expect(define?.messages[0]?.content).toContain('grep_world');
+      expect(define?.sources).toHaveLength(1);
+      const run = nodes[2]?.group;
+      expect(run?.messages[0]?.content).toContain(runId);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('appends a mid-turn package group before that turn\'s perception and dialogue', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      const t0 = await pipeline(s, 0, { perceptionText: 'evidence', calls: [call('c1')] });
+      t0.gate.append('package/define', {
+        id, name: 'grep_world', purpose: 'search the world', sourceBytes: 120,
+      });
+      t0.gate.append('tool/result', result(t0.id, 0, 'c1') as never);
+      await t0.gate.flush();
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
+      await s.writer.flush();
+
+      const fold = await foldOf(home());
+      const nodes = fold.snapshot().surface?.nodes ?? [];
+      expect(nodes.map((node) => node.group.kind))
+        .toEqual(['heading', 'package', 'perception', 'dialogue']);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('poisons the fold on a package event before any config', async () => {
+    const s = await openSession(home());
+    s.lifecycle('package/define', {
+      id, name: 'grep_world', purpose: 'search the world', sourceBytes: 120,
+    }, { ignorable: true });
+    await startConfig(s);
+    await s.close();
+    await expect(foldOf(home())).rejects.toThrow(/before any config/);
+  });
+
+  it('tolerates package events under an older reader type set (the ignorable rule)', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      const ready = s.gate('ready', null).gate;
+      ready.append('package/define', {
+        id, name: 'grep_world', purpose: 'search the world', sourceBytes: 120,
+      });
+      ready.append('package/run', { id, runId, sandbox: 'landlock' });
+      await ready.flush();
+      await s.writer.flush();
+
+      const older = new Set(
+        [...C13_EVENT_TYPES].filter((type) => !type.startsWith('package/')),
+      );
+      // The ignorable rule (reader.ts:117): an older knownTypes set serves the
+      // package events rather than refusing to rebuild — and the envelopes
+      // themselves carry the flag this lot adds at the gate.
+      const events = await loadVerifiedEvents(home(), 'n1', older);
+      const packageOnes = rawEnvelopes(events)
+        .filter((envelope) => envelope.type.startsWith('package/'));
+      expect(packageOnes).toHaveLength(2);
+      expect(packageOnes.every((envelope) => envelope.ignorable === true)).toBe(true);
+      const fold = new ContextFold();
+      await fold.observe(events);
+      expect(fold.snapshot().config).not.toBeNull();
+      expect(fold.snapshot().surface?.nodes ?? []).toHaveLength(3);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('refuses an unknown non-ignorable type at load (the reader rule)', async () => {
+    const s = await openSession(home());
+    s.lifecycle('future/thing', { n: 0 });
+    await s.close();
+    await expect(loadVerifiedEvents(home(), 'n1', C13_EVENT_TYPES)).rejects.toThrow();
+  });
+
+  it('carries no package source bytes and no credential in any payload', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      const ready = s.gate('ready', null).gate;
+      expect(() => ready.append('package/define', {
+        id, name: 'grep_world', purpose: 'search the world', sourceBytes: 120,
+        source: 'return { tools: [] }',
+      } as never)).toThrow(/unexpected key "source"/);
+    } finally {
+      await s.close();
+    }
   });
 });

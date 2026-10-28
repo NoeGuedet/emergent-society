@@ -1,6 +1,9 @@
 import type { JsonValue } from '../journal/index.js';
 import { NODE_EVENT_TYPES } from '../node/events.js';
 import type { GateScope, BoundaryRegistry } from '../node/gate.js';
+import {
+  MAX_ERROR_DETAIL_BYTES, MAX_PACKAGE_NAME_CHARS, MAX_PACKAGE_PURPOSE_CHARS,
+} from '../node/packages/constants.js';
 import type { CallId } from '../frontier/index.js';
 import type { WorldRange } from '../node/world.js';
 import { toJson } from './artifacts.js';
@@ -40,6 +43,27 @@ export interface ContextEventDataMap {
   'compaction/summary': CompactionSummary;
   'compaction/end': CompactionEnd;
   'compaction/abort': CompactionAbort;
+  /**
+   * The C1.5 package vocabulary (kernel.md, the local-log sections): each type
+   * records one kernel-mediated package fact. Scope-free (appendable at ready
+   * and turn scope), all ignorable (an older reader skips them), and none ever
+   * carries package source bytes or a credential — identities, declared names,
+   * digests and bounded sanitized detail only.
+   */
+  'package/define': { id: string; name: string; purpose: string; sourceBytes: number };
+  'package/run': { id: string; runId: string; sandbox: 'landlock' | 'off' };
+  'package/stop': { id: string; runId: string; reason: 'verb' | 'host-stop' };
+  'package/undefine': { id: string };
+  'package/effect': { id: string; runId: string; kind: 'tool-registered'; tool: string };
+  'package/error': {
+    id: string; runId: string | null;
+    code: 'corrupt' | 'crashed' | 'timeout' | 'protocol'; detail: string;
+  };
+  'package/service': {
+    id: string; runId: string;
+    service: 'execute' | 'web_search' | 'web_fetch';
+    subjectHash: string; ok: boolean; status: string;
+  };
 }
 
 // The declared shape of the config payload is AgentConfig; the runtime validator
@@ -53,16 +77,33 @@ declare module '../node/gate.js' {
   interface BoundaryDataMap extends ContextEventDataMap {}
 }
 
-const REGISTERED: Record<keyof ContextEventDataMap, true> = {
-  'artifact/chunk': true, 'artifact/end': true, 'system/message': true, 'world/perception': true,
-  'request/refused': true, 'assistant/message': true, 'tool/call': true, 'tool/result': true,
-  'compaction/start': true, 'compaction/summary': true, 'compaction/end': true,
-  'compaction/abort': true,
+/**
+ * One row per event type; the row's boolean is the type's ignorable default —
+ * the envelope flag's one home. `false` (all pre-C1.5 types): an older reader
+ * must refuse an unknown event of that type. `true` (the package family): an
+ * older reader skips it — none is load-bearing for the fold's sequencing
+ * proofs, so none may block a rebuild.
+ */
+const REGISTERED: Record<keyof ContextEventDataMap, boolean> = {
+  'artifact/chunk': false, 'artifact/end': false, 'system/message': false,
+  'world/perception': false, 'request/refused': false, 'assistant/message': false,
+  'tool/call': false, 'tool/result': false,
+  'compaction/start': false, 'compaction/summary': false, 'compaction/end': false,
+  'compaction/abort': false,
+  'package/define': true, 'package/run': true, 'package/stop': true,
+  'package/undefine': true, 'package/effect': true, 'package/error': true,
+  'package/service': true,
 };
 
-/** Every event type a C1.3 reader/replay must know: the node lifecycle union the context types. */
+/** Every event type a C1.5 reader/replay must know: the node lifecycle union the context types. */
 export const C13_EVENT_TYPES: ReadonlySet<string> =
   new Set([...NODE_EVENT_TYPES, ...Object.keys(REGISTERED)]);
+
+/** The per-type ignorable default of the one home; an unknown type is non-ignorable. */
+export function eventIgnorableDefault(type: string): boolean {
+  const known = (REGISTERED as Record<string, boolean | undefined>)[type];
+  return known === true;
+}
 
 const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 
@@ -141,6 +182,55 @@ function frontierCall(value: unknown, where: string): CallId {
   const call = text(value, where);
   if (call.length === 0) fail(where, 'must be a nonempty string');
   return call;
+}
+
+// --- package vocabulary helpers ---------------------------------------------
+
+const RUN_ID_RE = /^[0-9a-f]{32}$/;
+
+/** A run identity: 32 lowercase hex characters, the fresh id of one Run leaf. */
+function runIdOf(value: unknown, where: string): string {
+  const s = text(value, where);
+  if (!RUN_ID_RE.test(s)) fail(where, 'expected 32 lowercase hex characters');
+  return s;
+}
+
+/** A declared string with the vocabulary's own length bound (name, purpose, tool). */
+function declaredText(value: unknown, where: string, maxChars: number): string {
+  const s = text(value, where);
+  if (s.length > maxChars) fail(where, `expected at most ${maxChars} characters`);
+  return s;
+}
+
+/**
+ * Guest-produced bounded detail (the `package/error` detail, the
+ * `package/service` status): at most `MAX_ERROR_DETAIL_BYTES` UTF-8 bytes and
+ * no control characters other than newline and tab — sanitized before it can
+ * be journaled, never a raw capture.
+ */
+function boundedDetail(value: unknown, where: string): string {
+  const s = text(value, where, false);
+  for (const ch of s) {
+    const code = ch.codePointAt(0) ?? 0;
+    if ((code < 0x20 && ch !== '\n' && ch !== '\t') || code === 0x7f) {
+      fail(where, 'control characters are not journalable detail');
+    }
+  }
+  if (Buffer.byteLength(s, 'utf8') > MAX_ERROR_DETAIL_BYTES) {
+    fail(where, `detail exceeds ${MAX_ERROR_DETAIL_BYTES} bytes`);
+  }
+  return s;
+}
+
+/** A frozen vocabulary value; the `where` names the refusing field. */
+function enumOf<T extends string>(
+  value: unknown, where: string, allowed: readonly T[],
+): T {
+  const s = text(value, where);
+  if (!(allowed as readonly string[]).includes(s)) {
+    fail(where, `expected one of ${allowed.join(' | ')}`);
+  }
+  return s as T;
 }
 
 function worldPerception(value: unknown, where: string): WorldPerception {
@@ -423,6 +513,89 @@ export function createBoundaryRegistry(): BoundaryRegistry {
         fail('compaction/abort.reason', "must be 'stale' or 'orphan'");
       }
       return toJson({ id: text(o['id'], 'compaction/abort.id'), reason: o['reason'] });
+    },
+
+    // --- the C1.5 package vocabulary: scope-free, digest-and-identity only ---
+
+    'package/define': (data: unknown, _scope: GateScope): JsonValue => {
+      const o = record(data, 'package/define');
+      onlyKeys(o, ['id', 'name', 'purpose', 'sourceBytes'], 'package/define');
+      return toJson({
+        id: hash(o['id'], 'package/define.id'),
+        name: declaredText(o['name'], 'package/define.name', MAX_PACKAGE_NAME_CHARS),
+        purpose: declaredText(o['purpose'], 'package/define.purpose', MAX_PACKAGE_PURPOSE_CHARS),
+        sourceBytes: safeInt(o['sourceBytes'], 'package/define.sourceBytes', 0),
+      });
+    },
+
+    'package/run': (data: unknown, _scope: GateScope): JsonValue => {
+      const o = record(data, 'package/run');
+      onlyKeys(o, ['id', 'runId', 'sandbox'], 'package/run');
+      return toJson({
+        id: hash(o['id'], 'package/run.id'),
+        runId: runIdOf(o['runId'], 'package/run.runId'),
+        sandbox: enumOf(o['sandbox'], 'package/run.sandbox', ['landlock', 'off']),
+      });
+    },
+
+    'package/stop': (data: unknown, _scope: GateScope): JsonValue => {
+      const o = record(data, 'package/stop');
+      onlyKeys(o, ['id', 'runId', 'reason'], 'package/stop');
+      return toJson({
+        id: hash(o['id'], 'package/stop.id'),
+        runId: runIdOf(o['runId'], 'package/stop.runId'),
+        reason: enumOf(o['reason'], 'package/stop.reason', ['verb', 'host-stop']),
+      });
+    },
+
+    'package/undefine': (data: unknown, _scope: GateScope): JsonValue => {
+      const o = record(data, 'package/undefine');
+      onlyKeys(o, ['id'], 'package/undefine');
+      return toJson({ id: hash(o['id'], 'package/undefine.id') });
+    },
+
+    'package/effect': (data: unknown, _scope: GateScope): JsonValue => {
+      const o = record(data, 'package/effect');
+      onlyKeys(o, ['id', 'runId', 'kind', 'tool'], 'package/effect');
+      return toJson({
+        id: hash(o['id'], 'package/effect.id'),
+        runId: runIdOf(o['runId'], 'package/effect.runId'),
+        kind: enumOf(o['kind'], 'package/effect.kind', ['tool-registered']),
+        tool: declaredText(o['tool'], 'package/effect.tool', MAX_PACKAGE_NAME_CHARS),
+      });
+    },
+
+    'package/error': (data: unknown, _scope: GateScope): JsonValue => {
+      const o = record(data, 'package/error');
+      onlyKeys(o, ['id', 'runId', 'code', 'detail'], 'package/error');
+      return toJson({
+        id: hash(o['id'], 'package/error.id'),
+        // `runId` is optional in the design: a boot-time corrupt error has no
+        // Run. An omitted key and an explicit null normalize to the one
+        // canonical journal form (runId: null).
+        runId: o['runId'] === undefined || o['runId'] === null
+          ? null
+          : runIdOf(o['runId'], 'package/error.runId'),
+        code: enumOf(o['code'], 'package/error.code', [
+          'corrupt', 'crashed', 'timeout', 'protocol',
+        ]),
+        detail: boundedDetail(o['detail'], 'package/error.detail'),
+      });
+    },
+
+    'package/service': (data: unknown, _scope: GateScope): JsonValue => {
+      const o = record(data, 'package/service');
+      onlyKeys(o, ['id', 'runId', 'service', 'subjectHash', 'ok', 'status'], 'package/service');
+      return toJson({
+        id: hash(o['id'], 'package/service.id'),
+        runId: runIdOf(o['runId'], 'package/service.runId'),
+        service: enumOf(o['service'], 'package/service.service', [
+          'execute', 'web_search', 'web_fetch',
+        ]),
+        subjectHash: hash(o['subjectHash'], 'package/service.subjectHash'),
+        ok: bool(o['ok'], 'package/service.ok'),
+        status: boundedDetail(o['status'], 'package/service.status'),
+      });
     },
   };
   return registry;

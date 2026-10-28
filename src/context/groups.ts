@@ -58,8 +58,8 @@ export function sameSourceSet(a: readonly Source[], b: readonly Source[]): boole
 /**
  * A group is balanced when its messages are a complete unit: a dialogue is an
  * assistant followed by exactly its advertised results, in call order; a
- * perception or summary group is a single user message; a heading is never a
- * removable unit. An unbalanced group is never a legal compaction span
+ * perception, summary or package group is a single user message; a heading is
+ * never a removable unit. An unbalanced group is never a legal compaction span
  * (assistant + all results is indivisible).
  */
 export function isBalancedGroup(group: SurfaceGroup): boolean {
@@ -67,7 +67,8 @@ export function isBalancedGroup(group: SurfaceGroup): boolean {
     case 'heading':
       return false;
     case 'perception':
-    case 'summary': {
+    case 'summary':
+    case 'package': {
       const only = group.messages[0];
       return group.messages.length === 1 && only !== undefined && only.role === 'user';
     }

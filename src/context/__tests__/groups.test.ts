@@ -318,3 +318,65 @@ describe('validateCompactionSpan: every failure code is pinned', () => {
     expect(verdict.reason.code).toBe(code);
   });
 });
+
+
+// The package group kind (kernel.md, the context-assembler sections): balanced
+// as exactly one user message — the perception shape — citing its own sources,
+// and legal inside a compaction span like a dialogue group.
+describe('package groups: balance, citations and spans', () => {
+  it('is balanced as exactly one user message', () => {
+    expect(isBalancedGroup(group({
+      kind: 'package',
+      messages: [{ role: 'user', content: 'package defined' }],
+    }))).toBe(true);
+  });
+
+  it('is unbalanced with zero, two or non-user messages', () => {
+    expect(isBalancedGroup(group({ kind: 'package', messages: [] }))).toBe(false);
+    expect(isBalancedGroup(group({
+      kind: 'package',
+      messages: [{ role: 'user', content: 'a' }, { role: 'user', content: 'b' }],
+    }))).toBe(false);
+    expect(isBalancedGroup(group({
+      kind: 'package',
+      messages: [{ role: 'assistant', content: 'x', tool_calls: [] }],
+    }))).toBe(false);
+  });
+
+  it('cites its own sources like any non-summary group', () => {
+    const sources = [src(1), src(2)];
+    expect(groupCitations(group({
+      kind: 'package', sources,
+      messages: [{ role: 'user', content: 'package defined' }],
+    }))).toEqual(sources);
+  });
+
+  it('is a legal compaction span member beside a dialogue group', () => {
+    const heading = group({
+      kind: 'heading', id: src(0), messages: [{ role: 'system', content: 'h' }],
+    });
+    const pkg = group({
+      kind: 'package', id: src(1),
+      messages: [{ role: 'user', content: 'package defined' }],
+    });
+    const dialogue = group({
+      kind: 'dialogue', id: src(2),
+      messages: [
+        { role: 'assistant', content: null, tool_calls: [call('c1')] },
+        { role: 'tool', content: 'ok', tool_call_id: 'c1' },
+      ],
+    });
+    const groups = [heading, pkg, dialogue];
+    const messages = [...pkg.messages, ...dialogue.messages];
+    const shadow = Buffer.from(canonicalMessagesBytes(messages));
+    const candidate: CompactionStart = {
+      id: '', revision: surfaceRevision(groups),
+      groupIds: [pkg.id, dialogue.id],
+      sources: sortUnique([...pkg.sources, ...dialogue.sources]),
+      shadowHash: sha256HexOf(shadow), shadowBytes: shadow.length,
+    };
+    const withId: CompactionStart = { ...candidate, id: candidateIdentity(candidate) };
+    const verdict = validateCompactionSpan(groups, withId);
+    expect(verdict.ok).toBe(true);
+  });
+});

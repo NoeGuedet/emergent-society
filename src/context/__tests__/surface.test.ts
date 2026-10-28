@@ -443,3 +443,51 @@ describe('Surface shadow encoding (golden literal)', () => {
       .toBe('41672b307e432263fb23c6c110a718254ef13534dcedf7e27c8c37365adaa127');
   });
 });
+
+
+// The package group kind on the surface (kernel.md, the context-assembler
+// sections): the one kind whose id rule is a family — any package/* receipt —
+// not a single event type, because each package event is its own group.
+describe('Surface package groups', () => {
+  const PACKAGE_FAMILY = [
+    'package/define', 'package/run', 'package/stop', 'package/undefine',
+    'package/effect', 'package/error', 'package/service',
+  ];
+
+  it('appends a package group whose id names a package/* receipt', () => {
+    const { lookup, add } = makeLookup();
+    const heading = add('system/message', 0);
+    const surface = new Surface({ text: 'h', source: heading }, lookup);
+    const define = add('package/define', 1);
+    surface.append({
+      id: define, kind: 'package', turn: 0,
+      messages: [{ role: 'user', content: 'package defined' }], sources: [define],
+    });
+    const nodes = surface.snapshot().nodes;
+    expect(nodes.map((node) => node.group.kind)).toEqual(['heading', 'package']);
+    expect(nodes[1]?.group.messages)
+      .toEqual([{ role: 'user', content: 'package defined' }]);
+  });
+
+  it.each(PACKAGE_FAMILY)('accepts the %s receipt as a package group id', (type) => {
+    const { lookup, add } = makeLookup();
+    const heading = add('system/message', 0);
+    const surface = new Surface({ text: 'h', source: heading }, lookup);
+    const receipt = add(type, 1);
+    expect(() => surface.append({
+      id: receipt, kind: 'package', turn: 0,
+      messages: [{ role: 'user', content: 'fact' }], sources: [receipt],
+    })).not.toThrow();
+  });
+
+  it('refuses a package group whose id names a non-package receipt', () => {
+    const { lookup, add } = makeLookup();
+    const heading = add('system/message', 0);
+    const surface = new Surface({ text: 'h', source: heading }, lookup);
+    const perception = add('world/perception', 1);
+    expect(() => surface.append({
+      id: perception, kind: 'package', turn: 0,
+      messages: [{ role: 'user', content: 'fact' }], sources: [perception],
+    })).toThrow(SurfacePolicyError);
+  });
+});

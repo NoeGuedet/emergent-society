@@ -887,3 +887,40 @@ describe('snapshots: one write queue for every spelling of the same directory', 
     await expect(canonicalRows(path)).resolves.toEqual([older.seq, newer.seq]);
   });
 });
+
+
+// The package group kind round-trips through the checkpoint validator
+// (kernel.md, the context-assembler sections): a projection state carrying a
+// package group is a state this module can write and read back.
+describe('snapshots: package groups', () => {
+  it('round-trips a checkpoint carrying a package group', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const mark = state.watermark!;
+    if (state.surface === null) throw new Error('expected a folded surface');
+    const heading = state.surface.heading;
+    const nodes = [
+      state.surface.nodes[0]!,
+      {
+        position: 1,
+        group: {
+          id: { seq: mark.seq, hash: mark.hash }, kind: 'package' as const, turn: 0,
+          messages: [{ role: 'user' as const, content: 'package defined' }],
+          sources: [{ seq: mark.seq, hash: mark.hash }],
+        },
+      },
+    ];
+    const revision = sha256HexOf(Buffer.from(canonicalBytes({ heading, nodes })));
+    const enriched = {
+      ...clone(state),
+      surface: { heading, nodes, revision },
+    } as unknown as ProjectionState;
+    const snap: Snapshot = { ver: 1, seq: mark.seq, hash: mark.hash, val: enriched };
+
+    await expect(writeSnapshot(path, 'n1', snap)).resolves.toBe(true);
+    const read = await readSnapshot(path, 'n1', events);
+    expect(read).toEqual(snap);
+    expect(read?.val.surface?.nodes[1]?.group.kind).toBe('package');
+  });
+});

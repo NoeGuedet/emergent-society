@@ -112,6 +112,13 @@ function dataSource(value: unknown, where: string): Source {
   };
 }
 
+function dataBool(value: unknown, where: string): boolean {
+  if (typeof value !== 'boolean') {
+    invariant(`${where} is not a boolean`);
+  }
+  return value;
+}
+
 function dataWorldRange(value: unknown, where: string): WorldRange {
   const o = dataRecord(value, where);
   const edge = (v: unknown, at: string): string | null =>
@@ -277,6 +284,14 @@ export class ContextFold {
       case 'compaction/summary': this.onCompactionSummary(event); return;
       case 'compaction/end': this.onCompactionEnd(event); return;
       case 'compaction/abort': this.onCompactionAbort(event); return;
+      case 'package/define':
+      case 'package/run':
+      case 'package/stop':
+      case 'package/undefine':
+      case 'package/effect':
+      case 'package/error':
+      case 'package/service':
+        this.onPackageEvent(event); return;
       default: return;
     }
   }
@@ -542,6 +557,89 @@ export class ContextFold {
     entry.results.set(callId, { message, source: sourceOf(event), synthetic: true });
     if (entry.advertised.every((call) => entry.results.has(call.id))) {
       this.promoteRecovered(entry);
+    }
+  }
+
+  // --- package events -----------------------------------------------------------
+
+  /**
+   * One package fact, one closed group (kernel.md, the local-log sections): a
+   * single user message rendering the fact, appended at event time in journal
+   * order — inside a turn the group precedes that turn's perception and
+   * dialogues, which are promoted at the closer. A package event before any
+   * config is a fold invariant: the vocabulary is ignorable to older readers,
+   * never to this one.
+   */
+  private onPackageEvent(event: VerifiedEvent): void {
+    if (this.surface === null) invariant('package/* event before any config');
+    const type = event.type;
+    const data = dataRecord(event.data, `${type} data`);
+    const content = this.renderPackageFact(type, data);
+    const turn = this.open === null ? 0 : this.open.turn;
+    this.surface.append(toJson({
+      id: sourceOf(event), kind: 'package', turn,
+      messages: [{ role: 'user', content }], sources: [sourceOf(event)],
+    }) as unknown as SurfaceGroup);
+  }
+
+  /** The fixed, replay-stable rendering of each package fact. */
+  private renderPackageFact(type: string, data: Record<string, unknown>): string {
+    const id = dataString(data['id'], `${type}.id`);
+    switch (type) {
+      case 'package/define':
+        return `package defined: ${dataString(data['name'], `${type}.name`)}`
+          + ` (id ${id}, ${dataInt(data['sourceBytes'], `${type}.sourceBytes`)} bytes of source)`
+          + ` — ${dataString(data['purpose'], `${type}.purpose`)}`;
+      case 'package/run': {
+        const sandbox = dataString(data['sandbox'], `${type}.sandbox`);
+        if (sandbox !== 'landlock' && sandbox !== 'off') {
+          invariant(`${type}.sandbox ${JSON.stringify(sandbox)} is not a known sandbox mode`);
+        }
+        return `package run: ${id} started as run`
+          + ` ${dataString(data['runId'], `${type}.runId`)} (sandbox: ${sandbox})`;
+      }
+      case 'package/stop': {
+        const reason = dataString(data['reason'], `${type}.reason`);
+        if (reason !== 'verb' && reason !== 'host-stop') {
+          invariant(`${type}.reason ${JSON.stringify(reason)} is not a known reason`);
+        }
+        return `package run: ${id} stopped`
+          + ` (run ${dataString(data['runId'], `${type}.runId`)}, reason: ${reason})`;
+      }
+      case 'package/undefine':
+        return `package undefined: ${id}`;
+      case 'package/effect': {
+        const kind = dataString(data['kind'], `${type}.kind`);
+        if (kind !== 'tool-registered') {
+          invariant(`${type}.kind ${JSON.stringify(kind)} is not a known effect kind`);
+        }
+        return `package effect: ${id} registered the tool`
+          + ` '${dataString(data['tool'], `${type}.tool`)}'`
+          + ` (run ${dataString(data['runId'], `${type}.runId`)})`;
+      }
+      case 'package/error': {
+        const code = dataString(data['code'], `${type}.code`);
+        if (code !== 'corrupt' && code !== 'crashed' && code !== 'timeout'
+          && code !== 'protocol') {
+          invariant(`${type}.code ${JSON.stringify(code)} is not a known error code`);
+        }
+        const runId = data['runId'] === null
+          ? 'none' : dataString(data['runId'], `${type}.runId`);
+        return `package error: ${id} (run ${runId}, code: ${code})`
+          + ` ${dataString(data['detail'], `${type}.detail`)}`;
+      }
+      case 'package/service': {
+        const service = dataString(data['service'], `${type}.service`);
+        if (service !== 'execute' && service !== 'web_search' && service !== 'web_fetch') {
+          invariant(`${type}.service ${JSON.stringify(service)} is not a known service`);
+        }
+        const ok = dataBool(data['ok'], `${type}.ok`);
+        return `package service: ${id}`
+          + ` (run ${dataString(data['runId'], `${type}.runId`)}) ${service}`
+          + ` ${ok ? 'ok' : 'failed'}: ${dataString(data['status'], `${type}.status`)}`;
+      }
+      default:
+        invariant(`unknown package event type ${JSON.stringify(type)}`);
     }
   }
 

@@ -36,12 +36,20 @@ function sameCanonical(a: unknown, b: unknown): boolean {
   return Buffer.from(canonicalBytes(a)).equals(Buffer.from(canonicalBytes(b)));
 }
 
+/** The `package/*` family: the one kind whose id rule is a family, not a single type. */
+const PACKAGE_FAMILY: ReadonlySet<string> = new Set([
+  'package/define', 'package/run', 'package/stop', 'package/undefine',
+  'package/effect', 'package/error', 'package/service',
+]);
+
 function groupType(kind: SurfaceGroup['kind']): string | null {
   switch (kind) {
     case 'perception': return 'world/perception';
     case 'dialogue': return 'assistant/message';
     case 'summary': return 'compaction/summary';
     case 'heading': return 'system/message';
+    // Each package group's id names its own package/* event — the family rule.
+    case 'package': return 'package';
     default: return null;
   }
 }
@@ -157,7 +165,12 @@ export class Surface {
       throw new SurfacePolicyError('append: a group needs at least one source receipt');
     }
     const idReceipt = this.receipt(group.id, 'append.id');
-    if (idReceipt.type !== expected) {
+    if (expected === 'package') {
+      if (!PACKAGE_FAMILY.has(idReceipt.type)) {
+        throw new SurfacePolicyError(
+          `append: group id is ${idReceipt.type}, expected a package/* type`);
+      }
+    } else if (idReceipt.type !== expected) {
       throw new SurfacePolicyError(`append: group id is ${idReceipt.type}, expected ${expected}`);
     }
     if (!group.sources.some((source) => SAME(source, group.id))) {

@@ -423,9 +423,9 @@ export class NodeDriver {
   ): { readonly gate: BoundaryGate; readonly close: () => void } {
     const scope: GateScope = { phase, turn, signal, lookup: this.lookup };
     const callbacks: GateCallbacks = {
-      append: (type, data) => {
+      append: (type, data, opts) => {
         if (type === 'tool/call') this.turnToolCalls += 1;
-        const receipt = this.writer.append(type, data);
+        const receipt = this.writer.append(type, data, opts);
         this.record(receipt, data);
         return receipt;
       },

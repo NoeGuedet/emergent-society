@@ -115,7 +115,8 @@ export type AgentConfig = {
 };
 
 export type SurfaceGroup = {
-  readonly id: Source; readonly kind: 'heading' | 'perception' | 'dialogue' | 'summary';
+  readonly id: Source;
+  readonly kind: 'heading' | 'perception' | 'dialogue' | 'summary' | 'package';
   readonly turn: number; readonly messages: ChatMessage[];
   readonly sources: Source[];
 };
