@@ -222,6 +222,26 @@ describe('run registry: invalid registrations (the declaration bounds)', () => {
       tool({ parameters: [1, 2] as never }),
     ])).code).toBe('invalid-registration');
   });
+
+  it('refuses a schema whose root type is not object (the funnel shape, C1.6)', () => {
+    const { reg } = registry();
+    // The invoked arguments are one JSON object — a scalar- or array-rooted
+    // tool could never be called through the funnel, so it is refused at
+    // registration, not discovered uncallable at dispatch.
+    for (const parameters of [
+      { type: 'string' },
+      { type: 'integer' },
+      { type: 'array' },
+      { type: 'boolean' },
+    ]) {
+      const verdict = refusal(reg.registerRun(PKG, 'b'.repeat(32), [
+        tool({ name: 'scalar_root', parameters: parameters as never }),
+      ]));
+      expect(verdict.code, JSON.stringify(parameters)).toBe('invalid-registration');
+      expect(verdict.code === 'invalid-registration' ? verdict.detail : '',
+        JSON.stringify(parameters)).toContain('root type "object"');
+    }
+  });
 });
 
 describe('run registry: the one-live-run rule', () => {

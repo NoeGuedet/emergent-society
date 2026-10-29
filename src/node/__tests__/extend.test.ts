@@ -10,7 +10,8 @@ import { canonicalizeJson } from '../../journal/index.js';
 import { sha256HexOf } from '../../journal/index.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
 import type { VerifiedEvents } from '../../context/loader.js';
-import { defaultAgentConfig } from '../../context/config.js';
+import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
+import { ContextFold } from '../../context/fold.js';
 import { createBoundaryGate } from '../gate.js';
 import type { BoundaryGate, GateCallbacks, GateScope } from '../gate.js';
 import { dispatchCalls } from '../tools/dispatch.js';
@@ -40,6 +41,8 @@ type Session = {
   readonly supervisor: RunSupervisor;
   readonly gate: (phase: 'ready' | 'turn', turn: number | null) => BoundaryGate;
   readonly packageGate: (gate: BoundaryGate | null) => void;
+  /** A raw journal append, outside the boundary gate (the turn envelopes). */
+  readonly rawAppend: (type: string, data: JsonValue) => void;
   readonly shutdown: () => Promise<void>;
 };
 
@@ -111,6 +114,7 @@ async function openSession(): Promise<Session> {
   return {
     home, world, store, supervisor, gate,
     packageGate: (next) => { packageGate = next; },
+    rawAppend: (type, data) => { record(writer.append(type, data as never)); },
     shutdown,
   };
 }
@@ -410,21 +414,25 @@ describe('extend: refusals and the funnel boundary', () => {
     }
   }, 30_000);
 
-  it('hints the funnel when a registered name is attempted natively', async () => {
+  it('bridges a native call to a live-registered tool through the funnel (C1.6)', async () => {
     const s = await openSession();
     try {
       writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
       const defined = await extendCall(s, {
         verb: 'define', name: 'echo_pkg', purpose: 'echo', path: 'echo.js',
       });
-      const id = (defined.rawEvents
-        .find((event) => event.type === 'package/define')!.data as Record<string, unknown>)['id'];
+      const id = ([...defined.rawEvents]
+        .filter((event) => event.type === 'package/define')
+        .pop()!.data as Record<string, unknown>)['id'];
       await extendCall(s, { verb: 'run', id: id as string });
+      // The native idiom the models are trained for: the bare tool name,
+      // the tool's own parameters as the arguments. The kernel bridges it
+      // to the funnel — the same executor, the same facts.
       const gate = s.gate('turn', 0);
       s.packageGate(gate);
       try {
         await dispatchCalls(
-          projection([call('c1', 'echo_text', {})]), ID, gate, config(),
+          projection([call('c1', 'echo_text', { text: 'hi' })]), ID, gate, config(),
           { run: async () => { throw new Error('not used'); } },
           undefined,
           { store: s.store, supervisor: s.supervisor, sandbox: false },
@@ -433,12 +441,384 @@ describe('extend: refusals and the funnel boundary', () => {
         s.packageGate(null);
       }
       const list = await events(s.home);
-      const result = list
+      const last = [...list]
+        .filter((event) => event.type === 'tool/result').pop()!;
+      const data = last.data as { callId: string; isError: boolean; message: { content: string } };
+      expect(data.callId).toBe('c1');
+      expect(data.isError).toBe(false);
+      expect(data.message.content).toContain('"echoed":"hi"');
+      // The honest record: the tool/call fact carries the native name the
+      // model actually called — the funnel is the execution path, not the
+      // journal's story. Replay determinism follows from the fact shapes:
+      // the fold re-projects tool/call + tool/result, it never re-dispatches.
+      const native = [...list]
+        .filter((event) => event.type === 'tool/call').pop()!;
+      expect((native.data as { call: { function: { name: string } } })
+        .call.function.name).toBe('echo_text');
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('validates a bridged native call against the registered schema (the funnel boundary holds)', async () => {
+    const s = await openSession();
+    try {
+      writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
+      const defined = await extendCall(s, {
+        verb: 'define', name: 'echo_pkg', purpose: 'echo', path: 'echo.js',
+      });
+      const id = ([...defined.rawEvents]
+        .filter((event) => event.type === 'package/define')
+        .pop()!.data as Record<string, unknown>)['id'];
+      await extendCall(s, { verb: 'run', id: id as string });
+      for (const args of [{ text: '' }, { text: 'ok', extra: 1 }, 'not an object']) {
+        const gate = s.gate('turn', 0);
+        s.packageGate(gate);
+        try {
+          await dispatchCalls(
+            projection([call('c1', 'echo_text', args as JsonValue)]), ID, gate, config(),
+            { run: async () => { throw new Error('not used'); } },
+            undefined,
+            { store: s.store, supervisor: s.supervisor, sandbox: false },
+          );
+        } finally {
+          s.packageGate(null);
+        }
+        const list = await events(s.home);
+        const last = [...list]
+          .filter((event) => event.type === 'tool/result').pop()!;
+        const data = last.data as { isError: boolean; message: { content: string } };
+        expect(data.isError, JSON.stringify(args)).toBe(true);
+        expect(data.message.content, JSON.stringify(args)).toMatch(/tool\/invalid-args/);
+      }
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('refuses a native call to a stored-but-not-running tool as unknown-tool, bare', async () => {
+    const s = await openSession();
+    try {
+      writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
+      await extendCall(s, {
+        verb: 'define', name: 'echo_pkg', purpose: 'echo', path: 'echo.js',
+      });
+      // Defined but never run: the registry — the in-memory truth for live
+      // tools — has nothing, so the native attempt is a bare unknown-tool.
+      // Dispatch never reads the store.
+      const gate = s.gate('turn', 0);
+      s.packageGate(gate);
+      try {
+        await dispatchCalls(
+          projection([call('c1', 'echo_text', { text: 'hi' })]), ID, gate, config(),
+          { run: async () => { throw new Error('not used'); } },
+          undefined,
+          { store: s.store, supervisor: s.supervisor, sandbox: false },
+        );
+      } finally {
+        s.packageGate(null);
+      }
+      const list = await events(s.home);
+      const last = [...list]
+        .filter((event) => event.type === 'tool/result').pop()!;
+      const data = last.data as { isError: boolean; message: { content: string } };
+      expect(data.isError).toBe(true);
+      expect(data.message.content).toBe('error: unknown-tool');
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('holds the funnel capability: an attenuated extend never becomes a native bypass', async () => {
+    const s = await openSession();
+    try {
+      writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
+      const defined = await extendCall(s, {
+        verb: 'define', name: 'echo_pkg', purpose: 'echo', path: 'echo.js',
+      });
+      const id = ([...defined.rawEvents]
+        .filter((event) => event.type === 'package/define')
+        .pop()!.data as Record<string, unknown>)['id'];
+      await extendCall(s, { verb: 'run', id: id as string });
+      // The funnel attenuated out of allowedTools: the native idiom must not
+      // carry more capability than the funnel it bridges to.
+      const gate = s.gate('turn', 0);
+      s.packageGate(gate);
+      try {
+        await dispatchCalls(
+          projection([call('c1', 'echo_text', { text: 'hi' })]), ID, gate,
+          config({ allowedTools: ['execute', 'wait', 'web_search', 'web_fetch'] }),
+          { run: async () => { throw new Error('not used'); } },
+          undefined,
+          { store: s.store, supervisor: s.supervisor, sandbox: false },
+        );
+      } finally {
+        s.packageGate(null);
+      }
+      const list = await events(s.home);
+      const last = [...list]
+        .filter((event) => event.type === 'tool/result').pop()!;
+      const data = last.data as { failure: { code: string } | null; message: { content: string } };
+      expect(data.failure).toEqual({ code: 'unknown-tool', status: null });
+      expect(data.message.content).toBe('error: unknown-tool');
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('refuses a native call to a name the offering itself carries: denied, never bridged', async () => {
+    const s = await openSession();
+    try {
+      writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
+      const defined = await extendCall(s, {
+        verb: 'define', name: 'echo_pkg', purpose: 'echo', path: 'echo.js',
+      });
+      const id = ([...defined.rawEvents]
+        .filter((event) => event.type === 'package/define')
+        .pop()!.data as Record<string, unknown>)['id'];
+      await extendCall(s, { verb: 'run', id: id as string });
+      // An offering that lists a package tool's name but excludes it from
+      // allowedTools: an offered name is the kernel's vocabulary — denied,
+      // never a bridge candidate.
+      const offered = validateAgentConfig({
+        ...defaultAgentConfig(),
+        tools: [...defaultAgentConfig().tools, {
+          name: 'echo_text',
+          description: 'offered but excluded',
+          parameters: { type: 'object', properties: {}, additionalProperties: false },
+        }],
+      });
+      const gate = s.gate('turn', 0);
+      s.packageGate(gate);
+      try {
+        await dispatchCalls(
+          projection([call('c1', 'echo_text', { text: 'hi' })]), ID, gate, offered,
+          { run: async () => { throw new Error('not used'); } },
+          undefined,
+          { store: s.store, supervisor: s.supervisor, sandbox: false },
+        );
+      } finally {
+        s.packageGate(null);
+      }
+      const list = await events(s.home);
+      const last = [...list]
+        .filter((event) => event.type === 'tool/result').pop()!;
+      const data = last.data as { failure: { code: string } | null; message: { content: string } };
+      expect(data.failure).toEqual({ code: 'denied', status: null });
+      expect(data.message.content).toBe('error: denied');
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('settles a bridged invoke aborted mid-flight as the synthetic cancelled closer', async () => {
+    const s = await openSession();
+    try {
+      writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
+      const defined = await extendCall(s, {
+        verb: 'define', name: 'echo_pkg', purpose: 'echo', path: 'echo.js',
+      });
+      const id = ([...defined.rawEvents]
+        .filter((event) => event.type === 'package/define')
+        .pop()!.data as Record<string, unknown>)['id'];
+      await extendCall(s, { verb: 'run', id: id as string });
+      // The signal lands while the invoke is in flight: the gate's first
+      // flush (after the tool/call append) aborts, invokeTool's entry check
+      // settles cancelled, the synthetic closer is the one durable result.
+      const gate = s.gate('turn', 0);
+      const controller = new AbortController();
+      let flushed = false;
+      const abortingGate = {
+        append: gate.append.bind(gate),
+        flush: async () => {
+          await gate.flush();
+          if (!flushed) {
+            flushed = true;
+            controller.abort();
+          }
+        },
+        capture: gate.capture.bind(gate),
+        store: gate.store.bind(gate),
+        signal: controller.signal,
+      } as unknown as typeof gate;
+      const withCallId = (l: VerifiedEvents) => [...l]
         .filter((event) => event.type === 'tool/result')
-        .map((event) => (event.data as { message: { content: string } }).message.content);
-      expect(result[result.length - 1]).toMatch(/unknown-tool/);
-      expect(result[result.length - 1]).toMatch(/extend/);
-      expect(result[result.length - 1]).toMatch(/echo_text/);
+        .filter((event) => (event.data as { callId: string }).callId === 'c1');
+      const before = withCallId(await events(s.home)).length;
+      s.packageGate(abortingGate);
+      try {
+        await dispatchCalls(
+          projection([call('c1', 'echo_text', { text: 'never lands' })]), ID,
+          abortingGate, config(),
+          { run: async () => { throw new Error('not used'); } },
+          undefined,
+          { store: s.store, supervisor: s.supervisor, sandbox: false },
+        );
+      } finally {
+        s.packageGate(null);
+      }
+      const list = await events(s.home);
+      // Exactly one new result settles the call (the session journal
+      // accumulates earlier c1 results from the define and run dispatches).
+      expect(withCallId(list).length).toBe(before + 1);
+      const data = withCallId(list).pop()!.data as {
+        message: { content: string }; failure: { code: string } | null; synthetic: boolean;
+      };
+      expect(data.message.content).toBe('cancelled');
+      expect(data.failure).toEqual({ code: 'cancelled', status: null });
+      expect(data.synthetic).toBe(true);
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('closes a bridged call whose Run dies mid-invoke as run/crashed', async () => {
+    const s = await openSession();
+    try {
+      const DIE_SOURCE = 'return {\n'
+        + '  tools: [{\n'
+        + '    name: \'die_now\',\n'
+        + '    description: \'exits mid-invoke\',\n'
+        + '    parameters: { type: \'object\', properties: {}, additionalProperties: false },\n'
+        + '    handler: async () => { process.exit(3); },\n'
+        + '  }],\n'
+        + '};\n';
+      writeFileSync(join(s.world, 'die.js'), DIE_SOURCE);
+      const defined = await extendCall(s, {
+        verb: 'define', name: 'die_pkg', purpose: 'dies mid-invoke', path: 'die.js',
+      });
+      const id = ([...defined.rawEvents]
+        .filter((event) => event.type === 'package/define')
+        .pop()!.data as Record<string, unknown>)['id'];
+      await extendCall(s, { verb: 'run', id: id as string });
+      const gate = s.gate('turn', 0);
+      s.packageGate(gate);
+      try {
+        await dispatchCalls(
+          projection([call('c1', 'die_now', {})]), ID, gate, config(),
+          { run: async () => { throw new Error('not used'); } },
+          undefined,
+          { store: s.store, supervisor: s.supervisor, sandbox: false },
+        );
+      } finally {
+        s.packageGate(null);
+      }
+      const list = await events(s.home);
+      const last = [...list]
+        .filter((event) => event.type === 'tool/result').pop()!;
+      const data = last.data as { isError: boolean; message: { content: string } };
+      expect(data.isError).toBe(true);
+      expect(data.message.content).toMatch(/run\/crashed/);
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('settles a native call and its execute companion in order', async () => {
+    const s = await openSession();
+    try {
+      writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
+      const defined = await extendCall(s, {
+        verb: 'define', name: 'echo_pkg', purpose: 'echo', path: 'echo.js',
+      });
+      const id = ([...defined.rawEvents]
+        .filter((event) => event.type === 'package/define')
+        .pop()!.data as Record<string, unknown>)['id'];
+      await extendCall(s, { verb: 'run', id: id as string });
+      const gate = s.gate('turn', 0);
+      s.packageGate(gate);
+      try {
+        await dispatchCalls(
+          projection([
+            call('c1', 'echo_text', { text: 'hi' }),
+            call('c2', 'execute', { cmd: 'true' }),
+          ]), ID, gate, config(),
+          {
+            run: async () => ({
+              status: 'completed' as const, exitCode: 0, signal: null,
+              output: new Uint8Array(), truncated: false, reset: false, fresh: null,
+            }),
+          },
+          undefined,
+          { store: s.store, supervisor: s.supervisor, sandbox: false },
+        );
+      } finally {
+        s.packageGate(null);
+      }
+      const list = await events(s.home);
+      const byId = new Map([...list]
+        .filter((event) => event.type === 'tool/result')
+        .map((event) => {
+          const data = event.data as { callId: string; isError: boolean; message: { content: string } };
+          return [data.callId, data];
+        }));
+      expect(byId.get('c1')?.isError).toBe(false);
+      expect(byId.get('c1')?.message.content).toContain('"echoed":"hi"');
+      expect(byId.get('c2')?.isError).toBe(false);
+      expect(byId.get('c2')?.message.content).toMatch(/exit: 0/);
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('folds a bridged native dialogue (replay determinism)', async () => {
+    const s = await openSession();
+    // The real loop's envelope, one turn per dispatch: turn/start, the
+    // stored assistant projection (the advertised calls), the dispatch,
+    // turn/end. Without the envelopes the fold refuses the facts, exactly
+    // as it would refuse a forged journal.
+    const term = { run: async () => { throw new Error('not used'); } };
+    const port = { store: s.store, supervisor: s.supervisor, sandbox: false };
+    async function envelopeTurn(calls: FunctionCall[], turn: number): Promise<void> {
+      const gate = s.gate('turn', turn);
+      const tid: RequestId = { turn, ordinal: 0 };
+      const proj = projection(calls);
+      // The turn envelopes are driver-owned facts, journal-side (the loop's
+      // writeEvent path), so they bypass the boundary gate here too.
+      s.rawAppend('turn/start', { turn, trigger: 'boot', world: { from: null, to: null } });
+      gate.append('assistant/message', { id: tid, value: await gate.store(proj) });
+      s.packageGate(gate);
+      try {
+        await dispatchCalls(proj, tid, gate, config(), term, undefined, port);
+      } finally {
+        s.packageGate(null);
+      }
+      s.rawAppend('turn/end', { turn, outcome: 'chained', commit: null });
+      await gate.flush();
+    }
+    try {
+      // The config fact first (the heading surface the fold appends to), as
+      // the loop's ready scope journals it.
+      const readyGate = s.gate('ready', null);
+      readyGate.append('system/message', {
+        version: config().version, value: await readyGate.store(config()),
+      });
+      await readyGate.flush();
+      writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
+      await envelopeTurn([call('c1', 'extend', {
+        verb: 'define', name: 'echo_pkg', purpose: 'echo', path: 'echo.js',
+      })], 0);
+      const defined = await events(s.home);
+      const id = ([...defined]
+        .filter((event) => event.type === 'package/define')
+        .pop()!.data as Record<string, unknown>)['id'];
+      await envelopeTurn([call('c1', 'extend', { verb: 'run', id: id as string })], 1);
+      // The bridged native call, in its own turn, advertised honestly.
+      await envelopeTurn([call('c1', 'echo_text', { text: 'hi' })], 2);
+      // Replay is fact-driven: the fold re-projects the journaled dialogue —
+      // the native name pairs by tool_call_id like any call, and no layer
+      // checks tool/call names against the offering.
+      const fold = new ContextFold();
+      await fold.observe(await events(s.home));
+      const nodes = fold.snapshot().surface?.nodes ?? [];
+      const dialogue = nodes.filter((node) => node.group.kind === 'dialogue');
+      const bridged = dialogue.find((node) => node.group.messages
+        .some((message) => message.role === 'tool' && message.content.includes('"echoed":"hi"')));
+      expect(bridged, 'the bridged dialogue folds').toBeDefined();
+      const calls = bridged!.group.messages
+        .filter((message) => message.role === 'assistant');
+      expect(calls.length).toBeGreaterThanOrEqual(1);
+      expect(JSON.stringify(calls[0])).toContain('echo_text');
     } finally {
       await s.shutdown();
     }
@@ -625,8 +1005,11 @@ describe('extend: the convergence-round regressions', () => {
         .find((event) => event.type === 'package/define')!.data as Record<string, unknown>)['id'];
       await extendCall(s, { verb: 'run', id: id as string });
 
-      // An already-aborted gate signal: the invoke settles cancelled at
-      // entry, the synthetic cancelled closer is the durable result.
+      // An already-aborted gate signal: dispatch's loop-head check settles
+      // the call before the executor is ever entered — the synthetic
+      // cancelled closer is the durable result, no invoke is attempted.
+      // (The mid-invoke abort — the signal landing while the invoke is in
+      // flight — is covered by the bridge describe's own abort test.)
       const gate = s.gate('turn', 1);
       const controller = new AbortController();
       controller.abort();

@@ -256,6 +256,20 @@ export function createRunRegistry(events: RunRegistryEvents): {
       if (dialect !== null) {
         return { ok: false, code: 'invalid-registration', detail: dialect };
       }
+      // The funnel's one shape rule, made a registration rule (C1.6): the
+      // invoked arguments are one JSON object, so the declared root must be
+      // one — a scalar- or array-rooted tool could never be called through
+      // the funnel, and the native bridge holds the funnel's own shapes.
+      if (typeof parameters !== 'object' || parameters === null
+        || Array.isArray(parameters)
+        || (parameters as Record<string, unknown>)['type'] !== 'object') {
+        return {
+          ok: false,
+          code: 'invalid-registration',
+          detail: `tool ${index}'s parameters must have root type "object"`
+            + ' — the invoked arguments are one JSON object',
+        };
+      }
       const schemaBytes = canonicalBytes(parameters);
       if (schemaBytes > MAX_TOOL_SCHEMA_BYTES) {
         return {

@@ -8,7 +8,7 @@ import type { CommandOutcome, TerminalPort } from './terminal.js';
 import { boundToolText, decodeToolText } from './text.js';
 import { renderExtract, renderSearch } from './web.js';
 import type { WebOutcome, WebTools } from './web.js';
-import { executeExtend, type ExtendPort } from './extend.js';
+import { executeExtend, type ExtendDecision, type ExtendPort } from './extend.js';
 
 /**
  * Tool dispatch (T7, kernel.md §4).
@@ -21,10 +21,14 @@ import { executeExtend, type ExtendPort } from './extend.js';
  * place the credential is written, and only into an `Authorization` header; its
  * raw body is a frontier fact, so the local result carries only `frontierCall`
  * and no artifact), `extend` runs the six package verbs through the injected
- * `ExtendPort` (its funnel is the only invocation path for dynamic tools), and
- * any other name is an unknown tool that never becomes bash — including a
- * registered package tool attempted natively, whose unknown-tool message
- * points at the funnel. Arguments stay raw until here, where they are parsed as a plain JSON
+ * `ExtendPort`, and a **live-registered package tool attempted natively — the
+ * bare-name idiom the models are trained for — is bridged to the funnel**
+ * (C1.6): the same executor, the same kernel-side schema validation, the same
+ * confinement and caps, so the funnel stays the only invocation path while the
+ * native call just works. The advertised offering never moves (the frozen
+ * invariant); the bridge is dispatch sugar over it. Any other name is an
+ * unknown tool that never becomes bash. Arguments stay raw until here, where
+ * they are parsed as a plain JSON
  * object; a malformed, unknown or denied call yields a fixed error result with
  * the matching `tool_call_id` and no shell. An extract-level `failed: true`
  * render is an error result with a null `SafeFailure`, the ordinary-nonzero-exit
@@ -52,6 +56,27 @@ function invalidDetail(detail: string): Decision {
 }
 
 /**
+ * The native-call bridge (C1.6): a call whose name is a live-registered
+ * package tool becomes the funnel decision — the bare-name idiom the models
+ * are trained for, executed by the one invocation path. The registry is the
+ * in-memory truth for live tools (dispatch never reads the store), the
+ * arguments are the tool's own parameters, and the funnel's kernel-side
+ * schema validation rejects what the registration does not declare. A name
+ * that is not live-registered returns null: the caller keeps the frozen
+ * unknown-tool failure.
+ */
+function nativeBridgeDecision(call: FunctionCall, extend: ExtendPort): ExtendDecision | null {
+  if (extend.supervisor.registry.lookup(call.function.name) === null) return null;
+  let args: unknown;
+  try {
+    args = JSON.parse(call.function.arguments);
+  } catch {
+    args = undefined;
+  }
+  return { kind: 'extend', verb: 'call', tool: call.function.name, args };
+}
+
+/**
  * Recognizes one advertised call. A name is known only when it is both offered
  * by the config and has a handler here; an offered-but-denied name is `denied`,
  * and any other name is `unknown-tool` — never a shell command.
@@ -61,11 +86,15 @@ function decide(call: FunctionCall, config: AgentConfig): Decision {
   const offered = config.tools.some((tool) => tool.name === name);
   const hasHandler = name === 'execute' || name === 'wait'
     || name === 'web_search' || name === 'web_fetch' || name === 'extend';
+  // Attenuation precedes recognition for offered names (the audit's
+  // precedence fix): an offered name the config excludes is denied — it is
+  // the kernel's own vocabulary — never unknown-tool, and never a bridge
+  // candidate (the bridge takes only names outside the offering).
+  if (offered && !config.allowedTools.includes(name)) {
+    return { kind: 'error', failure: { code: 'denied', status: null } };
+  }
   if (!offered || !hasHandler) {
     return { kind: 'error', failure: { code: 'unknown-tool', status: null } };
-  }
-  if (!config.allowedTools.includes(name)) {
-    return { kind: 'error', failure: { code: 'denied', status: null } };
   }
 
   let parsed: unknown;
@@ -350,18 +379,31 @@ export async function dispatchCalls(
 
     const decision = decide(call, config);
     if (decision.kind === 'error') {
-      // A registered package tool attempted natively: the fixed funnel hint,
-      // still the frozen unknown-tool failure (the funnel is the only path).
-      const registered = extend !== undefined
-        && decision.failure.code === 'unknown-tool'
-        && extend.supervisor.registry.lookup(call.function.name) !== null;
-      if (registered) {
-        appendErrorResult(gate, id, call.id, decision.failure,
-          `${call.function.name} is a package tool — call it through the funnel:`
-          + ` extend {verb:"call", tool:${JSON.stringify(call.function.name)}, args:{...}}`);
-      } else {
-        appendErrorResult(gate, id, call.id, decision.failure, decision.detail);
+      // The native-call bridge: a live-registered package tool attempted by
+      // its bare name is dispatched through the funnel — the same executor,
+      // the same result facts (the tool/call above already carries the
+      // native name, the honest record of what the model called), the same
+      // confinement. The bridge holds the funnel's own capability, no more:
+      // the extend tool must be offered AND allowed (an attenuated funnel
+      // must not become a native bypass), and only a name OUTSIDE the
+      // offering is a candidate (an offered name is the kernel's vocabulary
+      // — denied or unknown-tool, never bridged). Everything else keeps its
+      // frozen failure, with the detail when decide() has one.
+      const extendUsable = config.tools.some((tool) => tool.name === 'extend')
+        && config.allowedTools.includes('extend');
+      const outsideOffering = !config.tools
+        .some((tool) => tool.name === call.function.name);
+      const bridge = decision.failure.code === 'unknown-tool' && outsideOffering
+        && extendUsable && extend !== undefined
+        ? nativeBridgeDecision(call, extend) : null;
+      if (bridge !== null && extend !== undefined) {
+        await executeExtend({
+          gate, id, callId: call.id, decision: bridge, config, port: extend,
+        });
+        await gate.flush();
+        continue;
       }
+      appendErrorResult(gate, id, call.id, decision.failure, decision.detail);
       await gate.flush();
       continue;
     }

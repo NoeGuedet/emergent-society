@@ -208,8 +208,9 @@ function renderInspect(
     lines.push(`- ${tool.name}: ${tool.description}`);
   }
   lines.push('');
-  lines.push('== package tools (live, through the funnel) ==');
-  lines.push('call them with: extend {verb:"call", tool:"<name>", args:{...}}');
+  lines.push('== package tools (live) ==');
+  lines.push('call them natively by name, or through the funnel:'
+    + ' extend {verb:"call", tool:"<name>", args:{...}}');
   const registered = port.supervisor.registry.tools();
   if (registered.length === 0) {
     lines.push(port.supervisor.liveRunId() !== null
