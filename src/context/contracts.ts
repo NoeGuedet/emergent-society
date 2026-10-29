@@ -198,12 +198,18 @@ export type CompactionAbort = { readonly id: string; readonly reason: 'stale' | 
  * a turn presents, plus the renderer identity that makes a re-render byte-exact
  * for the recorded Git version. Imported by the fold and the runtime.
  */
+/** The accepted perception renderer policies, spelled once; v1 is the pre-friction-pass-2 oldest-first budgeting. */
+export const RENDER_POLICIES = ['commit-patches-v1', 'commit-patches-v2'] as const;
+
+/** One accepted renderer policy. */
+export type RenderPolicy = typeof RENDER_POLICIES[number];
+
 export type WorldPerception = {
   readonly uid: string; readonly range: WorldRange;
   readonly effectiveFrom: string | null;
   readonly fallback: 'none' | 'unreachable-from';
   readonly renderer: {
-    readonly policy: 'commit-patches-v1';
+    readonly policy: RenderPolicy;
     /** Exact trimmed stdout of `git --version`; replay fails on any difference. */
     readonly gitVersion: string;
     readonly attrSource: 'to';

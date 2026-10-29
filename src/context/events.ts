@@ -8,6 +8,8 @@ import type { CallId } from '../frontier/index.js';
 import type { WorldRange } from '../node/world.js';
 import { toJson } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
+import { RENDER_POLICIES } from './contracts.js';
+import type { RenderPolicy } from './contracts.js';
 import { GATE_DIALECT, createValidator } from './validate.js';
 import type {
   AgentConfig, ArtifactChunk, ArtifactManifest, ArtifactRef, AssistantProjection,
@@ -241,7 +243,14 @@ function worldPerception(value: unknown, where: string): WorldPerception {
   ], where);
   const renderer = record(o['renderer'], `${where}.renderer`);
   onlyKeys(renderer, ['policy', 'gitVersion', 'attrSource'], `${where}.renderer`);
-  if (renderer['policy'] !== 'commit-patches-v1') fail(`${where}.renderer.policy`, 'unknown policy');
+  // The accepted policy set (RENDER_POLICIES, spelled once in contracts): v1 is
+  // the oldest-first budgeting (journals recorded before the friction pass 2
+  // replay unchanged), v2 is the newest-first budgeting. A policy outside the
+  // set is a refusal, never a silent byte-mismatch across renderer versions.
+  const policy = text(renderer['policy'], `${where}.renderer.policy`);
+  if (!(RENDER_POLICIES as readonly string[]).includes(policy)) {
+    fail(`${where}.renderer.policy`, 'unknown policy');
+  }
   if (renderer['attrSource'] !== 'to') fail(`${where}.renderer.attrSource`, "must be 'to'");
   const fallback = o['fallback'];
   if (fallback !== 'none' && fallback !== 'unreachable-from') fail(`${where}.fallback`, 'unknown');
@@ -260,7 +269,11 @@ function worldPerception(value: unknown, where: string): WorldPerception {
     range: worldRange(o['range'], `${where}.range`),
     effectiveFrom: nullableHash(o['effectiveFrom'], `${where}.effectiveFrom`),
     fallback,
-    renderer: { policy: 'commit-patches-v1', gitVersion: text(renderer['gitVersion'], `${where}.renderer.gitVersion`), attrSource: 'to' },
+    renderer: {
+      policy: policy as RenderPolicy,
+      gitVersion: text(renderer['gitVersion'], `${where}.renderer.gitVersion`),
+      attrSource: 'to',
+    },
     maxBytes: safeInt(o['maxBytes'], `${where}.maxBytes`, 0),
     maxCommits: safeInt(o['maxCommits'], `${where}.maxCommits`, 0),
     listTruncated: bool(o['listTruncated'], `${where}.listTruncated`),

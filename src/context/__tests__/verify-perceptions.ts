@@ -54,8 +54,9 @@ function replayData(event: VerifiedEvent, what: string): Record<string, unknown>
 
 /**
  * Resolves a recorded `world/perception` through the same T1 registry the gate
- * and fold use (so the wrapper/value range equality is enforced), refusing an
- * incompatible renderer policy with an explicit message before shape validation.
+ * and fold use (so the wrapper/value range equality is enforced), refusing a
+ * renderer policy outside the accepted set with an explicit message before
+ * shape validation.
  */
 function recordedPerception(
   events: VerifiedEvents | VerifiedEventIndex, data: PerceptionPayload,
@@ -66,10 +67,11 @@ function recordedPerception(
   const validate = (raw: unknown): WorldPerception => {
     if (isRecord(raw)) {
       const renderer = raw['renderer'];
-      if (isRecord(renderer) && renderer['policy'] !== RENDER_POLICY) {
+      if (isRecord(renderer) && renderer['policy'] !== 'commit-patches-v1'
+        && renderer['policy'] !== 'commit-patches-v2') {
         throw new Error(
           `replay: recorded perception renderer policy ${JSON.stringify(renderer['policy'])}`
-          + ` is incompatible with ${RENDER_POLICY}`);
+          + ' is not one of commit-patches-v1 | commit-patches-v2');
       }
     }
     const wrapped = REPLAY_REGISTRY['world/perception'](
@@ -85,12 +87,26 @@ function recordedPerception(
  * The recorded `uid` is fed to the renderer and compared, never re-derived; a
  * differing exact Git version and a differing rendered value both fail
  * reconstruction explicitly. Missing Git objects propagate as explicit errors.
+ *
+ * A v1 record (the pre-v2 oldest-first budgeting) validates and replays its
+ * recorded bytes, but the current renderer re-derives newest-first, so a byte
+ * comparison is impossible: for v1 only the exact Git version is checked
+ * against the host's and the re-derivation is skipped.
  */
 async function verifyPerception(
   events: VerifiedEvents | VerifiedEventIndex, world: WorldRepo, event: VerifiedEvent,
 ): Promise<void> {
   const data = replayData(event, 'world/perception') as unknown as PerceptionPayload;
   const recorded = recordedPerception(events, data);
+  if (recorded.renderer.policy !== RENDER_POLICY) {
+    const hostVersion = await world.gitVersion();
+    if (recorded.renderer.gitVersion !== hostVersion) {
+      throw new Error(
+        `replay: recorded Git version ${JSON.stringify(recorded.renderer.gitVersion)}`
+        + ` differs from the host's ${JSON.stringify(hostVersion)}`);
+    }
+    return;
+  }
   const rederived = await presentWorld(
     world, recorded.uid, recorded.range, recorded.maxBytes, recorded.maxCommits,
   );

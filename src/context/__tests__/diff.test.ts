@@ -5,18 +5,27 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { commitAs, gitIn, gitRaw, useWorld, writeWorldFile } from '../../node/__tests__/helpers.js';
 import { WorldRepo, gitEnv } from '../../node/world.js';
-import { presentWorld } from '../diff.js';
+import type { GateScope } from '../../node/gate.js';
+import { createBoundaryRegistry } from '../events.js';
+import type { WorldPerception } from '../contracts.js';
+import { RENDER_POLICY, presentWorld } from '../diff.js';
 
 /**
  * The bounded pinned Git perception (T4): `presentWorld` selects the newest
- * capped commits, renders ordered per-commit foreign patches oldest-first under
- * one shared byte budget, and records renderer identity. These fixtures use real
- * Git repositories through the node helpers.
+ * capped commits and budgets them NEWEST-first — a wake must never spend the
+ * byte budget on the oldest history and drop the commits that just landed —
+ * then emits the kept commits oldest-first so the reading order stays
+ * chronological, and records renderer identity. These fixtures use real Git
+ * repositories through the node helpers.
  */
 
 const fixture = useWorld('context-diff-');
 const MISSING = 'a'.repeat(40);
-const AGGREGATE = 'rendering truncated; remaining selected commits not shown';
+
+/** The exact aggregate omission line for a given dropped range. */
+const omissionLine = (count: number, oldest: string | null): string =>
+  `rendering truncated; ${count} older commit(s) not shown`
+  + (oldest === null ? '' : ` (oldest omitted ${oldest.slice(0, 12)})`);
 
 /** Writes a byte payload and commits it, returning the commit hash. */
 async function commitBytes(world: WorldRepo, author: string, rel: string, bytes: Buffer): Promise<string> {
@@ -190,7 +199,7 @@ describe('presentWorld renderer metadata', () => {
     const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
     const p = await presentWorld(world, 'n1', { from: null, to: c1 }, 4096, 4096);
     expect(p.renderer).toEqual({
-      policy: 'commit-patches-v1',
+      policy: RENDER_POLICY,
       gitVersion: (await gitIn(world, ['--version'])).replace(/\r?\n$/, ''),
       attrSource: 'to',
     });
@@ -255,7 +264,7 @@ describe('presentWorld negative and bounded fixtures', () => {
     expect(capture.bytesRetained).toBeLessThanOrEqual(4096);
   });
 
-  it('never exceeds the single shared budget and emits the exact aggregate omission literal', async () => {
+  it('budgets newest-first: the waking commits are kept, the oldest are named', async () => {
     const { world } = fixture();
     const hashes: string[] = [];
     for (let i = 0; i < 10; i += 1) {
@@ -265,16 +274,63 @@ describe('presentWorld negative and bounded fixtures', () => {
     const p = await presentWorld(world, 'n1', { from: null, to }, 512, 4096);
     expect(p.truncated).toBe(true);
     expect(Buffer.byteLength(p.text, 'utf8')).toBeLessThanOrEqual(512);
-    expect(p.text).toContain(AGGREGATE);
-    // Accounting is oldest-first: the first selected commit is rendered, later
-    // commits are not, and `included` names only what was presented.
-    expect(p.text).toContain(`commit ${hashes[0]}`);
-    expect(p.text).not.toContain(hashes.at(-1) ?? 'missing');
+    // Newest-first budgeting: the newest commit is presented, the oldest is
+    // dropped, and `included` names only what was presented — a contiguous
+    // newest suffix.
+    expect(p.text).toContain(`commit ${hashes.at(-1)}`);
+    expect(p.text).not.toContain(`commit ${hashes[0]}`);
     expect(p.included.length).toBeLessThan(hashes.length);
+    expect(p.included.length).toBeGreaterThan(0);
     for (const hash of p.included) {
       expect(p.text).toContain(`commit ${hash}`);
       expect(p.commits.some((c) => c.hash === hash)).toBe(true);
     }
+    const hashesIn = hashes.map((h) => p.included.includes(h));
+    expect(hashesIn).toEqual([...hashesIn].sort((a, b) => Number(a) - Number(b)));
+    // The omission notice names the dropped count and the oldest omitted hash.
+    const dropped = hashes.length - p.included.length;
+    expect(p.text).toContain(`\n${omissionLine(dropped, hashes[0] ?? null)}\n`);
+  });
+
+  it('seeds the kept budget with the preamble bytes under the same bound', async () => {
+    const { world } = fixture();
+    const hashes: string[] = [];
+    for (let i = 0; i < 10; i += 1) {
+      hashes.push(await commitAs(world, 'n2', { [`f${i}.txt`]: `${`row ${i} `.repeat(40)}\n` }));
+    }
+    // The fallback preamble consumes working budget: a renderer that forgot
+    // to seed the kept budget with it would emit 548 bytes here.
+    const p = await presentWorld(world, 'n1',
+      { from: MISSING, to: hashes.at(-1) ?? null }, 512, 4096);
+    expect(p.fallback).toBe('unreachable-from');
+    expect(p.truncated).toBe(true);
+    expect(Buffer.byteLength(p.text, 'utf8')).toBeLessThanOrEqual(512);
+    expect(p.text.startsWith('fallback: from unreachable; full history shown\n')).toBe(true);
+    expect(p.text).toContain(`commit ${hashes.at(-1)}`);
+    expect(p.text).not.toContain(`commit ${hashes[0]}`);
+  });
+
+  it('emits the kept commits oldest-to-newest after newest-first budgeting', async () => {
+    const { world } = fixture();
+    const hashes: string[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      hashes.push(await commitAs(world, 'n2', { [`f${i}.txt`]: 'y'.repeat(400) }));
+    }
+    // A budget that fits roughly the newest two commits fully.
+    const p = await presentWorld(world, 'n1', { from: null, to: hashes.at(-1) ?? null },
+      2048, 4096);
+    expect(p.included.length).toBeGreaterThanOrEqual(2);
+    // The kept set is a contiguous newest suffix, ordered oldest→newest.
+    expect(p.included).toEqual(hashes.slice(-p.included.length));
+    expect(p.truncated).toBe(true);
+    const at = (hash: string): number => p.text.indexOf(`commit ${hash}`);
+    for (let i = 1; i < p.included.length; i += 1) {
+      const older = p.included[i - 1]!;
+      const newer = p.included[i]!;
+      expect(at(older)).toBeGreaterThanOrEqual(0);
+      expect(at(older)).toBeLessThan(at(newer));
+    }
+    expect(at(p.included.at(-1)!)).toBeLessThan(p.text.indexOf('rendering truncated'));
   });
 });
 
@@ -384,10 +440,12 @@ describe('presentWorld notice byte grammar', () => {
     const p = await presentWorld(world, 'n1', { from: null, to: c1 }, 4096, 4096);
     expect(p.truncated).toBe(true);
     // The patch is cut mid-line; the notice must begin with a deterministic LF
-    // and end with one, never gluing onto the cut patch tail.
+    // and end with one, never gluing onto the cut patch tail — and it follows
+    // the truncated commit's block, not the front of the text.
     expect(p.text).toMatch(/\npatch truncated after \d+ bytes\n/);
     const noticeAt = p.text.indexOf('patch truncated after');
     expect(p.text[noticeAt - 1]).toBe('\n');
+    expect(noticeAt).toBeGreaterThan(p.text.indexOf(`commit ${c1}`));
   });
 
   it('precedes the aggregate omission notice with an LF', async () => {
@@ -397,10 +455,36 @@ describe('presentWorld notice byte grammar', () => {
       hashes.push(await commitAs(world, 'n2', { [`f${i}.txt`]: 'y'.repeat(400) }));
     }
     const p = await presentWorld(world, 'n1', { from: null, to: hashes.at(-1) ?? null }, 512, 4096);
-    expect(p.text).toContain(AGGREGATE);
-    expect(p.text).toMatch(/\nrendering truncated; remaining selected commits not shown\n/);
+    const line = omissionLine(hashes.length - p.included.length, hashes[0] ?? null);
+    expect(p.text).toContain(line);
+    expect(p.text).toMatch(new RegExp(`\\n${line.replace(/[()]/g, '\\$&')}\\n`));
     const at = p.text.indexOf('rendering truncated');
     expect(p.text[at - 1]).toBe('\n');
+  });
+
+  it('records the renderer policy identity', () => {
+    // v2 is the newest-first budgeting policy; v1 journals stay replayable
+    // through the registry's accepted-policy set.
+    expect(RENDER_POLICY).toBe('commit-patches-v2');
+  });
+
+  it('the registry accepts both policies and refuses a third', async () => {
+    const { world } = fixture();
+    const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
+    const p = await presentWorld(world, 'n1', { from: null, to: c1 }, 4096, 4096);
+    const registry = createBoundaryRegistry();
+    const scope: GateScope = {
+      phase: 'turn', turn: 0, signal: new AbortController().signal, lookup: () => null,
+    };
+    const wrap = (policy: string) => registry['world/perception'](
+      {
+        turn: 0, range: p.range,
+        value: { kind: 'inline', value: { ...p, renderer: { ...p.renderer, policy } } },
+      }, scope,
+    ) as unknown as { value: { value: WorldPerception } };
+    expect(wrap('commit-patches-v1').value.value.renderer.policy).toBe('commit-patches-v1');
+    expect(wrap('commit-patches-v2').value.value.renderer.policy).toBe('commit-patches-v2');
+    expect(() => wrap('commit-patches-v3')).toThrow(/unknown policy/);
   });
 
   it('places each preamble notice on its own LF-terminated line', async () => {
