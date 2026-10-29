@@ -670,7 +670,8 @@ describe('dispatchCalls: web tools', () => {
       expect(data.isError).toBe(true);
       expect(data.failure).toEqual({ code: 'denied', status: null });
       expect(data.raw).toBeNull();
-      expect(data.message.content).toBe('error: denied');
+      // The honest refusal (C1.6): the detail says why, value-free.
+      expect(data.message.content).toBe('error: denied\nno web provider is configured in this cell');
     } finally {
       await s.shutdown();
     }
@@ -913,6 +914,39 @@ describe('dispatchCalls: web tools', () => {
         neverTerminal, stubWeb([okSearch(), okSearch()], calls));
       expect(result).toEqual({ waited: false, called: 2 });
       expect(calls.map((entry) => entry.args[1])).toEqual([1, 20]);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('refuses a web call with no web provider configured, honestly (C1.6)', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      // The tools are offered and allowed, but the host composed no web
+      // port (no tavily entry in the cell): the refusal says why, in the
+      // same value-free words every time — never a bare denied the model
+      // must decode by trial.
+      const proj = projection([
+        call('w1', 'web_search', JSON.stringify({ query: 'q' })),
+        call('w2', 'web_fetch', JSON.stringify({ url: 'https://example.com' })),
+      ]);
+      const result = await dispatchCalls(proj, ID, s.gate('turn', 0), webConfig(),
+        neverTerminal, undefined);
+      expect(result).toEqual({ waited: false, called: 2 });
+      const results = (await events(home))
+        .filter((event) => event.type === 'tool/result')
+        .map((event) => event.data as {
+          callId: string; failure: { code: string } | null; message: { content: string };
+        });
+      // Both calls settle, each with the honest detail (a dropped result
+      // must fail this, not pass silently).
+      expect(results).toHaveLength(2);
+      expect(results.map((data) => data.callId)).toEqual(['w1', 'w2']);
+      for (const data of results) {
+        expect(data.failure).toEqual({ code: 'denied', status: null });
+        expect(data.message.content).toBe('error: denied\nno web provider is configured in this cell');
+      }
     } finally {
       await s.shutdown();
     }

@@ -55,7 +55,7 @@ export function defaultAgentConfig(): AgentConfig {
       },
       {
         name: 'extend',
-        description: 'Manage this node\'s own capabilities. Six verbs: inspect (the live catalogue: tools, packages, caps, runtime honesty); define (store a Package: name, purpose, path of a source file in the world); run (activate a stored Package as a confined Run: its tools become callable — address it by name or id; a name resolves to the latest stored version); call (invoke a running Package tool by name with args — the funnel); stop (deactivate the live Run of that name or id, reversible); undefine (delete a stored Package by name or id, irreversible).',
+        description: 'Manage this node\'s own capabilities. Six verbs: inspect (the live catalogue: tools, packages, caps, runtime honesty); define (store a Package: name, purpose, path of a source file in the world); run (activate a stored Package as a confined Run: its tools become callable — address it by name or id; a name resolves to the latest stored version); call (invoke a running Package tool with args — through the funnel, or by its bare name); stop (deactivate the live Run of that name or id, reversible); undefine (delete a stored Package by name or id, irreversible). A Package source is plain JavaScript evaluated as an async function body: it must return exactly {tools:[{name, description, parameters, handler}]} (handler a function; parameters in the safe schema dialect — type/properties/required/minLength/maximum/additionalProperties, every node carries a type from object|array|string|number|integer|boolean, root type object). inspect lists the caps.',
         parameters: {
           type: 'object',
           properties: {

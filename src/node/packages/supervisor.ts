@@ -721,11 +721,17 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
           result = { status: 'failed', error: err instanceof Error ? err.message : String(err) };
         }
       }
-    } else if (deps.web === null
-      || (frame.type === 'svc/web_search' && !deps.webAllowance.search)
+    } else if (deps.web === null) {
+      status = 'denied';
+      // The same honest refusal as the base tools (C1.6): the guest handler
+      // learns why in one round-trip — value-free, the fixed words.
+      result = { status: 'denied', detail: 'no web provider is configured in this cell' };
+    } else if ((frame.type === 'svc/web_search' && !deps.webAllowance.search)
       || (frame.type === 'svc/web_fetch' && !deps.webAllowance.fetch)) {
       status = 'denied';
-      result = { status: 'denied' };
+      // The per-tool allowance refusal names its own cause: the provider
+      // exists, this Run's grant does not cover the call.
+      result = { status: 'denied', detail: 'this Run has no web allowance for it' };
     } else {
       try {
         const outcome = frame.type === 'svc/web_search'

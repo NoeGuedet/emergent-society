@@ -409,6 +409,11 @@ export async function dispatchCalls(
     }
     if (decision.kind === 'extend') {
       if (extend === undefined) {
+        // The recorded deviation, deliberately bare: an absent extend port
+        // is host-composition state (the library path, the web-port
+        // precedent), not a cell fact the model can act on — no detail.
+        // The web channel above carries its honest detail because absence
+        // there IS a cell fact.
         appendErrorResult(gate, id, call.id, { code: 'denied', status: null });
         await gate.flush();
         continue;
@@ -427,7 +432,12 @@ export async function dispatchCalls(
     }
     if (decision.kind === 'web_search' || decision.kind === 'web_fetch') {
       if (web === undefined) {
-        appendErrorResult(gate, id, call.id, { code: 'denied', status: null });
+        // The honest refusal (C1.6): the tools are offered and allowed, but
+        // this cell composed no web provider — the same value-free words
+        // every time, so the model never pays a call to decode a bare
+        // denied. The failure code stays the frozen 'denied'.
+        appendErrorResult(gate, id, call.id, { code: 'denied', status: null },
+          'no web provider is configured in this cell');
         await gate.flush();
         continue;
       }
