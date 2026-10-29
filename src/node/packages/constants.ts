@@ -32,3 +32,6 @@ export const MAX_PACKAGE_SOURCE_BYTES_PER_NODE = 64 * 1024 * 1024;
 
 /** The stored manifest.json cap (canonical {name, purpose} is always under 1 KiB). */
 export const MAX_MANIFEST_BYTES = 1_024;
+
+/** One protocol line's byte cap — an unterminated line is killed at the cap. */
+export const MAX_FRAME_BYTES = 1_048_576;
