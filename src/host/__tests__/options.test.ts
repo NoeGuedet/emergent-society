@@ -17,6 +17,18 @@ it('parses start with defaults', () => {
   });
 });
 
+it('parses start with --charter-file, and keeps it absent otherwise', () => {
+  expect(parseHostCommand([
+    'start', '--home', '/x', '--model', 'm', '--heading', 'h', '--charter-file', '/tmp/charter.txt',
+  ])).toEqual({
+    command: 'start', home: '/x', uid: 'node-0', model: 'm', heading: 'h', noSandbox: false,
+    charterFile: '/tmp/charter.txt',
+  });
+  expect('charterFile' in parseHostCommand(
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h'],
+  )).toBe(false);
+});
+
 it('parses init/resume/pause', () => {
   expect(parseHostCommand(['init', '--home', '/x'])).toEqual({ command: 'init', home: '/x' });
   expect(parseHostCommand(['resume', '--home', '/x'])).toEqual({
@@ -40,10 +52,16 @@ it('rejects a relative home, a missing flag, an unknown flag and an invalid uid 
     ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--bogus'],
     ['start', '--home', '/x', '--uid', '../x', '--model', 'm', '--heading', 'h'],
     ['resume', '--home', '/x', '--model', 'm'],
+    ['resume', '--home', '/x', '--charter-file', '/tmp/charter.txt'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--charter-file', 'rel.txt'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--charter-file'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--charter-file='],
     ['init', '--home', '/x', '--uid', 'node-0'],
   ]) {
     expect(() => parseHostCommand(argv)).toThrow(UsageError);
   }
+  expect(() => parseHostCommand(['resume', '--home', '/x', '--charter-file', '/tmp/c.txt']))
+    .toThrow(/charter-file/);
 });
 
 it('parses status with --json and refuses the flags it does not own', () => {
@@ -58,14 +76,16 @@ it('parses status with --json and refuses the flags it does not own', () => {
   }
 });
 
-it('USAGE lists the five commands, the exit codes and the seven disclosures', () => {
+it('USAGE lists the five commands, the exit codes and the eight disclosures', () => {
   for (const s of [
     'init', 'start', 'resume', 'pause', 'Exit codes: 0', 'interrupts in-flight',
     'partial world writes', 'fresh PTY', 'not re-executed', 'one turn',
-    'released its cell', 'blocks a new host',
+    'released its cell', 'blocks a new host', '--charter-file', 'no journaled',
+    'resume refuses it', 'config wins.', 'secret-bearing file',
   ]) {
     expect(USAGE).toContain(s);
   }
+  expect(USAGE).toContain('[--charter-file <abs-path>]');
   expect(USAGE).toContain('status --home');
   expect(USAGE).toContain('--json');
   expect(USAGE).not.toContain('SECRET');

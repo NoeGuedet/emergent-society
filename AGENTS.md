@@ -13,11 +13,12 @@ machine default shell may be older, always select 24 via nvm first.
 
 - `init --home <abs-dir>` — create the cell home; prints the real `providers.json` path and a
   0600-mode hint, never writes the file.
-- `start --home <abs-dir> --model <id> --heading <text> [--uid node-0] [--no-sandbox]` —
+- `start --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--uid node-0] [--no-sandbox]` —
   boot and run a node; Landlock confinement is the default, `--no-sandbox` is the explicit
-  opt-out.
+  opt-out; `--charter-file` replaces the default charter on a start into a cell with no
+  journaled configuration (its content is journaled as configuration).
 - `resume --home <abs-dir> [--uid node-0] [--no-sandbox]` — resume a parked node;
-  `--model`/`--heading` are refused as unknown flags.
+  `--model`/`--heading`/`--charter-file` are refused as unknown flags.
 - `pause --home <abs-dir>` — deliver a stop to the host owning the home; no `--uid` (one host
   owns a home).
 - `status --home <abs-dir> [--json]` — read-only report; a produced but degraded report

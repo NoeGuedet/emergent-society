@@ -16,12 +16,13 @@ import { UsageError } from './errors.js';
  * `node:util` type ever escapes to the operator as a stack trace.
  *
  * Everything a purely syntactic check can catch lives here: an absolute home,
- * a uid that is one safe path segment, and a non-empty `--model`/`--heading` on
- * `start`. Whether a home exists, whether `mock-model` is acceptable, or
- * whether a journaled config exists is the host gate's decision (also exit `2`,
- * but after a real fold), not argv parsing's.
+ * a uid that is one safe path segment, a non-empty `--model`/`--heading`, and
+ * an absolute non-empty `--charter-file` on `start`. Whether a home exists,
+ * whether `mock-model` is acceptable, or whether a journaled config exists is
+ * the host gate's decision (also exit `2`, but after a real fold), not argv
+ * parsing's.
  *
- * `USAGE` names the five commands, the exit codes, and the seven §3.9
+ * `USAGE` names the five commands, the exit codes, and the eight §3.9
  * disclosures, so `--help` is honest about what a stop, a resume, a pause and
  * a status actually guarantee.
  */
@@ -44,6 +45,7 @@ export type HostCliCommand =
   | {
       readonly command: 'start'; readonly home: string; readonly uid: string;
       readonly model: string; readonly heading: string; readonly noSandbox: boolean;
+      readonly charterFile?: string;
     }
   | {
       readonly command: 'resume'; readonly home: string; readonly uid: string;
@@ -52,10 +54,10 @@ export type HostCliCommand =
   | { readonly command: 'pause'; readonly home: string }
   | { readonly command: 'status'; readonly home: string; readonly json: boolean };
 
-/** The five-command help text, its exit codes and the seven disclosures. */
+/** The five-command help text, its exit codes and the eight disclosures. */
 export const USAGE = `Usage:
   node dist/host/main.js init   --home <abs-dir>
-  node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--uid node-0] [--no-sandbox]
+  node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--uid node-0] [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> [--uid node-0] [--no-sandbox]
   node dist/host/main.js pause  --home <abs-dir>
   node dist/host/main.js status --home <abs-dir> [--json]
@@ -66,6 +68,10 @@ Stop interrupts in-flight work; partial world writes may be committed; the shell
 resume starts a fresh PTY; resume is a full fold and unresolved effects are not re-executed; resume
 spends one turn. pause returns 0 once the host has released its cell, not necessarily after process reaping.
 A live or unverified host.json blocks a new host; delete it only if you are certain no host runs.
+--charter-file replaces the default charter on a start into a cell with no journaled
+configuration (including the boot-recovery start); resume refuses it — the journaled
+config wins. The file's content is journaled as configuration; never point it at a
+secret-bearing file.
 `;
 
 /**
@@ -131,9 +137,22 @@ function parseStart(args: readonly string[]): HostCliCommand {
     home: { type: 'string' },
     model: { type: 'string' },
     heading: { type: 'string' },
+    'charter-file': { type: 'string' },
     uid: { type: 'string' },
     'no-sandbox': { type: 'boolean' },
   });
+  // `--charter-file` is optional and absolute like `--home`: the operator's
+  // own path, read once at the start gate, never defaulted to `undefined`
+  // under `exactOptionalPropertyTypes` (an absent flag stays an absent key).
+  const charterFile = values['charter-file'];
+  if (charterFile !== undefined) {
+    if (typeof charterFile !== 'string' || charterFile === '') {
+      throw new UsageError('--charter-file takes a value');
+    }
+    if (!isAbsolute(charterFile)) {
+      throw new UsageError(`--charter-file must be an absolute path: ${charterFile}`);
+    }
+  }
   return {
     command: 'start',
     home: homeOf(values, 'start'),
@@ -141,6 +160,7 @@ function parseStart(args: readonly string[]): HostCliCommand {
     model: textOf(values, 'model', 'start'),
     heading: textOf(values, 'heading', 'start'),
     noSandbox: values['no-sandbox'] === true,
+    ...(charterFile !== undefined ? { charterFile } : {}),
   };
 }
 
@@ -185,7 +205,8 @@ function parseStatus(args: readonly string[]): HostCliCommand {
  * command line. Any other leading token must be one of the five commands.
  *
  * @throws UsageError for an unknown command, an unknown or missing flag, a
- * relative home, a malformed uid, or an empty `--model`/`--heading`.
+ * relative home, a malformed uid, an empty `--model`/`--heading`, or a relative
+ * or empty `--charter-file`.
  */
 export function parseHostCommand(argv: readonly string[]): HostCliCommand {
   const name = argv[0];

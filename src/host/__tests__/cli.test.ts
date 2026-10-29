@@ -77,6 +77,7 @@ it('dispatches start with the resolved sandbox, no undefined optional fields, an
   expect(captured[0]!.uid).toBe('node-0');
   expect('model' in captured[0]!).toBe(true);
   expect('heading' in captured[0]!).toBe(true);
+  expect('charterFile' in captured[0]!).toBe(false);
   expect(stderr.filter((l) => l.trim() !== '').map((l) => JSON.parse(l).event))
     .toEqual(['host/boot']);
 });
@@ -93,6 +94,23 @@ it('dispatches resume without model/heading keys', async () => {
   expect(await runCli(['resume', '--home', '/x'], d)).toBe(0);
   expect('model' in captured[0]!).toBe(false);
   expect('heading' in captured[0]!).toBe(false);
+});
+
+it('dispatches the charter file only for start', async () => {
+  const captured: HostOptions[] = [];
+  const d = {
+    ...deps,
+    startHost: (o: HostOptions) => {
+      captured.push(o);
+      return { stop() {}, done: Promise.resolve(0) };
+    },
+  };
+  expect(await runCli(
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--charter-file', '/tmp/c.txt'], d,
+  )).toBe(0);
+  expect(captured[0]!.charterFile).toBe('/tmp/c.txt');
+  expect(await runCli(['resume', '--home', '/x'], d)).toBe(0);
+  expect('charterFile' in captured[1]!).toBe(false);
 });
 
 it('maps pause outcomes to 0/2/3 and runtime failures to 1', async () => {

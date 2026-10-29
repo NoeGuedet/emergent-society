@@ -15,7 +15,7 @@ describe('defaultAgentConfig', () => {
   it('returns the fully expanded factory default', () => {
     expect(base()).toEqual({
       version: 1,
-      charter: 'You act by writing in the shared world. Preserve durable knowledge in files.',
+      charter: 'You act by writing in the shared world. Preserve durable knowledge in files. Your context is finite: it is compacted periodically and whatever you have not put outside it is lost. The heading is the boot seed; the living direction is the world\'s files.',
       heading: 'Work on the current shared direction.',
       model: 'mock-model',
       parameters: { temperature: 0 },

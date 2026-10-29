@@ -86,10 +86,11 @@ async function runInit(home: string, out: Sink, err: Sink): Promise<number> {
  * `start`/`resume`: one host, whose exit code is the lifetime's.
  *
  * The sandbox defaults to Landlock (`{}`) and `--no-sandbox` is the only way to
- * say otherwise, so confinement is opt-out and loud. `model`/`heading` are
- * spread in only for `start`: under `exactOptionalPropertyTypes` an explicit
- * `undefined` would be a different option object than an absent one, and a
- * resume that carried the keys would be lying about what it supplied.
+ * say otherwise, so confinement is opt-out and loud. `model`/`--heading`/
+ * `charterFile` are spread in only for `start`: under
+ * `exactOptionalPropertyTypes` an explicit `undefined` would be a different
+ * option object than an absent one, and a resume that carried the keys would be
+ * lying about what it supplied.
  */
 async function runHost(command: HostRun, deps: CliDeps, err: Sink): Promise<number> {
   const makeLog = deps.createLog ?? createHostLog;
@@ -101,7 +102,13 @@ async function runHost(command: HostRun, deps: CliDeps, err: Sink): Promise<numb
     command: command.command,
     sandbox,
     log,
-    ...(command.command === 'start' ? { model: command.model, heading: command.heading } : {}),
+    ...(command.command === 'start'
+      ? {
+          model: command.model,
+          heading: command.heading,
+          ...(command.charterFile !== undefined ? { charterFile: command.charterFile } : {}),
+        }
+      : {}),
   });
   return await handle.done;
 }

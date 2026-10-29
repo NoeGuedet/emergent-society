@@ -255,7 +255,7 @@ async function damageInteriorFrame(target: string): Promise<void> {
 }
 
 type HostOnceSetup = {
-  readonly model?: string; readonly heading?: string;
+  readonly model?: string; readonly heading?: string; readonly charterFile?: string;
   readonly config?: AgentConfig; readonly fresh?: boolean;
   readonly expectRefusal?: boolean;
 };
@@ -264,7 +264,8 @@ type HostOnceSetup = {
  * Runs one host to completion. A non-refusal case waits for the park, stops the
  * host and returns its own code; a refusal case resolves before any park, so it
  * is awaited directly. `resume` drops `model`/`heading` because §3.5 refuses a
- * resume that carries either.
+ * resume that carries either; a `charterFile` in setup is threaded through on
+ * both commands so the resume refusal is observable too.
  */
 async function runHostOnce(command: 'start' | 'resume', setup: HostOnceSetup = {}): Promise<number> {
   if (setup.fresh === true) await resetHome();
@@ -274,10 +275,15 @@ async function runHostOnce(command: 'start' | 'resume', setup: HostOnceSetup = {
         ...opts,
         ...(setup.model !== undefined ? { model: setup.model } : {}),
         ...(setup.heading !== undefined ? { heading: setup.heading } : {}),
+        ...(setup.charterFile !== undefined ? { charterFile: setup.charterFile } : {}),
       }
     : (() => {
         const { model, heading, ...resumeOpts } = opts;
-        return { ...resumeOpts, command: 'resume' as const };
+        return {
+          ...resumeOpts,
+          command: 'resume' as const,
+          ...(setup.charterFile !== undefined ? { charterFile: setup.charterFile } : {}),
+        };
       })();
   const handle = track(startHost(options, hostDeps));
   if (setup.expectRefusal !== true) {
@@ -362,6 +368,63 @@ it('refuses mock-model, a missing heading and a corrupt log with exit 2', async 
   expect(logged(log)).toContainEqual(
     expect.objectContaining({ event: 'host/error', error: 'HostConfigError' }),
   );
+}, 20_000);
+
+it('start composes the operator charter; resume refuses the flag-carried file', async () => {
+  await serve();
+  const charterPath = join(home, 'charter.txt');
+  await writeFile(charterPath, 'Operator charter for a production variant.', { mode: 0o600 });
+  expect(await runHostOnce('start', { charterFile: charterPath })).toBe(0);
+  const events = await readC13(home, 'node-0');
+  const seeded = events.filter((e) => e.type === 'system/message')[0]!.data as
+    { value: { value: { charter: string } } };
+  expect(seeded.value.value.charter).toBe('Operator charter for a production variant.');
+  expect(await runHostOnce('resume', { charterFile: charterPath, expectRefusal: true })).toBe(2);
+}, 20_000);
+
+it('start refuses a missing, empty, invalid or oversize charter file with exit 2', async () => {
+  await serve();
+  expect(await runHostOnce('start', { charterFile: join(home, 'absent.txt'), expectRefusal: true }))
+    .toBe(2);
+  const emptyPath = join(home, 'empty.txt');
+  await writeFile(emptyPath, '');
+  expect(await runHostOnce('start', { charterFile: emptyPath, expectRefusal: true })).toBe(2);
+  const blankPath = join(home, 'blank.txt');
+  await writeFile(blankPath, ' \n\t ');
+  expect(await runHostOnce('start', { charterFile: blankPath, expectRefusal: true })).toBe(2);
+  await writeFile(join(home, 'bad.txt'), Buffer.from([0xff, 0xfe, 0x41]));
+  expect(await runHostOnce('start', { charterFile: join(home, 'bad.txt'), expectRefusal: true }))
+    .toBe(2);
+  expect(await runHostOnce('start', { charterFile: join(home, 'world'), expectRefusal: true }))
+    .toBe(2);
+  expect(await runHostOnce('start', { charterFile: join(home, 'providers.json'), expectRefusal: true }))
+    .toBe(2);
+  await writeFile(join(home, 'huge.txt'), 'x'.repeat(8193));
+  expect(await runHostOnce('start', { charterFile: join(home, 'huge.txt'), expectRefusal: true }))
+    .toBe(2);
+  expect(logged(log)).toContainEqual(
+    expect.objectContaining({ event: 'host/error', error: 'HostConfigError' }),
+  );
+  // The boot-recovery start (node/boot journaled, no config) still composes a
+  // charter — and the exact 8192-byte boundary is accepted, not refused.
+  await seedBootOnly(home);
+  const exactPath = join(home, 'exact.txt');
+  await writeFile(exactPath, 'x'.repeat(8192));
+  expect(await runHostOnce('start', { charterFile: exactPath })).toBe(0);
+  const events = await readC13(home, 'node-0');
+  const seeded = events.filter((e) => e.type === 'system/message')[0]!.data as
+    { value: { value: { charter: string } } };
+  expect(seeded.value.value.charter).toBe('x'.repeat(8192));
+}, 20_000);
+
+it('a journaled configuration wins over --charter-file', async () => {
+  await serve();
+  await seedConfig(existingConfig);
+  const charterPath = join(home, 'charter.txt');
+  await writeFile(charterPath, 'Operator charter for a production variant.', { mode: 0o600 });
+  expect(await runHostOnce('start', { charterFile: charterPath, expectRefusal: true })).toBe(2);
+  const events = await readC13(home, 'node-0');
+  expect(events.filter((e) => e.type === 'system/message')).toHaveLength(1);
 }, 20_000);
 
 it('resume uses the journaled model and writes no second system/message', async () => {

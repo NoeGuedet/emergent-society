@@ -1,5 +1,5 @@
-import { lstat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { lstat, open, stat, type FileHandle } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { defaultAgentConfig, validateAgentConfig } from '../context/config.js';
 import type { AgentConfig } from '../context/contracts.js';
 import { C13_EVENT_TYPES } from '../context/events.js';
@@ -235,7 +235,7 @@ export function wrapHandler(handler: TurnHandler, log: HostLog): TurnHandler {
 /** What one host run was asked to do; every field is the CLI's validated value. */
 export type HostOptions = {
   readonly home: string; readonly uid: string; readonly command: HostCommand;
-  readonly model?: string; readonly heading?: string;
+  readonly model?: string; readonly heading?: string; readonly charterFile?: string;
   readonly sandbox: false | { readonly launcherPath?: string };
   readonly pollMs?: number; readonly log: HostLog;
 };
@@ -331,6 +331,71 @@ async function readCellConfig(home: string, uid: string): Promise<CellConfigStat
   }
 }
 
+/** The operator charter ceiling: a file this large would own every request. */
+const MAX_CHARTER_BYTES = 8192;
+
+/**
+ * Reads the operator's charter file once, at the start gate. The path is the
+ * operator's own (validated absolute by argv parsing) and must resolve to a
+ * regular file — a FIFO, a device or a directory is refused rather than read;
+ * symlinks are followed. At most `MAX_CHARTER_BYTES + 1` raw bytes are ever
+ * loaded, so an oversize file is refused by its byte count, never buffered
+ * whole; the bytes must be valid UTF-8 — an invalid encoding is refused, not
+ * silently rewritten into replacement characters — and nothing about the file
+ * is ever echoed back except its path and size, never its content. The
+ * providers store is refused by path: a charter is journaled as configuration,
+ * and the credential store must never enter the journal.
+ */
+async function readCharterFile(home: string, uid: string, path: string): Promise<string> {
+  const resolved = resolve(path);
+  const { providersFile } = cellPaths(home, uid);
+  if (resolved === resolve(providersFile)) {
+    throw new HostConfigError(
+      'refusing the providers store as a charter file; its content would be journaled');
+  }
+  let info;
+  try {
+    info = await stat(resolved);
+  } catch (err) {
+    throw new HostConfigError(
+      `could not read the charter file ${path}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!info.isFile()) {
+    throw new HostConfigError(`the charter file ${path} is not a regular file`);
+  }
+  let handle: FileHandle;
+  try {
+    handle = await open(resolved, 'r');
+  } catch (err) {
+    throw new HostConfigError(
+      `could not read the charter file ${path}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    const buffer = Buffer.alloc(MAX_CHARTER_BYTES + 1);
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const { bytesRead: chunk } = await handle.read(
+        buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+      if (chunk === 0) break;
+      bytesRead += chunk;
+    }
+    if (bytesRead > MAX_CHARTER_BYTES) {
+      throw new HostConfigError(
+        `the charter file is over ${MAX_CHARTER_BYTES} bytes; the limit is ${MAX_CHARTER_BYTES}`);
+    }
+    let text: string;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead));
+    } catch {
+      throw new HostConfigError(`the charter file ${path} is not valid UTF-8`);
+    }
+    if (text.trim() === '') throw new HostConfigError('the charter file is empty');
+    return text;
+  } finally {
+    await handle.close();
+  }
+}
+
 /**
  * The start/resume gate, pinned by §3.5.
  *
@@ -338,10 +403,14 @@ async function readCellConfig(home: string, uid: string): Promise<CellConfigStat
  * durable `node/boot` but no `system/message` is the recoverable crash window
  * and is allowed. `resume` never supplies one — a `--model`/`--heading` on a
  * resume is refused rather than ignored, so an operator who expects their flags
- * to win is told the journaled config wins.
+ * to win is told the journaled config wins. `--charter-file` follows the same
+ * rule: it replaces the default charter on any start that composes a config (a
+ * fresh cell, or the boot-without-config recovery), and a resume carrying it is
+ * refused; the file is read after the journaled-config refusal, so a start on
+ * an already-configured cell never touches the operator's file.
  */
 async function resolveInitialConfig(options: HostOptions): Promise<AgentConfig> {
-  const { home, uid, command, model, heading } = options;
+  const { home, uid, command, model, heading, charterFile } = options;
   const state = await readCellConfig(home, uid);
   if (command === 'start') {
     if (model === undefined || model === '') throw new HostConfigError('start requires a model');
@@ -352,10 +421,20 @@ async function resolveInitialConfig(options: HostOptions): Promise<AgentConfig> 
     if (state.config !== null) {
       throw new HostConfigError('cell already has a journaled configuration; use resume');
     }
-    return validateAgentConfig({ ...defaultAgentConfig(), model, heading });
+    const charter = charterFile !== undefined
+      ? await readCharterFile(home, uid, charterFile) : undefined;
+    return validateAgentConfig({
+      ...defaultAgentConfig(),
+      model,
+      heading,
+      ...(charter !== undefined ? { charter } : {}),
+    });
   }
   if (model !== undefined || heading !== undefined) {
     throw new HostConfigError('resume takes no --model or --heading; the journaled config wins');
+  }
+  if (charterFile !== undefined) {
+    throw new HostConfigError('resume takes no --charter-file; the journaled config wins');
   }
   if (!state.hasLog || state.config === null) {
     throw new HostConfigError('no journaled configuration; use start');
