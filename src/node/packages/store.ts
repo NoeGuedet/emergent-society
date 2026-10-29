@@ -92,7 +92,7 @@ export type PackageStore = {
     readonly corrupt: readonly CorruptDefinition[];
   }>;
   /**
-   * The name channel (C1.6): the latest verified definition stored under a
+   * The name channel (the friction pass): the latest verified definition stored under a
    * name, or null. A derived, read-only query — the store is the durable
    * truth, "latest" is the greatest directory mtime among the name's stored
    * versions (define is write-once per id, undefine removes the entry, a
@@ -108,7 +108,8 @@ export type PackageStore = {
    * The name's newest stored id by mtime, with no verification and no
    * skipping — the destructive resolution (undefine). A corrupt newest
    * version is NOT skipped here: the caller faces it instead of having the
-   * destructive act land on an older version.
+   * destructive act land on an older version. "Newest" means newest
+   * attributable — see newestIdByName's own residual.
    */
   newestIdByName(name: string): Promise<string | null>;
   /** One verified definition by exact id, or null (derived, read-only). */
@@ -544,12 +545,15 @@ export async function createPackageStore(deps: PackageStoreDeps): Promise<Packag
   }
 
   /**
-   * The name's newest stored id by mtime, with no verification and no
-   * skipping — the destructive resolution. Unlike `resolveLatestByName`, a
-   * corrupt newest version is NOT skipped: the caller must face it (refuse
-   * and teach the id) rather than have the destructive act land on an older
-   * version the name was not addressing. Null when no stored manifest
-   * carries the name.
+   * The name's newest ATTRIBUTABLE stored id by mtime, with no verification
+   * and no skipping — the destructive resolution. Unlike
+   * `resolveLatestByName`, a newest that fails verification is NOT skipped:
+   * the caller faces it (refusing and teaching the id) rather than having
+   * the destructive act land on an older version the name was not
+   * addressing. An entry whose manifest cannot be parsed is unattributable
+   * to any name (the collectByName pre-filter), so it is invisible here and
+   * the boot scan deletes it; within one process lifetime the by-id channel
+   * remains exact for it. Null when no stored manifest carries the name.
    */
   async function newestIdByName(name: string): Promise<string | null> {
     const candidates = await collectByName(name);

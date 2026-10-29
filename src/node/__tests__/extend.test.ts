@@ -414,7 +414,7 @@ describe('extend: refusals and the funnel boundary', () => {
     }
   }, 30_000);
 
-  it('bridges a native call to a live-registered tool through the funnel (C1.6)', async () => {
+  it('bridges a native call to a live-registered tool through the funnel (the friction pass)', async () => {
     const s = await openSession();
     try {
       writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
@@ -1064,7 +1064,7 @@ const SHOUT_SOURCE = 'return {\n'
   + '  }],\n'
   + '};\n';
 
-describe('extend: packages addressable by name (C1.6 L1)', () => {
+describe('extend: packages addressable by name (the friction pass, L1)', () => {
   // Defines two versions of one name and pins their directory mtimes: the
   // latest-wins resolution must not depend on millisecond scheduling.
   async function defineTwoVersions(

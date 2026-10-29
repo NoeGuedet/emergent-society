@@ -223,7 +223,7 @@ describe('run registry: invalid registrations (the declaration bounds)', () => {
     ])).code).toBe('invalid-registration');
   });
 
-  it('refuses a schema whose root type is not object (the funnel shape, C1.6)', () => {
+  it('refuses a schema whose root type is not object (the funnel shape, the friction pass)', () => {
     const { reg } = registry();
     // The invoked arguments are one JSON object — a scalar- or array-rooted
     // tool could never be called through the funnel, so it is refused at

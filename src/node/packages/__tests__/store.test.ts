@@ -463,7 +463,7 @@ describe('package store: symlinked cell layouts', () => {
   });
 });
 
-describe('package store: the name channel (C1.6)', () => {
+describe('package store: the name channel (the friction pass)', () => {
   // Two stored versions of one name with pinned directory mtimes: the
   // latest-wins resolution must not depend on millisecond scheduling.
   async function twoVersions(f: { home: string; world: string; scratch: string }) {

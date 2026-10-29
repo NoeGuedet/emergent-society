@@ -670,7 +670,7 @@ describe('dispatchCalls: web tools', () => {
       expect(data.isError).toBe(true);
       expect(data.failure).toEqual({ code: 'denied', status: null });
       expect(data.raw).toBeNull();
-      // The honest refusal (C1.6): the detail says why, value-free.
+      // The honest refusal (the friction pass): the detail says why, value-free.
       expect(data.message.content).toBe('error: denied\nno web provider is configured in this cell');
     } finally {
       await s.shutdown();
@@ -919,7 +919,7 @@ describe('dispatchCalls: web tools', () => {
     }
   }, 15000);
 
-  it('refuses a web call with no web provider configured, honestly (C1.6)', async () => {
+  it('refuses a web call with no web provider configured, honestly (the friction pass)', async () => {
     const { home } = world();
     const s = await openSession(home);
     try {

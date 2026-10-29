@@ -256,7 +256,7 @@ export function createRunRegistry(events: RunRegistryEvents): {
       if (dialect !== null) {
         return { ok: false, code: 'invalid-registration', detail: dialect };
       }
-      // The funnel's one shape rule, made a registration rule (C1.6): the
+      // The funnel's one shape rule, made a registration rule (the friction pass): the
       // invoked arguments are one JSON object, so the declared root must be
       // one — a scalar- or array-rooted tool could never be called through
       // the funnel, and the native bridge holds the funnel's own shapes.

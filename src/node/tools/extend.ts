@@ -42,7 +42,7 @@ export type ExtendPort = {
 };
 
 /**
- * How a verb addresses a Package (C1.6): by name — the ergonomic standard
+ * How a verb addresses a Package (the friction pass): by name — the ergonomic standard
  * the models are trained for, resolving to the latest stored version — or by
  * id, the exact content-addressed channel. Exactly one, as decide() enforced.
  */
@@ -270,8 +270,8 @@ function renderInspect(
 
 /**
  * Resolves the run reference to a stored definition with the channel's own
- * honest not-found wording (C1.6): the name channel names the name, the id
- * channel names the id — never the bare pre-C1.6 id wording for a name the
+ * honest not-found wording (the friction pass): the name channel names the name, the id
+ * channel names the id — never the bare pre-friction-pass id wording for a name the
  * model actually sent. (Undefine does not use this: its destructive
  * resolution never skips, so it resolves by hand.)
  */
@@ -443,8 +443,10 @@ export async function executeExtend(opts: {
     // clean exit lands between the two live reads). Re-read the live ids and
     // refuse when they moved: a stop must never journal a verb fact for a
     // Run that already ended — the crash fact owns that Run's ending. The
-    // remaining window (re-read → stopRun) is the pre-name-era design's own,
-    // owned by the supervisor's kernelStopped/disposed machinery.
+    // remaining residual is the supervisor's drain rule, unchanged by the
+    // name channel: a child that exited while a grandchild still holds its
+    // stdout open keeps `live` set until the drain, a death this re-read
+    // cannot see — kernelStopped and the drain own that verdict.
     if (port.supervisor.liveRunId() !== liveId
       || port.supervisor.livePackageId() !== livePackage) {
       await appendResult(gate, id, callId,

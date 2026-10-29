@@ -448,7 +448,7 @@ describe('the world stays usable', () => {
   );
 
   it.skipIf(!launcherPresent)(
-    'grants /etc/ssl/openssl.cnf read — the node toolchain and crypto work (C1.6)', async () => {
+    'grants /etc/ssl/openssl.cnf read — the node toolchain and crypto work (the friction pass)', async () => {
       const { rt } = await confined();
       // Found empirically by the first live run: `node --check` (and any node
       // startup that loads OpenSSL's config) dies in the shell without the

@@ -23,7 +23,7 @@ import { executeExtend, type ExtendDecision, type ExtendPort } from './extend.js
  * and no artifact), `extend` runs the six package verbs through the injected
  * `ExtendPort`, and a **live-registered package tool attempted natively — the
  * bare-name idiom the models are trained for — is bridged to the funnel**
- * (C1.6): the same executor, the same kernel-side schema validation, the same
+ * (the friction pass): the same executor, the same kernel-side schema validation, the same
  * confinement and caps, so the funnel stays the only invocation path while the
  * native call just works. The advertised offering never moves (the frozen
  * invariant); the bridge is dispatch sugar over it. Any other name is an
@@ -50,13 +50,13 @@ type Decision =
 
 const INVALID: Decision = { kind: 'error', failure: { code: 'invalid-tool', status: null } };
 
-/** The C1.6 teaching refusal: the frozen code stays, the silence goes. */
+/** The friction pass teaching refusal: the frozen code stays, the silence goes. */
 function invalidDetail(detail: string): Decision {
   return { kind: 'error', failure: { code: 'invalid-tool', status: null }, detail };
 }
 
 /**
- * The native-call bridge (C1.6): a call whose name is a live-registered
+ * The native-call bridge (the friction pass): a call whose name is a live-registered
  * package tool becomes the funnel decision — the bare-name idiom the models
  * are trained for, executed by the one invocation path. The registry is the
  * in-memory truth for live tools (dispatch never reads the store), the
@@ -163,7 +163,7 @@ function decide(call: FunctionCall, config: AgentConfig): Decision {
     return { kind: 'extend', verb: 'define', name: name2, purpose, path };
   }
   if (verb === 'run' || verb === 'stop' || verb === 'undefine') {
-    // The C1.6 name channel: exactly one of name or id — both is ambiguous,
+    // The friction pass name channel: exactly one of name or id — both is ambiguous,
     // neither is empty. A wrong key SET names the rule (the teaching
     // refusal); a wrong-typed value with the right key set stays bare —
     // the model sent exactly one reference, the rule is not what it broke.
@@ -432,7 +432,7 @@ export async function dispatchCalls(
     }
     if (decision.kind === 'web_search' || decision.kind === 'web_fetch') {
       if (web === undefined) {
-        // The honest refusal (C1.6): the tools are offered and allowed, but
+        // The honest refusal (the friction pass): the tools are offered and allowed, but
         // this cell composed no web provider — the same value-free words
         // every time, so the model never pays a call to decode a bare
         // denied. The failure code stays the frozen 'denied'.

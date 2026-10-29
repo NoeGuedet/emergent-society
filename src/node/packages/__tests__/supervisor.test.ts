@@ -69,6 +69,7 @@ interface Harness {
     readonly sandbox?: boolean;
     readonly terminal?: { run: (cmd: string) => Promise<unknown> } | null;
     readonly web?: object | null;
+    readonly webAllowance?: { readonly search: boolean; readonly fetch: boolean };
   }): ReturnType<typeof createRunSupervisor>;
   dispose(): Promise<void>;
 }
@@ -105,7 +106,7 @@ async function harness(sandbox: boolean): Promise<Harness> {
         shellTimeoutMs: INVOKE_MS, killGraceMs: KILL_GRACE_MS,
         maxShellCaptureBytes: 16 * 1024 * 1024,
         now: clock.now, schedule: clock.schedule,
-        webAllowance: { search: true, fetch: true },
+        webAllowance: overrides.webAllowance ?? { search: true, fetch: true },
         terminal: (overrides.terminal !== undefined
           ? overrides.terminal
           : {
@@ -541,6 +542,37 @@ describe('run supervisor: the audit corrections', () => {
       .toMatchObject({ status: 'error', message: /denied/ });
     await denied.stopRun();
     await h.dispose();
+  }, 20_000);
+
+  it('names the allowance, not a phantom absent provider, when both web tools are attenuated', async () => {
+    const h = await harness(true);
+    try {
+      // The host nulls the web port when the config attenuates BOTH web
+      // tools — the honesty fix: the null port alone cannot distinguish
+      // "no provider configured" from "no allowance", and the allowance is
+      // the true cause whenever the config withheld it.
+      const attenuated = h.supervisor({
+        web: null, webAllowance: { search: false, fetch: false },
+      });
+      const start = await attenuated.startRun('0'.repeat(64), sourceOf('websearch.js'));
+      expect(start.ok).toBe(true);
+      const tool = attenuated.registry.lookup('find_docs');
+      expect(await attenuated.invokeTool(tool!, { query: 'landlock' }))
+        .toMatchObject({ status: 'error', message: /no web allowance for it/ });
+      await attenuated.stopRun();
+      // With the allowance covering the call, the null port is the cause.
+      const noProvider = h.supervisor({
+        web: null, webAllowance: { search: true, fetch: true },
+      });
+      const start2 = await noProvider.startRun('1'.repeat(64), sourceOf('websearch.js'));
+      expect(start2.ok).toBe(true);
+      const tool2 = noProvider.registry.lookup('find_docs');
+      expect(await noProvider.invokeTool(tool2!, { query: 'landlock' }))
+        .toMatchObject({ status: 'error', message: /no web provider is configured in this cell/ });
+      await noProvider.stopRun();
+    } finally {
+      await h.dispose();
+    }
   }, 20_000);
 
   it('refuses a forged pre-ready service request before any terminal run', async () => {
