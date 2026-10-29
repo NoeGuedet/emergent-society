@@ -83,5 +83,6 @@ export {
 // derived state beside a journal (the context snapshots): they must use the same
 // fsync/rename discipline, not their own.
 export {
-  JournalWriteStalledError, atomicWriteFile, ensureDurableDirectory, readFileOrNull, syncPath,
+  JournalWriteStalledError, atomicWriteFile, ensureDurableDirectory, isErrno,
+  readFileOrNull, syncPath,
 } from './fsutil.js';

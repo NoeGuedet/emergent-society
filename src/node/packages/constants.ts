@@ -23,3 +23,12 @@ export const MAX_PACKAGE_NAME_CHARS = 64;
 
 /** The declared purpose bound (1-512 chars, the same bound as descriptions). */
 export const MAX_PACKAGE_PURPOSE_CHARS = 512;
+
+/** One definition's source cap (the kernel-side bound on the fd read). */
+export const MAX_PACKAGE_SOURCE_BYTES = 1_048_576;
+
+/** The node-wide total source-bytes cap across all stored definitions. */
+export const MAX_PACKAGE_SOURCE_BYTES_PER_NODE = 64 * 1024 * 1024;
+
+/** The stored manifest.json cap (canonical {name, purpose} is always under 1 KiB). */
+export const MAX_MANIFEST_BYTES = 1_024;
