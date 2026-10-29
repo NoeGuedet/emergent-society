@@ -342,9 +342,11 @@ const MAX_CHARTER_BYTES = 8192;
  * loaded, so an oversize file is refused by its byte count, never buffered
  * whole; the bytes must be valid UTF-8 — an invalid encoding is refused, not
  * silently rewritten into replacement characters — and nothing about the file
- * is ever echoed back except its path and size, never its content. The
- * providers store is refused by path: a charter is journaled as configuration,
- * and the credential store must never enter the journal.
+ * is ever echoed back except its path, never its content. The providers store
+ * is refused by path AND by identity: a symlink or a hardlink to it carries
+ * the same inode, so the opened file's `(dev, ino)` is compared to the
+ * store's before a single byte is read — the credential store must never
+ * enter the journal.
  */
 async function readCharterFile(home: string, uid: string, path: string): Promise<string> {
   const resolved = resolve(path);
@@ -352,6 +354,13 @@ async function readCharterFile(home: string, uid: string, path: string): Promise
   if (resolved === resolve(providersFile)) {
     throw new HostConfigError(
       'refusing the providers store as a charter file; its content would be journaled');
+  }
+  let providersInfo;
+  try {
+    providersInfo = await stat(providersFile);
+  } catch {
+    // The store may not exist yet in a fresh home: no inode to compare then.
+    providersInfo = null;
   }
   let info;
   try {
@@ -371,6 +380,15 @@ async function readCharterFile(home: string, uid: string, path: string): Promise
       `could not read the charter file ${path}: ${err instanceof Error ? err.message : String(err)}`);
   }
   try {
+    // The identity check the path check cannot give: a symlink or a hardlink
+    // to the providers store has a different path but the same inode, and
+    // the opened handle's own stat is the opened bytes' truth — no TOCTOU.
+    const opened = await handle.stat();
+    if (providersInfo !== null
+      && opened.dev === providersInfo.dev && opened.ino === providersInfo.ino) {
+      throw new HostConfigError(
+        'refusing the providers store as a charter file; its content would be journaled');
+    }
     const buffer = Buffer.alloc(MAX_CHARTER_BYTES + 1);
     let bytesRead = 0;
     while (bytesRead < buffer.length) {

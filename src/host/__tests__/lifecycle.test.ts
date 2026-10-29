@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
-  mkdtemp, readdir, readFile, rm, writeFile,
+  link, mkdtemp, readdir, readFile, rm, symlink, writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -405,6 +405,14 @@ it('start refuses a missing, empty, invalid or oversize charter file with exit 2
   expect(await runHostOnce('start', { charterFile: join(home, 'world'), expectRefusal: true }))
     .toBe(2);
   expect(await runHostOnce('start', { charterFile: join(home, 'providers.json'), expectRefusal: true }))
+    .toBe(2);
+  // The store's identity, not just its path: a symlink or a hardlink to it
+  // carries the same inode and must refuse the same way.
+  await symlink(join(home, 'providers.json'), join(home, 'link-charter.txt'));
+  expect(await runHostOnce('start', { charterFile: join(home, 'link-charter.txt'), expectRefusal: true }))
+    .toBe(2);
+  await link(join(home, 'providers.json'), join(home, 'hard-charter.txt'));
+  expect(await runHostOnce('start', { charterFile: join(home, 'hard-charter.txt'), expectRefusal: true }))
     .toBe(2);
   await writeFile(join(home, 'huge.txt'), 'x'.repeat(8193));
   expect(await runHostOnce('start', { charterFile: join(home, 'huge.txt'), expectRefusal: true }))
