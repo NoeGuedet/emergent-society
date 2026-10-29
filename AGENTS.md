@@ -37,6 +37,9 @@ is still stopping.
 - `build:native` — build the vendored Landlock launcher (needs host `cc`).
 - `test:first-light` — `npm run build` + the compiled smoke script (scenarios A–E; the
   confinement scenario needs Linux Landlock ABI ≥ 3 and skips when unavailable).
+- `test:first-light-packages` — `npm run build` + the compiled packages smoke (scenario
+  F: define → run → funneled call → stop → crash → resume → re-run → pause; the
+  frozen-offering invariant asserted compiled-side).
 - `live:first-light` — live-model wrapper; refuses and exits `2` unless `ES_LIVE_LLM=1`.
 - `start` — `node dist/host/main.js`.
 
@@ -75,6 +78,7 @@ is still stopping.
 3. `npm test`
 4. `npm run build`
 5. `npm run test:first-light`
+6. `npm run test:first-light-packages`
 
 No push until every gate passes; there is no CI to catch a failure later.
 
