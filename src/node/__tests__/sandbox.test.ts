@@ -138,6 +138,17 @@ describe('buildSandboxSpec', () => {
       }
       const certs = await realpathOrNull('/etc/ssl/certs');
       if (certs !== null) expect(flagsFor(grants, certs)).toEqual(['--ro']);
+      // The C1.6 symmetric grant: the shell reads the interpreter's OpenSSL
+      // config (same dedupe respect as localtime — a target under an
+      // already-granted root is simply absent).
+      const opensslCnf = await realpathOrNull('/etc/ssl/openssl.cnf');
+      if (opensslCnf !== null) {
+        if (opensslCnf === '/usr' || opensslCnf.startsWith('/usr/')) {
+          expect(grants.some((grant) => grant.path === opensslCnf)).toBe(false);
+        } else {
+          expect(flagsFor(grants, opensslCnf)).toEqual(['--ro']);
+        }
+      }
       expect(flagsFor(grants, '/proc')).toEqual(['--ro']);
 
       expect(flagsFor(grants, '/dev/null')).toEqual(['--rw']);

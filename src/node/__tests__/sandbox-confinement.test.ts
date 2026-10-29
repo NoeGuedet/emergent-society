@@ -448,6 +448,51 @@ describe('the world stays usable', () => {
   );
 
   it.skipIf(!launcherPresent)(
+    'grants /etc/ssl/openssl.cnf read — the node toolchain and crypto work (C1.6)', async () => {
+      const { rt } = await confined();
+      // Found empirically by the first live run: `node --check` (and any node
+      // startup that loads OpenSSL's config) dies in the shell without the
+      // /etc/ssl/openssl.cnf read grant, while the Run spec always had it.
+      // The node-free faces first: the grant itself, readable through cat;
+      // /etc/ssl/private stays denied so a wholesale /etc/ssl grant cannot
+      // land unnoticed.
+      const read = await rt.run(
+        'test -r /etc/ssl/openssl.cnf && echo cnf-readable; '
+          + 'cat /etc/ssl/openssl.cnf >/dev/null && echo cat-ok; '
+          + 'cat /etc/ssl/private 2>&1; echo "private:$?"',
+        limits(), signal(),
+      );
+      expect(read.status).toBe('completed');
+      const readOut = text(read);
+      expect(readOut).toContain('cnf-readable');
+      expect(readOut).toContain('cat-ok');
+      expect(readOut).toMatch(/private:[1-9]/);
+      // The node face needs a node in the confined PATH (/usr/bin:/bin); a
+      // host with nvm-only node skips it rather than false-failing.
+      if (!existsSync('/usr/bin/node')) {
+        console.warn(
+          '[sandbox-confinement] no /usr/bin/node in the confined PATH: '
+            + 'skipping the node --check/crypto face of the openssl grant test',
+        );
+        return;
+      }
+      await writeFile(join(world, 'check.js'), 'const x = 1;\n');
+      const outcome = await rt.run(
+        'node --check check.js && echo node-check-ok; '
+          + 'node -e "require(\'node:crypto\').randomUUID(); console.log(\'crypto-ok\')"',
+        limits(), signal(),
+      );
+      expect(outcome.status).toBe('completed');
+      const out = text(outcome);
+      expect(out).toContain('node-check-ok');
+      expect(out).toContain('crypto-ok');
+      expect(out).not.toContain('OpenSSL configuration error');
+      expect(out).not.toContain('Permission denied');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it.skipIf(!launcherPresent)(
     'reads /proc through ps and completes a process-substitution read',
     async () => {
       const { rt } = await confined();

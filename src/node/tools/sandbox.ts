@@ -292,6 +292,15 @@ export async function buildSandboxSpec(opts: {
     const real = await optionalRealpath(join('/etc', name));
     if (real !== null) addGrant('--ro', real);
   }
+  // Node-tooling load-bearing, found empirically: node (the agent-run
+  // toolchain in the confined shell) opens OpenSSL's config before any
+  // script runs, and the missing read made `node --check` die while the Run
+  // spec always granted it. A regular file only — a host whose config path
+  // resolved to a directory must not silently gain a recursive read grant.
+  const opensslCnf = await optionalRealpath('/etc/ssl/openssl.cnf');
+  if (opensslCnf !== null && (await lstat(opensslCnf)).isFile()) {
+    addGrant('--ro', opensslCnf);
+  }
   const certs = await optionalRealpath('/etc/ssl/certs');
   if (certs !== null) addGrant('--ro', certs);
   const proc = await optionalRealpath('/proc');
@@ -447,7 +456,7 @@ export async function buildRunSandboxSpec(opts: {
   // Node-startup load-bearing, found empirically by the L3b confinement
   // battery: the interpreter's OpenSSL opens its own config before any guest
   // code runs, and a missing read makes every Run die at spawn (fail-closed,
-  // but feature-dead). The shell never needed it.
+  // but feature-dead). The shell carries the symmetric grant.
   const opensslCnf = await optionalRealpath('/etc/ssl/openssl.cnf');
   if (opensslCnf !== null) addGrant('--ro', opensslCnf);
   const certs = await optionalRealpath('/etc/ssl/certs');
