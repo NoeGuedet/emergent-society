@@ -1,8 +1,9 @@
 /**
  * The package layer's public surface (kernel.md, the local-log sections):
- * the frozen constants, the typed errors, and the definition store. The
- * facade protocol, registry and Run supervisor join this barrel in later
- * lots; internals stay unexported and tests import module paths directly.
+ * the frozen constants, the typed errors, the definition store and the Run
+ * supervisor — the composition root (the host) imports through this barrel.
+ * The protocol codec and the registry stay internal (their consumers are
+ * in-package); tests import module paths directly.
  */
 
 export {
@@ -21,3 +22,9 @@ export {
   type PackageStore,
   type PackageStoreDeps,
 } from './store.js';
+export {
+  createRunSupervisor,
+  type RunSupervisor,
+  type RunSupervisorDeps,
+  type RunSupervisorEvents,
+} from './supervisor.js';

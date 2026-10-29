@@ -7,6 +7,8 @@ import { ContextFold } from '../context/fold.js';
 import { loadVerifiedEvents } from '../context/loader.js';
 import { openFrontierJournal, type FrontierJournal } from '../frontier/index.js';
 import { nodeLayout } from '../journal/index.js';
+import { createPackageStore, createRunSupervisor } from '../node/packages/index.js';
+import { fileURLToPath } from 'node:url';
 import type { ProviderRegistry } from '../node/tools/providers.js';
 import { DEFAULT_TERMINAL_ENV } from '../node/tools/terminal.js';
 import { webToolsFromProviders } from '../node/tools/web.js';
@@ -109,10 +111,45 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
       credentialId: credential.credentialId,
     });
     const adapter = new ProviderAdapter(transport, systemProviderPolicy, frontier.gate);
+    // The extend port (C1.5): the host composes the store and the supervisor
+    // once per runtime over the cell's own roots. The supervisor is built
+    // INSIDE the factory: its event port is the loop's router and its service
+    // ports are the node's own — the allowedTools inheritance is decided here
+    // (a node without a tool passes a null port, so a package's svc call
+    // resolves denied).
+    const store = createPackageStore({
+      home, uid, worldDir: paths.world, scratchDir: join(home, 'tmp', uid),
+    });
     const runtime = createAgentRuntime({
       home, uid, world, initialConfig: config, adapter,
       terminal: { env: DEFAULT_TERMINAL_ENV, sandbox },
       ...(webTools !== undefined ? { webTools } : {}),
+      extend: (events, ports) => ({
+        store,
+        supervisor: createRunSupervisor({
+          home, uid,
+          sandbox: sandbox !== false,
+          shellTimeoutMs: config.policy.shellTimeoutMs,
+          killGraceMs: config.policy.killGraceMs,
+          maxShellCaptureBytes: config.policy.maxShellCaptureBytes,
+          now: () => Date.now(),
+          schedule: (ms, callback) => {
+            const timer = setTimeout(callback, ms);
+            return () => clearTimeout(timer);
+          },
+          terminal: config.allowedTools.includes('execute') ? ports.terminal : null,
+          web: config.allowedTools.includes('web_search')
+            || config.allowedTools.includes('web_fetch') ? ports.web : null,
+          events,
+          bootstrapPath: fileURLToPath(new URL(
+            '../node/packages/run-bootstrap.js', import.meta.url,
+          )),
+          ...(sandbox !== false && typeof sandbox === 'object'
+            && sandbox.launcherPath !== undefined
+            ? { launcherPath: sandbox.launcherPath } : {}),
+        }),
+        sandbox: sandbox !== false,
+      }),
     });
     const driver = await NodeDriver.open(home, uid, wrapHandler(runtime.handler, log), world, {
       knownTypes: C13_EVENT_TYPES,

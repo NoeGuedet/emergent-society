@@ -1,5 +1,7 @@
 import { Buffer } from 'node:buffer';
-import { BlobStore, assertNodeUid } from '../journal/index.js';
+import { rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { BlobStore, assertNodeUid, nodeDir } from '../journal/index.js';
 import { canonicalBytes } from '../context/artifacts.js';
 import { assemble } from '../context/assembler.js';
 import { defaultAgentConfig, validateAgentConfig } from '../context/config.js';
@@ -93,7 +95,10 @@ export type RuntimeOptions = {
    * construction — the host composes the store and the supervisor (L5), tests
    * inject them. When absent, offered `extend` calls resolve as `denied`.
    */
-  readonly extend?: (events: RunSupervisorEvents) => ExtendPort;
+  readonly extend?: (
+    events: RunSupervisorEvents,
+    ports: { readonly terminal: TerminalPort | null; readonly web: WebTools | null },
+  ) => ExtendPort;
 };
 
 export interface AgentRuntime {
@@ -175,18 +180,21 @@ class Runtime implements AgentRuntime {
       readHistory: (home, uid, knownTypes) => loadVerifiedEvents(home, uid, knownTypes),
       readBlob: (hash) => new BlobStore(this.options.home).get(hash),
       acknowledgedWorld: (turn) => this.fold.acknowledgedWorld(turn),
-      onStop: async (): Promise<void> => { await this.stopTerminal(); },
+      onStop: async (gate): Promise<void> => {
+        await this.stopTerminal();
+        await this.stopPackages(gate);
+      },
     };
     // The events router: the supervisor's effect/error/service facts append
     // to whichever gate the current dispatch holds — the turn gate here, the
     // ready gate for L5's boot scan.
     const packageGateHolder: { gate: BoundaryGate | null } = { gate: null };
     this.packageGateHolder = packageGateHolder;
-    this.extendPort = options.extend === undefined ? null : options.extend({
+    const packageEvents: RunSupervisorEvents = {
       effect: (payload) => { packageGateHolder.gate?.append('package/effect', payload); },
       error: (payload) => { packageGateHolder.gate?.append('package/error', payload); },
       service: (payload) => { packageGateHolder.gate?.append('package/service', payload); },
-    });
+    };
     this.terminalPort = {
       run: async (cmd, limits, signal) => {
         if (this.terminalStopped) {
@@ -204,6 +212,58 @@ class Runtime implements AgentRuntime {
         return built.runtime.run(cmd, limits, signal);
       },
     };
+    // The extend port is composed last: the factory receives the event
+    // router AND the node's own ports (svc inherits their rights — an
+    // absent tool is a null port, the allowedTools inheritance).
+    this.extendPort = options.extend === undefined
+      ? null
+      : options.extend(packageEvents, {
+        terminal: this.terminalPort,
+        web: options.webTools ?? null,
+      });
+  }
+
+  /**
+   * The host-stopped Run's disposal (the stopTerminal precedent): the
+   * supervisor's stop completes kernel-side, and the `package/stop` fact
+   * names the host as its reason through the stop gate — a stop-phase fact is
+   * never unattributed.
+   */
+  private async stopPackages(gate: BoundaryGate | null): Promise<void> {
+    const port = this.extendPort;
+    if (port === null) return;
+    const runId = port.supervisor.liveRunId();
+    const packageId = port.supervisor.livePackageId();
+    if (runId === null || packageId === null) return;
+    await port.supervisor.stopRun();
+    if (gate !== null) {
+      gate.append('package/stop', { id: packageId, runId, reason: 'host-stop' });
+      await gate.flush();
+    }
+  }
+
+  /**
+   * The boot scan (C1.5, design §6.1): every stored definition is re-verified
+   * in place — corrupt bytes are deleted and reported through the ready gate
+   * as `package/error` corrupt facts — and everything under `runs/` is reaped:
+   * no Run survives a restart, and a kernel crash between leaf creation and
+   * spawn cannot leak orphaned leaves. No config message, no re-journal: the
+   * offering is the frozen base offering by construction.
+   */
+  private async scanPackages(gate: BoundaryGate): Promise<void> {
+    const port = this.extendPort;
+    if (port === null) return;
+    const { corrupt } = await port.store.readMountedPackages();
+    for (const entry of corrupt) {
+      gate.append('package/error', {
+        id: entry.id, runId: null, code: 'corrupt', detail: entry.reason,
+      });
+    }
+    if (corrupt.length > 0) await gate.flush();
+    await rm(
+      join(nodeDir(this.options.home, this.options.uid), 'runs'),
+      { recursive: true, force: true },
+    ).catch(() => { /* absence is the clean state */ });
   }
 
   scheduleConfig(config: AgentConfig): void {
@@ -241,6 +301,10 @@ class Runtime implements AgentRuntime {
     // may spawn again, while an execute after a stop and before any next open
     // still fails closed. The runtime stays single-terminal — one live session.
     this.terminalStopped = false;
+    // The boot scan precedes the fold's config check, so it precedes the
+    // first turn (kernel.md, the C1.5 lifecycle): re-verify the stored
+    // definitions, report the corrupt ones, reap the orphaned run leaves.
+    await this.scanPackages(gate);
     if (this.fold.snapshot().config === null) {
       const stored = await gate.store(this.initialConfig);
       gate.append('system/message', { version: this.initialConfig.version, value: stored });

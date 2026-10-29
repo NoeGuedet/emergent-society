@@ -130,13 +130,14 @@ export interface DriverHooks {
    */
   acknowledgedWorld(turn?: number): WorldAcknowledgement | null;
   /**
-   * The handler's own teardown at driver stop (the C1.4b terminal session),
-   * called during shutdown after `node/shutdown` and before the writer closes,
-   * and — best-effort, with no shutdown event and before `writer.close()` —
-   * when `open()` fails after the writer was taken. Optional: a handler holding
-   * no host resources omits it.
+   * The handler's own teardown at driver stop (the C1.4b terminal session and
+   * the C1.5 live Package Run), called at two sites: the driver's shutdown
+   * (after `node/shutdown`, before the writer closes) with a fresh
+   * ready-scoped gate for the stop phase's own facts, and the failed
+   * `open()` resume path with `null` (no turn ran, so nothing is live to
+   * attribute). Optional: a handler holding no host resources omits it.
    */
-  readonly onStop?: () => Promise<void>;
+  readonly onStop?: (gate: BoundaryGate | null) => Promise<void>;
 }
 
 /**

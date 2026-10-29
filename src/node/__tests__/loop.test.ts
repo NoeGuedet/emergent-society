@@ -995,7 +995,7 @@ describe('shell confinement wiring (C1.4c)', () => {
   it('disposes a session build superseded by a stop and never memoizes the late result', async () => {
     const fx = fixture();
     const created: Array<{ readonly flag: { disposed: number } }> = [];
-    let stopHook: (() => Promise<void>) | null = null;
+    let stopHook: ((gate: BoundaryGate | null) => Promise<void>) | null = null;
     let stopOnBuild = true;
     const create = (): TerminalRuntime => {
       const flag = { disposed: 0 };
@@ -1006,7 +1006,7 @@ describe('shell confinement wiring (C1.4c)', () => {
       // supersedes the build deterministically — no timer, no race.
       const superseding = stopOnBuild;
       stopOnBuild = false;
-      if (superseding) queueMicrotask(() => { void stopHook?.(); });
+      if (superseding) queueMicrotask(() => { void stopHook?.(null); });
       return {
         run: () => Promise.resolve({
           status: 'completed', exitCode: 0, signal: null,

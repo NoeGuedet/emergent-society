@@ -247,7 +247,7 @@ export class NodeDriver {
       // and its failure, like the close's, must never mask the resume error,
       // which is the one that propagates.
       try {
-        await opts.hooks?.onStop?.();
+        await opts.hooks?.onStop?.(null);
       } catch { /* the resume error stands */ }
       try {
         await writer.close();
@@ -780,9 +780,15 @@ export class NodeDriver {
       failure ??= err;
     }
     try {
-      // The trusted handler's own teardown (the terminal session) runs before
-      // the journal closes; its failure joins the shutdown error channel.
-      await this.hooks?.onStop?.();
+      // The trusted handler's own teardown (the terminal session and the live
+      // Package Run) runs before the journal closes, with a ready-scoped gate
+      // for the stop phase's facts; its failure joins the shutdown error channel.
+      const stopGate = this.makeGate('ready', null, new AbortController().signal);
+      try {
+        await this.hooks?.onStop?.(stopGate.gate);
+      } finally {
+        stopGate.close();
+      }
     } catch (err) {
       failure ??= err;
     }
