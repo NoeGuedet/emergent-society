@@ -404,10 +404,11 @@ async function readCharterFile(home: string, uid: string, path: string): Promise
  * and is allowed. `resume` never supplies one — a `--model`/`--heading` on a
  * resume is refused rather than ignored, so an operator who expects their flags
  * to win is told the journaled config wins. `--charter-file` follows the same
- * rule: it replaces the default charter on any start that composes a config (a
- * fresh cell, or the boot-without-config recovery), and a resume carrying it is
- * refused; the file is read after the journaled-config refusal, so a start on
- * an already-configured cell never touches the operator's file.
+ * rule: its text becomes the BASE of the composed charter — the kernel
+ * appends the node's identity sentence — on any start that composes a config
+ * (a fresh cell, or the boot-without-config recovery), and a resume carrying
+ * it is refused; the file is read after the journaled-config refusal, so a
+ * start on an already-configured cell never touches the operator's file.
  */
 async function resolveInitialConfig(options: HostOptions): Promise<AgentConfig> {
   const { home, uid, command, model, heading, charterFile } = options;
@@ -421,13 +422,19 @@ async function resolveInitialConfig(options: HostOptions): Promise<AgentConfig> 
     if (state.config !== null) {
       throw new HostConfigError('cell already has a journaled configuration; use resume');
     }
-    const charter = charterFile !== undefined
-      ? await readCharterFile(home, uid, charterFile) : undefined;
+    // The composed charter always carries the node's identity: "You are
+    // <uid>." is the one kernel-composed sentence, appended to the factory
+    // or operator base — the uid is the git author of this node's commits and
+    // the self-name the wake predicate excludes (its own commits never wake
+    // it), and the charter is the pinned place it lives, outside compaction.
+    const base = charterFile !== undefined
+      ? await readCharterFile(home, uid, charterFile)
+      : defaultAgentConfig().charter;
     return validateAgentConfig({
       ...defaultAgentConfig(),
       model,
       heading,
-      ...(charter !== undefined ? { charter } : {}),
+      charter: `${base} You are ${uid}.`,
     });
   }
   if (model !== undefined || heading !== undefined) {

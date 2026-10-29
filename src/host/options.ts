@@ -68,10 +68,10 @@ Stop interrupts in-flight work; partial world writes may be committed; the shell
 resume starts a fresh PTY; resume is a full fold and unresolved effects are not re-executed; resume
 spends one turn. pause returns 0 once the host has released its cell, not necessarily after process reaping.
 A live or unverified host.json blocks a new host; delete it only if you are certain no host runs.
---charter-file replaces the default charter on a start into a cell with no journaled
-configuration (including the boot-recovery start); resume refuses it — the journaled
-config wins. The file's content is journaled as configuration; never point it at a
-secret-bearing file.
+--charter-file is the base of the composed charter on a start into a cell with no journaled
+configuration (including the boot-recovery start); the kernel appends the node identity sentence;
+resume refuses it — the journaled config wins. The file's content is journaled as configuration;
+never point it at a secret-bearing file.
 `;
 
 /**

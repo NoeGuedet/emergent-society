@@ -22,14 +22,15 @@ describe('defaultAgentConfig', () => {
       allowedTools: ['execute', 'wait', 'web_search', 'web_fetch', 'extend'],
       tools: [
         {
-          name: 'execute', description: 'Run a command in the shared world. The shell session persists across calls: working directory, exports and background jobs survive. A command that times out resets the session.',
+          name: 'execute', description: 'Run a command in the shared world. The shell session persists across calls: working directory, exports and background jobs survive. A command that times out resets the session. By default the shell is confined (the operator may start or resume with the sandbox off, which changes the boundaries below): write access is limited to the world (your working directory), $TMPDIR and two writable devices (/dev/null, /dev/tty); reads additionally cover /usr, /bin, /sbin, /lib*, a narrow /etc set, /proc and the remaining devices. /, /home, /var and the rest of the cell home are denied. Egress is open by decision: the shell can reach the network, and those exchanges are not journaled — the frontier records kernel-mediated calls only. The world\'s git metadata lives outside your worktree: a plain git in the world cannot see the world\'s history, and a .git you create is ignored and never staged — use ls and cat to explore the world.',
           parameters: {
             type: 'object', properties: { cmd: { type: 'string', minLength: 1 } },
             required: ['cmd'], additionalProperties: false,
           },
         },
         {
-          name: 'wait', description: 'Wait for a foreign world commit.',
+          name: 'wait',
+          description: 'End the turn and park until a foreign world commit lands (a commit you did not author; your own commits never wake you). Costs no tokens while parked. The next turn opens with a bounded patch view of the foreign commits since your last wake — read that first.',
           parameters: { type: 'object', properties: {}, additionalProperties: false },
         },
         {

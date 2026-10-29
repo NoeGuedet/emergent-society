@@ -357,6 +357,12 @@ it('start recovers a log with node/boot but no system/message', async () => {
   expect(events.some(
     (e) => e.type === 'node/boot' && (e.data as { reason?: string }).reason === 'resume',
   )).toBe(true);
+  // The factory-charter branch composes the identity sentence too (the common
+  // production path has no --charter-file).
+  const seeded = events.filter((e) => e.type === 'system/message')[0]!.data as
+    { value: { value: { charter: string } } };
+  expect(seeded.value.value.charter)
+    .toBe(`${defaultAgentConfig().charter} You are node-0.`);
 }, 20_000);
 
 it('refuses mock-model, a missing heading and a corrupt log with exit 2', async () => {
@@ -378,7 +384,8 @@ it('start composes the operator charter; resume refuses the flag-carried file', 
   const events = await readC13(home, 'node-0');
   const seeded = events.filter((e) => e.type === 'system/message')[0]!.data as
     { value: { value: { charter: string } } };
-  expect(seeded.value.value.charter).toBe('Operator charter for a production variant.');
+  expect(seeded.value.value.charter).toBe(
+    'Operator charter for a production variant. You are node-0.');
   expect(await runHostOnce('resume', { charterFile: charterPath, expectRefusal: true })).toBe(2);
 }, 20_000);
 
@@ -406,7 +413,9 @@ it('start refuses a missing, empty, invalid or oversize charter file with exit 2
     expect.objectContaining({ event: 'host/error', error: 'HostConfigError' }),
   );
   // The boot-recovery start (node/boot journaled, no config) still composes a
-  // charter — and the exact 8192-byte boundary is accepted, not refused.
+  // charter — and the exact 8192-byte FILE boundary is accepted, not refused
+  // (the composed charter grows by the identity sentence past the file cap,
+  // which bounds the operator's file, not the composed value).
   await seedBootOnly(home);
   const exactPath = join(home, 'exact.txt');
   await writeFile(exactPath, 'x'.repeat(8192));
@@ -414,7 +423,7 @@ it('start refuses a missing, empty, invalid or oversize charter file with exit 2
   const events = await readC13(home, 'node-0');
   const seeded = events.filter((e) => e.type === 'system/message')[0]!.data as
     { value: { value: { charter: string } } };
-  expect(seeded.value.value.charter).toBe('x'.repeat(8192));
+  expect(seeded.value.value.charter).toBe('x'.repeat(8192) + ' You are node-0.');
 }, 20_000);
 
 it('a journaled configuration wins over --charter-file', async () => {
