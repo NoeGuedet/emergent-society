@@ -358,7 +358,8 @@ describe('extend: refusals and the funnel boundary', () => {
         { verb: 'run', id: 'x', tool: 'y' },
         { verb: 'call', tool: 't' },
         { verb: 'call', tool: 't', args: 'not an object' },
-        { verb: 'stop' },
+        // A bare {verb:"stop"} is NOT malformed: the Run is a singleton, so
+        // the bare stop is valid (its own test pins the behavior).
         { verb: 'undefine', id: 'x', name: 'y' },
         { verb: 'inspect', extra: true },
       ];
@@ -515,7 +516,7 @@ describe('extend: refusals and the funnel boundary', () => {
     }
   }, 30_000);
 
-  it('refuses a native call to a stored-but-not-running tool as unknown-tool, bare', async () => {
+  it('refuses a native call to a stored-but-not-running tool as unknown-tool, teaching', async () => {
     const s = await openSession();
     try {
       writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
@@ -523,8 +524,8 @@ describe('extend: refusals and the funnel boundary', () => {
         verb: 'define', name: 'echo_pkg', purpose: 'echo', path: 'echo.js',
       });
       // Defined but never run: the registry — the in-memory truth for live
-      // tools — has nothing, so the native attempt is a bare unknown-tool.
-      // Dispatch never reads the store.
+      // tools — has nothing, so the native attempt is an unknown-tool whose
+      // detail teaches the live-Run rule. Dispatch never reads the store.
       const gate = s.gate('turn', 0);
       s.packageGate(gate);
       try {
@@ -542,7 +543,9 @@ describe('extend: refusals and the funnel boundary', () => {
         .filter((event) => event.type === 'tool/result').pop()!;
       const data = last.data as { isError: boolean; message: { content: string } };
       expect(data.isError).toBe(true);
-      expect(data.message.content).toBe('error: unknown-tool');
+      expect(data.message.content).toContain('error: unknown-tool');
+      expect(data.message.content).toContain('the offered tools are');
+      expect(data.message.content).toContain('only while their Run is live');
     } finally {
       await s.shutdown();
     }
@@ -579,7 +582,38 @@ describe('extend: refusals and the funnel boundary', () => {
         .filter((event) => event.type === 'tool/result').pop()!;
       const data = last.data as { failure: { code: string } | null; message: { content: string } };
       expect(data.failure).toEqual({ code: 'unknown-tool', status: null });
-      expect(data.message.content).toBe('error: unknown-tool');
+      expect(data.message.content).toContain('error: unknown-tool');
+      expect(data.message.content).toContain('the offered tools are');
+      // The Run IS live here: the liveness claim would be false, so the
+      // detail names the funnel's unavailability instead.
+      expect(data.message.content).toContain('the extend tool is not available in this cell');
+      expect(data.message.content).not.toContain('only while their Run is live');
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('stop without a reference stops the live Run (the singleton channel)', async () => {
+    const s = await openSession();
+    try {
+      writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
+      await extendCall(s, { verb: 'define', name: 'echo_pkg', purpose: 'echo', path: 'echo.js' });
+      await extendCall(s, { verb: 'run', name: 'echo_pkg' });
+      expect(s.supervisor.liveRunId()).not.toBeNull();
+      // A bare stop names the singleton itself: no reference, no wrong-name
+      // round trip.
+      const stopped = await extendCall(s, { verb: 'stop' });
+      expect(stopped.results[0]!.isError).toBe(false);
+      expect(stopped.results[0]!.content).toMatch(/^stopped \(package echo_pkg,/);
+      expect(s.supervisor.liveRunId()).toBeNull();
+      // A second bare stop names no live Run: the refusal teaches.
+      const second = await extendCall(s, { verb: 'stop' });
+      expect(second.results[0]!.isError).toBe(true);
+      expect(second.results[0]!.content).toContain('no Run is live');
+      // Both references is still a wrong key set — the at-most-one rule.
+      const both = await extendCall(s, { verb: 'stop', name: 'echo_pkg', id: 'x' });
+      expect(both.results[0]!.isError).toBe(true);
+      expect(both.results[0]!.content).toContain('extend stop takes at most one of name or id');
     } finally {
       await s.shutdown();
     }
@@ -1292,8 +1326,6 @@ describe('extend: packages addressable by name (the friction pass, L1)', () => {
         { verb: 'run' },
         { verb: 'run', name: 'x', id: 'y' },
         { verb: 'run', name: 'x', tool: 'y' },
-        { verb: 'stop' },
-        { verb: 'stop', name: 'x', id: 'y' },
         { verb: 'undefine' },
         { verb: 'undefine', name: 'x', id: 'y' },
         { verb: 'run', id: 'x', name: 'y' },
@@ -1305,12 +1337,30 @@ describe('extend: packages addressable by name (the friction pass, L1)', () => {
         expect(results[0]!.content, JSON.stringify(args))
           .toMatch(/takes exactly one of name or id/);
       }
+      // Stop keeps its own rule (the bare stop is valid): both keys, or a
+      // wrong key set, name the at-most-one rule.
+      const stopCases: JsonValue[] = [
+        { verb: 'stop', name: 'x', id: 'y' },
+        { verb: 'stop', name: 'x', tool: 'y' },
+      ];
+      for (const args of stopCases) {
+        const { results } = await extendCall(s, args);
+        expect(results[0]!.isError, JSON.stringify(args)).toBe(true);
+        expect(results[0]!.content, JSON.stringify(args)).toMatch(/invalid-tool/);
+        expect(results[0]!.content, JSON.stringify(args))
+          .toMatch(/takes at most one of name or id/);
+      }
       // A right key set with a wrong-typed value stays bare: the model sent
-      // exactly one reference — the rule is not what it broke.
+      // exactly one reference — the rule is not what it broke. The exact
+      // bare content is pinned, so a future detail cannot slip in silently.
       const mistyped = await extendCall(s, { verb: 'run', name: 3 });
       expect(mistyped.results[0]!.isError).toBe(true);
-      expect(mistyped.results[0]!.content).toMatch(/invalid-tool/);
-      expect(mistyped.results[0]!.content).not.toMatch(/takes exactly one of/);
+      expect(mistyped.results[0]!.content).toBe('error: invalid-tool');
+      for (const args of [{ verb: 'stop', name: 3 }, { verb: 'stop', id: 3 }] as const) {
+        const typed = await extendCall(s, { ...args });
+        expect(typed.results[0]!.isError, JSON.stringify(args)).toBe(true);
+        expect(typed.results[0]!.content, JSON.stringify(args)).toBe('error: invalid-tool');
+      }
     } finally {
       await s.shutdown();
     }

@@ -30,7 +30,12 @@ import { executeExtend, type ExtendDecision, type ExtendPort } from './extend.js
  * unknown tool that never becomes bash. Arguments stay raw until here, where
  * they are parsed as a plain JSON
  * object; a malformed, unknown or denied call yields a fixed error result with
- * the matching `tool_call_id` and no shell. An extract-level `failed: true`
+ * the matching `tool_call_id` and no shell — and, since the friction pass 2,
+ * a one-line detail naming the violated rule wherever the rule is
+ * nameable, so the model can fix the next call instead of decoding a bare
+ * code (the frozen failure codes are unchanged). A wrong-typed reference
+ * under a right key set and an attenuated offering stay bare (the C1.5
+ * and attenuation rulings). An extract-level `failed: true`
  * render is an error result with a null `SafeFailure`, the ordinary-nonzero-exit
  * precedent. `called` counts the calls actually accepted (each has its own
  * `tool/call`).
@@ -94,7 +99,21 @@ function decide(call: FunctionCall, config: AgentConfig): Decision {
     return { kind: 'error', failure: { code: 'denied', status: null } };
   }
   if (!offered || !hasHandler) {
-    return { kind: 'error', failure: { code: 'unknown-tool', status: null } };
+    // The teaching refusal (the friction pass 2): the frozen code stays, and
+    // the detail names the offered tools. The live-Run rule is taught only
+    // when the funnel itself is usable (offered AND allowed) — under
+    // attenuation it would be a false claim recommending an unreachable
+    // inspect; there the detail names the funnel's unavailability instead.
+    const extendUsable = config.tools.some((tool) => tool.name === 'extend')
+      && config.allowedTools.includes('extend');
+    return {
+      kind: 'error', failure: { code: 'unknown-tool', status: null },
+      detail: `the offered tools are ${config.tools.map((tool) => tool.name).join(', ')}`
+        + (extendUsable
+          ? ' — package tools are callable only while their Run is live'
+            + ' (extend {verb:"inspect"} lists the live catalogue)'
+          : ' — the extend tool is not available in this cell'),
+    };
   }
 
   let parsed: unknown;
@@ -103,43 +122,63 @@ function decide(call: FunctionCall, config: AgentConfig): Decision {
   } catch {
     parsed = undefined;
   }
-  if (!isRecord(parsed)) return INVALID;
+  if (!isRecord(parsed)) {
+    return invalidDetail(parsed === undefined
+      ? 'the arguments are not valid JSON'
+      : 'the arguments must be a JSON object');
+  }
 
   if (name === 'wait') {
     // `wait` accepts only an empty object.
-    return Object.keys(parsed).length === 0 ? { kind: 'wait' } : INVALID;
+    return Object.keys(parsed).length === 0
+      ? { kind: 'wait' }
+      : invalidDetail('wait takes an empty object — call it as {} to end the turn');
   }
 
   if (name === 'web_search') {
     const keys = Object.keys(parsed);
-    if (!keys.every((key) => key === 'query' || key === 'max_results')) return INVALID;
+    if (!keys.every((key) => key === 'query' || key === 'max_results')) {
+      return invalidDetail('web_search takes only query and max_results');
+    }
     const query = parsed['query'];
-    if (typeof query !== 'string' || query.trim().length === 0) return INVALID;
+    if (typeof query !== 'string' || query.trim().length === 0) {
+      return invalidDetail('query must be a non-blank string');
+    }
     const maxResults = parsed['max_results'];
     if (maxResults !== undefined
       && (typeof maxResults !== 'number'
         || !Number.isSafeInteger(maxResults) || maxResults < 1 || maxResults > 20)) {
-      return INVALID;
+      return invalidDetail('max_results must be an integer from 1 to 20');
     }
     return { kind: 'web_search', query, maxResults: maxResults as number | undefined };
   }
   if (name === 'web_fetch') {
     const keys = Object.keys(parsed);
-    if (keys.length !== 1 || keys[0] !== 'url') return INVALID;
+    if (keys.length !== 1 || keys[0] !== 'url') {
+      return invalidDetail('web_fetch takes only url');
+    }
     const url = parsed['url'];
-    if (typeof url !== 'string') return INVALID;
+    if (typeof url !== 'string') return invalidDetail('url must be a string');
     let parsedUrl: URL;
-    try { parsedUrl = new URL(url); } catch { return INVALID; }
-    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') return INVALID;
+    try { parsedUrl = new URL(url); } catch {
+      return invalidDetail('url must be an absolute http(s) URL');
+    }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      return invalidDetail('url must be an absolute http(s) URL');
+    }
     return { kind: 'web_fetch', url };
   }
 
   // `execute` requires its own non-whitespace string `cmd` and no unknown keys.
   if (name === 'execute') {
     const keys = Object.keys(parsed);
-    if (keys.length !== 1 || keys[0] !== 'cmd') return INVALID;
+    if (keys.length !== 1 || keys[0] !== 'cmd') {
+      return invalidDetail('execute takes only cmd');
+    }
     const cmd = parsed['cmd'];
-    if (typeof cmd !== 'string' || cmd.trim().length === 0) return INVALID;
+    if (typeof cmd !== 'string' || cmd.trim().length === 0) {
+      return invalidDetail('cmd must be a non-blank string');
+    }
     return { kind: 'execute', cmd };
   }
 
@@ -147,22 +186,61 @@ function decide(call: FunctionCall, config: AgentConfig): Decision {
   // argument shapes are validated here — the one-decision-point rule).
   const verbs = ['inspect', 'define', 'run', 'call', 'stop', 'undefine'];
   const verb = parsed['verb'];
-  if (typeof verb !== 'string' || !verbs.includes(verb)) return INVALID;
+  if (typeof verb !== 'string' || !verbs.includes(verb)) {
+    return invalidDetail('verb must be one of inspect, define, run, call, stop, undefine');
+  }
   const keys = Object.keys(parsed);
   const only = (...allowed: string[]): boolean =>
     keys.every((key) => allowed.includes(key));
   if (verb === 'inspect') {
-    return only('verb') ? { kind: 'extend', verb: 'inspect' } : INVALID;
+    return only('verb')
+      ? { kind: 'extend', verb: 'inspect' }
+      : invalidDetail('inspect takes only verb');
   }
   if (verb === 'define') {
-    if (!only('verb', 'name', 'purpose', 'path')) return INVALID;
+    if (!only('verb', 'name', 'purpose', 'path')) {
+      return invalidDetail('define takes verb, name, purpose, path');
+    }
     const [name2, purpose, path] = [parsed['name'], parsed['purpose'], parsed['path']];
-    if (typeof name2 !== 'string' || name2.length === 0) return INVALID;
-    if (typeof purpose !== 'string' || purpose.length === 0) return INVALID;
-    if (typeof path !== 'string' || path.length === 0) return INVALID;
+    if (typeof name2 !== 'string' || name2.length === 0) {
+      return invalidDetail('name must be a non-empty string');
+    }
+    if (typeof purpose !== 'string' || purpose.length === 0) {
+      return invalidDetail('purpose must be a non-empty string');
+    }
+    if (typeof path !== 'string' || path.length === 0) {
+      return invalidDetail('path must be a non-empty string');
+    }
     return { kind: 'extend', verb: 'define', name: name2, purpose, path };
   }
-  if (verb === 'run' || verb === 'stop' || verb === 'undefine') {
+  if (verb === 'stop') {
+    // The friction pass 2: stop addresses THE live Run, so a bare
+    // {verb:"stop"} stops it — the Run is a singleton and the live Run is
+    // the only referent. A supplied reference keeps the at-most-one rule, a
+    // wrong key SET still names the rule (the teaching refusal), and a
+    // wrong-typed value with a right key set stays bare — the model sent
+    // exactly one reference, the rule is not what it broke.
+    if (!only('verb', 'name', 'id')) {
+      return invalidDetail('extend stop takes at most one of name or id');
+    }
+    const hasName = Object.hasOwn(parsed, 'name');
+    const hasId = Object.hasOwn(parsed, 'id');
+    if (hasName && hasId) {
+      return invalidDetail('extend stop takes at most one of name or id');
+    }
+    if (!hasName && !hasId) {
+      return { kind: 'extend', verb: 'stop', ref: { by: 'bare' } };
+    }
+    if (hasName) {
+      const name2 = parsed['name'];
+      if (typeof name2 !== 'string' || name2.length === 0) return INVALID;
+      return { kind: 'extend', verb: 'stop', ref: { by: 'name', name: name2 } };
+    }
+    const id = parsed['id'];
+    if (typeof id !== 'string' || id.length === 0) return INVALID;
+    return { kind: 'extend', verb: 'stop', ref: { by: 'id', id } };
+  }
+  if (verb === 'run' || verb === 'undefine') {
     // The friction pass name channel: exactly one of name or id — both is ambiguous,
     // neither is empty. A wrong key SET names the rule (the teaching
     // refusal); a wrong-typed value with the right key set stays bare —
@@ -181,11 +259,17 @@ function decide(call: FunctionCall, config: AgentConfig): Decision {
     return { kind: 'extend', verb, ref: { by: 'id', id } };
   }
   // call: the funnel.
-  if (!only('verb', 'tool', 'args')) return INVALID;
+  if (!only('verb', 'tool', 'args')) {
+    return invalidDetail('call takes verb, tool, args');
+  }
   const tool = parsed['tool'];
   const args = parsed['args'];
-  if (typeof tool !== 'string' || tool.length === 0) return INVALID;
-  if (typeof args !== 'object' || args === null || Array.isArray(args)) return INVALID;
+  if (typeof tool !== 'string' || tool.length === 0) {
+    return invalidDetail('tool must be a non-empty string');
+  }
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) {
+    return invalidDetail('args must be a JSON object');
+  }
   return { kind: 'extend', verb: 'call', tool, args };
 }
 
@@ -410,12 +494,11 @@ export async function dispatchCalls(
     }
     if (decision.kind === 'extend') {
       if (extend === undefined) {
-        // The recorded deviation, deliberately bare: an absent extend port
-        // is host-composition state (the library path, the web-port
-        // precedent), not a cell fact the model can act on — no detail.
-        // The web channel above carries its honest detail because absence
-        // there IS a cell fact.
-        appendErrorResult(gate, id, call.id, { code: 'denied', status: null });
+        // A fact, not an action (the friction pass 2): the model cannot
+        // compose host ports, so the denial carries only the cell fact —
+        // the same value-free words every time, frozen code intact.
+        appendErrorResult(gate, id, call.id, { code: 'denied', status: null },
+          'this cell was composed without an extend port');
         await gate.flush();
         continue;
       }

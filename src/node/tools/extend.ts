@@ -45,10 +45,15 @@ export type ExtendPort = {
  * How a verb addresses a Package (the friction pass): by name — the ergonomic standard
  * the models are trained for, resolving to the latest stored version — or by
  * id, the exact content-addressed channel. Exactly one, as decide() enforced.
+ * `stop` alone adds the bare channel (its decision variant): the Run is a
+ * singleton, so a referenceless stop names THE live Run.
  */
 export type PackageRef =
   | { readonly by: 'name'; readonly name: string }
   | { readonly by: 'id'; readonly id: string };
+
+/** The stop channel: a name, an id, or nothing at all (the live Run itself). */
+export type StopRef = PackageRef | { readonly by: 'bare' };
 
 /** One validated extend decision, as decide() produced it. */
 export type ExtendDecision =
@@ -62,7 +67,7 @@ export type ExtendDecision =
     readonly kind: 'extend'; readonly verb: 'call';
     readonly tool: string; readonly args: unknown;
   }
-  | { readonly kind: 'extend'; readonly verb: 'stop'; readonly ref: PackageRef }
+  | { readonly kind: 'extend'; readonly verb: 'stop'; readonly ref: StopRef }
   | { readonly kind: 'extend'; readonly verb: 'undefine'; readonly ref: PackageRef };
 
 /** A schema violation the funnel refuses with, naming the field. */
@@ -449,6 +454,10 @@ export async function executeExtend(opts: {
     return;
   }
 
+  // Stop acts on the one live Run. A bare stop (the friction pass 2) names
+  // the singleton itself — no reference, no wrong-name round trip; a supplied
+  // reference is still checked against it, so a version skew (run v1, define
+  // v2, stop by name) can never misfire.
   if (decision.verb === 'stop') {
     const liveId = port.supervisor.liveRunId();
     const livePackage = port.supervisor.livePackageId();
@@ -457,16 +466,13 @@ export async function executeExtend(opts: {
         'error: package/not-found\nno Run is live — run a package first', true, max);
       return;
     }
-    // Stop acts on the one live Run, so the reference is checked against it:
-    // a name matches the live Run's package name, an id its package id. A
-    // version skew (run v1, define v2, stop by name) can never misfire.
     const liveDef = await port.store.definitionById(livePackage);
     // The manifest read above can straddle the Run's own death (a crash or a
     // clean exit lands between the two live reads). Re-read the live ids and
     // refuse when they moved: a stop must never journal a verb fact for a
     // Run that already ended — the crash fact owns that Run's ending. The
     // remaining residual is the supervisor's drain rule, unchanged by the
-    // name channel: a child that exited while a grandchild still holds its
+    // addressing channel: a child that exited while a grandchild still holds its
     // stdout open keeps `live` set until the drain, a death this re-read
     // cannot see — kernelStopped and the drain own that verdict.
     if (port.supervisor.liveRunId() !== liveId
@@ -476,18 +482,20 @@ export async function executeExtend(opts: {
         + ' — extend {verb:"inspect"} shows the live catalogue', true, max);
       return;
     }
-    const matches = decision.ref.by === 'id'
-      ? livePackage === decision.ref.id
-      : liveDef !== null && liveDef.name === decision.ref.name;
-    if (!matches) {
-      const wanted = decision.ref.by === 'name'
-        ? `name ${JSON.stringify(decision.ref.name)}` : `id ${decision.ref.id}`;
-      const liveName = liveDef !== null
-        ? `${liveDef.name} (id ${livePackage})` : livePackage;
-      await appendResult(gate, id, callId,
-        `error: package/not-found\nno live Run of ${wanted}`
-        + ` — the live Run is package ${liveName}`, true, max);
-      return;
+    if (decision.ref.by !== 'bare') {
+      const matches = decision.ref.by === 'id'
+        ? livePackage === decision.ref.id
+        : liveDef !== null && liveDef.name === decision.ref.name;
+      if (!matches) {
+        const wanted = decision.ref.by === 'name'
+          ? `name ${JSON.stringify(decision.ref.name)}` : `id ${decision.ref.id}`;
+        const liveName = liveDef !== null
+          ? `${liveDef.name} (id ${livePackage})` : livePackage;
+        await appendResult(gate, id, callId,
+          `error: package/not-found\nno live Run of ${wanted}`
+          + ` — the live Run is package ${liveName}`, true, max);
+        return;
+      }
     }
     await port.supervisor.stopRun();
     gate.append('package/stop', {

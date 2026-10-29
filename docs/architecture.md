@@ -66,7 +66,7 @@ not individually logged.
 | `sanitize.ts` | PTY output sanitization for the model-facing render |
 | `web.ts` | `web_search`/`web_fetch`: the Tavily client, renderers, `webToolsFromProviders`; every invocation crosses the frontier |
 | `providers.ts` | `loadProviders`: the kernel-side `providers.json` store (see §7) |
-| `dispatch.ts` | `dispatchCalls`: completes tool dialogues through the gate; owns the extend verbs' recognition (`run`/`stop`/`undefine` take name or id) and the native-call bridge — a live-registered package tool called by its bare name runs through the funnel |
+| `dispatch.ts` | `dispatchCalls`: completes tool dialogues through the gate; owns the extend verbs' recognition (`run`/`undefine` take name or id; `stop` takes name, id or nothing — the bare stop names THE live Run) and the native-call bridge — a live-registered package tool called by its bare name runs through the funnel |
 | `extend.ts` | The extend executor: the verbs, the verb facts, the funnel's kernel-side schema validation, the honest inspect catalogue |
 | `text.ts` | `boundToolText`: the model-visible tool-text bound |
 

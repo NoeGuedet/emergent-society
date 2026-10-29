@@ -387,6 +387,89 @@ describe('dispatchCalls: argument validation', () => {
     }
   }, 15000);
 
+  // The friction pass 2 teaching refusals: the frozen code stays, and the
+  // detail names the violated rule — the model can fix the next call without
+  // decoding a bare code.
+  const TEACHING: ReadonlyArray<readonly [string, FunctionCall, string]> = [
+    ['malformed JSON', {
+      id: 'j', type: 'function', function: { name: 'execute', arguments: '{bad' },
+    }, 'the arguments are not valid JSON'],
+    ['non-object arguments', call('k', 'execute', '[]'), 'the arguments must be a JSON object'],
+    ['wait with keys', call('w', 'wait', '{"ms":1}'), 'wait takes an empty object'],
+    ['execute with an extra key', call('x', 'execute', '{"cmd":"ls","extra":1}'),
+      'execute takes only cmd'],
+    ['execute with a wrong-typed cmd', call('y', 'execute', '{"cmd":3}'),
+      'cmd must be a non-blank string'],
+    ['web_search with an unknown key', call('q', 'web_search', '{"q":"hi"}'),
+      'web_search takes only query and max_results'],
+    ['web_search with an out-of-range max_results',
+      call('m', 'web_search', '{"query":"hi","max_results":0}'),
+      'max_results must be an integer from 1 to 20'],
+    ['web_fetch with a relative url', call('u', 'web_fetch', '{"url":"nope"}'),
+      'url must be an absolute http(s) URL'],
+    ['extend with an unknown verb', call('e', 'extend', '{"verb":"make"}'),
+      'verb must be one of inspect, define, run, call, stop, undefine'],
+    ['inspect with an extra key', call('i', 'extend', '{"verb":"inspect","x":1}'),
+      'inspect takes only verb'],
+    ['define with a missing purpose', call('d', 'extend', '{"verb":"define","name":"n"}'),
+      'purpose must be a non-empty string'],
+    ['call without args', call('c', 'extend', '{"verb":"call","tool":"t"}'),
+      'args must be a JSON object'],
+  ];
+
+  it.each(TEACHING)('the %s refusal teaches its rule', async (_name, one, want) => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([one]), ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'invalid-tool', status: null });
+      expect(data.message.content).toContain('error: invalid-tool\n');
+      expect(data.message.content).toContain(want);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('unknown-tool names the offered tools and the live-Run rule', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(
+        projection([call('c1', 'bogus', '{}')]), ID, s.gate('turn', 0), config(), neverTerminal,
+      );
+      const data = await firstResult(home);
+      expect(data.failure).toEqual({ code: 'unknown-tool', status: null });
+      expect(data.message.content).toContain('error: unknown-tool\n');
+      expect(data.message.content)
+        .toContain('the offered tools are execute, wait, web_search, web_fetch, extend');
+      expect(data.message.content).toContain('only while their Run is live');
+      expect(data.message.content).toContain('extend {verb:"inspect"} lists the live catalogue');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('an offered extend decision with no port is denied with the cell fact', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      // extend is offered and allowed, but no ExtendPort was composed (the
+      // library path): the denial carries the fact, never an action.
+      await dispatchCalls(
+        projection([call('c1', 'extend', '{"verb":"inspect"}')]),
+        ID, s.gate('turn', 0), config(), neverTerminal, undefined, undefined,
+      );
+      const data = await firstResult(home);
+      expect(data.failure).toEqual({ code: 'denied', status: null });
+      expect(data.message.content).toContain('error: denied\n');
+      expect(data.message.content).toContain('this cell was composed without an extend port');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
   it('denies an execution not in the allowlist without changing the offering', async () => {
     const { home, world: repo } = world();
     const s = await openSession(home);
