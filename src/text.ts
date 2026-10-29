@@ -58,14 +58,22 @@ export function utf8Prefix(text: string, maxBytes: number): { text: string; byte
  * The capture's form is part of the rendering: a local artifact names its
  * digest, a frontier call names the call and carries no artifact digest (a
  * fixed noun would otherwise claim one for a frontier capture). Neither form
- * claims a partial capture is complete.
+ * claims a partial capture is complete. A caller may append one `action`
+ * clause — a reachable next step for the tool that produced the truncation;
+ * it must never promise the raw bytes are retrievable, because no tool
+ * reads the kernel's blob store. The action is flattened to one line here,
+ * so a caller cannot widen the notice by accident.
  */
 export function truncationNotice(
   kind: 'output' | 'content', maxBytes: number, capture: TruncationCapture,
+  action?: string,
 ): string {
   const captured = `${capture.bytes} captured bytes, complete: ${capture.complete ? 'yes' : 'no'}`;
   const tail = capture.kind === 'artifact'
     ? `raw artifact: ${captured}; raw sha256 ${capture.sha256}`
     : `frontier call: ${capture.call}, ${captured}`;
-  return `\n[${kind} truncated: model text capped at ${maxBytes} bytes; ${tail}]`;
+  const flat = action === undefined
+    ? undefined : action.replace(/[\u000a\u000d\u2028\u2029]+/g, ' ');
+  return `\n[${kind} truncated: model text capped at ${maxBytes} bytes; ${tail}`
+    + (flat === undefined ? ']' : `; ${flat}]`);
 }

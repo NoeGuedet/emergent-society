@@ -86,4 +86,31 @@ describe('truncationNotice', () => {
     })).toBe(`\n[content truncated: model text capped at 512 bytes; `
       + `frontier call: c1, 512 captured bytes, complete: yes]`);
   });
+
+  it('appends the caller-supplied action after the artifact facts, one line', () => {
+    const action = 'the raw bytes are unreachable — rerun the command writing the full output'
+      + ' to a world file';
+    const withAction = truncationNotice('output', 256, {
+      kind: 'artifact', sha256: SHA, bytes: 4096, complete: false,
+    }, action);
+    expect(withAction).toBe(`\n[output truncated: model text capped at 256 bytes; `
+      + `raw artifact: 4096 captured bytes, complete: no; raw sha256 ${SHA}; ${action}]`);
+    // One line: no newline inside the notice beyond its own leading one.
+    expect(withAction.indexOf('\n', 1)).toBe(-1);
+    // No action: the notice keeps its exact prior shape.
+    expect(truncationNotice('output', 256, {
+      kind: 'artifact', sha256: SHA, bytes: 4096, complete: false,
+    })).toBe(`\n[output truncated: model text capped at 256 bytes; `
+      + `raw artifact: 4096 captured bytes, complete: no; raw sha256 ${SHA}]`);
+    const viaBound = boundToolText('a'.repeat(300), 256, {
+      kind: 'artifact', sha256: SHA, bytes: 4096, complete: false,
+    }, action);
+    expect(viaBound).toContain(action);
+    // A caller cannot widen the notice: newlines in the action are flattened.
+    const flat = truncationNotice('output', 256, {
+      kind: 'artifact', sha256: SHA, bytes: 512, complete: true,
+    }, 'line one\nline two');
+    expect(flat).toContain('line one line two');
+    expect(flat.indexOf('\n', 1)).toBe(-1);
+  });
 });

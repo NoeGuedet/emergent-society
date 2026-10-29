@@ -296,7 +296,8 @@ async function appendExecuteResult(
       content: raw === null ? rendered
         : boundToolText(rendered, maxToolResultBytes, {
           kind: 'artifact', sha256: raw.sha256, bytes: raw.bytes, complete: raw.complete,
-        }),
+        }, 'the raw bytes are unreachable — rerun the command writing the full output'
+          + ' to a world file'),
       tool_call_id: callId,
     },
     isError: executeIsError(outcome),

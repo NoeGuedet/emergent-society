@@ -271,7 +271,7 @@ describe('dispatchCalls: execute', () => {
       expect(data.isError).toBe(true);
       expect(data.failure).toEqual({ code: 'output-limit', status: null });
       const raw = data.raw!;
-      const notice = /\n\[output truncated: model text capped at (\d+) bytes; raw artifact: (\d+) captured bytes, complete: (yes|no); raw sha256 ([0-9a-f]{64})\]$/
+      const notice = /\n\[output truncated: model text capped at (\d+) bytes; raw artifact: (\d+) captured bytes, complete: (yes|no); raw sha256 ([0-9a-f]{64}); the raw bytes are unreachable — rerun the command writing the full output to a world file\]$/
         .exec(data.message.content);
       expect(notice).not.toBeNull();
       // The cap describes the model text; the raw facts describe the capture.

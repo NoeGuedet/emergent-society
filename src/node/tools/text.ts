@@ -14,11 +14,11 @@ export { decodeToolText } from '../../text.js';
  * Bounds the model-visible tool text to `maxBytes` UTF-8 bytes, measured after
  * deterministic decoding. The notice names the cap and the capture's own facts
  * — its captured byte count and whether capture completed, never a claim about
- * the retained prefix's size.
+ * the retained prefix's size — and may carry the caller's one action clause.
  */
 export function boundToolText(
-  text: string, maxBytes: number, capture: TruncationCapture,
+  text: string, maxBytes: number, capture: TruncationCapture, action?: string,
 ): string {
   if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
-  return utf8Prefix(text, maxBytes).text + truncationNotice('output', maxBytes, capture);
+  return utf8Prefix(text, maxBytes).text + truncationNotice('output', maxBytes, capture, action);
 }

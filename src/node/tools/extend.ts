@@ -194,8 +194,10 @@ function storeFailureText(err: PackageError): { content: string; isError: boolea
  * stored packages with the caps and their meaning, the kernel-owned
  * `spawn`/`speak`, and the runtime honesty — the sandbox mode with its
  * spelled-out meaning, the fail-closed contract, the withheld capabilities,
- * the caps, the no-rlimit residual, the egress-open residual, and the
- * 256 KiB funneled-args input cap with the svc/execute workaround.
+ * the caps, the no-rlimit residual, the egress-open residual, the
+ * 256 KiB funneled-args input cap with the svc.execute workaround, the svc
+ * facade (its resolve/reject contract), the Run's file reach (mode-conditional),
+ * and the Run's in-memory lifetime.
  */
 function renderInspect(
   config: AgentConfig,
@@ -222,6 +224,8 @@ function renderInspect(
     lines.push(`  schema: ${canonicalizeJson(tool.parameters)}`);
     lines.push(`  package: ${tool.packageId}`);
   }
+  lines.push('a Run is in-memory: a restart reaps it — stored definitions'
+    + ' survive, so run it again.');
   lines.push('');
   lines.push('== packages (stored, persistent across restarts) ==');
   if (packages.length === 0) {
@@ -261,10 +265,27 @@ function renderInspect(
     + ' process authority remain the guest process\'s own — the facade is the'
     + ' capability channel, not the whole sandbox.');
   lines.push('funneled args are capped at 256 KiB per call — larger inputs go'
-    + ' through svc/execute against world files.');
+    + ' through svc.execute against world files.');
+  // This pair mirrors the extend description's svc sentence (config.ts):
+  // keep the two in step; the tests pin both independently.
+  lines.push('the facade is svc: a handler is called as handler(args, svc) —'
+    + ' svc.execute(cmd) runs one command in the same persistent shell the'
+    + ' execute tool uses (when the execute tool is allowed); a completed'
+    + ' command resolves {status, exitCode, output}, any other outcome'
+    + ' (denied, timeout, spawn or session failure) rejects with a bounded'
+    + ' JSON error — catch it.');
+  lines.push('svc.web_search(query, maxResults?) and svc.web_fetch(url) make'
+    + ' the same kernel-mediated calls as the base tools (when the web tools'
+    + ' are allowed); they resolve {body} and reject on failure.');
+  lines.push(port.sandbox
+    ? 'a Run\'s file reach: its own leaf and the system read set only —'
+      + ' the world and the cell home are EACCES; world files go through'
+      + ' svc.execute.'
+    : 'a Run\'s file reach: none — unconfined (sandbox OFF above); the world'
+      + ' and the cell home are as reachable as to the kernel.');
   lines.push('no rlimits or cgroups exist: the caps above are the availability'
-    + ' physics. Egress from a Run is open (unmediated); svc/web_* is the'
-    + ' credential-backed, frontier-visible form.');
+    + ' physics. Egress from a Run is open (unmediated); svc.web_search/'
+    + 'svc.web_fetch is the credential-backed, frontier-visible form.');
   return lines.join('\n');
 }
 
@@ -325,7 +346,8 @@ export async function executeExtend(opts: {
       });
       await appendResult(gate, id, callId,
         `defined ${decision.name} (id ${defined.id},`
-        + ` ${defined.sourceBytes} bytes of source) — ${decision.purpose}`,
+        + ` ${defined.sourceBytes} bytes of source) — ${decision.purpose}\n`
+        + 'define parses the source and stores it; run validates the registration',
         false, max);
     } catch (err) {
       if (err instanceof PackageError) {

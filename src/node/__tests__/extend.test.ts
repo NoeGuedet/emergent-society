@@ -146,6 +146,7 @@ interface Dispatched {
 
 async function extendCall(
   s: Session, args: JsonValue, over: Partial<AgentConfig> = {},
+  portSandbox = false,
 ): Promise<Dispatched> {
   const gate = s.gate('turn', 0);
   s.packageGate(gate);
@@ -154,7 +155,7 @@ async function extendCall(
       projection([call('c1', 'extend', args)]), ID, gate, config(over),
       { run: async () => { throw new Error('not used'); } },
       undefined,
-      { store: s.store, supervisor: s.supervisor, sandbox: false },
+      { store: s.store, supervisor: s.supervisor, sandbox: portSandbox },
     );
   } finally {
     s.packageGate(null);
@@ -202,7 +203,23 @@ describe('extend: the six verbs', () => {
       // Runtime honesty: the sandbox mode and the input cap.
       expect(content).toMatch(/sandbox/i);
       expect(content).toContain('256 KiB');
+      // Inspect-only teaching lines (the offering embeds the description, so
+      // these line-anchored fragments pin the inspect rendering itself).
+      expect(content).toMatch(/(^|\n)a Run is in-memory: a restart reaps it/);
+      expect(content).toMatch(
+        /(^|\n)the facade is svc: a handler is called as handler\(args, svc\)/);
+      expect(content).toMatch(/(^|\n)svc\.web_search\(query, maxResults\?\)/);
+      // This harness port is sandbox-OFF: the reach line must not claim EACCES.
+      expect(content).toMatch(/(^|\n)a Run's file reach: none — unconfined/);
+      expect(content).not.toContain('EACCES');
       expect(results[0]!.isError).toBe(false);
+      // The sandbox-on inspect pins the confined reach line instead.
+      const confined = await extendCall(s, { verb: 'inspect' }, {}, true);
+      const onContent = confined.results[0]!.content;
+      expect(confined.results[0]!.isError).toBe(false);
+      expect(onContent).toMatch(/(^|\n)a Run's file reach: its own leaf/);
+      expect(onContent).toContain('EACCES');
+      expect(onContent).not.toContain('none — unconfined');
     } finally {
       await s.shutdown();
     }
@@ -217,6 +234,8 @@ describe('extend: the six verbs', () => {
       });
       expect(results[0]!.isError).toBe(false);
       expect(results[0]!.content).toMatch(/defined echo_pkg/);
+      expect(results[0]!.content).toContain(
+        'define parses the source and stores it; run validates the registration');
       const defines = rawEvents.filter((event) => event.type === 'package/define');
       expect(defines).toHaveLength(1);
       const data = defines[0]!.data as Record<string, unknown>;

@@ -400,9 +400,14 @@ describe('the composition root', () => {
 describe('proof 1: one mediated path (a regression guard on kernel sources)', () => {
   it('sees fetch only at the two frontier call sites and no network module anywhere', async () => {
     const sources = await kernelSources();
-    // Needles are composed at runtime so this test never matches itself.
-    const FETCH = 'fet' + 'ch(';
-    expect(containing(sources, FETCH)).toEqual([
+    // Needles are composed at runtime so this test never matches itself. The
+    // fetch needle is a call-site shape, not a bare substring: prose that
+    // *names* the svc facade (svc.web_fetch(url)) is not a call site, while a
+    // new `fetch(` call anywhere — the global is only callable unqualified —
+    // still trips the guard.
+    const FETCH_RE = new RegExp('(^|[^_a-zA-Z0-9])fet' + 'ch\\(');
+    expect(sources.filter((source) => FETCH_RE.test(source.text))
+      .map((source) => source.rel).sort()).toEqual([
       'node/tools/web.ts', 'provider/transport.ts',
     ]);
 
