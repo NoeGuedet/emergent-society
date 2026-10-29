@@ -66,7 +66,7 @@ not individually logged.
 | `sanitize.ts` | PTY output sanitization for the model-facing render |
 | `web.ts` | `web_search`/`web_fetch`: the Tavily client, renderers, `webToolsFromProviders`; every invocation crosses the frontier |
 | `providers.ts` | `loadProviders`: the kernel-side `providers.json` store (see §7) |
-| `dispatch.ts` | `dispatchCalls`: completes tool dialogues through the gate; owns the six extend verbs' recognition |
+| `dispatch.ts` | `dispatchCalls`: completes tool dialogues through the gate; owns the extend verbs' recognition (`run`/`stop`/`undefine` take name or id) and the native-call bridge — a live-registered package tool called by its bare name runs through the funnel |
 | `extend.ts` | The extend executor: the verbs, the verb facts, the funnel's kernel-side schema validation, the honest inspect catalogue |
 | `text.ts` | `boundToolText`: the model-visible tool-text bound |
 
@@ -174,7 +174,7 @@ proceeds, plus boot reconciliation), `index.ts` (exports).
 | Run facade protocol | `src/node/packages/protocol.ts` (kernel side) + `run-bootstrap.ts` (child side, self-contained, verify-then-use) |
 | Live tool registry | `src/node/packages/registry.ts` — transactional registration, the safe schema dialect, the frozen caps |
 | Confined Run supervisor | `src/node/packages/supervisor.ts` + the Run policy in `sandbox.ts` (`buildRunSandboxSpec`) — deadlines, the drain rule, kernel-side disposal |
-| The `extend` tool and the funnel | `src/node/tools/extend.ts` (executor) + the `decide()` arm in `dispatch.ts`; the offering is frozen at the factory (`config.ts`) |
+| The `extend` tool and the funnel | `src/node/tools/extend.ts` (executor) + the `decide()` arm and the native-call bridge in `dispatch.ts`; the offering is frozen at the factory (`config.ts`) |
 | Package lifecycle | the boot scan and host-stop disposal in `src/node/loop.ts`; composition in `src/host/host.ts` |
 | Only the kernel emits | the narrow `TurnContext` (`driver.ts`) for the local log; the frontier gate (`src/frontier/journal.ts`) for the exchanges |
 | The provider-parameter contract | `src/context/parameters.ts` (bounds) + `src/context/contracts.ts` (payload shapes) |

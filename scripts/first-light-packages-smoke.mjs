@@ -5,10 +5,13 @@
 // state-machine reply queue (the package id is a runtime fact, read from the
 // model-visible history, never scripted statically).
 //
-// The spine: define (from a world file) → run → funneled call → stop →
-// SIGKILL the host → resume → re-mount → re-run → pause. The frozen-offering
-// invariant is asserted compiled-side: every request body's tools array is
-// byte-identical across the whole lifecycle.
+// The spine: define (from a world file) → run (by id) → funneled call →
+// native call (the bare tool name, bridged to the funnel) → a NEWER
+// same-name define (the version skew) → stop (by name — the LIVE older
+// version) → SIGKILL the host → resume → re-mount → re-run (by name — the
+// NEWEST stored version) → pause. The frozen-offering invariant is asserted
+// compiled-side: every request body's tools array is byte-identical across
+// the whole lifecycle — including the turn that carried a native call.
 //
 // Output contract: exactly `packages smoke: ok (F)` on stdout, exit 0, whole
 // run <= 90 s. On failure: `scenario F: <message>`, the host's last 20
@@ -49,6 +52,15 @@ const ECHO_SOURCE = 'return { tools: [{ name: "echo_text",'
   + ' required: ["text"], additionalProperties: false },'
   + ' handler: async (args) => ({ echoed: args.text }) }] };\n';
 
+// The NEWER same-name version's source: a different tool name, so the
+// version skew is observable in the registered surface, not only the id.
+const SHOUT_SOURCE = 'return { tools: [{ name: "shout_text",'
+  + ' description: "shouts the text",'
+  + ' parameters: { type: "object",'
+  + ' properties: { text: { type: "string", minLength: 1 } },'
+  + ' required: ["text"], additionalProperties: false },'
+  + ' handler: async (args) => ({ shouted: args.text.toUpperCase() }) }] };\n';
+
 const ID_RE = /id ([0-9a-f]{64})/;
 
 const home = await mkdtemp(join(tmpdir(), 'packages-smoke-'));
@@ -57,6 +69,7 @@ let server = null;
 let phase = 'define';
 let session = 1;
 let packageId = '';
+let newerId = '';
 
 // The global watchdog guarantees the 90 s budget: an unref'd timer registered
 // BEFORE the scenario, killing the live host and failing with a labeled
@@ -191,8 +204,11 @@ function lastToolResult(body) {
   return content;
 }
 
-/** The state machine: session 1 defines, runs, funnels and stops; the
- * restart's session 2 re-runs; each session parks with a text reply. */
+/** The state machine: session 1 defines, runs (by id), funnels, bridges a
+ * native call, defines a NEWER version under the same name (the version
+ * skew) and stops (by name — must stop the LIVE older version); the
+ * restart's session 2 re-runs (by name — must resolve the NEWER stored
+ * version); each session parks with a text reply. */
 function respond(body) {
   const last = lastToolResult(body);
   if (session === 1) {
@@ -210,22 +226,47 @@ function respond(body) {
       return assistantTool('extend', { verb: 'run', id: packageId }, 'call_2');
     }
     if (phase === 'call') {
-      phase = 'stop';
+      phase = 'native';
       return assistantTool('extend', {
         verb: 'call', tool: 'echo_text', args: { text: 'funneled in the smoke' },
       }, 'call_3');
     }
-    if (phase === 'stop') {
+    if (phase === 'native') {
       assert.ok(last !== null && last.includes('funneled in the smoke'),
         `the funneled result reached the history: ${bounded(last)}`);
+      phase = 'skew-define';
+      // The native idiom: the bare tool name, the model's own parameters —
+      // the kernel bridges it to the funnel.
+      return assistantTool('echo_text', { text: 'natively bridged in the smoke' }, 'call_3b');
+    }
+    if (phase === 'skew-define') {
+      assert.ok(last !== null && last.includes('natively bridged in the smoke'),
+        `the bridged native result reached the history: ${bounded(last)}`);
+      phase = 'stop';
+      // The version skew: a NEWER definition under the same name, stored
+      // while the older one stays live.
+      return assistantTool('extend', {
+        verb: 'define', name: 'echo_pkg', purpose: 'the newer version', path: 'shout.js',
+      }, 'call_3c');
+    }
+    if (phase === 'stop') {
+      const match = last !== null ? ID_RE.exec(last) : null;
+      assert.ok(match !== null, `the skew define result carries the id: ${bounded(last)}`);
+      newerId = match[1];
+      assert.notEqual(newerId, packageId,
+        'the newer same-name definition must be a different id');
       phase = 'park';
-      return assistantTool('extend', { verb: 'stop', id: packageId }, 'call_4');
+      // The name channel: the stop addresses the live Run by name — under
+      // the skew it must stop the LIVE older version, not the newest stored.
+      return assistantTool('extend', { verb: 'stop', name: 'echo_pkg' }, 'call_4');
     }
     return assistantText('parking before the crash');
   }
   if (phase === 'rerun') {
     phase = 'park2';
-    return assistantTool('extend', { verb: 'run', id: packageId }, 'call_5');
+    // The name channel again: the re-run addresses the package by name and
+    // must resolve the NEWEST stored version.
+    return assistantTool('extend', { verb: 'run', name: 'echo_pkg' }, 'call_5');
   }
   return assistantText('done');
 }
@@ -252,6 +293,7 @@ try {
   const init = runCli(['init', '--home', home]);
   assert.equal(init.code, 0, `F: init failed: ${bounded(init.stderr)}`);
   await writeFile(join(home, 'world', 'echo.js'), ECHO_SOURCE);
+  await writeFile(join(home, 'world', 'shout.js'), SHOUT_SOURCE);
 
   // F.2 — the loopback server first, then the 0600 provider store with the
   // real port: one write, one chmod.
@@ -271,20 +313,47 @@ try {
   // F.4 — session 1's census, through the compiled reader.
   {
     const events = await localEvents();
-    assert.equal(ofType(events, 'package/define').length, 1,
-      'F: exactly one package/define');
+    assert.equal(ofType(events, 'package/define').length, 2,
+      'F: two package/define facts (one per same-name version)');
     const define = ofType(events, 'package/define')[0];
     assert.equal(define.data.name, 'echo_pkg');
     assert.ok(/^[0-9a-f]{64}$/.test(define.data.id), 'F: the definition id is sha256');
     assert.equal(ofType(events, 'package/run').length, 1, 'F: one run fact');
+    const firstRunId = ofType(events, 'package/run')[0].data.runId;
     assert.equal(ofType(events, 'package/effect').length, 1, 'F: one effect fact');
     assert.equal(ofType(events, 'package/effect')[0].data.tool, 'echo_text');
     assert.equal(ofType(events, 'package/stop').length, 1, 'F: one verb stop');
+    // THE SKEW PROOF: the stop was addressed by NAME while a NEWER version
+    // was already stored — the fact must journal the LIVE older version's
+    // id and run id, never a latest-stored resolution.
+    assert.equal(ofType(events, 'package/stop')[0].data.id, packageId,
+      'F: the name-addressed stop journaled the LIVE package id (not the newest)');
+    assert.equal(ofType(events, 'package/stop')[0].data.runId, firstRunId,
+      'F: the name-addressed stop journaled the live Run id');
     assert.equal(ofType(events, 'package/stop')[0].data.reason, 'verb');
     const funneled = ofType(events, 'tool/result')
       .find((event) => (event.data.message?.content ?? '').includes('funneled in the smoke'));
     assert.ok(funneled !== undefined, 'F: the funneled result is durable');
     assert.equal(funneled.data.frontierCall, null, 'F: a funneled result crosses no frontier');
+    // The bridged native call: the tool/call fact carries the native name
+    // (the honest record of what the model called), and the result is the
+    // tool's own echoed payload — unwrapped, exactly what the funnel would
+    // have returned for the same arguments.
+    const nativeCall = ofType(events, 'tool/call')
+      .find((event) => event.data.call?.function?.name === 'echo_text');
+    assert.ok(nativeCall !== undefined, 'F: the native call is journaled under its own name');
+    assert.equal(nativeCall.data.call.function.arguments,
+      JSON.stringify({ text: 'natively bridged in the smoke' }),
+      'F: the native call fact carries the model\'s raw arguments');
+    const nativeResult = ofType(events, 'tool/result')
+      .find((event) => (event.data.message?.content ?? '')
+        .includes('natively bridged in the smoke'));
+    assert.ok(nativeResult !== undefined, 'F: the bridged native result is durable');
+    assert.equal(nativeResult.data.isError, false, 'F: the bridge settled the call');
+    assert.equal(nativeResult.data.callId, 'call_3b', 'F: the native result closes its own call');
+    assert.equal(nativeResult.data.message.content,
+      '{"echoed":"natively bridged in the smoke"}',
+      'F: the bridged result is the tool\'s own unwrapped payload');
     assert.equal(ofType(events, 'package/error').length, 0, 'F: no crash facts');
     // No stored source byte ever entered an event.
     for (const event of events) {
@@ -313,20 +382,27 @@ try {
 
   {
     const events = await localEvents();
-    // The re-run: the definition survived the crash+resume.
+    // The re-run was addressed by NAME with TWO same-name versions stored:
+    // it must resolve the NEWEST (the shout version), a different id from
+    // the live v1 the first session ran — the latest-stored resolution
+    // proven compiled-side.
     assert.equal(ofType(events, 'package/run').length, 2, 'F: two run facts (one per session)');
     const runs = ofType(events, 'package/run');
-    assert.equal(runs[0].data.id, runs[1].data.id, 'F: both runs name the same package');
+    assert.equal(runs[1].data.id, newerId,
+      'F: the name-addressed re-run resolved the NEWEST stored version');
+    assert.notEqual(runs[0].data.id, runs[1].data.id,
+      'F: the two runs exercised both same-name versions');
     // The second session's stop is the host's (the pause disposed the live
-    // re-run): reason host-stop.
+    // re-run): reason host-stop, on the resolved newest version.
     const stops = ofType(events, 'package/stop');
     assert.equal(stops.length, 2, 'F: two stop facts');
     assert.equal(stops[1].data.reason, 'host-stop', 'F: the pause is a host-stop');
-    // The re-run re-registered the tool: one effect per runId.
+    assert.equal(stops[1].data.id, newerId, 'F: the host-stop names the re-run package');
+    // One effect per run — and the surface discriminates the versions.
     const effects = ofType(events, 'package/effect');
     assert.equal(effects.length, 2, 'F: one effect per run');
-    assert.ok(effects.every((event) => event.data.tool === 'echo_text'),
-      'F: both effects name the echo tool');
+    assert.equal(effects[0].data.tool, 'echo_text', 'F: the first run registered the echo tool');
+    assert.equal(effects[1].data.tool, 'shout_text', 'F: the re-run registered the shout tool');
     assert.equal(ofType(events, 'package/error').length, 0,
       'F: no crash facts across the crash and the host-stop');
   }
@@ -341,10 +417,12 @@ try {
 
   // F.8 — the frozen-offering invariant, compiled-side: every request body's
   // tools array is byte-identical across the whole lifecycle.
-  // Session 1: define, run, call, stop, park = 5 requests; session 2's
-  // re-run and park = 2 more (the resume replays no request).
-  assert.ok(server.bodies.length >= 7,
-    `F: expected 7+ requests, got ${server.bodies.length}`);
+  // Session 1: define, run, funneled call, native call, skew define, stop,
+  // park = 7 requests; session 2's re-run and park = 2 more (the resume
+  // replays no request). The bridged native call must not move the offering —
+  // this assertion is what the bridge was designed not to disturb.
+  assert.ok(server.bodies.length >= 9,
+    `F: expected 9+ requests, got ${server.bodies.length}`);
   const toolsArrays = server.bodies.map((body) => {
     const parsed = JSON.parse(body);
     return JSON.stringify(parsed.tools ?? null);
@@ -357,11 +435,12 @@ try {
   assert.ok(tools.some((tool) => tool.function?.name === 'extend'),
     'F: extend is offered');
 
-  // F.9 — the run leaves are reaped; the package definition persists.
+  // F.9 — the run leaves are reaped; both same-name definitions persist.
   const packagesDir = join(home, 'nodes', UID, 'packages');
   const ids = await readdir(packagesDir);
-  assert.equal(ids.length, 1, 'F: exactly one stored definition');
-  assert.equal(ids[0], packageId, 'F: the stored definition is the defined id');
+  assert.equal(ids.length, 2, 'F: both same-name versions stay stored');
+  assert.ok(ids.includes(packageId), 'F: the first version persists');
+  assert.ok(ids.includes(newerId), 'F: the newer version persists');
   const runsDir = join(home, 'nodes', UID, 'runs');
   let runsLeft = null;
   try { runsLeft = await readdir(runsDir); } catch { /* absent: also clean */ }
