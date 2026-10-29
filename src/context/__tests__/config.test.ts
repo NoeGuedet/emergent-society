@@ -55,7 +55,7 @@ describe('defaultAgentConfig', () => {
         },
         {
           name: 'extend',
-          description: 'Manage this node\'s own capabilities. Six verbs: inspect (the live catalogue: tools, packages, caps, runtime honesty); define (store a Package: name, purpose, path of a source file in the world); run (activate a stored Package as a confined Run: its tools become callable); call (invoke a running Package tool by name with args — the funnel); stop (deactivate the running Run, reversible); undefine (delete a stored Package, irreversible).',
+          description: 'Manage this node\'s own capabilities. Six verbs: inspect (the live catalogue: tools, packages, caps, runtime honesty); define (store a Package: name, purpose, path of a source file in the world); run (activate a stored Package as a confined Run: its tools become callable — address it by name or id; a name resolves to the latest stored version); call (invoke a running Package tool by name with args — the funnel); stop (deactivate the live Run of that name or id, reversible); undefine (delete a stored Package by name or id, irreversible).',
           parameters: {
             type: 'object',
             properties: {

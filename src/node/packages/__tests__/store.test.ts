@@ -462,3 +462,98 @@ describe('package store: symlinked cell layouts', () => {
     rmSync(f.home, { recursive: true, force: true });
   });
 });
+
+describe('package store: the name channel (C1.6)', () => {
+  // Two stored versions of one name with pinned directory mtimes: the
+  // latest-wins resolution must not depend on millisecond scheduling.
+  async function twoVersions(f: { home: string; world: string; scratch: string }) {
+    const s = await store(f);
+    worldFile(f, 'v1.js', GOOD_SOURCE);
+    worldFile(f, 'v2.js', 'return { tools: [] };\n// v2\n');
+    const v1 = (await s.definePackage({
+      name: 'same', purpose: 'first', path: 'v1.js',
+    })).id;
+    const v2 = (await s.definePackage({
+      name: 'same', purpose: 'second', path: 'v2.js',
+    })).id;
+    const { utimesSync } = await import('node:fs');
+    const packagesDir = join(f.home, 'nodes', 'n1', 'packages');
+    utimesSync(join(packagesDir, v1), new Date(1_000), new Date(1_000));
+    utimesSync(join(packagesDir, v2), new Date(2_000), new Date(2_000));
+    return { s, v1, v2 };
+  }
+
+  it('resolves a name to the latest stored version, and falls back on undefine', async () => {
+    const f = fixture();
+    try {
+      const { s, v1, v2 } = await twoVersions(f);
+      // Latest wins: v2 is the later definition.
+      expect((await s.resolveLatestByName('same'))?.id).toBe(v2);
+      // Undefining the latest makes the name resolve to the previous one.
+      await s.undefinePackage(v2);
+      expect((await s.resolveLatestByName('same'))?.id).toBe(v1);
+      // An unknown name resolves to nothing.
+      expect(await s.resolveLatestByName('other')).toBeNull();
+      // The exact channel: the id is definitionById's own key.
+      expect((await s.definitionById(v1))?.name).toBe('same');
+      expect(await s.definitionById('0'.repeat(64))).toBeNull();
+      expect(await s.definitionById('not-an-id')).toBeNull();
+    } finally {
+      rmSync(f.home, { recursive: true, force: true });
+    }
+  });
+
+  it('skips a corrupt newest version instead of masking the healthy ones', async () => {
+    const f = fixture();
+    try {
+      const { s, v1, v2 } = await twoVersions(f);
+      // Corrupt the newest version's manifest in place: the identity no
+      // longer verifies, so the name must resolve to the healthy v1.
+      const manifestPath = join(f.home, 'nodes', 'n1', 'packages', v2, 'manifest.json');
+      writeFileSync(manifestPath, '{"name":"same","purpose":"forged"}');
+      const resolved = await s.resolveLatestByName('same');
+      expect(resolved?.id).toBe(v1);
+    } finally {
+      rmSync(f.home, { recursive: true, force: true });
+    }
+  });
+
+  it('breaks an mtime tie by id, deterministically', async () => {
+    const f = fixture();
+    try {
+      const { s, v1, v2 } = await twoVersions(f);
+      // The same pinned mtime for both: the greater id wins — a rule, not a
+      // scheduling accident.
+      const { utimesSync } = await import('node:fs');
+      const packagesDir = join(f.home, 'nodes', 'n1', 'packages');
+      const sameTime = new Date(3_000);
+      utimesSync(join(packagesDir, v1), sameTime, sameTime);
+      utimesSync(join(packagesDir, v2), sameTime, sameTime);
+      const expected = v1 > v2 ? v1 : v2;
+      expect((await s.resolveLatestByName('same'))?.id).toBe(expected);
+    } finally {
+      rmSync(f.home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the latest resolution across an idempotent re-define (write-once does not bump mtime)', async () => {
+    const f = fixture();
+    try {
+      const { s, v1, v2 } = await twoVersions(f);
+      // Re-defining v1's exact content (same name, purpose and bytes) is the
+      // same id — a write-once no-op that must not disturb the pinned mtimes:
+      // right after the tool reports the re-define, the name still resolves
+      // to the newer version.
+      worldFile(f, 'v1.js', GOOD_SOURCE);
+      const again = await s.definePackage({
+        name: 'same', purpose: 'first', path: 'v1.js',
+      });
+      expect(again.id).toBe(v1);
+      expect((await s.resolveLatestByName('same'))?.id).toBe(v2);
+      expect(await s.newestIdByName('same')).toBe(v2);
+      expect(await s.newestIdByName('absent')).toBeNull();
+    } finally {
+      rmSync(f.home, { recursive: true, force: true });
+    }
+  });
+});

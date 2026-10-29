@@ -40,10 +40,16 @@ type Decision =
   | { readonly kind: 'web_search'; readonly query: string;
       readonly maxResults: number | undefined }
   | { readonly kind: 'web_fetch'; readonly url: string }
-  | { readonly kind: 'error'; readonly failure: SafeFailure }
+  | { readonly kind: 'error'; readonly failure: SafeFailure;
+      readonly detail?: string | undefined }
   | (import('./extend.js').ExtendDecision);
 
 const INVALID: Decision = { kind: 'error', failure: { code: 'invalid-tool', status: null } };
+
+/** The C1.6 teaching refusal: the frozen code stays, the silence goes. */
+function invalidDetail(detail: string): Decision {
+  return { kind: 'error', failure: { code: 'invalid-tool', status: null }, detail };
+}
 
 /**
  * Recognizes one advertised call. A name is known only when it is both offered
@@ -128,10 +134,22 @@ function decide(call: FunctionCall, config: AgentConfig): Decision {
     return { kind: 'extend', verb: 'define', name: name2, purpose, path };
   }
   if (verb === 'run' || verb === 'stop' || verb === 'undefine') {
-    if (!only('verb', 'id')) return INVALID;
+    // The C1.6 name channel: exactly one of name or id — both is ambiguous,
+    // neither is empty. A wrong key SET names the rule (the teaching
+    // refusal); a wrong-typed value with the right key set stays bare —
+    // the model sent exactly one reference, the rule is not what it broke.
+    if (!only('verb', 'name', 'id')
+      || Object.hasOwn(parsed, 'name') === Object.hasOwn(parsed, 'id')) {
+      return invalidDetail(`extend ${verb} takes exactly one of name or id`);
+    }
+    if (Object.hasOwn(parsed, 'name')) {
+      const name = parsed['name'];
+      if (typeof name !== 'string' || name.length === 0) return INVALID;
+      return { kind: 'extend', verb, ref: { by: 'name', name } };
+    }
     const id = parsed['id'];
     if (typeof id !== 'string' || id.length === 0) return INVALID;
-    return { kind: 'extend', verb, id };
+    return { kind: 'extend', verb, ref: { by: 'id', id } };
   }
   // call: the funnel.
   if (!only('verb', 'tool', 'args')) return INVALID;
@@ -342,7 +360,7 @@ export async function dispatchCalls(
           `${call.function.name} is a package tool — call it through the funnel:`
           + ` extend {verb:"call", tool:${JSON.stringify(call.function.name)}, args:{...}}`);
       } else {
-        appendErrorResult(gate, id, call.id, decision.failure);
+        appendErrorResult(gate, id, call.id, decision.failure, decision.detail);
       }
       await gate.flush();
       continue;

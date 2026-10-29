@@ -663,3 +663,254 @@ describe('extend: the convergence-round regressions', () => {
     }
   }, 30_000);
 });
+
+// The second committed source for the same package name: the same strict
+// authoring shape, a different tool name — the version discriminator the
+// name-addressing tests assert on (v1 registers echo_text, v2 shout_text).
+const SHOUT_SOURCE = 'return {\n'
+  + '  tools: [{\n'
+  + '    name: \'shout_text\',\n'
+  + '    description: \'shouts the text\',\n'
+  + '    parameters: {\n'
+  + '      type: \'object\',\n'
+  + '      properties: { text: { type: \'string\', minLength: 1 } },\n'
+  + '      required: [\'text\'],\n'
+  + '      additionalProperties: false,\n'
+  + '    },\n'
+  + '    handler: async (args) => ({ shouted: args.text.toUpperCase() }),\n'
+  + '  }],\n'
+  + '};\n';
+
+describe('extend: packages addressable by name (C1.6 L1)', () => {
+  // Defines two versions of one name and pins their directory mtimes: the
+  // latest-wins resolution must not depend on millisecond scheduling.
+  async function defineTwoVersions(
+    s: Session,
+  ): Promise<{ v1: string; v2: string }> {
+    const { utimesSync } = await import('node:fs');
+    writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
+    writeFileSync(join(s.world, 'shout.js'), SHOUT_SOURCE);
+    const first = await extendCall(s, {
+      verb: 'define', name: 'echo_pkg', purpose: 'v1', path: 'echo.js',
+    });
+    const v1 = ([...first.rawEvents]
+      .filter((event) => event.type === 'package/define')
+      .pop()!.data as Record<string, unknown>)['id'] as string;
+    const second = await extendCall(s, {
+      verb: 'define', name: 'echo_pkg', purpose: 'v2', path: 'shout.js',
+    });
+    const v2 = ([...second.rawEvents]
+      .filter((event) => event.type === 'package/define')
+      .pop()!.data as Record<string, unknown>)['id'] as string;
+    // Pin the define order on the filesystem: v2 is the later definition.
+    const packagesDir = join(s.home, 'nodes', 'n1', 'packages');
+    utimesSync(join(packagesDir, v1), new Date(1_000), new Date(1_000));
+    utimesSync(join(packagesDir, v2), new Date(2_000), new Date(2_000));
+    return { v1, v2 };
+  }
+
+  it('runs a package by name — the latest stored version, with its id taught', async () => {
+    const s = await openSession();
+    try {
+      const { v2 } = await defineTwoVersions(s);
+      const { results, rawEvents } = await extendCall(s, { verb: 'run', name: 'echo_pkg' });
+      expect(results[0]!.isError).toBe(false);
+      // The announcement is v2's surface: shout_text, not echo_text.
+      expect(results[0]!.content).toContain('shout_text');
+      expect(results[0]!.content).not.toContain('echo_text');
+      // The resolved id is taught in the result and journaled in the fact.
+      expect(results[0]!.content).toContain(v2);
+      const runs = rawEvents.filter((event) => event.type === 'package/run');
+      expect(runs).toHaveLength(1);
+      expect((runs[0]!.data as Record<string, unknown>)['id']).toBe(v2);
+      await extendCall(s, { verb: 'stop', id: v2 });
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('stops the live Run by name and journals the verb fact', async () => {
+    const s = await openSession();
+    try {
+      const { v2 } = await defineTwoVersions(s);
+      await extendCall(s, { verb: 'run', name: 'echo_pkg' });
+      const { results, rawEvents } = await extendCall(s, { verb: 'stop', name: 'echo_pkg' });
+      expect(results[0]!.isError).toBe(false);
+      expect(results[0]!.content).toContain('stopped');
+      const stops = rawEvents.filter((event) => event.type === 'package/stop');
+      const last = stops[stops.length - 1]!;
+      expect((last.data as Record<string, unknown>)['id']).toBe(v2);
+      expect((last.data as Record<string, unknown>)['reason']).toBe('verb');
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('refuses a stop by name that is not the live Run, naming the live package', async () => {
+    const s = await openSession();
+    try {
+      await defineTwoVersions(s);
+      writeFileSync(join(s.world, 'other.js'), ECHO_SOURCE);
+      const other = await extendCall(s, {
+        verb: 'define', name: 'other_pkg', purpose: 'stored, not running', path: 'other.js',
+      });
+      expect(other.results[0]!.isError).toBe(false);
+      await extendCall(s, { verb: 'run', name: 'echo_pkg' });
+      const { results } = await extendCall(s, { verb: 'stop', name: 'other_pkg' });
+      expect(results[0]!.isError).toBe(true);
+      expect(results[0]!.content).toMatch(/package\/not-found/);
+      // The honest refusal names the package the live Run actually belongs to.
+      expect(results[0]!.content).toContain('echo_pkg');
+      await extendCall(s, { verb: 'stop', name: 'echo_pkg' });
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('undefines the latest version by name and falls back to the previous one', async () => {
+    const s = await openSession();
+    try {
+      const { v2 } = await defineTwoVersions(s);
+      const { results } = await extendCall(s, { verb: 'undefine', name: 'echo_pkg' });
+      expect(results[0]!.isError).toBe(false);
+      expect(results[0]!.content).toContain(v2);
+      // The latest version is gone; the name now resolves to v1.
+      expect(await s.store.readPackageSource(v2)).toBeNull();
+      const { results: rerun } = await extendCall(s, { verb: 'run', name: 'echo_pkg' });
+      expect(rerun[0]!.isError).toBe(false);
+      expect(rerun[0]!.content).toContain('echo_text');
+      await extendCall(s, { verb: 'stop', name: 'echo_pkg' });
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('refuses an unknown name with the honest not-found wording', async () => {
+    const s = await openSession();
+    try {
+      // run and undefine address the store: the refusal names the name.
+      for (const args of [{ verb: 'run', name: 'ghost' }, { verb: 'undefine', name: 'ghost' }]) {
+        const { results } = await extendCall(s, args);
+        expect(results[0]!.isError, JSON.stringify(args)).toBe(true);
+        expect(results[0]!.content, JSON.stringify(args)).toMatch(/package\/not-found/);
+        expect(results[0]!.content, JSON.stringify(args)).toContain('no stored package has that name');
+      }
+      // stop addresses the live Run: the refusal says nothing is live.
+      const stopped = await extendCall(s, { verb: 'stop', name: 'ghost' });
+      expect(stopped.results[0]!.isError).toBe(true);
+      expect(stopped.results[0]!.content).toMatch(/package\/not-found/);
+      expect(stopped.results[0]!.content).toContain('no Run is live');
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('refuses a stop by id that is not the live Run, naming the live package', async () => {
+    const s = await openSession();
+    try {
+      const { v1, v2 } = await defineTwoVersions(s);
+      await extendCall(s, { verb: 'run', id: v1 });
+      const { results } = await extendCall(s, { verb: 'stop', id: v2 });
+      expect(results[0]!.isError).toBe(true);
+      expect(results[0]!.content).toMatch(/package\/not-found/);
+      // The honest refusal names the package the live Run actually belongs to.
+      expect(results[0]!.content).toContain('echo_pkg');
+      expect(results[0]!.content).toContain(v1);
+      await extendCall(s, { verb: 'stop', name: 'echo_pkg' });
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('stops the live Run under a version skew (run v1, define v2, stop by name)', async () => {
+    const s = await openSession();
+    try {
+      const { v1 } = await defineTwoVersions(s);
+      // The live Run is v1 (started by id); v2 is newer but not running.
+      await extendCall(s, { verb: 'run', id: v1 });
+      const { results, rawEvents } = await extendCall(s, { verb: 'stop', name: 'echo_pkg' });
+      expect(results[0]!.isError).toBe(false);
+      // The name matched the LIVE Run's package: v1 stops, not v2.
+      const stops = rawEvents.filter((event) => event.type === 'package/stop');
+      const last = stops[stops.length - 1]!;
+      expect((last.data as Record<string, unknown>)['id']).toBe(v1);
+      expect((last.data as Record<string, unknown>)['reason']).toBe('verb');
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('undefines the latest version by name while an older same-name version runs', async () => {
+    const s = await openSession();
+    try {
+      const { v1, v2 } = await defineTwoVersions(s);
+      await extendCall(s, { verb: 'run', id: v1 });
+      const { results } = await extendCall(s, { verb: 'undefine', name: 'echo_pkg' });
+      expect(results[0]!.isError).toBe(false);
+      // The destructive act landed on the latest version, not the live older one.
+      expect(results[0]!.content).toContain(v2);
+      expect(await s.store.readPackageSource(v2)).toBeNull();
+      expect(await s.store.readPackageSource(v1)).not.toBeNull();
+      // The live older version is still stoppable by name.
+      const stopped = await extendCall(s, { verb: 'stop', name: 'echo_pkg' });
+      expect(stopped.results[0]!.isError).toBe(false);
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('refuses an undefine by name whose newest version is corrupt, teaching the id', async () => {
+    const s = await openSession();
+    try {
+      const { v1, v2 } = await defineTwoVersions(s);
+      // Corrupt the newest version in place: the identity no longer verifies.
+      const manifestPath = join(s.home, 'nodes', 'n1', 'packages', v2, 'manifest.json');
+      writeFileSync(manifestPath, '{"name":"echo_pkg","purpose":"forged"}');
+      const { results } = await extendCall(s, { verb: 'undefine', name: 'echo_pkg' });
+      expect(results[0]!.isError).toBe(true);
+      expect(results[0]!.content).toMatch(/undefine\/corrupt/);
+      // The refusal teaches the exact id of the corrupt newest version.
+      expect(results[0]!.content).toContain(v2);
+      // The healthy older version was NOT the destructive target.
+      expect(await s.store.readPackageSource(v1)).not.toBeNull();
+      // The taught escape hatch works: by-id undefine is existence-only.
+      const escaped = await extendCall(s, { verb: 'undefine', id: v2 });
+      expect(escaped.results[0]!.isError).toBe(false);
+      expect(await s.store.readPackageSource(v2)).toBeNull();
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('refuses a malformed reference with a detail naming the rule', async () => {
+    const s = await openSession();
+    try {
+      // A wrong key SET names the rule: extra keys, both keys, neither key.
+      const cases: JsonValue[] = [
+        { verb: 'run' },
+        { verb: 'run', name: 'x', id: 'y' },
+        { verb: 'run', name: 'x', tool: 'y' },
+        { verb: 'stop' },
+        { verb: 'stop', name: 'x', id: 'y' },
+        { verb: 'undefine' },
+        { verb: 'undefine', name: 'x', id: 'y' },
+        { verb: 'run', id: 'x', name: 'y' },
+      ];
+      for (const args of cases) {
+        const { results } = await extendCall(s, args);
+        expect(results[0]!.isError, JSON.stringify(args)).toBe(true);
+        expect(results[0]!.content, JSON.stringify(args)).toMatch(/invalid-tool/);
+        expect(results[0]!.content, JSON.stringify(args))
+          .toMatch(/takes exactly one of name or id/);
+      }
+      // A right key set with a wrong-typed value stays bare: the model sent
+      // exactly one reference — the rule is not what it broke.
+      const mistyped = await extendCall(s, { verb: 'run', name: 3 });
+      expect(mistyped.results[0]!.isError).toBe(true);
+      expect(mistyped.results[0]!.content).toMatch(/invalid-tool/);
+      expect(mistyped.results[0]!.content).not.toMatch(/takes exactly one of/);
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+});

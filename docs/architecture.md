@@ -74,7 +74,7 @@ not individually logged.
 
 | Module | Role |
 |---|---|
-| `store.ts` | The definition store: fd-first define, content-addressed identity, write-once persistence under `nodes/<uid>/packages/`, the deleting re-mount scan and the read-only listing |
+| `store.ts` | The definition store: fd-first define, content-addressed identity, write-once persistence under `nodes/<uid>/packages/`, the deleting re-mount scan, the read-only listing and the name channel (a name resolves to the latest stored version) |
 | `protocol.ts` | The Run facade protocol codec: the eight-frame vocabulary, per-line byte accounting, the one-in-flight guards, drain-aware writes |
 | `run-bootstrap.ts` | The child half: verify-then-use (inline sha256 before any guest byte), the inlined canonical encoder in lockstep with the journal's, bounded capture, the serial handler chain |
 | `registry.ts` | The live tool registry: transactional registration, the safe schema dialect, the frozen caps |

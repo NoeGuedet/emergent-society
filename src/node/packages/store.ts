@@ -91,6 +91,28 @@ export type PackageStore = {
     readonly definitions: readonly PackageDefinition[];
     readonly corrupt: readonly CorruptDefinition[];
   }>;
+  /**
+   * The name channel (C1.6): the latest verified definition stored under a
+   * name, or null. A derived, read-only query — the store is the durable
+   * truth, "latest" is the greatest directory mtime among the name's stored
+   * versions (define is write-once per id, undefine removes the entry, a
+   * same-content re-define is the same id), tie-broken by id so the answer
+   * is deterministic. Undefining the latest version makes the name resolve
+   * to the previous one — no index, nothing transactional to maintain. The
+   * candidates are verified newest-first and the first healthy one wins, so
+   * a corrupt newest version never masks the healthy ones beneath it. The
+   * name channel is ergonomic; the id channel stays exact.
+   */
+  resolveLatestByName(name: string): Promise<PackageDefinition | null>;
+  /**
+   * The name's newest stored id by mtime, with no verification and no
+   * skipping — the destructive resolution (undefine). A corrupt newest
+   * version is NOT skipped here: the caller faces it instead of having the
+   * destructive act land on an older version.
+   */
+  newestIdByName(name: string): Promise<string | null>;
+  /** One verified definition by exact id, or null (derived, read-only). */
+  definitionById(id: string): Promise<PackageDefinition | null>;
   undefinePackage(id: string): Promise<void>;
 };
 
@@ -377,7 +399,13 @@ export async function createPackageStore(deps: PackageStoreDeps): Promise<Packag
     }
   }
 
-  /** Re-derives the identity from the stored bytes; the dir must hold exactly the two files. */
+  /**
+   * Re-derives the identity from the stored bytes; the dir must hold exactly
+   * the two files. A directory that vanishes mid-verification (an undefine
+   * racing the scan) is not-ok, never a thrown ENOENT: the callers treat a
+   * refusal as absence, and a store method must never escalate a raced
+   * absence into a handler error.
+   */
   async function verifyStored(
     id: string,
     idDir: string,
@@ -385,7 +413,15 @@ export async function createPackageStore(deps: PackageStoreDeps): Promise<Packag
     | { readonly ok: true; readonly definition: PackageDefinition }
     | { readonly ok: false; readonly reason: string }
   > {
-    const names = (await readdir(idDir)).sort();
+    let names: string[];
+    try {
+      names = (await readdir(idDir)).sort();
+    } catch (err) {
+      if (isErrno(err, 'ENOENT') || isErrno(err, 'ENOTDIR')) {
+        return { ok: false, reason: 'the entry is gone' };
+      }
+      throw err;
+    }
     if (names.length !== 2 || names[0] !== MANIFEST_FILE || names[1] !== SOURCE_FILE) {
       return { ok: false, reason: 'unexpected directory contents' };
     }
@@ -456,7 +492,78 @@ export async function createPackageStore(deps: PackageStoreDeps): Promise<Packag
     return { definitions, corrupt };
   }
 
+  // The cheap pre-filter of the name channel: the manifest alone, unverified
+  // — candidates are collected by name and only the winners are verified, so
+  // a node with many stored packages pays one bounded manifest read each,
+  // never a full source re-verification per lookup.
+  async function manifestNameOf(id: string): Promise<string | null> {
+    const raw = await readStoredFile(join(packagesDir, id, MANIFEST_FILE), MAX_MANIFEST_BYTES);
+    if (raw === null) return null;
+    try {
+      const manifest = JSON.parse(raw.toString('utf8'));
+      if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)) {
+        return null;
+      }
+      const name = (manifest as { name?: unknown }).name;
+      return typeof name === 'string' ? name : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The name's stored candidates, newest-first: mtime desc, id desc as the
+   * deterministic tie-break. The manifest pre-filter is read-only and
+   * unverified — an entry whose manifest cannot be parsed is unattributable
+   * to any name (the boot scan deletes corrupt entries; within one process
+   * lifetime the by-id channel remains exact for them).
+   */
+  async function collectByName(name: string): Promise<{ id: string; mtimeMs: number }[]> {
+    const candidates: { id: string; mtimeMs: number }[] = [];
+    for (const entry of await readPackagesDir()) {
+      if (!entry.isDirectory() || !ID_RE.test(entry.name)) continue;
+      if (await manifestNameOf(entry.name) !== name) continue;
+      const info = await statOrNull(join(packagesDir, entry.name));
+      if (info === null) continue;
+      candidates.push({ id: entry.name, mtimeMs: info.mtimeMs });
+    }
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+    return candidates;
+  }
+
+  async function resolveLatestByName(name: string): Promise<PackageDefinition | null> {
+    // The first healthy candidate wins; a corrupt newest version is skipped,
+    // never masking the healthy ones beneath it — the read-only resolution
+    // (run) favors what works. The destructive resolution (undefine) uses
+    // newestIdByName instead, which never skips.
+    for (const candidate of await collectByName(name)) {
+      const verdict = await verifyStored(candidate.id, join(packagesDir, candidate.id));
+      if (verdict.ok) return verdict.definition;
+    }
+    return null;
+  }
+
+  /**
+   * The name's newest stored id by mtime, with no verification and no
+   * skipping — the destructive resolution. Unlike `resolveLatestByName`, a
+   * corrupt newest version is NOT skipped: the caller must face it (refuse
+   * and teach the id) rather than have the destructive act land on an older
+   * version the name was not addressing. Null when no stored manifest
+   * carries the name.
+   */
+  async function newestIdByName(name: string): Promise<string | null> {
+    const candidates = await collectByName(name);
+    return candidates.length > 0 ? candidates[0]!.id : null;
+  }
+
+  async function definitionById(id: string): Promise<PackageDefinition | null> {
+    if (!ID_RE.test(id)) return null;
+    const verdict = await verifyStored(id, join(packagesDir, id));
+    return verdict.ok ? verdict.definition : null;
+  }
+
   return {
-    definePackage, readMountedPackages, readPackageSource, listPackages, undefinePackage,
+    definePackage, readMountedPackages, readPackageSource, listPackages,
+    resolveLatestByName, newestIdByName, definitionById, undefinePackage,
   };
 }

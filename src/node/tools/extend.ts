@@ -4,7 +4,7 @@ import type { AgentConfig } from '../../context/contracts.js';
 import { canonicalizeJson } from '../../journal/index.js';
 import { boundToolText } from './text.js';
 import { PackageError } from '../packages/errors.js';
-import type { PackageStore } from '../packages/store.js';
+import type { PackageDefinition, PackageStore } from '../packages/store.js';
 import type { RunSupervisor } from '../packages/supervisor.js';
 
 /**
@@ -41,6 +41,15 @@ export type ExtendPort = {
   readonly sandbox: boolean;
 };
 
+/**
+ * How a verb addresses a Package (C1.6): by name — the ergonomic standard
+ * the models are trained for, resolving to the latest stored version — or by
+ * id, the exact content-addressed channel. Exactly one, as decide() enforced.
+ */
+export type PackageRef =
+  | { readonly by: 'name'; readonly name: string }
+  | { readonly by: 'id'; readonly id: string };
+
 /** One validated extend decision, as decide() produced it. */
 export type ExtendDecision =
   | { readonly kind: 'extend'; readonly verb: 'inspect' }
@@ -48,13 +57,13 @@ export type ExtendDecision =
     readonly kind: 'extend'; readonly verb: 'define';
     readonly name: string; readonly purpose: string; readonly path: string;
   }
-  | { readonly kind: 'extend'; readonly verb: 'run'; readonly id: string }
+  | { readonly kind: 'extend'; readonly verb: 'run'; readonly ref: PackageRef }
   | {
     readonly kind: 'extend'; readonly verb: 'call';
     readonly tool: string; readonly args: unknown;
   }
-  | { readonly kind: 'extend'; readonly verb: 'stop'; readonly id: string }
-  | { readonly kind: 'extend'; readonly verb: 'undefine'; readonly id: string };
+  | { readonly kind: 'extend'; readonly verb: 'stop'; readonly ref: PackageRef }
+  | { readonly kind: 'extend'; readonly verb: 'undefine'; readonly ref: PackageRef };
 
 /** A schema violation the funnel refuses with, naming the field. */
 function schemaViolation(args: unknown, schema: unknown, where: string): string | null {
@@ -258,6 +267,30 @@ function renderInspect(
   return lines.join('\n');
 }
 
+/**
+ * Resolves the run reference to a stored definition with the channel's own
+ * honest not-found wording (C1.6): the name channel names the name, the id
+ * channel names the id — never the bare pre-C1.6 id wording for a name the
+ * model actually sent. (Undefine does not use this: its destructive
+ * resolution never skips, so it resolves by hand.)
+ */
+async function resolveRef(
+  port: ExtendPort, ref: PackageRef,
+): Promise<{ readonly def: PackageDefinition | null; readonly notFoundText: string }> {
+  if (ref.by === 'id') {
+    return {
+      def: await port.store.definitionById(ref.id),
+      notFoundText: 'error: package/not-found\nno stored package has that id'
+        + ' — extend {verb:"inspect"} lists the stored catalogue',
+    };
+  }
+  return {
+    def: await port.store.resolveLatestByName(ref.name),
+    notFoundText: 'error: package/not-found\nno stored package has that name'
+      + ' — extend {verb:"inspect"} lists the stored catalogue',
+  };
+}
+
 /** Executes one validated extend decision and appends its result. */
 export async function executeExtend(opts: {
   readonly gate: BoundaryGate;
@@ -304,14 +337,23 @@ export async function executeExtend(opts: {
   }
 
   if (decision.verb === 'run') {
-    const source = await port.store.readPackageSource(decision.id);
-    if (source === null) {
-      await appendResult(gate, id, callId,
-        'error: package/not-found\nno stored package has that id'
-        + ' — extend {verb:"inspect"} lists the stored catalogue', true, max);
+    const { def, notFoundText } = await resolveRef(port, decision.ref);
+    if (def === null) {
+      await appendResult(gate, id, callId, notFoundText, true, max);
       return;
     }
-    const verdict = await port.supervisor.startRun(decision.id, source);
+    const source = await port.store.readPackageSource(def.id);
+    if (source === null) {
+      // The definition was resolved but is gone at delivery (an undefine
+      // raced between the two reads): the refusal keeps the channel the
+      // model actually used. Content integrity needs no re-verification
+      // here — the Run's own verify-then-use makes a child spawned over
+      // mismatched bytes exit fatal before any guest byte evaluates, so
+      // the journaled package/run id can only ever name bytes that passed.
+      await appendResult(gate, id, callId, notFoundText, true, max);
+      return;
+    }
+    const verdict = await port.supervisor.startRun(def.id, source);
     if (!verdict.ok) {
       const text = verdict.code === 'busy'
         ? 'error: run/busy\na Run is already active — stop it first'
@@ -327,11 +369,12 @@ export async function executeExtend(opts: {
       return;
     }
     gate.append('package/run', {
-      id: decision.id, runId: verdict.runId,
+      id: def.id, runId: verdict.runId,
       sandbox: port.sandbox ? 'landlock' : 'off',
     });
-    const lines = [`run started (run ${verdict.runId}, sandbox:`
-      + ` ${port.sandbox ? 'landlock' : 'off'}), ${verdict.tools.length} tool(s):`];
+    const lines = [`run started (package ${def.name} (id ${def.id}),`
+      + ` run ${verdict.runId}, sandbox: ${port.sandbox ? 'landlock' : 'off'}),`
+      + ` ${verdict.tools.length} tool(s):`];
     for (const tool of verdict.tools) {
       lines.push(`- ${tool.name}: ${tool.description}`);
       lines.push(`  schema: ${canonicalizeJson(tool.parameters)}`);
@@ -386,40 +429,114 @@ export async function executeExtend(opts: {
   if (decision.verb === 'stop') {
     const liveId = port.supervisor.liveRunId();
     const livePackage = port.supervisor.livePackageId();
-    if (liveId === null || livePackage !== decision.id) {
+    if (liveId === null || livePackage === null) {
       await appendResult(gate, id, callId,
-        'error: package/not-found\nthat package has no live Run', true, max);
+        'error: package/not-found\nno Run is live — run a package first', true, max);
+      return;
+    }
+    // Stop acts on the one live Run, so the reference is checked against it:
+    // a name matches the live Run's package name, an id its package id. A
+    // version skew (run v1, define v2, stop by name) can never misfire.
+    const liveDef = await port.store.definitionById(livePackage);
+    // The manifest read above can straddle the Run's own death (a crash or a
+    // clean exit lands between the two live reads). Re-read the live ids and
+    // refuse when they moved: a stop must never journal a verb fact for a
+    // Run that already ended — the crash fact owns that Run's ending. The
+    // remaining window (re-read → stopRun) is the pre-name-era design's own,
+    // owned by the supervisor's kernelStopped/disposed machinery.
+    if (port.supervisor.liveRunId() !== liveId
+      || port.supervisor.livePackageId() !== livePackage) {
+      await appendResult(gate, id, callId,
+        'error: package/not-found\nthe Run ended before the stop landed'
+        + ' — extend {verb:"inspect"} shows the live catalogue', true, max);
+      return;
+    }
+    const matches = decision.ref.by === 'id'
+      ? livePackage === decision.ref.id
+      : liveDef !== null && liveDef.name === decision.ref.name;
+    if (!matches) {
+      const wanted = decision.ref.by === 'name'
+        ? `name ${JSON.stringify(decision.ref.name)}` : `id ${decision.ref.id}`;
+      const liveName = liveDef !== null
+        ? `${liveDef.name} (id ${livePackage})` : livePackage;
+      await appendResult(gate, id, callId,
+        `error: package/not-found\nno live Run of ${wanted}`
+        + ` — the live Run is package ${liveName}`, true, max);
       return;
     }
     await port.supervisor.stopRun();
     gate.append('package/stop', {
-      id: decision.id, runId: liveId, reason: 'verb',
+      id: livePackage, runId: liveId, reason: 'verb',
     });
     await appendResult(gate, id, callId,
-      `stopped (run ${liveId}); the package stays defined — re-run it anytime`,
+      `stopped (package ${liveDef !== null ? liveDef.name : livePackage}, run ${liveId});`
+      + ' the package stays defined — re-run it anytime',
       false, max);
     return;
   }
 
-  // undefine
-  if (port.supervisor.livePackageId() === decision.id) {
+  // undefine — the destructive resolution. By name: the newest stored id
+  // under that name with NO skipping — a corrupt newest version is faced
+  // and refused (teaching the id channel), never stepped around onto an
+  // older version the name was not addressing. By id: existence-only, the
+  // model names the exact entry — deleting it whatever its state is the
+  // honest escape hatch the corrupt refusal teaches.
+  if (decision.ref.by === 'id') {
+    if (port.supervisor.livePackageId() === decision.ref.id) {
+      await appendResult(gate, id, callId,
+        'error: undefine while a Run is active\nstop it first — two deliberate'
+        + ' acts, two facts', true, max);
+      return;
+    }
+    try {
+      await port.store.undefinePackage(decision.ref.id);
+    } catch (err) {
+      if (err instanceof PackageError && err.code === 'not-found') {
+        await appendResult(gate, id, callId,
+          'error: package/not-found\nno stored package has that id', true, max);
+        return;
+      }
+      throw err;
+    }
+    gate.append('package/undefine', { id: decision.ref.id });
+    await appendResult(gate, id, callId,
+      `undefined (id ${decision.ref.id}); the definition is gone — re-defining the same`
+      + ' source restores the exact identity', false, max);
+    return;
+  }
+  const newest = await port.store.newestIdByName(decision.ref.name);
+  if (newest === null) {
+    await appendResult(gate, id, callId,
+      'error: package/not-found\nno stored package has that name'
+      + ' — extend {verb:"inspect"} lists the stored catalogue', true, max);
+    return;
+  }
+  const def = await port.store.definitionById(newest);
+  if (def === null) {
+    await appendResult(gate, id, callId,
+      'error: undefine/corrupt\nthe newest version of that name does not verify'
+      + ` — undefine it by id instead: {verb:"undefine", id:"${newest}"}`, true, max);
+    return;
+  }
+  if (port.supervisor.livePackageId() === def.id) {
     await appendResult(gate, id, callId,
       'error: undefine while a Run is active\nstop it first — two deliberate'
       + ' acts, two facts', true, max);
     return;
   }
   try {
-    await port.store.undefinePackage(decision.id);
+    await port.store.undefinePackage(def.id);
   } catch (err) {
     if (err instanceof PackageError && err.code === 'not-found') {
       await appendResult(gate, id, callId,
-        'error: package/not-found\nno stored package has that id', true, max);
+        'error: package/not-found\nno stored package has that name'
+        + ' — extend {verb:"inspect"} lists the stored catalogue', true, max);
       return;
     }
     throw err;
   }
-  gate.append('package/undefine', { id: decision.id });
+  gate.append('package/undefine', { id: def.id });
   await appendResult(gate, id, callId,
-    `undefined (${decision.id}); the definition is gone — re-defining the same`
+    `undefined ${def.name} (id ${def.id}); the definition is gone — re-defining the same`
     + ' source restores the exact identity', false, max);
 }
