@@ -442,3 +442,23 @@ describe('package store: undefine', () => {
     rmSync(f.home, { recursive: true, force: true });
   });
 });
+
+
+describe('package store: symlinked cell layouts', () => {
+  it('defines from a symlinked world root (realpath containment)', async () => {
+    const f = fixture();
+    // The world reached through a symlink: containment compares the pinned
+    // fd's realpath, so the root must resolve before comparing.
+    const link = join(f.home, 'world-link');
+    symlinkSync(f.world, link);
+    const s = await createPackageStore({
+      home: f.home, uid: 'n1', worldDir: link, scratchDir: f.scratch,
+    });
+    writeFileSync(join(f.world, 'via-link.js'), GOOD_SOURCE);
+    const result = await s.definePackage({
+      name: 'via_link', purpose: 'through the symlink', path: 'via-link.js',
+    });
+    expect(result.id).toMatch(/^[0-9a-f]{64}$/);
+    rmSync(f.home, { recursive: true, force: true });
+  });
+});

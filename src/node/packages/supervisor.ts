@@ -393,6 +393,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
         }
 
         const child = spawn(program, [...argv], {
+          cwd: leaf,
           stdio: ['pipe', 'pipe', 'pipe'],
           // Constructed from nothing — never filtered `process.env`; the
           // allowlist is exactly the two leaf paths, so NODE_OPTIONS and
@@ -481,6 +482,9 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
     async invokeTool(tool: RegisteredTool, args: unknown, signal?: AbortSignal): Promise<InvokeVerdict> {
       const run = live;
       if (run === null || run.exited || run.disposed) return { status: 'crashed' };
+      // An abort that landed before the invoke began settles cancelled at
+      // entry — the post-flush re-check's missing twin for the funnel.
+      if (signal?.aborted === true) return { status: 'cancelled' };
       const callId = `invoke-${randomBytes(8).toString('hex')}`;
       if (!run.invokeGuard.begin(callId)) return { status: 'crashed' };
       return new Promise<InvokeVerdict>((resolve) => {
@@ -573,6 +577,9 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
     if (outcome.status === 'teardown') {
       const resolve = run.startResolve;
       run.startResolve = null;
+      // The ready deadline releases on this path too, whatever the child's
+      // exit state — no timer ever outlives its Run.
+      run.cancelReady();
       if (!run.exited) teardown(run);
       releaseSlot(run);
       if (run.readied || resolve !== null) {

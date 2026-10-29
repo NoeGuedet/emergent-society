@@ -161,8 +161,8 @@ class Runtime implements AgentRuntime {
   private readonly extendPort: ExtendPort | null;
   /** The gate holder the package event router reads (the current dispatch's). */
   private packageGateHolder: { gate: BoundaryGate | null } = { gate: null };
-  /** Flushes the queued out-of-dispatch package facts into a gate. */
-  private flushPackageFacts: (gate: BoundaryGate) => void = () => {};
+  /** Flushes the queued out-of-dispatch package facts into a gate; returns how many landed. */
+  private flushPackageFacts: (gate: BoundaryGate) => number = () => 0;
   readonly handler: TurnHandler;
   readonly hooks: DriverHooks;
 
@@ -188,6 +188,14 @@ class Runtime implements AgentRuntime {
         const terminalError = await this.stopTerminal()
           .then(() => null, (err: unknown) => err);
         await this.stopPackages(gate);
+        // A fact queued while the node was parked (a Run that crashed before
+        // this stop) lands here — the queue must not die with the process,
+        // because a production resume is a new one. The flush happens only
+        // when a fact actually landed: an empty queue must not perturb the
+        // stop's own durable sequencing.
+        if (gate !== null && this.flushPackageFacts(gate) > 0) {
+          await gate.flush();
+        }
         if (terminalError !== null) throw terminalError;
       },
     };
@@ -210,10 +218,12 @@ class Runtime implements AgentRuntime {
       if (packageFactQueue.length >= 64) packageFactQueue.shift();
       packageFactQueue.push({ type, data });
     };
-    const flushPackageFacts = (gate: BoundaryGate): void => {
-      for (const fact of packageFactQueue.splice(0)) {
+    const flushPackageFacts = (gate: BoundaryGate): number => {
+      const queued = packageFactQueue.splice(0);
+      for (const fact of queued) {
         gate.append(fact.type as 'package/effect', fact.data as never);
       }
+      return queued.length;
     };
     this.flushPackageFacts = flushPackageFacts;
     const packageEvents: RunSupervisorEvents = {
@@ -332,7 +342,7 @@ class Runtime implements AgentRuntime {
     // definitions, report the corrupt ones, reap the orphaned run leaves.
     await this.scanPackages(gate);
     // A fact queued while the node was parked (an idle Run crash) lands here.
-    this.flushPackageFacts(gate);
+    void this.flushPackageFacts(gate);
     if (this.fold.snapshot().config === null) {
       const stored = await gate.store(this.initialConfig);
       gate.append('system/message', { version: this.initialConfig.version, value: stored });

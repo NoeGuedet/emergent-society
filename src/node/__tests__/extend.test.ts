@@ -611,3 +611,55 @@ describe('extend: the audit corrections', () => {
     }
   }, 30_000);
 });
+
+
+describe('extend: the convergence-round regressions', () => {
+  it('settles an aborted funneled invoke as the synthetic cancelled closer', async () => {
+    const s = await openSession();
+    try {
+      writeFileSync(join(s.world, 'echo.js'), ECHO_SOURCE);
+      const defined = await extendCall(s, {
+        verb: 'define', name: 'echo_pkg', purpose: 'echo', path: 'echo.js',
+      });
+      const id = (defined.rawEvents
+        .find((event) => event.type === 'package/define')!.data as Record<string, unknown>)['id'];
+      await extendCall(s, { verb: 'run', id: id as string });
+
+      // An already-aborted gate signal: the invoke settles cancelled at
+      // entry, the synthetic cancelled closer is the durable result.
+      const gate = s.gate('turn', 1);
+      const controller = new AbortController();
+      controller.abort();
+      // The gate carries the aborted signal through a fresh scope.
+      const abortedGate = {
+        append: gate.append.bind(gate),
+        flush: gate.flush.bind(gate),
+        capture: gate.capture.bind(gate),
+        store: gate.store.bind(gate),
+        signal: controller.signal,
+      } as unknown as typeof gate;
+      s.packageGate(abortedGate);
+      try {
+        await dispatchCalls(
+          projection([call('c1', 'extend', {
+            verb: 'call', tool: 'echo_text', args: { text: 'never lands' },
+          })]),
+          { turn: 1, ordinal: 0 }, abortedGate, config(),
+          { run: async () => { throw new Error('not used'); } },
+          undefined,
+          { store: s.store, supervisor: s.supervisor, sandbox: false },
+        );
+      } finally {
+        s.packageGate(null);
+      }
+      const list = await events(s.home);
+      const last = [...list].filter((event) => event.type === 'tool/result').pop()!;
+      const data = last.data as { message: { content: string }; failure: { code: string } | null; synthetic: boolean };
+      expect(data.message.content).toBe('cancelled');
+      expect(data.failure).toEqual({ code: 'cancelled', status: null });
+      expect(data.synthetic).toBe(true);
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+});

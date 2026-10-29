@@ -66,6 +66,22 @@ describe('protocol codec: framing round-trip', () => {
     expect(seen).toEqual(FRAMES);
   });
 
+  it('refuses a frame carrying a lone surrogate as invalid-shape (never a kernel crash)', () => {
+    const decoder = new FrameDecoder();
+    // A forged frame whose description is a lone surrogate: valid JSON to
+    // parse, but no canonical form — the decoder refuses it before any
+    // downstream canonicalization can throw inside the kernel. The JSON text
+    // must carry the ESCAPE SEQUENCE (backslash-u-d800): JSON.parse decodes
+    // it in memory to the lone surrogate, which the raw character cannot
+    // reach (it lands as U+FFFD through any UTF-8 round trip).
+    const jsonEscape = String.fromCharCode(0x5c) + 'ud800';
+    const newline = String.fromCharCode(0x0a);
+    const forged = `{"type":"run/ready","tools":[{"name":"x","description":"${jsonEscape}","parameters":{}}]}${newline}`;
+    const outcomes = decoder.push(forged);
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]).toMatchObject({ status: 'teardown', reason: 'invalid-shape' });
+  });
+
   it('decodes many complete lines arriving in one chunk', () => {
     const [first, second, third] = [
       FRAMES[0]!, FRAMES[1]!, FRAMES[2]!,

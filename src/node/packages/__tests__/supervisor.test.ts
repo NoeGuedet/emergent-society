@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -388,6 +388,9 @@ describe('run supervisor: the confinement battery (Landlock)', () => {
 
   it.skipIf(!existsSync(launcher))('an unconfined Run reads them all (--no-sandbox honestly)', async () => {
     const h = await harness(false);
+    mkdirSync(join(h.home, 'nodes', 'n1'), { recursive: true });
+    writeFileSync(join(h.home, 'nodes', 'n1', 'canary.txt'), 'journal-canary\n');
+    writeFileSync(join(h.world, 'canary.txt'), 'world-canary\n');
     const providersPath = join(h.home, 'providers.json');
     const source = Buffer.from(
       'return { tools: [{ name: "probe_escape",'
@@ -407,6 +410,12 @@ describe('run supervisor: the confinement battery (Landlock)', () => {
     const tool = s.registry.lookup('probe_escape');
     const providers = await s.invokeTool(tool!, { path: providersPath });
     expect(providers).toMatchObject({ status: 'ok', result: { read: true } });
+    // The positive controls: the canaries ARE readable unconfined (the pair
+    // proves the confined side's read:false was the policy, not the path).
+    const journalCanary = await s.invokeTool(tool!, { path: join(h.home, 'nodes', 'n1', 'canary.txt') });
+    expect(journalCanary).toMatchObject({ status: 'ok', result: { read: true } });
+    const worldCanary = await s.invokeTool(tool!, { path: join(h.world, 'canary.txt') });
+    expect(worldCanary).toMatchObject({ status: 'ok', result: { read: true } });
     await s.stopRun();
     await h.dispose();
   }, 20_000);
@@ -568,6 +577,86 @@ describe('run supervisor: the audit corrections', () => {
     const verdict = await s.invokeTool(tool!, {});
     // The handler completes with the truncated output — never a timeout.
     expect(verdict).toMatchObject({ status: 'ok' });
+    await s.stopRun();
+    await h.dispose();
+  }, 20_000);
+});
+
+describe('run supervisor: the convergence-round regressions', () => {
+  it('refuses a late run/ready after a stop (a genuine late frame)', async () => {
+    const h = await harness(true);
+    const s = h.supervisor();
+    // The ready is DELAYED: the stop lands first, the child's ready arrives
+    // after the run is disposed — it must never re-register.
+    const delayed = Buffer.from(
+      'await new Promise((resolve) => setTimeout(resolve, 400));\n'
+      + 'return { tools: [{ name: "late_tool", description: "late",'
+      + ' parameters: { type: "object" }, handler: async () => ({}) }] };\n',
+    );
+    const pending = s.startRun('1'.repeat(64), delayed);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await s.stopRun();
+    const verdict = await pending;
+    expect(verdict).toMatchObject({ ok: false, code: 'crashed' });
+    expect(s.registry.liveRunId()).toBeNull();
+    // The slot is free: a second run starts cleanly.
+    const second = await s.startRun('2'.repeat(64), sourceOf('echo.js'));
+    expect(second).toMatchObject({ ok: true });
+    await s.stopRun();
+    await h.dispose();
+  }, 20_000);
+
+  it('journals a signal-killed child as crashed (exit code null)', async () => {
+    const h = await harness(true);
+    const s = h.supervisor();
+    const selfkiller = Buffer.from(
+      'return { tools: [{ name: "die_now", description: "self SIGKILL",'
+      + ' parameters: { type: "object" },'
+      + ' handler: async () => { process.kill(process.pid, "SIGKILL"); return {}; } }] };\n',
+    );
+    const start = await s.startRun('3'.repeat(64), selfkiller);
+    expect(start.ok).toBe(true);
+    const tool = s.registry.lookup('die_now');
+    const verdict = await s.invokeTool(tool!, {});
+    expect(verdict).toMatchObject({ status: 'crashed' });
+    expect(h.events.errors.some((e) => e.code === 'crashed')).toBe(true);
+    await h.dispose();
+  }, 20_000);
+
+  it('denies the web service the node does not allow (per-tool attenuation)', async () => {
+    const h = await harness(true);
+    const extractCalls: string[] = [];
+    const s = createRunSupervisor({
+      home: h.home, uid: 'n1', sandbox: true,
+      shellTimeoutMs: INVOKE_MS, killGraceMs: KILL_GRACE_MS,
+      maxShellCaptureBytes: 16 * 1024 * 1024,
+      webAllowance: { search: true, fetch: false },
+      now: h.clock.now, schedule: h.clock.schedule,
+      terminal: null,
+      web: {
+        search: async () => ({ ok: true, status: 200, body: Buffer.from('hits'), frontierCall: null }),
+        extract: async (url: string) => { extractCalls.push(url); throw new Error('must not be called'); },
+      } as never,
+      events: {
+        effect: () => {}, error: () => {},
+        service: (payload) => { h.events.services.push({ service: payload.service, subjectHash: payload.subjectHash, ok: payload.ok, status: payload.status }); },
+      },
+      bootstrapPath: bootstrapSource,
+    });
+    // The fixture calls web_fetch — the service this node does NOT allow.
+    const fetchSource = Buffer.from(
+      'return { tools: [{ name: "fetch_page",'
+      + ' description: "fetches a page",'
+      + ' parameters: { type: "object", properties: { url: { type: "string" } },'
+      + ' required: ["url"] },'
+      + ' handler: async (args, svc) => ({ body: (await svc.web_fetch(args.url)).body }) }] };\n',
+    );
+    const start = await s.startRun('4'.repeat(64), fetchSource);
+    expect(start.ok).toBe(true);
+    const tool = s.registry.lookup('fetch_page');
+    expect(await s.invokeTool(tool!, { url: 'https://example.org' }))
+      .toMatchObject({ status: 'error', message: /denied/ });
+    expect(extractCalls).toEqual([]);
     await s.stopRun();
     await h.dispose();
   }, 20_000);
