@@ -101,7 +101,7 @@ async function spineFor(
   const frontier = await fx.frontier();
   const scratchDir = join(fx.home, 'tmp', 'n1');
   await import('node:fs').then((fs) => fs.promises.mkdir(scratchDir, { recursive: true }));
-  const store = createPackageStore({
+  const store = await createPackageStore({
     home: fx.home, uid: 'n1', worldDir: fx.world.path, scratchDir,
   });
   const runtime = createAgentRuntime({
@@ -120,6 +120,7 @@ async function spineFor(
           return () => clearTimeout(timer);
         },
         terminal: ports.terminal, web: null,
+        webAllowance: { search: true, fetch: true },
         events,
         bootstrapPath: bootstrapSource,
       }),
@@ -372,5 +373,124 @@ describe('package lifecycle: the host stop', () => {
       }
       rmSync(join(fx.home, '..'), { recursive: true, force: true });
     }
+  }, 40_000);
+});
+
+describe('package lifecycle: the final-swarm corrections', () => {
+  it('journals an idle Run crash that lands while the node is parked', async () => {
+    const fx = world();
+    let phase = 'define';
+    let packageId = '';
+    const spine = await spineFor(fx, (messages) => {
+      const last = lastToolResult(messages);
+      if (phase === 'define') {
+        phase = 'run';
+        return calling([callOf('c1', 'define', {
+          name: 'selfkiller', purpose: 'dies on a timer', path: 'selfkiller.js',
+        })]);
+      }
+      if (phase === 'run') {
+        const match = last !== null ? ID_RE.exec(last) : null;
+        expect(match, `id: ${last}`).not.toBeNull();
+        packageId = match![1] as string;
+        phase = 'park';
+        return calling([callOf('c2', 'run', { id: packageId })]);
+      }
+      return noCalls('parked while the Run idles');
+    });
+    try {
+      // The guest exits on its own timer, AFTER the node parks: the crash
+      // fact arrives with no dispatch gate held.
+      writeFileSync(join(fx.world.path, 'selfkiller.js'),
+        'const fs = await import("node:fs");\n'
+        + 'fs.writeFileSync("arming.txt", "1");\n'
+        + 'setTimeout(() => process.exit(7), 250);\n'
+        + 'return { tools: [{ name: "never_called",'
+        + ' description: "dies first",'
+        + ' parameters: { type: "object" },'
+        + ' handler: async () => ({}) }] };\n');
+      const driver = await spine.open();
+      const running = driver.run();
+      await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+      // Give the idle crash time to land while parked.
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      driver.stop();
+      await running;
+      // The reopen uses the SAME runtime: the queued crash fact lives in
+      // its package fact queue, and its ready phase flushes it.
+      const driver2 = await spine.open();
+      const running2 = driver2.run();
+      await vi.waitFor(() => expect(driver2.state).toBe('waiting'));
+      driver2.stop();
+      await running2;
+      const events = await spine.events();
+      const crashed = [...events].filter(
+        (event) => event.type === 'package/error'
+          && (event.data as Record<string, unknown>)['code'] === 'crashed',
+      );
+      expect(crashed).toHaveLength(1);
+      expect((crashed[0]!.data as Record<string, unknown>)['id']).toBe(packageId);
+    } finally {
+      rmSync(join(fx.home, '..'), { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  it('keeps a pre-C1.5 four-tool journal exactly as it was (no migration)', async () => {
+    const fx = world();
+    // Session 1 journals a FOUR-tool config (the pre-C1.5 shape).
+    const oldConfig = { ...defaultAgentConfig() };
+    oldConfig.tools = oldConfig.tools.filter((tool) => tool.name !== 'extend');
+    oldConfig.allowedTools = oldConfig.allowedTools.filter((name) => name !== 'extend');
+    const transport1 = new SpineTransport(() => noCalls('old cell parks'));
+    const frontier = await fx.frontier();
+    const runtime1 = createAgentRuntime({
+      home: fx.home, uid: 'n1', world: fx.world, initialConfig: oldConfig,
+      terminal: { env: { PATH: '/usr/bin:/bin' } },
+      adapter: new ProviderAdapter(transport1, systemProviderPolicy, frontier.gate),
+    });
+    let driver = await NodeDriver.open(
+      fx.home, 'n1', runtime1.handler, fx.world,
+      { knownTypes: C13_EVENT_TYPES, hooks: runtime1.hooks, worldPollMs: 0 },
+    );
+    let running = driver.run();
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    driver.stop();
+    await running;
+
+    // Session 2 boots with the DEFAULT (five-tool) factory config: the
+    // journaled four-tool config wins — extend is not offered.
+    let attempted = false;
+    const transport2 = new SpineTransport(() => {
+      if (!attempted) {
+        attempted = true;
+        return calling([callOf('c1', 'extend', { verb: 'inspect' })]);
+      }
+      return noCalls('done');
+    });
+    const runtime2 = createAgentRuntime({
+      home: fx.home, uid: 'n1', world: fx.world, initialConfig: defaultAgentConfig(),
+      terminal: { env: { PATH: '/usr/bin:/bin' } },
+      adapter: new ProviderAdapter(transport2, systemProviderPolicy, frontier.gate),
+    });
+    driver = await NodeDriver.open(
+      fx.home, 'n1', runtime2.handler, fx.world,
+      { knownTypes: C13_EVENT_TYPES, hooks: runtime2.hooks, worldPollMs: 0 },
+    );
+    running = driver.run();
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    driver.stop();
+    await running;
+
+    const events = await loadVerifiedEvents(fx.home, 'n1', C13_EVENT_TYPES);
+    // No config rewrite: exactly one system/message, the four-tool journal.
+    const configs = [...events].filter((event) => event.type === 'system/message');
+    expect(configs).toHaveLength(1);
+    // The extend attempt closed unknown-tool — the old cell's exact behavior.
+    const refused = [...events].filter((event) => event.type === 'tool/result')
+      .map((event) => (event.data as { failure: { code: string } | null }).failure);
+    expect(refused.some((failure) => failure !== null && failure.code === 'unknown-tool'))
+      .toBe(true);
+    // No migration: no package fact exists.
+    expect([...events].some((event) => event.type.startsWith('package/'))).toBe(false);
   }, 40_000);
 });

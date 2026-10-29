@@ -27,6 +27,11 @@ import { encodeFrame, validateFrame, type ProtocolFrame } from '../protocol.js';
 
 const BOOTSTRAP_SOURCE = readFileSync(new URL('../run-bootstrap.ts', import.meta.url), 'utf8');
 const ECHO_SOURCE = readFileSync(new URL('./fixtures/echo.js', import.meta.url), 'utf8');
+/** A source whose TOP-LEVEL code writes a marker: if any guest byte ran
+ * before the digest check, this file exists — verify-then-use's own proof. */
+const SIDE_EFFECT_SOURCE = 'const fs = await import("node:fs");'
+  + ' fs.writeFileSync("guest-ran.txt", "ran");'
+  + ' return { tools: [] };\n';
 const WORLDWRITE_SOURCE = readFileSync(new URL('./fixtures/worldwrite.js', import.meta.url), 'utf8');
 const CRASHY_SOURCE = readFileSync(new URL('./fixtures/crashy.js', import.meta.url), 'utf8');
 const BADSHAPE_SOURCE = readFileSync(new URL('./fixtures/badshape.js', import.meta.url), 'utf8');
@@ -414,7 +419,7 @@ describe('the spawned bootstrap child', () => {
   }, 20_000);
 
   it('refuses a substituted package.js: exit 1, no run/ready, no stdout', async () => {
-    const leaf = makeLeaf(ECHO_SOURCE);
+    const leaf = makeLeaf(SIDE_EFFECT_SOURCE);
     const harness = startLeaf(leaf, sha256Of('a different source'));
     try {
       const status = await harness.waitForExit();
@@ -422,9 +427,11 @@ describe('the spawned bootstrap child', () => {
       expect(harness.stdoutText).toBe('');
       expect(harness.receivedCount()).toBe(0);
       expect(harness.stderrText).toBe('');
-      // Verify-then-use: not a single guest byte evaluated — the capture
-      // file the guest's evaluation would have opened never exists.
+      // Verify-then-use: not a single guest byte evaluated — the marker the
+      // guest's TOP-LEVEL code writes, and the capture file its evaluation
+      // would have opened, both never exist.
       expect(existsSync(leaf.outputPath)).toBe(false);
+      expect(existsSync(join(leaf.dir, 'guest-ran.txt'))).toBe(false);
     } finally {
       await cleanup(harness, leaf);
     }

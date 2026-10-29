@@ -93,6 +93,12 @@ export type RunSupervisorDeps = {
   readonly terminal: TerminalPort | null;
   /** The node's own web tools, or null when neither web tool is allowed. */
   readonly web: WebTools | null;
+  /**
+   * Per-service allowances (the node's own allowedTools): a node allowing
+   * only `web_search` does not expose `web_fetch` to packages — a package
+   * never exceeds its node's rights, per service, not per port.
+   */
+  readonly webAllowance: { readonly search: boolean; readonly fetch: boolean };
   readonly events: RunSupervisorEvents;
   /** The bootstrap artifact; default is the compiled sibling, tests pass the .ts source. */
   readonly bootstrapPath?: string;
@@ -136,7 +142,8 @@ export type InvokeVerdict =
   | { readonly status: 'ok'; readonly result: unknown }
   | { readonly status: 'error'; readonly message: string }
   | { readonly status: 'crashed' }
-  | { readonly status: 'timeout' };
+  | { readonly status: 'timeout' }
+  | { readonly status: 'cancelled' };
 
 interface LiveRun {
   readonly runId: string;
@@ -161,6 +168,8 @@ interface LiveRun {
     readonly settle: (verdict: InvokeVerdict) => void;
     readonly cancel: () => void;
   } | null;
+  /** The dispatch signal of the in-flight invoke (svc calls inherit it). */
+  invokeSignal: AbortSignal | null;
   cancelReady: () => void;
 }
 
@@ -209,7 +218,7 @@ function truncateBytes(text: string, budget: number): string {
  */
 export function createRunSupervisor(deps: RunSupervisorDeps): {
   startRun(packageId: string, source: Buffer): Promise<StartRunVerdict>;
-  invokeTool(tool: RegisteredTool, args: unknown): Promise<InvokeVerdict>;
+  invokeTool(tool: RegisteredTool, args: unknown, signal?: AbortSignal): Promise<InvokeVerdict>;
   /** Kernel-side disposal: unregister, notify fire-and-forget, grace, SIGKILL. */
   stopRun(): Promise<void>;
   readonly registry: {
@@ -279,6 +288,9 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
     const startResolve = run.startResolve;
     run.startResolve = null;
     if (startResolve !== null) {
+      // Every start-settling path releases the ready deadline: a failed
+      // start must not hold the host's event loop for the remaining window.
+      run.cancelReady();
       if (code === 125) {
         startResolve({ ok: false, code: 'spawn-failed', detail: boundDetail(stderr) });
       } else if (code === EXIT_BAD_DECLARATION) {
@@ -299,14 +311,18 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
     const invoke = run.invoke;
     run.invoke = null;
     // Capture the kernel-initiated status BEFORE the teardown marks it: the
-    // crash fact belongs to a child that died on its own.
+    // crash fact belongs to a child that died on its own — including a
+    // signal death (OOM, an external SIGKILL), whose exit code is null.
     const kernelInitiated = run.kernelStopped;
+    const childInitiated = code !== 0 && code !== EXIT_DIGEST_MISMATCH;
     teardown(run);
-    if (run.readied && !kernelInitiated && code !== 0 && code !== null
-      && code !== EXIT_DIGEST_MISMATCH) {
+    if (run.readied && !kernelInitiated
+      && (childInitiated || code === null)) {
       deps.events.error({
         id: run.packageId, runId: run.runId, code: 'crashed',
-        detail: boundDetail(stderr),
+        detail: code === null
+          ? `the child died by signal${stderr === '' ? '' : `: ${boundDetail(stderr)}`}`
+          : boundDetail(stderr),
       });
     }
     invoke?.settle({ status: 'crashed' });
@@ -391,7 +407,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
           startedAt: deps.now(),
           stdoutClosed: false, exited: false, disposed: false,
           kernelStopped: false, readied: false,
-          startResolve: null, invoke: null,
+          startResolve: null, invoke: null, invokeSignal: null,
           cancelReady: () => {},
         };
         live = run;
@@ -462,7 +478,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
       }
     },
 
-    async invokeTool(tool: RegisteredTool, args: unknown): Promise<InvokeVerdict> {
+    async invokeTool(tool: RegisteredTool, args: unknown, signal?: AbortSignal): Promise<InvokeVerdict> {
       const run = live;
       if (run === null || run.exited || run.disposed) return { status: 'crashed' };
       const callId = `invoke-${randomBytes(8).toString('hex')}`;
@@ -473,10 +489,22 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
           if (settled) return;
           settled = true;
           timer();
+          signal?.removeEventListener('abort', onAbort);
+          run.invokeSignal = null;
           run.invokeGuard.settle(callId);
           run.invoke = null;
           resolve(verdict);
         };
+        // The dispatch's stop settles the in-flight invoke as cancelled —
+        // never left hanging to the deadline — and its svc calls inherit
+        // the signal so the terminal/web work aborts like a direct call.
+        const onAbort = (): void => {
+          if (run.invoke !== null && run.invoke.callId === callId) {
+            settle({ status: 'cancelled' });
+          }
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        run.invokeSignal = signal ?? null;
         const timer = deps.schedule(deps.shellTimeoutMs, () => {
           if (run.invoke !== null && run.invoke.callId === callId) {
             const elapsed = deps.now() - run.startedAt;
@@ -504,6 +532,10 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
       if (run === null) return;
       live = null;
       registry.unregisterRun(run.runId);
+      // The Run is dead from this line: no frame it emits — a late ready, a
+      // trailing result — is ever processed again (a re-registration would
+      // brick the one-run slot against a child that is about to die).
+      run.disposed = true;
       // The kernel initiates this teardown: the exit that follows is not a
       // crash fact.
       run.kernelStopped = true;
@@ -535,6 +567,9 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
     outcome: { status: 'frame'; frame: ProtocolFrame }
       | { status: 'teardown'; reason: string },
   ): void {
+    // A torn-down Run processes nothing further: a single protocol violation
+    // produces exactly one fact, never one per poisoned-decoder verdict.
+    if (run.disposed) return;
     if (outcome.status === 'teardown') {
       const resolve = run.startResolve;
       run.startResolve = null;
@@ -664,7 +699,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
           const outcome = await deps.terminal.run(frame.cmd, {
             timeoutMs: deps.shellTimeoutMs, killGraceMs: deps.killGraceMs,
             maxCaptureBytes: deps.maxShellCaptureBytes,
-          }, new AbortController().signal);
+          }, run.invokeSignal ?? new AbortController().signal);
           ok = outcome.status === 'completed';
           status = outcome.status;
           result = {
@@ -679,7 +714,9 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
           result = { status: 'failed', error: err instanceof Error ? err.message : String(err) };
         }
       }
-    } else if (deps.web === null) {
+    } else if (deps.web === null
+      || (frame.type === 'svc/web_search' && !deps.webAllowance.search)
+      || (frame.type === 'svc/web_fetch' && !deps.webAllowance.fetch)) {
       status = 'denied';
       result = { status: 'denied' };
     } else {
@@ -687,9 +724,9 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
         const outcome = frame.type === 'svc/web_search'
           ? await deps.web.search(
             frame.query, 'maxResults' in frame ? frame.maxResults : undefined,
-            new AbortController().signal,
+            run.invokeSignal ?? new AbortController().signal,
           )
-          : await deps.web.extract(frame.url, new AbortController().signal);
+          : await deps.web.extract(frame.url, run.invokeSignal ?? new AbortController().signal);
         ok = outcome.ok;
         status = outcome.ok ? 'completed' : 'failed';
         result = {

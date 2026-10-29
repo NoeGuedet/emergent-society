@@ -124,10 +124,27 @@ export type PackageStoreDeps = {
  * caller owns these paths — kernel-supplied, never agent-authored — so the
  * store itself resolves nothing it was not handed.
  */
-export function createPackageStore(deps: PackageStoreDeps): PackageStore {
+export async function createPackageStore(deps: PackageStoreDeps): Promise<PackageStore> {
   const packagesDir = join(nodeDir(deps.home, deps.uid), 'packages');
-  const worldRoot = resolve(deps.worldDir);
-  const scratchRoot = resolve(deps.scratchDir);
+  // Realpath the injected roots when they exist: containment compares the
+  // pinned fd's own realpath, so a symlinked world root must resolve before
+  // comparing. The scratch leaf may not exist yet (it is created lazily) —
+  // an absent root falls back to the lexical resolution, and define from it
+  // simply fails containment until it does.
+  const resolveRoot = async (path: string): Promise<string> => {
+    const lexical = resolve(path);
+    try {
+      return await realpath(lexical);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT'
+        || (err as NodeJS.ErrnoException).code === 'ENOTDIR') {
+        return lexical;
+      }
+      throw err;
+    }
+  };
+  const worldRoot = await resolveRoot(deps.worldDir);
+  const scratchRoot = await resolveRoot(deps.scratchDir);
 
   function insideContainment(resolved: string): boolean {
     for (const root of [worldRoot, scratchRoot]) {

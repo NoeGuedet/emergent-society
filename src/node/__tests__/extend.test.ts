@@ -87,7 +87,7 @@ async function openSession(): Promise<Session> {
       packageGate?.append('package/service', payload);
     },
   };
-  const store = createPackageStore({ home, uid: 'n1', worldDir: world, scratchDir: scratch });
+  const store = await createPackageStore({ home, uid: 'n1', worldDir: world, scratchDir: scratch });
   const supervisor = createRunSupervisor({
     home, uid: 'n1', sandbox: false,
     shellTimeoutMs: 5_000, killGraceMs: 200,
@@ -97,6 +97,7 @@ async function openSession(): Promise<Session> {
       return () => clearTimeout(timer);
     },
     terminal: null, web: null,
+      webAllowance: { search: true, fetch: true },
     events,
     bootstrapPath: bootstrapSource,
   });

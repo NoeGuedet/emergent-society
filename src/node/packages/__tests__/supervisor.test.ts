@@ -105,6 +105,7 @@ async function harness(sandbox: boolean): Promise<Harness> {
         shellTimeoutMs: INVOKE_MS, killGraceMs: KILL_GRACE_MS,
         maxShellCaptureBytes: 16 * 1024 * 1024,
         now: clock.now, schedule: clock.schedule,
+        webAllowance: { search: true, fetch: true },
         terminal: (overrides.terminal !== undefined
           ? overrides.terminal
           : {
@@ -182,6 +183,20 @@ describe('run supervisor: the sandboxed happy path', () => {
 });
 
 describe('run supervisor: failure isolation (injected-clock deadlines)', () => {
+  it('ignores a late run/ready after the stop (the dead Run never re-registers)', async () => {
+    const h = await harness(true);
+    const s = h.supervisor();
+    const start = await s.startRun('9'.repeat(64), sourceOf('echo.js'));
+    expect(start.ok).toBe(true);
+    await s.stopRun();
+    // The stop marked the run disposed: a forged or trailing ready frame from
+    // the dying child can never re-register into the freed one-run slot.
+    const verdict = await s.startRun('a'.repeat(64), sourceOf('echo.js'));
+    expect(verdict).toMatchObject({ ok: true });
+    await s.stopRun();
+    await h.dispose();
+  }, 20_000);
+
   it('refuses the ready deadline with run/timeout and tears the Run down', async () => {
     const h = await harness(true);
     const s = h.supervisor();
@@ -283,6 +298,7 @@ describe('run supervisor: failure isolation (injected-clock deadlines)', () => {
       maxShellCaptureBytes: 16 * 1024 * 1024,
       now: h.clock.now, schedule: h.clock.schedule,
       terminal: null, web: null,
+      webAllowance: { search: true, fetch: true },
       events: {
         effect: () => {}, error: () => {}, service: () => {},
       },
@@ -331,10 +347,19 @@ describe('run supervisor: the facade services', () => {
 });
 
 describe('run supervisor: the confinement battery (Landlock)', () => {
-  it.skipIf(!existsSync(launcher))('a confined Run cannot read the credential store or the world', async () => {
+  it.skipIf(!existsSync(launcher))('a confined Run cannot read the credential store, the journal or the world', async () => {
     const h = await harness(true);
     const providersPath = join(h.home, 'providers.json');
-    const journalPath = join(h.home, 'nodes', 'n1');
+    // REAL files, not directories or absent paths: a directory read fails
+    // EISDIR and an absent path ENOENT even unconfined — only a readable
+    // file distinguishes the policy.
+    const journalPath = join(h.home, 'nodes', 'n1', 'canary.txt');
+    await import('node:fs').then((fs) => fs.promises.mkdir(
+      join(h.home, 'nodes', 'n1'), { recursive: true },
+    ));
+    writeFileSync(journalPath, 'journal-canary\n');
+    const worldCanary = join(h.world, 'canary.txt');
+    writeFileSync(worldCanary, 'world-canary\n');
     const source = Buffer.from(
       'return { tools: [{ name: "probe_confinement",'
       + ' description: "tries to escape",'
@@ -355,7 +380,7 @@ describe('run supervisor: the confinement battery (Landlock)', () => {
     expect(providers).toMatchObject({ status: 'ok', result: { read: false } });
     const journal = await s.invokeTool(tool!, { path: journalPath });
     expect(journal).toMatchObject({ status: 'ok', result: { read: false } });
-    const world = await s.invokeTool(tool!, { path: join(h.world, 'does-not-matter') });
+    const world = await s.invokeTool(tool!, { path: worldCanary });
     expect(world).toMatchObject({ status: 'ok', result: { read: false } });
     await s.stopRun();
     await h.dispose();
@@ -477,6 +502,7 @@ describe('run supervisor: the audit corrections', () => {
       maxShellCaptureBytes: 16 * 1024 * 1024,
       now: h.clock.now, schedule: h.clock.schedule,
       terminal: null, web: null,
+      webAllowance: { search: true, fetch: true },
       events: { effect: () => {}, error: () => {}, service: () => {} },
       bootstrapPath: join(h.home, 'run-bootstrap.ts'),
     });

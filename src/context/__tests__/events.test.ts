@@ -264,6 +264,8 @@ describe('boundary registry: the package event vocabulary', () => {
     });
     expect(forwarded).toEqual([{ type: 'package/define', opts: { ignorable: true } }]);
     gate.append('compaction/abort', { id: 'x', reason: 'stale' });
-    expect(forwarded[1]).toEqual({ type: 'compaction/abort', opts: { ignorable: false } });
+    // Non-ignorable types forward NO opts (the envelope's stated form is an
+    // absent flag, never an explicit false).
+    expect(forwarded[1]).toEqual({ type: 'compaction/abort', opts: undefined });
   });
 });

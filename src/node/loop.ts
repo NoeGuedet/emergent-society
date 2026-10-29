@@ -161,6 +161,8 @@ class Runtime implements AgentRuntime {
   private readonly extendPort: ExtendPort | null;
   /** The gate holder the package event router reads (the current dispatch's). */
   private packageGateHolder: { gate: BoundaryGate | null } = { gate: null };
+  /** Flushes the queued out-of-dispatch package facts into a gate. */
+  private flushPackageFacts: (gate: BoundaryGate) => void = () => {};
   readonly handler: TurnHandler;
   readonly hooks: DriverHooks;
 
@@ -181,8 +183,12 @@ class Runtime implements AgentRuntime {
       readBlob: (hash) => new BlobStore(this.options.home).get(hash),
       acknowledgedWorld: (turn) => this.fold.acknowledgedWorld(turn),
       onStop: async (gate): Promise<void> => {
-        await this.stopTerminal();
+        // Independent disposals: the terminal teardown's failure never skips
+        // the Run disposal, and it rethrows only after both have settled.
+        const terminalError = await this.stopTerminal()
+          .then(() => null, (err: unknown) => err);
         await this.stopPackages(gate);
+        if (terminalError !== null) throw terminalError;
       },
     };
     // The events router: the supervisor's effect/error/service facts append
@@ -190,10 +196,30 @@ class Runtime implements AgentRuntime {
     // ready gate for L5's boot scan.
     const packageGateHolder: { gate: BoundaryGate | null } = { gate: null };
     this.packageGateHolder = packageGateHolder;
+    // A fact arriving with no gate held (an idle Run crash while the node is
+    // parked) is QUEUED and flushed into the next gate — a kernel-mediated
+    // fact is never silently dropped (design §6.3/§8). The queue is bounded:
+    // a torn-down Run emits at most one fact per kind.
+    const packageFactQueue: { type: string; data: unknown }[] = [];
+    const queueFact = (type: string, data: unknown): void => {
+      const gate = packageGateHolder.gate;
+      if (gate !== null) {
+        gate.append(type as 'package/effect', data as never);
+        return;
+      }
+      if (packageFactQueue.length >= 64) packageFactQueue.shift();
+      packageFactQueue.push({ type, data });
+    };
+    const flushPackageFacts = (gate: BoundaryGate): void => {
+      for (const fact of packageFactQueue.splice(0)) {
+        gate.append(fact.type as 'package/effect', fact.data as never);
+      }
+    };
+    this.flushPackageFacts = flushPackageFacts;
     const packageEvents: RunSupervisorEvents = {
-      effect: (payload) => { packageGateHolder.gate?.append('package/effect', payload); },
-      error: (payload) => { packageGateHolder.gate?.append('package/error', payload); },
-      service: (payload) => { packageGateHolder.gate?.append('package/service', payload); },
+      effect: (payload) => { queueFact('package/effect', payload); },
+      error: (payload) => { queueFact('package/error', payload); },
+      service: (payload) => { queueFact('package/service', payload); },
     };
     this.terminalPort = {
       run: async (cmd, limits, signal) => {
@@ -305,6 +331,8 @@ class Runtime implements AgentRuntime {
     // first turn (kernel.md, the C1.5 lifecycle): re-verify the stored
     // definitions, report the corrupt ones, reap the orphaned run leaves.
     await this.scanPackages(gate);
+    // A fact queued while the node was parked (an idle Run crash) lands here.
+    this.flushPackageFacts(gate);
     if (this.fold.snapshot().config === null) {
       const stored = await gate.store(this.initialConfig);
       gate.append('system/message', { version: this.initialConfig.version, value: stored });
@@ -491,6 +519,7 @@ class Runtime implements AgentRuntime {
       }
       const calls = sent.projection.message.tool_calls;
       this.packageGateHolder.gate = ctx.gate;
+      this.flushPackageFacts(ctx.gate);
       let dispatched: { waited: boolean; called: number };
       try {
         dispatched = await dispatchCalls(

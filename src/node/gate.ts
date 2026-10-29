@@ -183,7 +183,8 @@ class Gate implements BoundaryGate {
     const validated = validator(data, this.scope);
     this.preflight(validated);
     const envelope = this.callbacks.append(
-      type, validated, { ignorable: eventIgnorableDefault(type) },
+      type, validated,
+      eventIgnorableDefault(type) ? { ignorable: true } : undefined,
     );
     this.pending.push(envelope);
     return { seq: envelope.seq, hash: envelope.hash };

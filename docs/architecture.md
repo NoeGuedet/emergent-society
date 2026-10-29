@@ -220,7 +220,8 @@ kernel-side behavior, not replaceable Packages. The `extend` Package layer is
 **implemented**: mechanism and tool Packages — content-addressed definitions persisted
 under `nodes/<uid>/packages/`, Runs as Landlock-confined children behind a JSON-lines
 facade, a live runtime registry, the frozen five-tool offering with the `extend call`
-funnel, the boot scan and the host-stop disposal (`src/node/packages/`). Policies stay
+funnel (`src/node/packages/`; the boot scan and the host-stop disposal live in
+`src/node/loop.ts`). Policies stay
 kernel-side: the replacement seam (a policy Package arrives through the same facade,
 never in-kernel trust) is **specified, not implemented**, opened when C2 demonstrates
 the need.

@@ -96,6 +96,8 @@ const SNAPSHOT_JSON_STRINGIFY = JSON.stringify;
 const SNAPSHOT_OBJECT_KEYS = Object.keys;
 const SNAPSHOT_ARRAY_IS_ARRAY = Array.isArray;
 const SNAPSHOT_NUMBER_IS_SAFE_INTEGER = Number.isSafeInteger;
+const SNAPSHOT_NUMBER_IS_FINITE = Number.isFinite;
+const SNAPSHOT_OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
 const SNAPSHOT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
 const SNAPSHOT_GET_OWN_PROPERTY_SYMBOLS = Object.getOwnPropertySymbols;
 
@@ -377,7 +379,7 @@ function stringifyValue(value: unknown, seen: Set<object>): string {
     case 'boolean':
       return value ? 'true' : 'false';
     case 'number': {
-      if (!Number.isFinite(value)) throw new UnserializableValue('non-finite number');
+      if (!SNAPSHOT_NUMBER_IS_FINITE(value)) throw new UnserializableValue('non-finite number');
       const text = SNAPSHOT_JSON_STRINGIFY(value);
       if (text === undefined) throw new UnserializableValue('number has no JSON form');
       return text;
@@ -438,7 +440,7 @@ function stringifyArray(items: readonly unknown[], seen: Set<object>): string {
 }
 
 function stringifyObject(value: object, seen: Set<object>): string {
-  const prototype: unknown = Object.getPrototypeOf(value);
+  const prototype: unknown = SNAPSHOT_OBJECT_GET_PROTOTYPE_OF(value);
   if (prototype !== Object.prototype && prototype !== null) {
     throw new UnserializableValue('a non-plain object has no canonical JSON form');
   }

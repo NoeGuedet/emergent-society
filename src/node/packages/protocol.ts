@@ -286,6 +286,13 @@ export class FrameDecoder {
     }
     try {
       const frame = validateFrame(parsed);
+      // Canonicalizability is part of frame validity: a frame carrying a
+      // lone surrogate (or any value with no canonical JSON form) would
+      // throw NonCanonicalizableError at every downstream canonicalization
+      // — registry registration, funnel results — inside the kernel's own
+      // stdout handler. The decoder refuses it here instead: a forged frame
+      // tears the Run down, it never crashes the kernel.
+      void canonicalizeJson(frame as unknown as JsonValue);
       return { status: 'frame', frame };
     } catch (err) {
       this.poisoned = true;

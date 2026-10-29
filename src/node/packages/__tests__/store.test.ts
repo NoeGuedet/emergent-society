@@ -32,8 +32,8 @@ function fixture(): {
   return { home, world, scratch };
 }
 
-function store(f: { home: string; world: string; scratch: string }) {
-  return createPackageStore({
+async function store(f: { home: string; world: string; scratch: string }) {
+  return await createPackageStore({
     home: f.home, uid: 'n1', worldDir: f.world, scratchDir: f.scratch,
   });
 }
@@ -47,7 +47,7 @@ function worldFile(f: { world: string }, name: string, content = GOOD_SOURCE): s
 describe('package store: argument validation', () => {
   it('refuses every malformed name and an out-of-bound purpose', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const source = worldFile(f, 'good.js');
     const badNames = [
       'a/b', 'a\\b', '.', '..', 'a\0b', '.hidden', '', 'x'.repeat(65), 'a\uD800b',
@@ -74,7 +74,7 @@ describe('package store: argument validation', () => {
 
   it('refuses an empty path argument', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     await expect(
       s.definePackage({ name: 'grep_world', purpose: 'search', path: '' }),
     ).rejects.toMatchObject({ code: 'invalid-argument' });
@@ -85,7 +85,7 @@ describe('package store: argument validation', () => {
 describe('package store: fd-first path resolution', () => {
   it('accepts a world file and a scratch file', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const worldPath = worldFile(f, 'world-src.js');
     const scratchPath = join(f.scratch, 'scratch-src.js');
     writeFileSync(scratchPath, GOOD_SOURCE);
@@ -105,7 +105,7 @@ describe('package store: fd-first path resolution', () => {
 
   it('resolves a relative path against the world worktree root', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     worldFile(f, 'relative-src.js');
     const result = await s.definePackage({
       name: 'rel_tool', purpose: 'relative', path: 'relative-src.js',
@@ -116,7 +116,7 @@ describe('package store: fd-first path resolution', () => {
 
   it('returns ONE fixed refusal message for every out-of-containment outcome', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const outside = join(f.home, 'outside.js');
     writeFileSync(outside, GOOD_SOURCE);
     const missing = join(f.world, 'never-existed.js');
@@ -138,7 +138,7 @@ describe('package store: fd-first path resolution', () => {
 
   it('refuses an in-world symlink that escapes the grants', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const outside = join(f.home, 'outside.js');
     writeFileSync(outside, GOOD_SOURCE);
     symlinkSync(outside, join(f.world, 'escape.js'));
@@ -150,7 +150,7 @@ describe('package store: fd-first path resolution', () => {
 
   it('follows an in-world symlink to an in-world target', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     worldFile(f, 'target.js', 'return { tools: [] }; // target\n');
     symlinkSync('target.js', join(f.world, 'alias.js'));
     const result = await s.definePackage({
@@ -162,7 +162,7 @@ describe('package store: fd-first path resolution', () => {
 
   it('refuses a FIFO, a directory and a hardlinked file', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const fifo = join(f.world, 'pipe.js');
     const made = spawnSync('mkfifo', [fifo]);
     expect(made.status).toBe(0);
@@ -186,7 +186,7 @@ describe('package store: fd-first path resolution', () => {
 
   it('reads the pinned fd: a repointed symlink never changes a stored definition', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const a = worldFile(f, 'a.js', 'return { tools: [] }; // a\n');
     const b = worldFile(f, 'b.js', 'return { tools: [] }; // b\n');
     const alias = join(f.world, 'swap.js');
@@ -211,7 +211,7 @@ describe('package store: fd-first path resolution', () => {
 describe('package store: parse precheck (parse-only, never executed)', () => {
   it('refuses TS-annotated source with the teaching hint', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const source = worldFile(f, 'ts.js', 'const x: number = 1;\nreturn { tools: [] };\n');
     const err = await s.definePackage({
       name: 'ts_tool', purpose: 'p', path: source,
@@ -224,7 +224,7 @@ describe('package store: parse precheck (parse-only, never executed)', () => {
 
   it('refuses unbalanced source with the teaching hint', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const source = worldFile(f, 'unbalanced.js', 'return { tools: [] ;\n');
     await expect(
       s.definePackage({ name: 'u_tool', purpose: 'p', path: source }),
@@ -234,7 +234,7 @@ describe('package store: parse precheck (parse-only, never executed)', () => {
 
   it('classifies a pathological-nesting RangeError as invalid-source', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const source = worldFile(f, 'deep.js', `return ${'('.repeat(50_000)}1${')'.repeat(49_999)};\n`);
     await expect(
       s.definePackage({ name: 'd_tool', purpose: 'p', path: source }),
@@ -246,7 +246,7 @@ describe('package store: parse precheck (parse-only, never executed)', () => {
 describe('package store: identity, idempotence and persistence', () => {
   it('is idempotent on identical content (same id, one directory)', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const source = worldFile(f, 'same.js');
     const first = await s.definePackage({
       name: 'grep_world', purpose: 'search', path: source,
@@ -262,7 +262,7 @@ describe('package store: identity, idempotence and persistence', () => {
 
   it('gives different content a different id', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const a = worldFile(f, 'one.js', 'return { tools: [] }; // one\n');
     const b = worldFile(f, 'two.js', 'return { tools: [] }; // two\n');
     const one = await s.definePackage({ name: 't', purpose: 'p', path: a });
@@ -276,12 +276,12 @@ describe('package store: identity, idempotence and persistence', () => {
 
   it('persists across a store reopen (no driver involved)', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const source = worldFile(f, 'persist.js');
     const defined = await s.definePackage({
       name: 'grep_world', purpose: 'search', path: source,
     });
-    const reopened = store(f);
+    const reopened = await store(f);
     const { mounted, corrupt } = await reopened.readMountedPackages();
     expect(corrupt).toEqual([]);
     expect(mounted).toHaveLength(1);
@@ -298,7 +298,7 @@ describe('package store: identity, idempotence and persistence', () => {
 
   it('writes owner-only trees (0700 directories, 0600 files)', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const source = worldFile(f, 'modes.js');
     const { id } = await s.definePackage({
       name: 'grep_world', purpose: 'search', path: source,
@@ -318,7 +318,7 @@ describe('package store: identity, idempotence and persistence', () => {
 describe('package store: caps', () => {
   it('refuses a source over the 1 MiB per-source cap', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const path = join(f.world, 'big.js');
     const fd = openSync(path, 'w');
     writevSync(fd, [Buffer.from('return 1;'), Buffer.alloc(1024 * 1024)]);
@@ -331,7 +331,7 @@ describe('package store: caps', () => {
 
   it('asserts the 64 MiB node cap at the boundary (no real 64 MiB write)', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const small = await s.definePackage({
       name: 'small', purpose: 'p', path: worldFile(f, 'small.js', 'return 1;\n'),
     });
@@ -364,7 +364,7 @@ describe('package store: caps', () => {
 describe('package store: the reopen scan', () => {
   it('deletes a corrupted definition and reports it (hash mismatch)', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const source = worldFile(f, 'corrupt-me.js');
     const { id } = await s.definePackage({
       name: 'corrupt_me', purpose: 'p', path: source,
@@ -383,7 +383,7 @@ describe('package store: the reopen scan', () => {
 
   it('deletes a definition whose stored source is a FIFO (the scan never hangs)', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const source = worldFile(f, 'fifo-scan.js');
     const { id } = await s.definePackage({
       name: 'fifo_scan', purpose: 'p', path: source,
@@ -402,7 +402,7 @@ describe('package store: the reopen scan', () => {
 
   it('deletes a definition directory carrying a stray file', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const source = worldFile(f, 'stray.js');
     const { id } = await s.definePackage({
       name: 'stray', purpose: 'p', path: source,
@@ -421,7 +421,7 @@ describe('package store: the reopen scan', () => {
 describe('package store: undefine', () => {
   it('deletes the definition directory and refuses an unknown id', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     const source = worldFile(f, 'gone.js');
     const { id } = await s.definePackage({
       name: 'gone', purpose: 'p', path: source,
@@ -436,7 +436,7 @@ describe('package store: undefine', () => {
 
   it('refuses a malformed id without touching the filesystem', async () => {
     const f = fixture();
-    const s = store(f);
+    const s = await store(f);
     await expect(s.undefinePackage('not-an-id'))
       .rejects.toMatchObject({ code: 'not-found' });
     rmSync(f.home, { recursive: true, force: true });

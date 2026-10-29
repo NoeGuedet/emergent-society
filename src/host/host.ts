@@ -117,7 +117,7 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
     // ports are the node's own — the allowedTools inheritance is decided here
     // (a node without a tool passes a null port, so a package's svc call
     // resolves denied).
-    const store = createPackageStore({
+    const store = await createPackageStore({
       home, uid, worldDir: paths.world, scratchDir: join(home, 'tmp', uid),
     });
     const runtime = createAgentRuntime({
@@ -140,6 +140,10 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
           terminal: config.allowedTools.includes('execute') ? ports.terminal : null,
           web: config.allowedTools.includes('web_search')
             || config.allowedTools.includes('web_fetch') ? ports.web : null,
+          webAllowance: {
+            search: config.allowedTools.includes('web_search'),
+            fetch: config.allowedTools.includes('web_fetch'),
+          },
           events,
           bootstrapPath: fileURLToPath(new URL(
             '../node/packages/run-bootstrap.js', import.meta.url,

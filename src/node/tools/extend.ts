@@ -244,9 +244,12 @@ function renderInspect(
     : 'Run sandbox: OFF — package code runs as this kernel process: it can'
       + ' read, overwrite and destroy the credential store and every node'
       + ' tree, and signal the kernel');
-  lines.push('withheld from package code by design: the frontier, the journal,'
-    + ' the credential store, raw fs, raw network, timers, process authority,'
-    + ' and the model call (the first future svc kind).');
+  lines.push('withheld from package code by design: the kernel objects (the'
+    + ' gate, the journal writer, the git plumbing, the provider transport,'
+    + ' providers.json loading) and the model call (the first future svc kind).'
+    + ' Egress is open by design (Landlock mediates no network); timers and'
+    + ' process authority remain the guest process\'s own — the facade is the'
+    + ' capability channel, not the whole sandbox.');
   lines.push('funneled args are capped at 256 KiB per call — larger inputs go'
     + ' through svc/execute against world files.');
   lines.push('no rlimits or cgroups exist: the caps above are the availability'
@@ -351,7 +354,7 @@ export async function executeExtend(opts: {
         `error: tool/invalid-args\n${violation}`, true, max);
       return;
     }
-    const verdict = await port.supervisor.invokeTool(tool, decision.args);
+    const verdict = await port.supervisor.invokeTool(tool, decision.args, opts.gate.signal);
     if (verdict.status === 'ok') {
       await appendResult(gate, id, callId,
         canonicalizeJson(verdict.result as never), false, max);
@@ -359,6 +362,17 @@ export async function executeExtend(opts: {
     }
     if (verdict.status === 'error') {
       await appendResult(gate, id, callId, `error: ${verdict.message}`, true, max);
+      return;
+    }
+    if (verdict.status === 'cancelled') {
+      // The gate's stop settled this invoke: the synthetic cancelled closer,
+      // the abort precedent — an effect is never left unattributed.
+      gate.append('tool/result', {
+        turn: id.turn, request: id, callId,
+        message: { role: 'tool', content: 'cancelled', tool_call_id: callId },
+        isError: true, raw: null, failure: { code: 'cancelled', status: null },
+        synthetic: true, frontierCall: null,
+      });
       return;
     }
     await appendResult(gate, id, callId,
