@@ -10,6 +10,8 @@ import { ContextFold } from '../context/fold.js';
 import { loadVerifiedEvents } from '../context/loader.js';
 import { writeSnapshot } from '../context/snapshots.js';
 import { dispatchCalls } from './tools/dispatch.js';
+import type { ExtendPort } from './tools/extend.js';
+import type { RunSupervisorEvents } from './packages/supervisor.js';
 import type { ProviderAdapter } from '../provider/adapter.js';
 import type { AgentConfig, ProjectionState, RequestId } from '../context/contracts.js';
 import { MAX_CAPTURE_BYTES } from './gate.js';
@@ -85,6 +87,13 @@ export type RuntimeOptions = {
   };
   /** Kernel-mediated web tools; when absent, offered web calls resolve as `denied`. */
   readonly webTools?: WebTools;
+  /**
+   * The extend port factory (C1.5): the loop owns the event router (it alone
+   * knows which gate the current dispatch holds), the caller owns the
+   * construction — the host composes the store and the supervisor (L5), tests
+   * inject them. When absent, offered `extend` calls resolve as `denied`.
+   */
+  readonly extend?: (events: RunSupervisorEvents) => ExtendPort;
 };
 
 export interface AgentRuntime {
@@ -143,6 +152,10 @@ class Runtime implements AgentRuntime {
   /** Set by the driver's stop: a late run can never respawn a session. */
   private terminalStopped = false;
   private readonly terminalPort: TerminalPort;
+  /** The extend port, built once per runtime; null resolves calls as denied. */
+  private readonly extendPort: ExtendPort | null;
+  /** The gate holder the package event router reads (the current dispatch's). */
+  private packageGateHolder: { gate: BoundaryGate | null } = { gate: null };
   readonly handler: TurnHandler;
   readonly hooks: DriverHooks;
 
@@ -164,6 +177,16 @@ class Runtime implements AgentRuntime {
       acknowledgedWorld: (turn) => this.fold.acknowledgedWorld(turn),
       onStop: async (): Promise<void> => { await this.stopTerminal(); },
     };
+    // The events router: the supervisor's effect/error/service facts append
+    // to whichever gate the current dispatch holds — the turn gate here, the
+    // ready gate for L5's boot scan.
+    const packageGateHolder: { gate: BoundaryGate | null } = { gate: null };
+    this.packageGateHolder = packageGateHolder;
+    this.extendPort = options.extend === undefined ? null : options.extend({
+      effect: (payload) => { packageGateHolder.gate?.append('package/effect', payload); },
+      error: (payload) => { packageGateHolder.gate?.append('package/error', payload); },
+      service: (payload) => { packageGateHolder.gate?.append('package/service', payload); },
+    });
     this.terminalPort = {
       run: async (cmd, limits, signal) => {
         if (this.terminalStopped) {
@@ -403,9 +426,16 @@ class Runtime implements AgentRuntime {
         return { outcome: 'error', toolCalls: accepted > 0, error: sent.failure };
       }
       const calls = sent.projection.message.tool_calls;
-      const dispatched = await dispatchCalls(
-        sent.projection, id, ctx.gate, config, this.terminalPort, this.options.webTools,
-      );
+      this.packageGateHolder.gate = ctx.gate;
+      let dispatched: { waited: boolean; called: number };
+      try {
+        dispatched = await dispatchCalls(
+          sent.projection, id, ctx.gate, config, this.terminalPort,
+          this.options.webTools, this.extendPort ?? undefined,
+        );
+      } finally {
+        this.packageGateHolder.gate = null;
+      }
       accepted += dispatched.called;
       ordinal += 1;
       if (calls.length === 0) return { outcome: 'waiting', toolCalls: accepted > 0 };

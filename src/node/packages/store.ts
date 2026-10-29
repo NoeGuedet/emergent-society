@@ -75,6 +75,22 @@ export type PackageStore = {
     readonly mounted: readonly PackageDefinition[];
     readonly corrupt: readonly CorruptDefinition[];
   }>;
+  /**
+   * The stored source bytes of one definition, or null when the id is
+   * unknown. The bytes are re-verified by the Run's verify-then-use at
+   * spawn — this read is the delivery, not the proof.
+   */
+  readPackageSource(id: string): Promise<Buffer | null>;
+  /**
+   * The read-only listing: every definition is verified in place, NOTHING
+   * is deleted — the read-only catalogue's own path. The deleting scan is
+   * `readMountedPackages` (the boot re-mount's, whose corrupt deletions the
+   * L5 caller reports through the gate).
+   */
+  listPackages(): Promise<{
+    readonly definitions: readonly PackageDefinition[];
+    readonly corrupt: readonly CorruptDefinition[];
+  }>;
   undefinePackage(id: string): Promise<void>;
 };
 
@@ -402,5 +418,28 @@ export function createPackageStore(deps: PackageStoreDeps): PackageStore {
     await syncPath(packagesDir);
   }
 
-  return { definePackage, readMountedPackages, undefinePackage };
+  async function readPackageSource(id: string): Promise<Buffer | null> {
+    // A malformed id is indistinguishable from an unknown one: no fs touch.
+    if (!ID_RE.test(id)) return null;
+    return readStoredFile(join(packagesDir, id, SOURCE_FILE), MAX_PACKAGE_SOURCE_BYTES);
+  }
+
+  async function listPackages(): Promise<{
+    readonly definitions: readonly PackageDefinition[];
+    readonly corrupt: readonly CorruptDefinition[];
+  }> {
+    const definitions: PackageDefinition[] = [];
+    const corrupt: CorruptDefinition[] = [];
+    for (const entry of await readPackagesDir()) {
+      if (!entry.isDirectory() || !ID_RE.test(entry.name)) continue;
+      const verdict = await verifyStored(entry.name, join(packagesDir, entry.name));
+      if (verdict.ok) definitions.push(verdict.definition);
+      else corrupt.push({ id: entry.name, reason: verdict.reason });
+    }
+    return { definitions, corrupt };
+  }
+
+  return {
+    definePackage, readMountedPackages, readPackageSource, listPackages, undefinePackage,
+  };
 }

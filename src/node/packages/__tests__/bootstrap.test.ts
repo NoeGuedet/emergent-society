@@ -395,11 +395,12 @@ describe('the spawned bootstrap child', () => {
       if (ready.type !== 'run/ready') throw new Error('expected run/ready');
       expect(ready.tools).toEqual([{
         name: 'echo_text',
-        description: 'echo the given text',
+        description: 'echoes the text',
         parameters: {
           type: 'object',
-          properties: { text: { type: 'string' } },
+          properties: { text: { type: 'string', minLength: 1 } },
           required: ['text'],
+          additionalProperties: false,
         },
       }]);
       harness.send({ type: 'tool/invoke', callId: 'i-1', name: 'echo_text', args: { text: 'hello' } });

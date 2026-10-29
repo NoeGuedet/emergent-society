@@ -1,0 +1,411 @@
+import type { BoundaryGate } from '../gate.js';
+import type { RequestId } from '../../context/contracts.js';
+import type { AgentConfig } from '../../context/contracts.js';
+import { canonicalizeJson } from '../../journal/index.js';
+import { boundToolText } from './text.js';
+import { PackageError } from '../packages/errors.js';
+import type { PackageStore } from '../packages/store.js';
+import type { RunSupervisor } from '../packages/supervisor.js';
+
+/**
+ * The extend executor (kernel.md, the sandbox and local-log sections): the
+ * peer of terminal and web — the six verbs, the append home of the four
+ * verb facts (define, run, stop, undefine; the registry's effect facts and
+ * the supervisor's error/service facts ride the injected event port), the
+ * funnel's kernel-side schema validation, and the honest inspect catalogue.
+ *
+ * Invariants this module owns:
+ * - **Recognition never lives here** — decide() validated the verb and its
+ *   exact key set before the executor runs; it receives a typed decision.
+ * - **Verb facts append at the handler** — the store stays gate-less and
+ *   liveness-free; the registry owns effect facts; the supervisor owns
+ *   crash/timeout/protocol/service facts.
+ * - **The funnel validates before the send** — the registered schema is
+ *   kernel-side and restricted to the safe dialect, so the validation
+ *   work is bounded and a violation is a teaching refusal
+ *   (`tool/invalid-args`), never a wire round-trip.
+ * - **Results append like base results** — raw-captured through
+ *   `gate.capture`, bounded by `maxToolResultBytes`, `frontierCall: null`.
+ *
+ * What this module never does: mutate the offering (frozen for the process
+ * lifetime — the registry is read at dispatch, never spliced into the
+ * request), read a path outside the store's injected roots, or trust the
+ * child's own good behavior.
+ */
+
+/** The funnel's thread into dispatchCalls, exactly like TerminalPort/WebTools. */
+export type ExtendPort = {
+  readonly store: PackageStore;
+  readonly supervisor: RunSupervisor;
+  /** The Run sandbox mode the supervisor spawns under — inspect's honesty. */
+  readonly sandbox: boolean;
+};
+
+/** One validated extend decision, as decide() produced it. */
+export type ExtendDecision =
+  | { readonly kind: 'extend'; readonly verb: 'inspect' }
+  | {
+    readonly kind: 'extend'; readonly verb: 'define';
+    readonly name: string; readonly purpose: string; readonly path: string;
+  }
+  | { readonly kind: 'extend'; readonly verb: 'run'; readonly id: string }
+  | {
+    readonly kind: 'extend'; readonly verb: 'call';
+    readonly tool: string; readonly args: unknown;
+  }
+  | { readonly kind: 'extend'; readonly verb: 'stop'; readonly id: string }
+  | { readonly kind: 'extend'; readonly verb: 'undefine'; readonly id: string };
+
+/** A schema violation the funnel refuses with, naming the field. */
+function schemaViolation(args: unknown, schema: unknown, where: string): string | null {
+  if (typeof schema !== 'object' || schema === null || Array.isArray(schema)) {
+    return `${where}: the registered schema is not an object`;
+  }
+  const node = schema as Record<string, unknown>;
+  const type = node['type'];
+  if (type === 'object') {
+    if (typeof args !== 'object' || args === null || Array.isArray(args)) {
+      return `${where}: expected an object`;
+    }
+    const record = args as Record<string, unknown>;
+    const properties = typeof node['properties'] === 'object'
+      && node['properties'] !== null && !Array.isArray(node['properties'])
+      ? node['properties'] as Record<string, unknown> : {};
+    if (node['additionalProperties'] === false) {
+      for (const key of Object.keys(record)) {
+        if (!Object.hasOwn(properties, key)) {
+          return `${where}: the argument ${JSON.stringify(key)} is not declared`;
+        }
+      }
+    }
+    if (Array.isArray(node['required'])) {
+      for (const required of node['required']) {
+        if (typeof required === 'string' && !Object.hasOwn(record, required)) {
+          return `${where}: the required argument ${JSON.stringify(required)} is missing`;
+        }
+      }
+    }
+    // Only keys PRESENT on the args object are validated: an omitted
+    // optional property is legal (required was enforced above) — the
+    // design's own worked example has optional properties.
+    for (const [key, child] of Object.entries(properties)) {
+      if (!Object.hasOwn(record, key)) continue;
+      const violation = schemaViolation(record[key], child, `${where}.${key}`);
+      if (violation !== null) return violation;
+    }
+    return null;
+  }
+  if (type === 'array') {
+    if (!Array.isArray(args)) return `${where}: expected an array`;
+    return null;
+  }
+  if (type === 'string') {
+    if (typeof args !== 'string') return `${where}: expected a string`;
+    const minLength = node['minLength'];
+    if (typeof minLength === 'number' && args.length < minLength) {
+      return `${where}: shorter than minLength ${minLength}`;
+    }
+    return null;
+  }
+  if (type === 'integer') {
+    if (typeof args !== 'number' || !Number.isSafeInteger(args)) {
+      return `${where}: expected an integer`;
+    }
+    const maximum = node['maximum'];
+    if (typeof maximum === 'number' && args > maximum) {
+      return `${where}: greater than maximum ${maximum}`;
+    }
+    return null;
+  }
+  if (type === 'number') {
+    if (typeof args !== 'number' || !Number.isFinite(args)) {
+      return `${where}: expected a number`;
+    }
+    const maximum = node['maximum'];
+    if (typeof maximum === 'number' && args > maximum) {
+      return `${where}: greater than maximum ${maximum}`;
+    }
+    return null;
+  }
+  if (type === 'boolean') {
+    if (typeof args !== 'boolean') return `${where}: expected a boolean`;
+    return null;
+  }
+  return `${where}: the schema type ${JSON.stringify(type)} is not in the dialect`;
+}
+
+/** The bounded, raw-captured tool result — the execute append shape. */
+async function appendResult(
+  gate: BoundaryGate, id: RequestId, callId: string,
+  content: string, isError: boolean, maxToolResultBytes: number,
+): Promise<void> {
+  const raw = content.length > 0
+    ? await gate.capture(Buffer.from(content, 'utf8'), 'utf8', !isError) : null;
+  gate.append('tool/result', {
+    turn: id.turn, request: id, callId,
+    message: {
+      role: 'tool',
+      content: raw === null ? content
+        : boundToolText(content, maxToolResultBytes, {
+          kind: 'artifact', sha256: raw.sha256, bytes: raw.bytes, complete: raw.complete,
+        }),
+      tool_call_id: callId,
+    },
+    isError,
+    raw,
+    failure: null,
+    synthetic: false,
+    frontierCall: null,
+  });
+}
+
+function failure(text: string): { content: string; isError: true } {
+  return { content: text, isError: true };
+}
+
+function storeFailureText(err: PackageError): { content: string; isError: boolean } {
+  switch (err.code) {
+    case 'invalid-argument':
+      return failure(`error: define/invalid-argument\n${err.message}`);
+    case 'path-refused':
+      return failure(`error: define/path-refused\n${err.message}`);
+    case 'invalid-source':
+      return failure(`error: define/invalid-source\n${err.message}`);
+    case 'cap-exceeded':
+      return failure(`error: define/cap-exceeded\n${err.message}`);
+    case 'not-found':
+      return failure('error: package/not-found\nno stored package has that id'
+        + ' — extend {verb:"inspect"} lists the stored catalogue');
+  }
+}
+
+/**
+ * Renders the honest inspect catalogue (kernel.md, the sandbox and
+ * local-log sections): base tools, package tools with their schemas, the
+ * stored packages with the caps and their meaning, the kernel-owned
+ * `spawn`/`speak`, and the runtime honesty — the sandbox mode with its
+ * spelled-out meaning, the fail-closed contract, the withheld capabilities,
+ * the caps, the no-rlimit residual, the egress-open residual, and the
+ * 256 KiB funneled-args input cap with the svc/execute workaround.
+ */
+function renderInspect(
+  config: AgentConfig,
+  port: ExtendPort,
+  packages: readonly { id: string; name: string; purpose: string; sourceBytes: number }[],
+): string {
+  const lines: string[] = [];
+  lines.push('== base tools (the offering, frozen for this process) ==');
+  for (const tool of config.tools) {
+    lines.push(`- ${tool.name}: ${tool.description}`);
+  }
+  lines.push('');
+  lines.push('== package tools (live, through the funnel) ==');
+  lines.push('call them with: extend {verb:"call", tool:"<name>", args:{...}}');
+  const registered = port.supervisor.registry.tools();
+  if (registered.length === 0) {
+    lines.push(port.supervisor.liveRunId() !== null
+      ? '(no tools registered — a zero-tool Run is active, inert but honest)'
+      : '(none registered — no Run is active)');
+  }
+  for (const tool of registered) {
+    lines.push(`- ${tool.name}: ${tool.description}`);
+    lines.push(`  schema: ${canonicalizeJson(tool.parameters)}`);
+    lines.push(`  package: ${tool.packageId}`);
+  }
+  lines.push('');
+  lines.push('== packages (stored, persistent across restarts) ==');
+  if (packages.length === 0) {
+    lines.push('(none stored — define one from a world file)');
+  }
+  for (const pkg of packages) {
+    const running = port.supervisor.livePackageId() === pkg.id;
+    lines.push(`- ${pkg.name} (id ${pkg.id}, ${pkg.sourceBytes} bytes of source):`
+      + ` ${pkg.purpose} — ${running ? 'running' : 'defined, not running'}`);
+  }
+  const usedBytes = packages.reduce((sum, pkg) => sum + pkg.sourceBytes, 0);
+  lines.push(`caps: one Run at a time (a tool swap is stop then run — two`
+    + ' deliberate acts); 32 tools per Run; definition sources total'
+    + ` ${usedBytes} / 67108864 bytes.`);
+  lines.push('');
+  lines.push('== kernel-owned, visible but never mounted ==');
+  lines.push('- spawn: creating new nodes — not available yet; its first use is a dated event.');
+  lines.push('- speak: the human channel — agent zero alone, not available yet.');
+  lines.push('');
+  lines.push('== runtime honesty ==');
+  const status = port.supervisor.sandboxStatus();
+  lines.push(port.sandbox
+    ? `Run sandbox: ${status === null
+      ? 'Landlock confinement (not yet probed this process; fail-closed: a'
+        + ' sandbox that cannot be built or probed makes every extend run close'
+        + ' as run/spawn-failed)'
+      : `landlock abi ${status.abi} enforcement ${status.enforcement}`
+        + ' (fail-closed: a sandbox that cannot be built or probed makes every'
+        + ' extend run close as run/spawn-failed)'}`
+    : 'Run sandbox: OFF — package code runs as this kernel process: it can'
+      + ' read, overwrite and destroy the credential store and every node'
+      + ' tree, and signal the kernel');
+  lines.push('withheld from package code by design: the frontier, the journal,'
+    + ' the credential store, raw fs, raw network, timers, process authority,'
+    + ' and the model call (the first future svc kind).');
+  lines.push('funneled args are capped at 256 KiB per call — larger inputs go'
+    + ' through svc/execute against world files.');
+  lines.push('no rlimits or cgroups exist: the caps above are the availability'
+    + ' physics. Egress from a Run is open (unmediated); svc/web_* is the'
+    + ' credential-backed, frontier-visible form.');
+  return lines.join('\n');
+}
+
+/** Executes one validated extend decision and appends its result. */
+export async function executeExtend(opts: {
+  readonly gate: BoundaryGate;
+  readonly id: RequestId;
+  readonly callId: string;
+  readonly decision: ExtendDecision;
+  readonly config: AgentConfig;
+  readonly port: ExtendPort;
+}): Promise<void> {
+  const { gate, id, callId, decision, config, port } = opts;
+  const max = config.policy.maxToolResultBytes;
+
+  if (decision.verb === 'inspect') {
+    // The read-only catalogue: a read-only listing, never the deleting scan.
+    const { definitions } = await port.store.listPackages();
+    await appendResult(gate, id, callId,
+      renderInspect(config, port, definitions.map((pkg) => ({
+        id: pkg.id, name: pkg.name, purpose: pkg.purpose, sourceBytes: pkg.sourceBytes,
+      }))), false, max);
+    return;
+  }
+
+  if (decision.verb === 'define') {
+    try {
+      const defined = await port.store.definePackage({
+        name: decision.name, purpose: decision.purpose, path: decision.path,
+      });
+      gate.append('package/define', {
+        id: defined.id, name: decision.name,
+        purpose: decision.purpose, sourceBytes: defined.sourceBytes,
+      });
+      await appendResult(gate, id, callId,
+        `defined ${decision.name} (id ${defined.id},`
+        + ` ${defined.sourceBytes} bytes of source) — ${decision.purpose}`,
+        false, max);
+    } catch (err) {
+      if (err instanceof PackageError) {
+        await appendResult(gate, id, callId, storeFailureText(err).content, true, max);
+        return;
+      }
+      throw err;
+    }
+    return;
+  }
+
+  if (decision.verb === 'run') {
+    const source = await port.store.readPackageSource(decision.id);
+    if (source === null) {
+      await appendResult(gate, id, callId,
+        'error: package/not-found\nno stored package has that id'
+        + ' — extend {verb:"inspect"} lists the stored catalogue', true, max);
+      return;
+    }
+    const verdict = await port.supervisor.startRun(decision.id, source);
+    if (!verdict.ok) {
+      const text = verdict.code === 'busy'
+        ? 'error: run/busy\na Run is already active — stop it first'
+        : verdict.code === 'name-conflict'
+          ? `error: run/name-conflict\nthe declaration collides with reserved names:`
+            + ` ${verdict.names.join(', ')}`
+          : verdict.code === 'invalid-registration'
+            ? `error: run/invalid-registration\n${verdict.detail}`
+            : verdict.code === 'timeout'
+              ? 'error: run/timeout\nthe child sent no run/ready in time'
+              : `error: run/${verdict.code}\n${verdict.detail}`;
+      await appendResult(gate, id, callId, text, true, max);
+      return;
+    }
+    gate.append('package/run', {
+      id: decision.id, runId: verdict.runId,
+      sandbox: port.sandbox ? 'landlock' : 'off',
+    });
+    const lines = [`run started (run ${verdict.runId}, sandbox:`
+      + ` ${port.sandbox ? 'landlock' : 'off'}), ${verdict.tools.length} tool(s):`];
+    for (const tool of verdict.tools) {
+      lines.push(`- ${tool.name}: ${tool.description}`);
+      lines.push(`  schema: ${canonicalizeJson(tool.parameters)}`);
+    }
+    await appendResult(gate, id, callId, lines.join('\n'), false, max);
+    return;
+  }
+
+  if (decision.verb === 'call') {
+    const tool = port.supervisor.registry.lookup(decision.tool);
+    if (tool === null) {
+      await appendResult(gate, id, callId,
+        `error: tool-not-found\nno live tool named ${JSON.stringify(decision.tool)}`
+        + ' — extend {verb:"inspect"} lists the live catalogue', true, max);
+      return;
+    }
+    const violation = schemaViolation(decision.args, tool.parameters, 'args');
+    if (violation !== null) {
+      await appendResult(gate, id, callId,
+        `error: tool/invalid-args\n${violation}`, true, max);
+      return;
+    }
+    const verdict = await port.supervisor.invokeTool(tool, decision.args);
+    if (verdict.status === 'ok') {
+      await appendResult(gate, id, callId,
+        canonicalizeJson(verdict.result as never), false, max);
+      return;
+    }
+    if (verdict.status === 'error') {
+      await appendResult(gate, id, callId, `error: ${verdict.message}`, true, max);
+      return;
+    }
+    await appendResult(gate, id, callId,
+      verdict.status === 'crashed'
+        ? 'error: run/crashed\nthe Run died during the call'
+        : 'error: run/timeout\nthe call exceeded the deadline and the Run was torn down',
+      true, max);
+    return;
+  }
+
+  if (decision.verb === 'stop') {
+    const liveId = port.supervisor.liveRunId();
+    const livePackage = port.supervisor.livePackageId();
+    if (liveId === null || livePackage !== decision.id) {
+      await appendResult(gate, id, callId,
+        'error: package/not-found\nthat package has no live Run', true, max);
+      return;
+    }
+    await port.supervisor.stopRun();
+    gate.append('package/stop', {
+      id: decision.id, runId: liveId, reason: 'verb',
+    });
+    await appendResult(gate, id, callId,
+      `stopped (run ${liveId}); the package stays defined — re-run it anytime`,
+      false, max);
+    return;
+  }
+
+  // undefine
+  if (port.supervisor.livePackageId() === decision.id) {
+    await appendResult(gate, id, callId,
+      'error: undefine while a Run is active\nstop it first — two deliberate'
+      + ' acts, two facts', true, max);
+    return;
+  }
+  try {
+    await port.store.undefinePackage(decision.id);
+  } catch (err) {
+    if (err instanceof PackageError && err.code === 'not-found') {
+      await appendResult(gate, id, callId,
+        'error: package/not-found\nno stored package has that id', true, max);
+      return;
+    }
+    throw err;
+  }
+  gate.append('package/undefine', { id: decision.id });
+  await appendResult(gate, id, callId,
+    `undefined (${decision.id}); the definition is gone — re-defining the same`
+    + ' source restores the exact identity', false, max);
+}

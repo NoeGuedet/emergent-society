@@ -128,6 +128,9 @@ export type StartRunVerdict =
     | { readonly code: 'name-conflict'; readonly names: readonly string[] }
   ));
 
+/** The supervisor's public surface (the loop's and the funnel's port type). */
+export type RunSupervisor = ReturnType<typeof createRunSupervisor>;
+
 /** The outcome of one funneled invoke, as the L4 handler maps it. */
 export type InvokeVerdict =
   | { readonly status: 'ok'; readonly result: unknown }
@@ -219,6 +222,10 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
     liveRunId: () => string | null;
   };
   liveRunId(): string | null;
+  /** The live run's owning package id, or null. */
+  livePackageId(): string | null;
+  /** The last probed Run sandbox status, or null before the first probe. */
+  sandboxStatus(): { readonly abi: number; readonly enforcement: 'full' | 'partial' } | null;
   isIdle(): boolean;
 } {
   const registry = createRunRegistry({ effect: deps.events.effect });
@@ -237,6 +244,8 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
     ? 'run-bootstrap.mts' : 'run-bootstrap.mjs';
 
   let live: LiveRun | null = null;
+  /** The last successful probe's status (inspect's runtime honesty). */
+  let lastProbe: { abi: number; enforcement: 'full' | 'partial' } | null = null;
   /** The synchronous slot reservation: a concurrent start refuses busy. */
   let starting = false;
 
@@ -308,6 +317,8 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
   return {
     registry,
     liveRunId: () => live?.runId ?? null,
+    livePackageId: () => live?.packageId ?? null,
+    sandboxStatus: () => lastProbe,
     isIdle: () => live === null && !starting,
 
     async startRun(packageId: string, source: Buffer): Promise<StartRunVerdict> {
@@ -348,7 +359,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
               home: deps.home, uid: deps.uid, runLeaf: leaf, interpreterPath: interpreter,
               ...(deps.launcherPath !== undefined ? { launcherPath: deps.launcherPath } : {}),
             });
-            await probeSandbox(spec);
+            lastProbe = await probeSandbox(spec);
             program = spec.launcherPath;
             argv = [...spec.grantArgs, '--', interpreter, bootstrapLeaf, ...runArgs];
             env = spec.env;

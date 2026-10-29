@@ -19,7 +19,7 @@ describe('defaultAgentConfig', () => {
       heading: 'Work on the current shared direction.',
       model: 'mock-model',
       parameters: { temperature: 0 },
-      allowedTools: ['execute', 'wait', 'web_search', 'web_fetch'],
+      allowedTools: ['execute', 'wait', 'web_search', 'web_fetch', 'extend'],
       tools: [
         {
           name: 'execute', description: 'Run a command in the shared world. The shell session persists across calls: working directory, exports and background jobs survive. A command that times out resets the session.',
@@ -51,6 +51,26 @@ describe('defaultAgentConfig', () => {
             type: 'object',
             properties: { url: { type: 'string', minLength: 1 } },
             required: ['url'], additionalProperties: false,
+          },
+        },
+        {
+          name: 'extend',
+          description: 'Manage this node\'s own capabilities. Six verbs: inspect (the live catalogue: tools, packages, caps, runtime honesty); define (store a Package: name, purpose, path of a source file in the world); run (activate a stored Package as a confined Run: its tools become callable); call (invoke a running Package tool by name with args — the funnel); stop (deactivate the running Run, reversible); undefine (delete a stored Package, irreversible).',
+          parameters: {
+            type: 'object',
+            properties: {
+              verb: {
+                type: 'string',
+                enum: ['inspect', 'define', 'run', 'call', 'stop', 'undefine'],
+              },
+              name: { type: 'string' },
+              purpose: { type: 'string' },
+              path: { type: 'string' },
+              id: { type: 'string' },
+              tool: { type: 'string' },
+              args: { type: 'object' },
+            },
+            required: ['verb'], additionalProperties: false,
           },
         },
       ],

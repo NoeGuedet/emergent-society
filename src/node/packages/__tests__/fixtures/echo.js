@@ -1,18 +1,16 @@
-// The minimal authoring shape (kernel.md, the sandbox and local-log sections):
-// plain JavaScript, no imports, evaluated as an async function body. The source
-// returns one registration object; the handler stays in the child's memory, the
-// wire carries only {name, description, parameters}.
+// One registered tool: the minimal authoring shape with a strict schema —
+// the funnel-validation fixture (a required string with a length floor and
+// additionalProperties refused). Plain JavaScript, no imports.
 return {
-  tools: [
-    {
-      name: 'echo_text',
-      description: 'echo the given text',
-      parameters: {
-        type: 'object',
-        properties: { text: { type: 'string' } },
-        required: ['text'],
-      },
-      handler: async (args) => ({ echoed: args.text }),
+  tools: [{
+    name: 'echo_text',
+    description: 'echoes the text',
+    parameters: {
+      type: 'object',
+      properties: { text: { type: 'string', minLength: 1 } },
+      required: ['text'],
+      additionalProperties: false,
     },
-  ],
+    handler: async (args) => ({ echoed: args.text }),
+  }],
 };

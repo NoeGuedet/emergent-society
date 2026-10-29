@@ -8,6 +8,7 @@ import type { CommandOutcome, TerminalPort } from './terminal.js';
 import { boundToolText, decodeToolText } from './text.js';
 import { renderExtract, renderSearch } from './web.js';
 import type { WebOutcome, WebTools } from './web.js';
+import { executeExtend, type ExtendPort } from './extend.js';
 
 /**
  * Tool dispatch (T7, kernel.md §4).
@@ -19,8 +20,11 @@ import type { WebOutcome, WebTools } from './web.js';
  * `web_fetch` run through the injected `WebTools` port (its client is the only
  * place the credential is written, and only into an `Authorization` header; its
  * raw body is a frontier fact, so the local result carries only `frontierCall`
- * and no artifact), and any other name is an unknown tool that never becomes
- * bash. Arguments stay raw until here, where they are parsed as a plain JSON
+ * and no artifact), `extend` runs the six package verbs through the injected
+ * `ExtendPort` (its funnel is the only invocation path for dynamic tools), and
+ * any other name is an unknown tool that never becomes bash — including a
+ * registered package tool attempted natively, whose unknown-tool message
+ * points at the funnel. Arguments stay raw until here, where they are parsed as a plain JSON
  * object; a malformed, unknown or denied call yields a fixed error result with
  * the matching `tool_call_id` and no shell. An extract-level `failed: true`
  * render is an error result with a null `SafeFailure`, the ordinary-nonzero-exit
@@ -36,7 +40,8 @@ type Decision =
   | { readonly kind: 'web_search'; readonly query: string;
       readonly maxResults: number | undefined }
   | { readonly kind: 'web_fetch'; readonly url: string }
-  | { readonly kind: 'error'; readonly failure: SafeFailure };
+  | { readonly kind: 'error'; readonly failure: SafeFailure }
+  | (import('./extend.js').ExtendDecision);
 
 const INVALID: Decision = { kind: 'error', failure: { code: 'invalid-tool', status: null } };
 
@@ -49,7 +54,7 @@ function decide(call: FunctionCall, config: AgentConfig): Decision {
   const name = call.function.name;
   const offered = config.tools.some((tool) => tool.name === name);
   const hasHandler = name === 'execute' || name === 'wait'
-    || name === 'web_search' || name === 'web_fetch';
+    || name === 'web_search' || name === 'web_fetch' || name === 'extend';
   if (!offered || !hasHandler) {
     return { kind: 'error', failure: { code: 'unknown-tool', status: null } };
   }
@@ -95,11 +100,46 @@ function decide(call: FunctionCall, config: AgentConfig): Decision {
   }
 
   // `execute` requires its own non-whitespace string `cmd` and no unknown keys.
+  if (name === 'execute') {
+    const keys = Object.keys(parsed);
+    if (keys.length !== 1 || keys[0] !== 'cmd') return INVALID;
+    const cmd = parsed['cmd'];
+    if (typeof cmd !== 'string' || cmd.trim().length === 0) return INVALID;
+    return { kind: 'execute', cmd };
+  }
+
+  // `extend`: the six verbs, each with its exact key set (the funnel's
+  // argument shapes are validated here — the one-decision-point rule).
+  const verbs = ['inspect', 'define', 'run', 'call', 'stop', 'undefine'];
+  const verb = parsed['verb'];
+  if (typeof verb !== 'string' || !verbs.includes(verb)) return INVALID;
   const keys = Object.keys(parsed);
-  if (keys.length !== 1 || keys[0] !== 'cmd') return INVALID;
-  const cmd = parsed['cmd'];
-  if (typeof cmd !== 'string' || cmd.trim().length === 0) return INVALID;
-  return { kind: 'execute', cmd };
+  const only = (...allowed: string[]): boolean =>
+    keys.every((key) => allowed.includes(key));
+  if (verb === 'inspect') {
+    return only('verb') ? { kind: 'extend', verb: 'inspect' } : INVALID;
+  }
+  if (verb === 'define') {
+    if (!only('verb', 'name', 'purpose', 'path')) return INVALID;
+    const [name2, purpose, path] = [parsed['name'], parsed['purpose'], parsed['path']];
+    if (typeof name2 !== 'string' || name2.length === 0) return INVALID;
+    if (typeof purpose !== 'string' || purpose.length === 0) return INVALID;
+    if (typeof path !== 'string' || path.length === 0) return INVALID;
+    return { kind: 'extend', verb: 'define', name: name2, purpose, path };
+  }
+  if (verb === 'run' || verb === 'stop' || verb === 'undefine') {
+    if (!only('verb', 'id')) return INVALID;
+    const id = parsed['id'];
+    if (typeof id !== 'string' || id.length === 0) return INVALID;
+    return { kind: 'extend', verb, id };
+  }
+  // call: the funnel.
+  if (!only('verb', 'tool', 'args')) return INVALID;
+  const tool = parsed['tool'];
+  const args = parsed['args'];
+  if (typeof tool !== 'string' || tool.length === 0) return INVALID;
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return INVALID;
+  return { kind: 'extend', verb: 'call', tool, args };
 }
 
 function appendSyntheticCancelled(
@@ -115,10 +155,17 @@ function appendSyntheticCancelled(
 
 function appendErrorResult(
   gate: BoundaryGate, id: RequestId, callId: string, failure: SafeFailure,
+  detail?: string,
 ): void {
   gate.append('tool/result', {
     turn: id.turn, request: id, callId,
-    message: { role: 'tool', content: `error: ${failure.code}`, tool_call_id: callId },
+    message: {
+      role: 'tool',
+      content: detail === undefined
+        ? `error: ${failure.code}`
+        : `error: ${failure.code}\n${detail}`,
+      tool_call_id: callId,
+    },
     isError: true, raw: null, failure, synthetic: false,
     frontierCall: null,
   });
@@ -263,7 +310,7 @@ async function appendWebResult(
 
 export async function dispatchCalls(
   projection: AssistantProjection, id: RequestId, gate: BoundaryGate,
-  config: AgentConfig, terminal: TerminalPort, web?: WebTools,
+  config: AgentConfig, terminal: TerminalPort, web?: WebTools, extend?: ExtendPort,
 ): Promise<DispatchResult> {
   const calls = projection.message.tool_calls;
   let called = 0;
@@ -285,7 +332,30 @@ export async function dispatchCalls(
 
     const decision = decide(call, config);
     if (decision.kind === 'error') {
-      appendErrorResult(gate, id, call.id, decision.failure);
+      // A registered package tool attempted natively: the fixed funnel hint,
+      // still the frozen unknown-tool failure (the funnel is the only path).
+      const registered = extend !== undefined
+        && decision.failure.code === 'unknown-tool'
+        && extend.supervisor.registry.lookup(call.function.name) !== null;
+      if (registered) {
+        appendErrorResult(gate, id, call.id, decision.failure,
+          `${call.function.name} is a package tool — call it through the funnel:`
+          + ` extend {verb:"call", tool:${JSON.stringify(call.function.name)}, args:{...}}`);
+      } else {
+        appendErrorResult(gate, id, call.id, decision.failure);
+      }
+      await gate.flush();
+      continue;
+    }
+    if (decision.kind === 'extend') {
+      if (extend === undefined) {
+        appendErrorResult(gate, id, call.id, { code: 'denied', status: null });
+        await gate.flush();
+        continue;
+      }
+      await executeExtend({
+        gate, id, callId: call.id, decision, config, port: extend,
+      });
       await gate.flush();
       continue;
     }
