@@ -40,7 +40,7 @@ import type { WorldRepo } from './world.js';
  * The persistent shell is confined by default (C1.4c): the first `execute`
  * builds the Landlock policy from the world, the cell home and the uid, probes
  * it functionally and spawns the vendored launcher. A sandbox that cannot be
- * built or probed fails every `execute` closed as `spawn-failed` (kernel.md:217)
+ * built or probed fails every `execute` closed as `spawn-failed` (kernel.md:84)
  * — never a silent unconfined shell; `terminal.sandbox: false` is the loud,
  * explicit escape hatch and a supplied `create` factory owns confinement
  * itself. The kernel process stays outside the sandbox: it also spawns git,
@@ -83,7 +83,7 @@ export type RuntimeOptions = {
      * debugging only). `{ launcherPath }` overrides the binary (tests). A
      * supplied `create` owns the runtime entirely — no spec is built for it.
      * An unusable sandbox fails every `execute` closed as `spawn-failed`
-     * (kernel.md:217), never a silent unconfined shell.
+     * (kernel.md:84), never a silent unconfined shell.
      */
     readonly sandbox?: false | { readonly launcherPath?: string };
   };

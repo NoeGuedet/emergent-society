@@ -53,9 +53,14 @@ is still stopping.
 
 ## Invariants (non-negotiable)
 
-- Only the `execute` shell runs Landlock-confined, and confinement fails closed: a sandbox
-  that cannot be built or probed makes every `execute` close as `spawn-failed`. The kernel
-  process and provider/web mediation are not sandboxed.
+- The `execute` shell and package Runs run Landlock-confined, and confinement fails closed
+  for both: a sandbox that cannot be built or probed makes every `execute` close as
+  `spawn-failed` and every `extend run` as `run/spawn-failed`. The kernel process itself
+  (journal, git, provider and web mediation) is never confined; its git subprocesses run
+  unconfined by design; the only confined children are the shell and the Runs.
+- Journaled configs win: a cell journaled before the Package layer keeps its four-tool
+  offering until a fresh cell home is initialized (`init` is idempotent — re-running it
+  on an existing home changes nothing) — no auto-migration exists or is planned.
 - `providers.json` must be a regular file, mode `0600` (0400 accepted; group/other bits
   refused), owned by the same UID as the process. The API key is never placed on argv, in
   env, in logs, in the journal, or in the world.

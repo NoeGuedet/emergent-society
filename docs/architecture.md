@@ -66,8 +66,20 @@ not individually logged.
 | `sanitize.ts` | PTY output sanitization for the model-facing render |
 | `web.ts` | `web_search`/`web_fetch`: the Tavily client, renderers, `webToolsFromProviders`; every invocation crosses the frontier |
 | `providers.ts` | `loadProviders`: the kernel-side `providers.json` store (see §7) |
-| `dispatch.ts` | `dispatchCalls`: completes tool dialogues through the gate |
+| `dispatch.ts` | `dispatchCalls`: completes tool dialogues through the gate; owns the six extend verbs' recognition |
+| `extend.ts` | The extend executor: the verbs, the verb facts, the funnel's kernel-side schema validation, the honest inspect catalogue |
 | `text.ts` | `boundToolText`: the model-visible tool-text bound |
+
+### `src/node/packages/` — the Package layer
+
+| Module | Role |
+|---|---|
+| `store.ts` | The definition store: fd-first define, content-addressed identity, write-once persistence under `nodes/<uid>/packages/`, the deleting re-mount scan and the read-only listing |
+| `protocol.ts` | The Run facade protocol codec: the eight-frame vocabulary, per-line byte accounting, the one-in-flight guards, drain-aware writes |
+| `run-bootstrap.ts` | The child half: verify-then-use (inline sha256 before any guest byte), the inlined canonical encoder in lockstep with the journal's, bounded capture, the serial handler chain |
+| `registry.ts` | The live tool registry: transactional registration, the safe schema dialect, the frozen caps |
+| `supervisor.ts` | The Run supervisor: the confined spawn, injected-clock deadlines, the drain rule, kernel-side disposal, svc routing through the node's own ports |
+| `constants.ts` / `errors.ts` / `index.ts` | The one-home frozen caps; the typed error family; the barrel |
 
 ### `src/journal/` — one storage module, two layouts
 
@@ -158,6 +170,12 @@ proceeds, plus boot reconciliation), `index.ts` (exports).
 | Persistent terminal `execute` | `src/node/tools/terminal.ts` + `sandbox.ts` + `native/es-landlock/` + `dispatch.ts`; `sanitize.ts` renders PTY output for the model |
 | Linux stdin-wait proof | `src/node/tools/proc.ts` |
 | Disposable projection cache | `src/context/snapshots.ts` |
+| Package definition store | `src/node/packages/store.ts` — fd-first define, content-addressed identity, write-once persistence under `nodes/<uid>/packages/` |
+| Run facade protocol | `src/node/packages/protocol.ts` (kernel side) + `run-bootstrap.ts` (child side, self-contained, verify-then-use) |
+| Live tool registry | `src/node/packages/registry.ts` — transactional registration, the safe schema dialect, the frozen caps |
+| Confined Run supervisor | `src/node/packages/supervisor.ts` + the Run policy in `sandbox.ts` (`buildRunSandboxSpec`) — deadlines, the drain rule, kernel-side disposal |
+| The `extend` tool and the funnel | `src/node/tools/extend.ts` (executor) + the `decide()` arm in `dispatch.ts`; the offering is frozen at the factory (`config.ts`) |
+| Package lifecycle | the boot scan and host-stop disposal in `src/node/loop.ts`; composition in `src/host/host.ts` |
 | Only the kernel emits | the narrow `TurnContext` (`driver.ts`) for the local log; the frontier gate (`src/frontier/journal.ts`) for the exchanges |
 | The provider-parameter contract | `src/context/parameters.ts` (bounds) + `src/context/contracts.ts` (payload shapes) |
 | The two observation surfaces joined | `world_head` on every `http/request` (`src/frontier/events.ts`) + the commit hash in `turn/end` (`src/node/events.ts`) |
@@ -199,8 +217,13 @@ Everything implemented is mechanism (journal, frontier, gate, watcher, commit-pe
 ritual, sandbox) except one deliberate exception: the assembler and compaction policies
 decide what a wake's diff presents and what is retained — implemented, but as trusted
 kernel-side behavior, not replaceable Packages. The `extend` Package layer is
-**specified, not implemented**; until then every policy change is a kernel-side decision
-recorded in the local log, never a frontier fact.
+**implemented**: mechanism and tool Packages — content-addressed definitions persisted
+under `nodes/<uid>/packages/`, Runs as Landlock-confined children behind a JSON-lines
+facade, a live runtime registry, the frozen five-tool offering with the `extend call`
+funnel, the boot scan and the host-stop disposal (`src/node/packages/`). Policies stay
+kernel-side: the replacement seam (a policy Package arrives through the same facade,
+never in-kernel trust) is **specified, not implemented**, opened when C2 demonstrates
+the need.
 
 ## 7. The credential store and the hostile-provider disclosure
 

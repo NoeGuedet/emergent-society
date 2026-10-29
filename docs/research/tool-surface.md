@@ -2,7 +2,7 @@
 
 This note records the tool-surface arbitration for the Package layer (`extend`, C1.5,
 specified) and the measurement it opens. Status vocabulary: the frozen offering, the
-discovery path and the funnel below are **specified, not implemented**; the evidence and
+discovery path and the funnel below are **implemented**; the evidence and
 the probes are verified facts.
 
 ## The question
