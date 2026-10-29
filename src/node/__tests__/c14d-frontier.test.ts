@@ -428,9 +428,11 @@ describe('proof 1: one mediated path (a regression guard on kernel sources)', ()
       }
     }
 
-    // Exactly three legitimate kernel sites; a fourth fails the proof.
+    // Exactly four legitimate kernel sites (the supervisor's plain spawn is
+    // the fourth, C1.5 design §5.2); a fifth fails the proof.
     expect(containing(sources, 'child' + '_process')).toEqual([
-      'journal/lock.ts', 'node/tools/sandbox.ts', 'node/world-git.ts',
+      'journal/lock.ts', 'node/packages/supervisor.ts',
+      'node/tools/sandbox.ts', 'node/world-git.ts',
     ]);
   });
 

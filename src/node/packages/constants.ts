@@ -35,3 +35,21 @@ export const MAX_MANIFEST_BYTES = 1_024;
 
 /** One protocol line's byte cap — an unterminated line is killed at the cap. */
 export const MAX_FRAME_BYTES = 1_048_576;
+
+/** The one concurrent Run per node (a frozen cap: one Run carries all the tooling). */
+export const MAX_CONCURRENT_RUNS_PER_NODE = 1;
+
+/** The most tools one Run may register. */
+export const MAX_TOOLS_PER_RUN = 32;
+
+/** One registered tool's schema cap (canonical bytes). */
+export const MAX_TOOL_SCHEMA_BYTES = 4_096;
+
+/** The whole declaration's surface cap (names + descriptions + schemas, canonical bytes). */
+export const MAX_DECLARED_SURFACE_BYTES = 49_152;
+
+/** The window a spawned child has to send `run/ready`. */
+export const PACKAGE_READY_TIMEOUT_MS = 10_000;
+
+/** The bootstrap's bounded capture of non-protocol writes (output.log). */
+export const MAX_OUTPUT_LOG_BYTES = 65_536;

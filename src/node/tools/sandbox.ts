@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process';
 import { lstat, mkdir, realpath } from 'node:fs/promises';
-import { join, resolve, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { assertNodeUid } from '../../journal/index.js';
+import { assertNodeUid, nodeDir } from '../../journal/index.js';
 import { NodeError } from '../errors.js';
 import { realpathOrSelf } from '../world.js';
 
@@ -329,6 +329,163 @@ export async function buildSandboxSpec(opts: {
 }
 
 /**
+ * The Run policy's spec: narrower than the shell's everywhere except the
+ * interpreter chain (design §5.2) — read+execute on the merged-usr set and
+ * the resolved interpreter chain, the same narrow `/etc`/`/proc`/device read
+ * set (load-bearing for node startup), read+write on the Run leaf ONLY. Never
+ * `<home>` itself, never `nodes/<uid>/packages/`, never the world (a Run is
+ * not a shell). The probe asserts the credential store unreachable at every
+ * spawn: the Run builder is the new code where a grant-list bug would live,
+ * so its deny path is `<home>/providers.json`, not the launcher's own path.
+ */
+export type RunSandboxSpec = {
+  readonly launcherPath: string;
+  readonly probeArgv: readonly string[];
+  /** The grant prefix; the supervisor appends `--` and the interpreter argv. */
+  readonly grantArgs: readonly string[];
+  /** An allowlist constructed from nothing: the leaf twice, and no inherited var. */
+  readonly env: { readonly HOME: string; readonly TMPDIR: string };
+  readonly interpreterPath: string;
+};
+
+/**
+ * Builds the Run policy. The leaf must already exist (the kernel creates it
+ * with `ensureDurableDirectory` before the spawn); it is verified real,
+ * 0700, kernel-uid-owned and inside `nodes/<uid>/runs/` — the same
+ * fail-closed posture as the scratch leaf. The interpreter chain is
+ * resolved here from the caller-supplied `interpreterPath` (the supervisor
+ * re-derives `realpath(process.execPath)` at every spawn, so a kernel
+ * interpreter upgrade cannot leave a stale grant).
+ */
+export async function buildRunSandboxSpec(opts: {
+  readonly home: string;
+  readonly uid: string;
+  readonly runLeaf: string;
+  readonly interpreterPath: string;
+  readonly launcherPath?: string;
+}): Promise<RunSandboxSpec> {
+  let uid: string;
+  try {
+    uid = assertNodeUid(opts.uid);
+  } catch (err) {
+    throw new SandboxUnavailableError(
+      `refusing node uid ${JSON.stringify(opts.uid)} as a path segment: ${describe(err)}`);
+  }
+  const home = await realpathOrSelf(resolve(opts.home));
+
+  const launcherPath = await resolveLauncher(
+    opts.launcherPath !== undefined ? opts.launcherPath : DEFAULT_LAUNCHER,
+  );
+
+  // The leaf: real, 0700, kernel-owned, inside nodes/<uid>/runs/.
+  const runsDir = join(nodeDir(home, uid), 'runs');
+  let leaf: string;
+  try {
+    leaf = await realpath(resolve(opts.runLeaf));
+  } catch (err) {
+    throw new SandboxUnavailableError(
+      `the Run leaf ${opts.runLeaf} is not usable: ${describe(err)}`);
+  }
+  let leafInfo;
+  try {
+    leafInfo = await lstat(leaf);
+  } catch (err) {
+    throw new SandboxUnavailableError(`could not inspect the Run leaf ${leaf}: ${describe(err)}`);
+  }
+  if (!leafInfo.isDirectory()) {
+    throw new SandboxUnavailableError(`the Run leaf ${leaf} is not a real directory`);
+  }
+  if (!isWithin(leaf, runsDir)) {
+    throw new SandboxUnavailableError(
+      `the Run leaf ${leaf} is not under ${runsDir}; refusing to grant it`);
+  }
+  const kernelUid = process.getuid?.();
+  if (kernelUid === undefined) {
+    throw new SandboxUnavailableError('this platform has no kernel uid; Linux is required');
+  }
+  if (leafInfo.uid !== kernelUid) {
+    throw new SandboxUnavailableError(
+      `the Run leaf ${leaf} is owned by uid ${leafInfo.uid}, not the kernel uid ${kernelUid}`);
+  }
+  if ((leafInfo.mode & 0o777) !== 0o700) {
+    throw new SandboxUnavailableError(
+      `the Run leaf ${leaf} is mode 0${(leafInfo.mode & 0o777).toString(8)}, not 0700`);
+  }
+
+  // The interpreter chain: the resolved binary, its directory (the loader's
+  // neighborhood), and the sibling lib directory when it exists — re-derived
+  // at every spawn by the caller, never cached.
+  const interpreter = await (async (): Promise<string> => {
+    try {
+      return await realpath(resolve(opts.interpreterPath));
+    } catch (err) {
+      throw new SandboxUnavailableError(
+        `the interpreter ${opts.interpreterPath} is not usable: ${describe(err)}`);
+    }
+  })();
+  const interpreterDir = dirname(interpreter);
+  const interpreterLib = await optionalRealpath(join(interpreterDir, '..', 'lib'));
+
+  const grants: Grant[] = [];
+  const addGrant = (flag: GrantFlag, path: string): void => {
+    if (grants.some((grant) => isWithin(path, grant.path))) return;
+    grants.push({ flag, path });
+  };
+
+  addGrant('--rw', leaf);
+  for (const candidate of SYSTEM_ROOTS) {
+    const real = await optionalRealpath(candidate);
+    if (real !== null) addGrant('--rox', real);
+  }
+  addGrant('--rox', interpreterDir);
+  if (interpreterLib !== null) addGrant('--rox', interpreterLib);
+  addGrant('--rox', interpreter);
+  for (const name of ETC_FILES) {
+    const real = await optionalRealpath(join('/etc', name));
+    if (real !== null) addGrant('--ro', real);
+  }
+  // Node-startup load-bearing, found empirically by the L3b confinement
+  // battery: the interpreter's OpenSSL opens its own config before any guest
+  // code runs, and a missing read makes every Run die at spawn (fail-closed,
+  // but feature-dead). The shell never needed it.
+  const opensslCnf = await optionalRealpath('/etc/ssl/openssl.cnf');
+  if (opensslCnf !== null) addGrant('--ro', opensslCnf);
+  const certs = await optionalRealpath('/etc/ssl/certs');
+  if (certs !== null) addGrant('--ro', certs);
+  const proc = await optionalRealpath('/proc');
+  if (proc !== null) addGrant('--ro', proc);
+  for (const [flag, candidate] of DEVICES) {
+    const real = await optionalRealpath(candidate);
+    if (real !== null) addGrant(flag, real);
+  }
+
+  // The launcher runs unconfined for a few dozen instructions before
+  // `restrict_self`; an agent-writable launcher would be a full escape.
+  const covering = grants.find((grant) => isWithin(launcherPath, grant.path));
+  if (covering !== undefined) {
+    throw new SandboxUnavailableError(
+      `the Landlock launcher ${launcherPath} is inside the granted root ${covering.path}; `
+        + 'the Run could rewrite it and escape the policy');
+  }
+
+  const grantArgs = grants.flatMap((grant) => [grant.flag, grant.path]);
+  const providersPath = join(home, 'providers.json');
+  const probeArgv: readonly string[] = [
+    '--probe',
+    '--probe-deny', providersPath,
+    '--probe-rw', leaf,
+    ...grantArgs,
+  ];
+  return {
+    launcherPath,
+    probeArgv,
+    grantArgs,
+    env: { HOME: leaf, TMPDIR: leaf },
+    interpreterPath: interpreter,
+  };
+}
+
+/**
  * Runs the functional probe in a short-lived child of the launcher: write /
  * read-back / remove in both writable dirs, an exact-EACCES deny read, and the
  * ptrace pair that proves the domain restriction bites. Resolves the status or
@@ -336,7 +493,7 @@ export async function buildSandboxSpec(opts: {
  * Never cached here — the terminal runtime memoizes.
  */
 export async function probeSandbox(
-  spec: SandboxSpec,
+  spec: Pick<SandboxSpec, 'launcherPath' | 'probeArgv'>,
 ): Promise<{ readonly abi: number; readonly enforcement: 'full' | 'partial' }> {
   return new Promise((resolvePromise, reject) => {
     execFile(
