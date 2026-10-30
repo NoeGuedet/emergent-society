@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { rm } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { BlobStore, assertNodeUid, nodeDir } from '../journal/index.js';
 import { canonicalBytes } from '../context/artifacts.js';
@@ -15,7 +15,6 @@ import { dispatchCalls } from './tools/dispatch.js';
 import type { ExtendPort } from './tools/extend.js';
 import type { RunSupervisorEvents } from './packages/supervisor.js';
 import type { ProviderAdapter } from '../provider/adapter.js';
-import { mkdir } from 'node:fs/promises';
 import type { AgentConfig, ProjectionState, RequestId } from '../context/contracts.js';
 import { MAX_CAPTURE_BYTES } from './gate.js';
 import type { BoundaryGate, DriverHooks, DurableWatermark } from './gate.js';
@@ -90,6 +89,8 @@ export type RuntimeOptions = {
       readonly launcherPath?: string;
       /** The shell's cgroup leaf; absent = no cgroup attach (Landlock-only). */
       readonly cgroupPath?: string;
+      /** Written into the leaf before the shell spawns (delegated hosts only). */
+      readonly leafLimits?: { readonly memoryMaxBytes: number; readonly pidsMax: number };
     };
   };
   /** Kernel-mediated web tools; when absent, offered web calls resolve as `denied`. */
@@ -419,6 +420,13 @@ class Runtime implements AgentRuntime {
       // The leaf must exist before the launcher joins it; the naming and the
       // tree belong to the host layer, which passes the path as a string.
       await mkdir(sandbox.cgroupPath, { recursive: true });
+      if (sandbox.leafLimits !== undefined) {
+        // Before any process enters: a leaf keeps its caps for the session.
+        await writeFile(join(sandbox.cgroupPath, 'memory.max'), String(sandbox.leafLimits.memoryMaxBytes))
+          .catch(() => {});
+        await writeFile(join(sandbox.cgroupPath, 'pids.max'), String(sandbox.leafLimits.pidsMax))
+          .catch(() => {});
+      }
     }
     const spec = await buildSandboxSpec({
       world: cwd,

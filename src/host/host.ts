@@ -26,7 +26,9 @@ import {
   assertCellLayout, assertHomeOutsideCheckout, assertHomePermissions, cellPaths,
 } from './layout.js';
 import type { HostLog } from './observe.js';
-import { attachCell, bootHygiene, ensureLeaf, nodeLeaf, runLeaf } from './cgroups.js';
+import {
+  attachCell, bootHygiene, detectLaunchMode, ensureLeaf, LIMITS, limitLeaf, nodeLeaf, runLeaf,
+} from './cgroups.js';
 import type { CellCgroup } from './cgroups.js';
 import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
 
@@ -77,6 +79,7 @@ export type CellOptions = {
   readonly providers: ProviderRegistry;
   readonly sandbox: false | {
     readonly launcherPath?: string; readonly cgroupRoot?: string;
+    readonly leafLimits?: { readonly memoryMaxBytes: number; readonly pidsMax: number };
   };
   readonly pollMs?: number; readonly log: HostLog;
 };
@@ -128,6 +131,7 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
     const shellSandbox = sandbox === false ? false : {
       ...(sandbox.launcherPath !== undefined ? { launcherPath: sandbox.launcherPath } : {}),
       ...(cgroupRoot !== undefined ? { cgroupPath: nodeLeaf(cgroupRoot, uid) } : {}),
+      ...(sandbox.leafLimits !== undefined ? { leafLimits: sandbox.leafLimits } : {}),
     };
     const runtime = createAgentRuntime({
       home, uid, world, initialConfig: config, adapter,
@@ -165,6 +169,9 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
               prepareCgroupLeaf: async (runId: string): Promise<string> => {
                 const leaf = runLeaf(cgroupRoot, runId);
                 await ensureLeaf(leaf);
+                if (sandbox !== false && sandbox.leafLimits !== undefined) {
+                  await limitLeaf(leaf, sandbox.leafLimits);
+                }
                 return leaf;
               },
             }
@@ -271,7 +278,17 @@ async function attachSandbox(
       return sandbox;
     }
     await bootHygiene(attach.root);
-    return { ...sandbox, cgroupRoot: attach.root };
+    return {
+      ...sandbox,
+      cgroupRoot: attach.root,
+      ...(attach.limits
+        ? {
+          leafLimits: {
+            memoryMaxBytes: LIMITS.nodeMemoryMaxBytes, pidsMax: LIMITS.nodePidsMax,
+          },
+        }
+        : {}),
+    };
   } catch (err) {
     // The additive layer must never turn a boot into a failure.
     log.emit('host/degraded', {
@@ -287,6 +304,7 @@ export type HostOptions = {
   readonly model?: string; readonly heading?: string; readonly charterFile?: string;
   readonly sandbox: false | {
     readonly launcherPath?: string; readonly cgroupRoot?: string;
+    readonly leafLimits?: { readonly memoryMaxBytes: number; readonly pidsMax: number };
   };
   readonly pollMs?: number; readonly log: HostLog;
 };
@@ -598,6 +616,8 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         uid, command, ...(deps.now !== undefined ? { now: deps.now } : {}),
         sandbox: sandbox === false ? 'off' : 'landlock',
       });
+      // Read the launch mode before the attach moves this process into svc/.
+      const launchMode = detectLaunchMode();
       const cellSandbox = await attachSandbox(home, uid, sandbox, log, deps);
       const providers = await loadProviderStore(home);
       const credential = llmCredentialFrom(providers);
@@ -609,6 +629,10 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         home, uid, command, model: cell.config.model,
         webTools: cell.webTools ? 'tavily' : 'off',
         sandbox: sandbox === false ? 'off' : 'landlock',
+        launch: launchMode,
+        limits: cellSandbox !== false && cellSandbox.leafLimits !== undefined
+          ? 'available' : 'unavailable',
+        reap: launchMode,
       });
       if (stopRequested) cell.driver.stop('stop-requested');
       await cell.driver.run();

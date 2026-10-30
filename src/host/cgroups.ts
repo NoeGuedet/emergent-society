@@ -32,6 +32,32 @@ import { join, resolve } from 'node:path';
 /** The cgroup2 filesystem magic (`statfs().type`), used to verify the mount. */
 const CGROUP2_SUPER_MAGIC = 0x63677270;
 
+/**
+ * The W0 limits module: every bound in one place. `ES_*` overrides exist for
+ * the smokes (a smaller cap is cheaper to hit); they are NOT AgentConfig
+ * fields — journaled configs never reach existing cells, so a config key would
+ * silently exercise the defaults forever.
+ */
+function positiveInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  // An empty or NaN override must never become a zero cap (a pids.max=0 leaf
+  // cannot spawn) or silently drop the cap: fall back to the default.
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+export const LIMITS = {
+  /** A node session's cgroup caps (the shell's own leaf; Runs have their own). */
+  nodeMemoryMaxBytes: positiveInt('ES_NODE_MEMORY_MAX_BYTES', 4 * 1024 ** 3),
+  nodePidsMax: positiveInt('ES_NODE_PIDS_MAX', 1024),
+  /** The kernel's own `svc/` caps (kernel + its git + any off-cell tree). */
+  svcMemoryMaxBytes: positiveInt('ES_SVC_MEMORY_MAX_BYTES', 4 * 1024 ** 3),
+  svcPidsMax: positiveInt('ES_SVC_PIDS_MAX', 1024),
+  freezeDeadlineMs: 2000,
+  freezePollMs: 20,
+} as const;
+
 /** The two independent capability classes — never one "cgroup unavailable" flag. */
 export type CgroupCapabilities = {
   /** `cgroup.freeze`/`cgroup.kill` on a user-owned child leaf (works unprivileged). */
@@ -41,7 +67,7 @@ export type CgroupCapabilities = {
 };
 
 export type CellCgroup =
-  | { readonly ok: true; readonly root: string }
+  | { readonly ok: true; readonly root: string; readonly limits: boolean }
   | { readonly ok: false; readonly reason: string };
 
 /** `<home>`'s stable cgroup name; the hash keeps the unit/dir name valid and unique.
@@ -196,7 +222,71 @@ export async function attachCell(home: string, anchor?: string): Promise<CellCgr
     await rmdir(root).catch(() => {});
     return { ok: false, reason: `attach: ${describeFsError(err)}` };
   }
-  return { ok: true, root };
+  // Delegated only: enable the controllers on the (now process-free) anchor and
+  // the cell root, then bound the kernel's own leaf. A non-delegated host fails
+  // these writes by design; the cell then runs Landlock-only for limits.
+  const limits = await enableControllers(resolved, root)
+    && await limitLeaf(svc, { memoryMaxBytes: LIMITS.svcMemoryMaxBytes, pidsMax: LIMITS.svcPidsMax });
+  return { ok: true, root, limits };
+}
+
+/**
+ * Enables `+memory +pids` on the anchor and the cell root. Both must be
+ * process-free (the kernel lives in `svc/`): the "no internal processes" rule
+ * is a property of the cgroup whose own subtree_control is written. Returns
+ * whether BOTH writes stuck; a host without delegation refuses (EACCES/EBUSY)
+ * and the answer is `false` — never an error.
+ */
+export async function enableControllers(anchor: string, cellRoot: string): Promise<boolean> {
+  for (const dir of [anchor, cellRoot]) {
+    try {
+      await writeFile(join(dir, 'cgroup.subtree_control'), '+memory +pids');
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Writes a leaf's memory/pids caps. Best-effort: a leaf whose parent never
+ * enabled the controllers has no `memory.max` file, and the answer is `false`.
+ */
+export async function limitLeaf(
+  leaf: string,
+  caps: { readonly memoryMaxBytes: number; readonly pidsMax: number },
+): Promise<boolean> {
+  try {
+    await writeFile(join(leaf, 'memory.max'), String(caps.memoryMaxBytes));
+    await writeFile(join(leaf, 'pids.max'), String(caps.pidsMax));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The launch mode, read from the runtime: a transient systemd service makes
+ * the kernel the unit's MainPID, so its cgroup basename ends in `.service`;
+ * a direct `npm start` runs in whatever scope the shell inherited. Used for
+ * the honest `host/boot` line.
+ */
+export function detectLaunchMode(): 'service' | 'direct' {
+  const anchor = resolveAnchor();
+  return anchor === null ? 'direct' : launchModeFromCgroup(anchor);
+}
+
+/** The pure predicate behind `detectLaunchMode`: any path segment ending in
+ * `.service` is a transient systemd service (its MainPID is the kernel); a
+ * scope or anything else is a direct launch. Segment-based so the post-move
+ * path (`<unit>.service/es-<hash>/svc`) still classifies as service. Split out
+ * so tests can cover the shapes without moving the worker. */
+export function launchModeFromCgroup(cgroupPath: string): 'service' | 'direct' {
+  return cgroupPath.split('/').some((segment) => segment.endsWith('.service')
+    // Every user process lives under `user@<uid>.service`; the user manager is
+    // not the launch unit.
+    && !/^user@\d+\.service$/u.test(segment))
+    ? 'service' : 'direct';
 }
 
 /** Creates (or reuses) a leaf under the cell root. */

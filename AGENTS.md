@@ -68,7 +68,7 @@ is still stopping.
   the launcher joins its leaf before restricting itself, and `cgroup.freeze`/`kill` are
   the fence and reaper primitives. This layer is additive and degrading — a host
   without cgroup v2 runs Landlock-only with one bounded diagnostic, never a refused
-  shell; memory/pids limits arrive only with the delegated service launch (not written yet).
+  shell; memory/pids limits are written only under the delegated service launch.
 - Journaled configs win: a cell journaled before the Package layer keeps its four-tool
   offering until a fresh cell home is initialized (`init` is idempotent — re-running it
   on an existing home changes nothing) — no auto-migration exists or is planned.

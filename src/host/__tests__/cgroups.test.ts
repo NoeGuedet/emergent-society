@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFileSync, realpathSync } from 'node:fs';
 import { lstat, mkdir, readFile, rmdir, writeFile } from 'node:fs/promises';
@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   attachCell, bootHygiene, cellHash, cellRootUnder, cellUnitName,
-  cgroupCapabilities, ensureLeaf, freezeSet, killLeaves, nodeLeaf,
-  resolveAnchor, runLeaf, svcDir,
+  cgroupCapabilities, detectLaunchMode, enableControllers, ensureLeaf, freezeSet,
+  killLeaves, launchModeFromCgroup, limitLeaf, nodeLeaf, resolveAnchor, runLeaf, svcDir,
 } from '../cgroups.js';
 
 /**
@@ -124,6 +124,33 @@ describe.skipIf(anchor === null)('cgroup anchor', () => {
   });
 });
 
+describe('launch shape and limits (unprivileged answers)', () => {
+  it('classifies the launch shape from the cgroup basename', () => {
+    expect(launchModeFromCgroup('/x/es-ab.service')).toBe('service');
+    expect(launchModeFromCgroup('/x/es-ab.service/svc')).toBe('service');
+    expect(launchModeFromCgroup('/x/dsh-subprocess-1.scope')).toBe('direct');
+    expect(launchModeFromCgroup('/x/es-ab.slice')).toBe('direct');
+    // The user manager's own segment is present in EVERY user path; it must
+    // never be mistaken for the launch unit.
+    expect(launchModeFromCgroup('/user.slice/user@1000.service/app.slice/es-x.scope'))
+      .toBe('direct');
+    // The runner is not a transient service: the honest boot line is direct.
+    expect(detectLaunchMode()).toBe('direct');
+  });
+  it('does not claim limit capability unprivileged', async () => {
+    if (anchor === null || limitsAvailable) return; // delegated host: nothing to assert
+    const root = await freshRoot();
+    const leaf = join(root, 'node-x');
+    try {
+      await ensureLeaf(leaf);
+      expect(await limitLeaf(leaf, { memoryMaxBytes: 1_000_000, pidsMax: 10 })).toBe(false);
+      expect(await enableControllers(anchor as string, root)).toBe(false);
+    } finally {
+      await removeTree(root);
+    }
+  });
+});
+
 describe.skipIf(freezeLeaf === null)('cgroup attach, freeze and kill', () => {
   it('attaches the kernel into svc/ and detaches cleanly', async () => {
     const base = await freshRoot();
@@ -159,19 +186,23 @@ describe.skipIf(freezeLeaf === null)('cgroup attach, freeze and kill', () => {
           return [];
         }
       }), '--ro', realpathSync('/proc')];
-      // 1. The exec'd program sees the leaf at its first instruction.
-      const res = spawnSync(
+      // One spawn, read while alive: the child's own cgroup names the leaf
+      // AFTER its execve (the join happens pre-restriction, pre-exec), which
+      // proves both the attach-before-exec ordering and the in-place exec.
+      const child = spawn(
         LAUNCHER,
-        ['--cgroup', leaf, ...grants, '--', '/bin/sh', '-c', 'exec cat /proc/self/cgroup'],
-        { encoding: 'utf8', timeout: 10_000 },
+        ['--cgroup', leaf, ...grants, '--', '/bin/sleep', '5'],
+        { stdio: 'ignore' },
       );
-      expect(res.status, `stdout=${res.stdout} stderr=${res.stderr}`).toBe(0);
-      expect((res.stdout ?? '').trim()).toMatch(/\/node-test$/u);
-      // 2. The attached pid is the spawn's own pid (execve in place, not a fork).
-      const child = spawn(LAUNCHER, ['--cgroup', leaf, ...grants, '--', '/bin/sleep', '2'], { stdio: 'ignore' });
       try {
-        const applied = await readFile(`/proc/${child.pid as number}/cgroup`, 'utf8');
-        expect(applied.trim()).toMatch(/\/node-test$/u);
+        const deadline = Date.now() + 5000;
+        let applied = '';
+        while (Date.now() < deadline) {
+          applied = (await readFile(`/proc/${child.pid as number}/cgroup`, 'utf8')).trim();
+          if (applied.endsWith('/node-test')) break;
+          await new Promise((resolve) => { setTimeout(resolve, 20); });
+        }
+        expect(applied).toMatch(/\/node-test$/u);
       } finally {
         child.kill('SIGKILL');
         await once(child, 'exit').catch(() => {});

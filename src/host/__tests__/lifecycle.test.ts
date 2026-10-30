@@ -484,7 +484,10 @@ it('reclaims a stale owner whose pid was reaped', async () => {
   const h = track(startHost(opts, hostDeps));
   await waitForLog(log, 'host/parked');
   expect(logged(log)).toContainEqual(
-    expect.objectContaining({ event: 'host/boot', sandbox: 'off' }),
+    expect.objectContaining({
+      event: 'host/boot', sandbox: 'off', launch: 'direct',
+      limits: 'unavailable', reap: 'direct',
+    }),
   );
   const live = await readOwner(home);
   expect(live.kind).toBe('live');
