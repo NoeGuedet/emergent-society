@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { GitCommandError, WorldHeadError } from '../errors.js';
 import {
-  MAX_COMMIT_REFUSAL_DETAIL, boundedRefusalDetail, classifyCommitFailure, commitAllRefused,
-  isCommitRefusal, renderCommitRefusal,
+  MAX_COMMIT_REFUSAL_DETAIL, WorldWalkError, boundedRefusalDetail, classifyCommitFailure,
+  commitAllRefused, isCommitRefusal, renderCommitRefusal,
 } from '../world-commit.js';
 import type { WorldCommitInfo } from '../world-types.js';
 
@@ -49,22 +49,45 @@ describe('classifyCommitFailure: the commit boundary names every refusal', () =>
       .resolves.toMatchObject({ commit: null, refusal: { reason: 'world-head' } });
   });
 
-  it('classifies the nested-repository walk\'s raw EACCES', () => {
-    const err = Object.assign(new Error('EACCES: permission denied, scandir \'/w/locked\''), {
-      code: 'EACCES',
-    });
-    expect(classifyCommitFailure(err)).toEqual({
+  it('classifies every raw walk errno as a refusal, never a kernel path', () => {
+    // The walk is the only raw filesystem read in the commit path. It runs
+    // before any git child, so its failure has no `GitCommandError` class: a
+    // permission denial keeps the historical `walk-eacces`, a child past the
+    // path budget is `walk-too-deep`, and every other errno (ENAMETOOLONG from
+    // a vanishing path, EIO, EMFILE) is `walk-failure`. The detail carries the
+    // relative path, never the absolute one.
+    expect(classifyCommitFailure(new WorldWalkError('readdir', 'EACCES', 'locked'))).toEqual({
       reason: 'walk-eacces',
-      detail: 'EACCES: permission denied, scandir \'/w/locked\'',
+      detail: 'world walk readdir failed (EACCES): locked',
     });
-    const eperm = Object.assign(new Error('EPERM'), { code: 'EPERM' });
-    expect(classifyCommitFailure(eperm)?.reason).toBe('walk-eacces');
+    expect(classifyCommitFailure(new WorldWalkError('readdir', 'EPERM', 'x'))?.reason)
+      .toBe('walk-eacces');
+    for (const code of ['ENAMETOOLONG', 'EIO', 'EMFILE']) {
+      const walk = new WorldWalkError('readdir', code, 'deep/rel');
+      expect(classifyCommitFailure(walk)).toMatchObject({
+        reason: 'walk-failure',
+        detail: `world walk readdir failed (${code}): deep/rel`,
+      });
+      // A raw errno that escapes the walk is the same class, not a death.
+      const raw = Object.assign(new Error(`${code}: scandir`), { code });
+      expect(classifyCommitFailure(raw)).toMatchObject({ reason: 'walk-failure' });
+    }
+    const rawEacces = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    expect(classifyCommitFailure(rawEacces)?.reason).toBe('walk-eacces');
+    // A subtree past the walk's path budget is its own reason: the commit is
+    // refused, never silently partial, so the model knows what to move.
+    expect(classifyCommitFailure(new WorldWalkError('walk', 'ETOODEEP', 'deep/rel'))).toEqual({
+      reason: 'walk-too-deep',
+      detail: 'world walk walk failed (ETOODEEP): deep/rel',
+    });
   });
 
   it('passes through a later stage\'s typed refusal', () => {
     const refusal = { reason: 'budget' as const, detail: 'staged paths over the budget' };
     expect(classifyCommitFailure(refusal)).toEqual(refusal);
     expect(isCommitRefusal(refusal)).toBe(true);
+    expect(isCommitRefusal({ reason: 'walk-failure', detail: 'deep path' })).toBe(true);
+    expect(isCommitRefusal({ reason: 'walk-too-deep', detail: 'deep path' })).toBe(true);
     expect(isCommitRefusal({ reason: 'not-a-reason', detail: 'x' })).toBe(false);
     expect(isCommitRefusal({ reason: 'budget' })).toBe(false);
   });
@@ -72,9 +95,27 @@ describe('classifyCommitFailure: the commit boundary names every refusal', () =>
   it('returns null for a failure the boundary cannot name', () => {
     // A programming error or a malformed uid is not a world refusal: the caller
     // keeps its own fatal policy rather than having the class silently widened.
+    // A raw errno is not in this class: it is a walk refusal (see above).
     expect(classifyCommitFailure(new Error('handler bug'))).toBeNull();
-    expect(classifyCommitFailure(Object.assign(new Error('EIO'), { code: 'EIO' }))).toBeNull();
+    // Node's ERR_* codes are programming errors, not errnos: they must stay
+    // loud even though they start with E.
+    expect(classifyCommitFailure(
+      Object.assign(new Error('bad argument'), { code: 'ERR_INVALID_ARG_TYPE' }),
+    )).toBeNull();
     expect(classifyCommitFailure(undefined)).toBeNull();
+  });
+
+  it('names the git subcommand under the repository prefix', () => {
+    // Every production git child carries the explicit pair first; naming
+    // `args[0]` would render "git --git-dir exited 128" on every refusal.
+    const prefixed = new GitCommandError(
+      ['--git-dir', '/w.git', '--work-tree', '/w', 'add', '--all'],
+      128, 'fatal: adding files failed', { kind: 'exit' },
+    );
+    expect(classifyCommitFailure(prefixed)).toEqual({
+      reason: 'git-exit',
+      detail: 'git add exited 128: fatal: adding files failed',
+    });
   });
 
   it('bounds and single-lines the detail and the rendered carrier', () => {
@@ -86,6 +127,21 @@ describe('classifyCommitFailure: the commit boundary names every refusal', () =>
     expect(line.startsWith('commit refused (git-exit): x ')).toBe(true);
     expect(line.length).toBeLessThanOrEqual(MAX_COMMIT_REFUSAL_DETAIL + 40);
     expect(line).not.toContain('\n');
+  });
+
+  it('strips the full control/format class and caps by code points', () => {
+    // The model-visible line must not carry a C1 control, a bidi override, a
+    // zero-width joiner, a BOM or a line separator: any of them can forge a
+    // second line or reorder the text visually.
+    const hostile = `a\u0085b\u202ec\u200bd\ufeffe\u001b[31m${'x'.repeat(1000)}`;
+    const bounded = boundedRefusalDetail(hostile);
+    expect(bounded).not.toMatch(
+      /[\p{Cc}\p{Cf}\u2028\u2029\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/u,
+    );
+    expect(bounded).toContain('a b c d e');
+    expect(bounded.length).toBeLessThanOrEqual(MAX_COMMIT_REFUSAL_DETAIL);
+    expect(boundedRefusalDetail('z'.repeat(5000)))
+      .toBe('z'.repeat(MAX_COMMIT_REFUSAL_DETAIL));
   });
 });
 

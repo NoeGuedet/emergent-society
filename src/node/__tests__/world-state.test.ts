@@ -70,6 +70,26 @@ it('bounds the reason to one line', async () => {
   expect(Array.from(state.reason ?? '')).toHaveLength(120);
 });
 
+it('re-bounds a hostile reason and refuses an oversized sidecar on read', async () => {
+  const path = worldStatePath(home);
+  // The writer bounds the reason, but a same-uid actor can write the file: the
+  // read re-bounds it, including the bidi/format class, so status --json can
+  // never emit an unbounded or visually reordering value.
+  await writeFile(path, JSON.stringify({
+    v: 1, degraded: true, reason: `${'r'.repeat(10)}\u202e${'x'.repeat(500)}`,
+  }), { mode: 0o600 });
+  const state = await readWorldState(home);
+  expect(state.degraded).toBe(true);
+  expect(Array.from(state.reason ?? '')).toHaveLength(120);
+  expect(state.reason).not.toMatch(/[\u202a-\u202e]/u);
+  // Over MAX_SIDECAR_BYTES: not a file this kernel wrote, so healthy before a
+  // single byte is parsed.
+  await writeFile(path, JSON.stringify({
+    v: 1, degraded: true, reason: 'r'.repeat(5000),
+  }), { mode: 0o600 });
+  await expect(readWorldState(home)).resolves.toEqual(HEALTHY_WORLD_STATE);
+});
+
 it('is total: malformed, invalid, unknown-key and non-regular files read healthy', async () => {
   const path = worldStatePath(home);
   await writeFile(path, 'not json', { mode: 0o600 });

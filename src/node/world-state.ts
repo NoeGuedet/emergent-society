@@ -1,6 +1,7 @@
 import { lstat, readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { atomicWriteFile, syncPath } from '../journal/index.js';
+import { singleLine } from '../text.js';
 
 /**
  * The durable degraded-world sidecar: `<home>/world-state.json`.
@@ -44,12 +45,16 @@ export function worldStatePath(home: string): string {
 /** One bounded reason label: status renders it, so it never grows a payload. */
 const MAX_REASON_CODE_POINTS = 120;
 
+/**
+ * The largest sidecar this kernel writes (a version, a flag, a bounded reason
+ * and a timestamp are well under 1 KiB). A larger file is not ours: it reads as
+ * healthy before a single byte is parsed, so a hostile or damaged home cannot
+ * turn a status report into an unbounded read.
+ */
+const MAX_SIDECAR_BYTES = 4096;
+
 function boundedReason(reason: string): string {
-  return Array.from(reason.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' '))
-    .slice(0, MAX_REASON_CODE_POINTS)
-    .join('')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return singleLine(reason, MAX_REASON_CODE_POINTS);
 }
 
 /**
@@ -97,10 +102,16 @@ export async function readWorldState(home: string): Promise<WorldState> {
   } catch {
     return HEALTHY_WORLD_STATE;
   }
-  if (!entry.isFile()) return HEALTHY_WORLD_STATE;
+  if (!entry.isFile() || entry.size > MAX_SIDECAR_BYTES) return HEALTHY_WORLD_STATE;
   try {
-    return parseWorldState(JSON.parse(await readFile(path, 'utf8')) as unknown)
-      ?? HEALTHY_WORLD_STATE;
+    const parsed = parseWorldState(JSON.parse(await readFile(path, 'utf8')) as unknown);
+    if (parsed === null) return HEALTHY_WORLD_STATE;
+    // The writer bounds the reason, but the reader cannot trust the file: a
+    // reason planted by a same-uid actor is re-bounded exactly like a written
+    // one, so `status --json` can never emit an unbounded or formatting value.
+    return parsed.reason === undefined
+      ? parsed
+      : { ...parsed, reason: boundedReason(parsed.reason) };
   } catch {
     return HEALTHY_WORLD_STATE;
   }

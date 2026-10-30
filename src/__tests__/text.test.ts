@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { describe, expect, it } from 'vitest';
-import { decodeToolText, truncationNotice, utf8Prefix } from '../text.js';
+import { decodeToolText, singleLine, truncationNotice, utf8Prefix } from '../text.js';
 import { boundToolText } from '../node/tools/text.js';
 
 /**
@@ -50,6 +50,36 @@ describe('utf8Prefix', () => {
 describe('decodeToolText', () => {
   it('replaces invalid UTF-8 bytes non-fatally, deterministically', () => {
     expect(decodeToolText(Buffer.from([0x61, 0xff, 0x62]))).toBe('a\uFFFDb');
+  });
+});
+
+describe('singleLine', () => {
+  it('strips control, bidi and zero-width characters and collapses whitespace', () => {
+    const hostile = 'a\u0000b\u0085c\u202ed\u200be\ufefff\u001b[31m\n\tg';
+    expect(singleLine(hostile, 100)).toBe('a b c d e f [31m g');
+  });
+
+  it('strips the whole Cc/Cf class, separators and variation selectors', () => {
+    // U+061C (Arabic letter mark), U+206A (deprecated bidi), U+E0001 (tag),
+    // U+FE0F (variation selector), U+2028 (line separator): all invisible or
+    // reordering, all stripped; the visible letters survive as one line.
+    const exotic = 'a\u061cb\u206ac\u{e0001}d\uFE0Fe\u2028f';
+    const stripped = singleLine(exotic, 100);
+    expect(stripped).toBe('a b c d e f');
+    expect(stripped).not.toMatch(
+      /[\p{Cc}\p{Cf}\u2028\u2029\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/u,
+    );
+  });
+
+  it('caps by code points without splitting a surrogate pair', () => {
+    const value = `${'a'.repeat(299)}😀b`;
+    const bounded = singleLine(value, 300);
+    expect(Array.from(bounded)).toHaveLength(300);
+    expect(bounded.endsWith('😀')).toBe(true);
+  });
+
+  it('returns an empty string for whitespace-only input', () => {
+    expect(singleLine(' \n\t ', 10)).toBe('');
   });
 });
 

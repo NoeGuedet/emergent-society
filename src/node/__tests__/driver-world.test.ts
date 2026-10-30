@@ -1165,9 +1165,13 @@ describe('the commit boundary is a refusal, not a death', () => {
       const turns: number[] = [];
       const d = await NodeDriver.open(home, 'n1', async (ctx) => {
         turns.push(ctx.turn);
-        // The second turn repairs the world: the commit path succeeds and the
-        // sidecar is cleared without a commit of its own.
-        if (ctx.turn === 1) await unblock(blocked);
+        // The second turn repairs the world AND writes, so its commit is a real
+        // one: that is the only event that clears the sidecar and resets the
+        // retry streak.
+        if (ctx.turn === 1) {
+          await unblock(blocked);
+          await writeFile(join(world.path, 'n1-recovered.md'), 'x');
+        }
         return wait();
       }, world, { worldPollMs: 0, schedule });
       const running = d.run();
@@ -1199,6 +1203,53 @@ describe('the commit boundary is a refusal, not a death', () => {
       } finally {
         await unblock(blockedAgain);
       }
+    } finally {
+      await unblock(blocked);
+    }
+  });
+
+  it('does not clear the degraded sidecar on a no-op commit attempt', async () => {
+    // A no-op attempt runs the walk and `add` but publishes nothing. A held ref
+    // lock can still block the next real commit, so the degraded projection must
+    // survive it; only a commit that moved HEAD may clear it (A1).
+    const { home, world } = fixture();
+    const blocked = await blockGitAdd(world);
+    type Timer = { readonly ms: number; readonly fire: () => void; cancelled: boolean };
+    const timers: Timer[] = [];
+    const schedule = (ms: number, callback: () => void): (() => void) => {
+      const timer: Timer = { ms, fire: callback, cancelled: false };
+      timers.push(timer);
+      return () => { timer.cancelled = true; };
+    };
+    try {
+      const turns: number[] = [];
+      const d = await NodeDriver.open(home, 'n1', async (ctx) => {
+        turns.push(ctx.turn);
+        if (ctx.turn === 1) await unblock(blocked); // repaired, but nothing to commit
+        if (ctx.turn === 2) await writeFile(join(world.path, 'n1-recovered.md'), 'x');
+        return wait();
+      }, world, { worldPollMs: 0, schedule });
+      const running = d.run();
+      await parked(d, world);
+      expect(timers).toHaveLength(1);
+
+      timers[0]!.fire();
+      await vi.waitFor(() => expect(turns).toEqual([0, 1]));
+      await parked(d, world);
+      // The no-op attempt did not move HEAD: the degraded fact stands.
+      expect((await readWorldState(home)).degraded).toBe(true);
+      expect(timers).toHaveLength(1);
+
+      // A foreign commit wakes the node; its own turn writes and commits, and
+      // that real commit is the clear.
+      await commitAs(world, 'n2', { 'n2/hello.md': 'hi' });
+      await HeadWatcher.for(world).check();
+      await vi.waitFor(() => expect(turns).toEqual([0, 1, 2]));
+      await parked(d, world);
+      expect((await readWorldState(home)).degraded).toBe(false);
+
+      d.stop();
+      await running;
     } finally {
       await unblock(blocked);
     }

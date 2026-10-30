@@ -1,6 +1,7 @@
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { assertNodeUid } from '../journal/index.js';
+import { singleLine } from '../text.js';
 import { NOOP, delay } from '../util.js';
 import { GitCommandError, WorldHeadError, WorldReconciliationError } from './errors.js';
 import {
@@ -51,6 +52,40 @@ const COMMIT_RETRY_MS = 25;
  */
 const MAX_RECONCILE_SCAN = 4096;
 
+/**
+ * The nested-repository walk's own path budget, in UTF-8 bytes. A child
+ * directory whose absolute path is longer than this is NOT descended and NOT
+ * ignored: it is refused as the typed `walk-too-deep`. Excluding it from `add`
+ * would silently drop content git can still reach by relative paths (a
+ * relative mkdir/chdir chain can legally pass PATH_MAX, and a nested
+ * repository there makes `add` fail on its unborn HEAD); a skip would leave the
+ * effect unattributed. A refusal keeps the kernel alive, tells the model which
+ * subtree is outside the commit, and leaves the content for it to move or
+ * remove. The root is never refused by the budget: its readdir is the walk's
+ * entry point, and a root past PATH_MAX fails typed from readdir itself.
+ */
+const MAX_WALK_PATH_BYTES = 3800;
+
+/**
+ * One raw filesystem failure of the nested-repository walk. The walk runs
+ * before any git child exists, so its errors are not `GitCommandError`s; this
+ * class is how they cross into the classifier as a typed refusal instead of
+ * escaping as a driver error (which would kill the kernel and leave the turn
+ * open, making every later boot fail). The detail carries the relative path,
+ * never the absolute one: the walk is the one model-visible source of a
+ * peer-authored path.
+ */
+export class WorldWalkError extends Error {
+  constructor(
+    readonly operation: string,
+    readonly code: string,
+    readonly rel: string,
+  ) {
+    super(`world walk ${operation} failed (${code}): ${rel === '' ? '.' : rel}`);
+    this.name = 'WorldWalkError';
+  }
+}
+
 /** What git says when another process holds the index or the ref, or when a branch compare-and-swap loses its race. */
 const LOCK_CONTENTION = /index\.lock|cannot lock ref|Another git process seems to be running/i;
 
@@ -95,14 +130,16 @@ function identity(author: string): Record<string, string> {
  * failure as `driver-error`. `git-exit` is a command that ran and refused,
  * `git-spawn` a child that never started, `git-timeout`/`git-abort` a child the
  * process layer ended, `output-cap` the kernel's own output bound, `walk-eacces`
- * the world walk's raw permission failure (not a `GitCommandError`), `world-head`
- * a HEAD the kernel cannot publish to (detached, outside `refs/heads/`, or
- * switched during the attempt), and `budget`/`freeze-timeout` the later
- * commit-boundary budgets and fence.
+ * and `walk-failure` the world walk's raw filesystem failure (a permission
+ * errno, or any other errno — the walk is not a `GitCommandError`),
+ * `walk-too-deep` a child past the walk's path budget (refused, never silently
+ * excluded from the commit), `world-head` a HEAD the kernel cannot publish to
+ * (detached, outside `refs/heads/`, or switched during the attempt), and
+ * `budget`/`freeze-timeout` the later commit-boundary budgets and fence.
  */
 export type CommitRefusal = {
-  readonly reason: 'walk-eacces' | 'git-exit' | 'git-spawn' | 'git-timeout' | 'git-abort'
-    | 'output-cap' | 'world-head' | 'budget' | 'freeze-timeout';
+  readonly reason: 'walk-eacces' | 'walk-failure' | 'walk-too-deep' | 'git-exit' | 'git-spawn'
+    | 'git-timeout' | 'git-abort' | 'output-cap' | 'world-head' | 'budget' | 'freeze-timeout';
   readonly detail: string;
 };
 
@@ -112,8 +149,8 @@ export type CommitRefusal = {
  * the fence), which `isCommitRefusal` must pass through.
  */
 const COMMIT_REFUSAL_REASONS: ReadonlySet<string> = new Set([
-  'walk-eacces', 'git-exit', 'git-spawn', 'git-timeout', 'git-abort',
-  'output-cap', 'world-head', 'budget', 'freeze-timeout',
+  'walk-eacces', 'walk-failure', 'walk-too-deep', 'git-exit', 'git-spawn', 'git-timeout',
+  'git-abort', 'output-cap', 'world-head', 'budget', 'freeze-timeout',
 ]);
 
 /** The rendered detail bound: one bounded line, never a payload. */
@@ -126,11 +163,10 @@ export const MAX_COMMIT_REFUSAL_DETAIL = 300;
  * path from a hostile world.
  */
 export function boundedRefusalDetail(detail: string): string {
-  return Array.from(detail.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' '))
-    .slice(0, MAX_COMMIT_REFUSAL_DETAIL)
-    .join('')
-    .replace(/\s+/g, ' ')
-    .trim();
+  // The strip class and the cap live in the shared text boundary; the rendered
+  // line is model-visible, so it must not carry a character that can forge a
+  // second line or reorder it visually.
+  return singleLine(detail, MAX_COMMIT_REFUSAL_DETAIL);
 }
 
 /** The one model-visible rendering of a refusal: one bounded line. */
@@ -156,8 +192,9 @@ export function isCommitRefusal(value: unknown): value is CommitRefusal {
  * The sources are recognized by shape and class, not by one shared predicate:
  * a typed refusal passes through by its fields, a `GitCommandError` by its
  * class and process kind, a `WorldHeadError` by its class, and the
- * nested-repository walk's raw `EACCES`/`EPERM` by its code (it fails before
- * any git child exists).
+ * nested-repository walk's raw filesystem failure (any errno: EACCES, EPERM,
+ * ENAMETOOLONG, EIO, EMFILE…) by its class or code, since it fails before any
+ * git child exists. A raw errno that escapes the walk is the same class.
  */
 export function classifyCommitFailure(err: unknown): CommitRefusal | null {
   if (isCommitRefusal(err)) {
@@ -169,43 +206,77 @@ export function classifyCommitFailure(err: unknown): CommitRefusal | null {
   if (err instanceof WorldHeadError) {
     return { reason: 'world-head', detail: boundedRefusalDetail(err.reason) };
   }
+  if (err instanceof WorldWalkError) {
+    return {
+      reason: err.code === 'ETOODEEP'
+        ? 'walk-too-deep'
+        : isWalkPermissionCode(err.code) ? 'walk-eacces' : 'walk-failure',
+      detail: boundedRefusalDetail(err.message),
+    };
+  }
   if (err instanceof GitCommandError) {
-    const command = err.args[0] ?? 'git';
+    const label = gitLabel(err.args);
     if (err.outputCapped) {
       return {
         reason: 'output-cap',
         detail: boundedRefusalDetail(
-          `git ${command} output exceeded ${MAX_GIT_OUTPUT_BYTES} bytes`),
+          `${label} output exceeded ${MAX_GIT_OUTPUT_BYTES} bytes`),
       };
     }
     switch (err.kind) {
       case 'spawn':
         return {
           reason: 'git-spawn',
-          detail: boundedRefusalDetail(`git ${command} could not be spawned: ${err.stderr}`),
+          detail: boundedRefusalDetail(`${label} could not be spawned: ${err.stderr}`),
         };
       case 'timeout':
-        return { reason: 'git-timeout', detail: boundedRefusalDetail(`git ${command} timed out`) };
+        return { reason: 'git-timeout', detail: boundedRefusalDetail(`${label} timed out`) };
       case 'abort':
-        return { reason: 'git-abort', detail: boundedRefusalDetail(`git ${command} was aborted`) };
+        return { reason: 'git-abort', detail: boundedRefusalDetail(`${label} was aborted`) };
       case 'exit':
         return {
           reason: 'git-exit',
           detail: boundedRefusalDetail(
-            `git ${command} exited ${err.exitCode ?? 'unknown'}: ${err.stderr}`),
+            `${label} exited ${err.exitCode ?? 'unknown'}: ${err.stderr}`),
         };
     }
   }
-  // The walk's only raw filesystem failure; every other read in the commit
-  // path goes through a git child and is a GitCommandError.
+  // The walk is the only raw filesystem read in the commit path; a raw errno
+  // that escapes it is still the same class. Only an errno-shaped string is
+  // accepted: Node's `ERR_*` codes are programming errors and must stay loud
+  // (rethrown by `commitAllRefused`), never be swallowed as a refusal.
   const code = (err as NodeJS.ErrnoException | undefined)?.code;
-  if (code === 'EACCES' || code === 'EPERM') {
+  if (typeof code === 'string' && /^E[A-Z0-9]+$/.test(code)
+    && code !== 'ENOENT' && code !== 'ENOTDIR') {
     return {
-      reason: 'walk-eacces',
+      reason: isWalkPermissionCode(code) ? 'walk-eacces' : 'walk-failure',
       detail: boundedRefusalDetail(err instanceof Error ? err.message : String(err)),
     };
   }
   return null;
+}
+
+/** Whether one errno is the walk's permission class (the reason that predates `walk-failure`). */
+function isWalkPermissionCode(code: string): boolean {
+  return code === 'EACCES' || code === 'EPERM';
+}
+
+/**
+ * The git subcommand of one failed call, skipping the `--git-dir`/`--work-tree`
+ * pair and any `-c key=value` the repository prefixes. A detail that named
+ * `args[0]` would say `git --git-dir exited 128` on every production failure.
+ */
+function gitLabel(args: readonly string[]): string {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]!;
+    if (arg === '--git-dir' || arg === '--work-tree' || arg === '-c') {
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('-')) continue;
+    return `git ${arg}`;
+  }
+  return 'git';
 }
 
 /** The discriminated result of one commit attempt: a commit, or a typed refusal. */
@@ -379,6 +450,9 @@ async function commitOnce(
   // whose subtree content is never committed. The pathspec exclusion is the
   // load-bearing half; the index sweep below is the belt.
   const nested = await nestedRepoDirs(io);
+  // A nested repository is excluded from the staging sweep: staging it would
+  // either fail on its unborn HEAD or record a gitlink whose object lives only
+  // in the agent's repo. The belt below removes any gitlink that survived.
   await io.git([
     'add', '--all', '--', '.',
     ...nested.map((rel) => `:(exclude,literal)${rel}`),
@@ -424,13 +498,23 @@ async function commitOnce(
 /**
  * The world's directories that carry a `.git` entry (directory, file or
  * symlink), relative to the world root — the nested repositories an agent
- * created. The world root itself is skipped: a stray root-level `.git` is
- * never read by the explicit pair and is never staged by git.
+ * created. The world root itself is skipped: a stray root-level `.git` is never
+ * read by the explicit pair and is never staged by git.
+ *
+ * A child past the walk's path budget is refused as `walk-too-deep`, not
+ * skipped: the subtree may be git-reachable by relative paths, so dropping it
+ * would be a silent partial commit; refusing keeps the effect attributable and
+ * the kernel alive.
  */
 async function nestedRepoDirs(io: WorldIo): Promise<string[]> {
-  const found: string[] = [];
+  const nested: string[] = [];
   const visit = async (rel: string): Promise<void> => {
     const dir = rel === '' ? io.path : join(io.path, rel);
+    // The root is never refused by the budget: its readdir is the walk's entry
+    // point, and a root past PATH_MAX fails typed from readdir below.
+    if (rel !== '' && Buffer.byteLength(dir, 'utf8') > MAX_WALK_PATH_BYTES) {
+      throw new WorldWalkError('walk', 'ETOODEEP', rel);
+    }
     let entries;
     try {
       entries = await readdir(dir, { withFileTypes: true });
@@ -438,10 +522,12 @@ async function nestedRepoDirs(io: WorldIo): Promise<string[]> {
       const code = (err as NodeJS.ErrnoException).code;
       // A directory a peer removed between the readdir and the descent.
       if (code === 'ENOENT' || code === 'ENOTDIR') return;
-      throw err;
+      throw new WorldWalkError(
+        'readdir', typeof code === 'string' ? code : 'unknown', rel,
+      );
     }
     if (rel !== '' && entries.some((entry) => entry.name === '.git')) {
-      found.push(rel);
+      nested.push(rel);
       return;
     }
     for (const entry of entries) {
@@ -452,7 +538,7 @@ async function nestedRepoDirs(io: WorldIo): Promise<string[]> {
     }
   };
   await visit('');
-  return found;
+  return nested;
 }
 
 /** The staged paths whose index entry is a `160000` gitlink. */

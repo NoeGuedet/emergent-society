@@ -226,9 +226,13 @@ export async function runGitWithStdin(
     child.on('error', (err) => reject(
       new GitCommandError(args, null, String(err), classifyGitFailure(err)),
     ));
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       if (code === 0) resolvePromise(stdout);
-      else reject(new GitCommandError(args, code, stderr, { kind: 'exit' }));
+      else reject(new GitCommandError(args, code, stderr, classifyGitFailure({
+        // A future timeout kills this child: the close then carries the kill,
+        // not a git exit status, and must be classified as the timeout it is.
+        killed: child.killed, signal,
+      })));
     });
     child.stdin.end(input);
   });

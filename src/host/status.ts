@@ -4,6 +4,7 @@ import {
   FRONTIER_EVENT_TYPES, validateFrontierEvent, type HttpRequest, type HttpResponse,
 } from '../frontier/index.js';
 import { JournalReader, frontierLayout } from '../journal/index.js';
+import { singleLine } from '../text.js';
 import { WorldRepo } from '../node/world.js';
 import { readWorldState } from '../node/world-state.js';
 import { readOwner } from './owner.js';
@@ -354,11 +355,7 @@ export function formatStatus(report: StatusReport): string {
 
 /** One bounded single-line operator value for the human report. */
 function bounded(text: string, limit = 120): string {
-  return Array.from(text.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' '))
-    .slice(0, limit)
-    .join('')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return singleLine(text, limit);
 }
 
 /** The host line, one shape per owner state; `stale` carries no pid. */

@@ -1,11 +1,14 @@
 // The compiled C1 refusal smoke: a real cell, a real Git world, the real
 // journals, a loopback fake provider. It proves the refusal path end to end:
 // a chmod-000 file planted in the world makes a turn's commit refuse; the turn
-// ends `waiting`, the kernel stays alive, `status` is degraded (exit 1), the
-// next turn's model-visible context carries the bounded refusal line, and a
-// later turn commits and clears the sidecar. It then plants an interrupted turn
-// plus the same damage, resumes, and asserts the boot reconcile refuses without
-// wedging the home (the synthetic closer has no commit and the host boots).
+// ends `waiting`, the kernel is alive with no fault event, `status` is degraded
+// (exit 1 from the sidecar alone), the next turn's model-visible context carries
+// the bounded refusal line exactly once, and the node's OWN shell removes the
+// blocker and writes, so the next turn's real commit — not a no-op attempt —
+// clears the sidecar. It then plants an interrupted turn plus the same damage,
+// resumes, asserts the boot reconcile refuses without wedging the home (the
+// synthetic closer has no commit and the host boots), and lets the resumed
+// node's shell repair it, with a second real commit advancing HEAD.
 //
 // Output contract: exactly `w0-refusal smoke: ok` on stdout, exit 0, whole run
 // <= 180 s. On failure: `w0-refusal smoke: <label>: <message>`, the child's last
@@ -16,7 +19,7 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { rmSync } from 'node:fs';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -96,29 +99,45 @@ const assistantTool = (name, args) => ({
 });
 
 /**
- * The loopback fake provider. The first request whose body carries the refusal
- * line is the retry turn: it answers with one `execute` call that writes
- * `second.txt`, so that turn's commit is a real non-empty commit. Every other
- * request answers text. Bodies stay in memory and are never printed.
+ * The shell command the node runs to recover: it removes the planted blockers
+ * itself (the harness never repairs the world after the plant) and appends a
+ * line, so the turn's commit is real and non-empty. Both names are removed
+ * unconditionally; only one exists in each phase.
+ */
+const RECOVERY_CMD = "rm -f blocked.txt blocked2.txt; printf 'recovered\\n' >> recovered.txt";
+
+/**
+ * The loopback fake provider. Any request whose body carries the refusal line
+ * is a recovery turn: it answers with one `execute` call, delayed so the status
+ * read happens while the turn is in flight rather than after its commit. Every
+ * other request answers text. Bodies stay in memory and are never printed.
  */
 function startServer() {
   return new Promise((resolve, reject) => {
     const requests = [];
-    let retryServed = false;
+    // One armed recovery per phase: the first carrier request repairs, and the
+    // chained turn that follows gets text (the carrier stays in history, so an
+    // unconditional execute would loop). The smoke re-arms before the resume.
+    let recoveryArmed = true;
+    // The armed recovery reply is HELD, not delayed: the smoke observes
+    // `pending`, reads status while the turn is in flight, then releases it.
+    // That makes the ordering a proof, not a race against a timer.
+    let held = null;
     const server = createServer((req, res) => {
       const chunks = [];
       req.on('data', (chunk) => chunks.push(chunk));
       req.on('end', () => {
         const body = Buffer.concat(chunks).toString('utf8');
         requests.push({ body, authorization: req.headers.authorization ?? null });
-        let reply;
-        if (!retryServed && body.includes('commit refused')) {
-          retryServed = true;
-          reply = assistantTool('execute', { cmd: "printf 'second\\n' > second.txt" });
-        } else {
-          reply = DEFAULT_TEXT_REPLY;
+        if (recoveryArmed && body.includes('commit refused')) {
+          recoveryArmed = false;
+          held = {
+            res,
+            payload: JSON.stringify(assistantTool('execute', { cmd: RECOVERY_CMD })),
+          };
+          return;
         }
-        const payload = JSON.stringify(reply);
+        const payload = JSON.stringify(DEFAULT_TEXT_REPLY);
         res.writeHead(200, {
           'content-type': 'application/json',
           'content-length': String(Buffer.byteLength(payload)),
@@ -129,7 +148,23 @@ function startServer() {
     server.on('error', reject);
     server.listen(0, '127.0.0.1', () => {
       liveServers.add(server);
-      resolve({ server, port: server.address().port, requests });
+      resolve({
+        server,
+        port: server.address().port,
+        requests,
+        armRecovery: () => { recoveryArmed = true; },
+        get pending() { return held !== null; },
+        releaseRecovery: () => {
+          const reply = held;
+          held = null;
+          if (reply === null || reply.res.destroyed) return;
+          reply.res.writeHead(200, {
+            'content-type': 'application/json',
+            'content-length': String(Buffer.byteLength(reply.payload)),
+          });
+          reply.res.end(reply.payload);
+        },
+      });
     });
   });
 }
@@ -222,17 +257,20 @@ async function hasRefusal(home) {
   }
 }
 
+/** HEAD, or null on an unborn branch (the first start's baseline). */
+function tryHead(home) {
+  try {
+    return git(home, ['rev-parse', 'HEAD']).trim();
+  } catch {
+    return null;
+  }
+}
+
 function statusReport(home, acceptable) {
   const result = runCli(['status', '--home', home, '--json']);
   assert.ok(acceptable.includes(result.code),
     `status exited ${result.code}: ${bounded(result.stderr)}`);
   return JSON.parse(result.stdout);
-}
-
-/** The exact command that repairs the world: restore the mode, then remove. */
-async function unblock(path) {
-  await chmod(path, 0o600).catch(() => {});
-  await rm(path, { force: true }).catch(() => {});
 }
 
 /** One plant: an untracked unreadable file makes `git add --all` exit 128. */
@@ -253,16 +291,19 @@ async function main() {
     server = await startServer();
     await writeProviders(home, server.port);
 
-    // 1. Plant the damage, start the cell, and wait for the refused turn.
+    // 1. Plant the damage, start the cell, and wait for the refused turn. The
+    //    precondition is asserted before the kernel can act: the file exists,
+    //    is unreadable, and the world starts healthy (no sidecar). The harness
+    //    never repairs the world: the node's own shell does, in the retry turn.
     const blocked = join(home, 'world', 'blocked.txt');
     await plantUnreadable(blocked);
+    assert.equal((await lstat(blocked)).mode & 0o777, 0o000, 'the planted file is unreadable');
+    assert.equal((await readWorldState(home)).degraded, false, 'the home starts healthy');
+    const headBefore = tryHead(home);
     child = spawnHost(['start', '--home', home, '--model', 'w0-refusal-test',
       '--heading', 'Refusal smoke.', '--no-sandbox']);
     await waitFor(() => hasRefusal(home),
       { child, label: 'the first turn records a refusal' });
-
-    // Repair immediately: the bounded retry (1 s) is the second turn.
-    await unblock(blocked);
 
     const refused = await stableEvents(home);
     const endIndex = refused.findIndex((event) => event.type === 'turn/end');
@@ -276,44 +317,76 @@ async function main() {
     assert.equal(refusal.ignorable, true, 'the refusal event is ignorable');
     assert.equal(refusal.data.refusal.reason, 'git-exit', 'the refusal reason is git-exit');
 
-    // 2. The kernel is alive and status says degraded, exiting 1.
+    // 2. The retry turn is in flight and its recovery reply is HELD: the
+    //    operator status reads below therefore happen before the recovery
+    //    commit, deterministically (no sleep, no race with a timer).
+    await waitFor(() => server.pending, { child, label: 'the retry turn is in flight' });
+
+    // 3. The kernel is alive, no fault event was logged, and status says
+    //    degraded, exiting 1 for the sidecar (not for a folded error).
     assert.equal(child.smoke.exitCode, undefined, 'the kernel must not exit on a refusal');
+    assert.ok(child.pid !== undefined, 'the kernel has a pid');
+    assert.doesNotThrow(() => process.kill(child.pid, 0), 'the kernel process is alive');
+    for (const name of ['host/error', 'driver/error']) {
+      assert.equal(child.smoke.events.some((event) => event.event === name), false,
+        `no ${name} event on a refusal`);
+    }
     const degraded = statusReport(home, [1]);
     assert.equal(degraded.world.state, 'degraded', 'status world state is degraded');
     assert.equal(degraded.world.reason, 'git-exit', 'status carries the refusal reason');
+    assert.equal(degraded.frontier.error, null, 'the exit 1 is the sidecar, not the frontier');
+    assert.equal(degraded.world.error, null, 'the exit 1 is the sidecar, not the world read');
     const human = runCli(['status', '--home', home]);
     assert.equal(human.code, 1, 'the human degraded report exits 1');
+    assert.equal(server.pending, true, 'the recovery reply is still held');
     assert.ok(human.stdout.includes('world-state: degraded reason=git-exit'),
       'the human report names the degraded world');
 
-    // 3. The next turn's model-visible context carries the bounded system line
-    //    exactly once: the carrier is one durable group, not a line re-rendered
-    //    or duplicated per turn. This script is a manual acceptance artifact
-    //    (run after `npm run build`); it is deliberately not wired to an npm
-    //    script.
-    await waitFor(() => server.requests.some((request) => request.body.includes('commit refused')),
-      { child, label: 'the retry turn is sent' });
+    // 4. The next turn's model-visible context carries the bounded system line
+    //    exactly once: one durable group, one occurrence. This script is a
+    //    manual acceptance artifact (run after `npm run build`); it is
+    //    deliberately not wired to an npm script.
     const carrier = server.requests.find((request) => request.body.includes('commit refused'));
+    assert.ok(carrier !== undefined, 'the retry turn request is present');
     const messages = JSON.parse(carrier.body).messages;
     const carriers = messages.filter((message) => message.role === 'system'
-      && message.content.includes('commit refused (git-exit)'));
+      && message.content.startsWith('commit refused ('));
     assert.equal(carriers.length, 1,
       'the next turn sees the refusal carrier exactly once');
+    assert.match(carriers[0].content, /^commit refused \(git-exit\): /,
+      'the carrier names the cause');
+    assert.equal(carriers[0].content.includes('\n'), false, 'the carrier is one line');
+    const occurrences = messages.reduce((total, message) => total
+      + (typeof message.content === 'string'
+        ? (message.content.match(/commit refused/g) ?? []).length : 0), 0);
+    assert.equal(occurrences, 1, 'the carrier phrase occurs exactly once in the request');
 
-    // 4. The second turn commits; the sidecar is cleared by the success.
+    // 5. Release the held recovery: the node's own shell removes the blocker
+    //    and writes, so the retry turn's commit is real; that commit — not a
+    //    no-op attempt — clears the sidecar, and its closer joins the hash.
+    server.releaseRecovery();
     await waitFor(() => {
       try {
         return git(home, ['log', '-1', '--format=%an%x00%s']).trim() === 'node-0\0turn 1';
       } catch {
         return false;
       }
-    }, { child, label: 'the second turn commits' });
-    assert.equal(await readFile(join(home, 'world', 'second.txt'), 'utf8'), 'second\n',
-      'the second turn wrote its world file');
+    }, { child, label: 'the retry turn commits after the shell repair' });
+    assert.equal(await readFile(join(home, 'world', 'recovered.txt'), 'utf8'), 'recovered\n',
+      'the shell repair wrote a world file');
+    const headAfter = git(home, ['rev-parse', 'HEAD']).trim();
+    assert.notEqual(headAfter, headBefore, 'a real commit moved HEAD');
+    const recoveryEnd = (await stableEvents(home)).filter((event) => event.type === 'turn/end'
+      && 'commit' in event.data).pop();
+    assert.equal(recoveryEnd.data.commit, headAfter, 'the closer joins the commit hash');
     await waitFor(async () => (await readWorldState(home)).degraded === false,
       { child, label: 'the sidecar clears on a successful commit' });
+    // Absent, not merely healthy: a malformed file would also read healthy.
+    await assert.rejects(lstat(join(home, 'world-state.json')), /ENOENT/,
+      'the sidecar file is removed');
     const healthy = statusReport(home, [0]);
     assert.equal(healthy.world.state, 'healthy', 'status is healthy after the commit');
+    assert.equal(healthy.world.error, null, 'the healthy report has no world error');
 
     // 5. Pause, then plant an interrupted turn and resume: the boot reconcile
     //    must refuse, write the synthetic closer WITHOUT a commit, and boot.
@@ -334,6 +407,9 @@ async function main() {
 
     const blocked2 = join(home, 'world', 'blocked2.txt');
     await plantUnreadable(blocked2);
+    assert.equal((await lstat(blocked2)).mode & 0o777, 0o000,
+      'the boot-phase file is unreadable');
+    server.armRecovery();
     child = spawnHost(['resume', '--home', home, '--no-sandbox']);
     await waitFor(() => sawEvent(child, 'host/boot'), { child, label: 'the damaged home boots' });
     const boot = bootLine(child);
@@ -350,15 +426,35 @@ async function main() {
       && event.data.turn === 2), 'the boot refusal is recorded');
     await waitFor(async () => (await readWorldState(home)).degraded === true,
       { child, label: 'the boot refusal sets the sidecar' });
+    // The resumed node's first turn is in flight with its recovery reply held:
+    // the status read observes the booted degraded state before that commit.
+    await waitFor(() => server.pending, { child, label: 'the resumed turn is in flight' });
     const degradedAgain = statusReport(home, [1]);
     assert.equal(degradedAgain.world.state, 'degraded', 'the booted home is degraded');
+    assert.equal(degradedAgain.frontier.error, null, 'the booted exit 1 is the sidecar');
+    assert.equal(degradedAgain.world.error, null, 'the booted exit 1 is not a world read');
+    assert.equal(server.pending, true, 'the resumed recovery reply is still held');
+    server.releaseRecovery();
 
-    // 6. Repair and let the bounded retry clear it: the home stays serviceable.
-    await unblock(blocked2);
+    // 6. The resumed node's own shell repairs the world in its first turn; a
+    //    real commit (not a no-op attempt) clears the sidecar and advances HEAD.
+    await waitFor(() => {
+      try {
+        return git(home, ['rev-parse', 'HEAD']).trim() !== head;
+      } catch {
+        return false;
+      }
+    }, { child, label: 'the resumed home commits after its shell repair' });
+    const recoveredLines = (await readFile(join(home, 'world', 'recovered.txt'), 'utf8'))
+      .trim().split('\n');
+    assert.ok(recoveredLines.length >= 2, 'the resumed turn appended to recovered.txt');
     await waitFor(async () => (await readWorldState(home)).degraded === false,
-      { child, label: 'the resumed home clears the sidecar on success' });
-    assert.equal(statusReport(home, [0]).world.state, 'healthy',
-      'the resumed home is healthy after the retry commit');
+      { child, label: 'the resumed home clears the sidecar on a real commit' });
+    await assert.rejects(lstat(join(home, 'world-state.json')), /ENOENT/,
+      'the resumed sidecar file is removed');
+    const healthyAgain = statusReport(home, [0]);
+    assert.equal(healthyAgain.world.state, 'healthy',
+      'the resumed home is healthy after the commit');
 
     const exitedAgain = once(child, 'exit');
     const pauseAgain = runCli(['pause', '--home', home]);

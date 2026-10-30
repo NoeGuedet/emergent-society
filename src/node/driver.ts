@@ -764,20 +764,25 @@ export class NodeDriver {
    * (kernel.md §5.2) — or, when the boundary refuses, the refusal is recorded
    * and the turn ends without a commit.
    *
-   * A successful attempt resets the bounded self-retry and clears the durable
-   * degraded sidecar (the only clear); a refusal is returned, never thrown, so
-   * the caller decides. Unknown failures still throw.
+   * A successful commit — one that produced a hash — resets the bounded
+   * self-retry and clears the durable degraded sidecar (the only clear). A
+   * no-op attempt is not a successful commit: it proves the walk and `add` ran,
+   * but it publishes nothing, so a held ref lock can still block the next real
+   * commit and the degraded projection must stay. A refusal is returned, never
+   * thrown, so the caller decides. Unknown failures still throw.
    */
   private async commitWorld(turn: number): Promise<DriverCommitAttempt> {
     const attempt = await commitAllRefused(
       () => this.world.commitAll(this.uid, `turn ${turn}`),
     );
     if (attempt.refusal !== null) return { commit: null, refusal: attempt.refusal };
-    this.retryAttempt = 0;
-    this.clearRetryTimer();
-    await this.clearWorldDegraded();
     const commit = attempt.commit?.hash ?? null;
-    if (commit !== null) this.watcher.poke();
+    if (commit !== null) {
+      this.retryAttempt = 0;
+      this.clearRetryTimer();
+      await this.clearWorldDegraded();
+      this.watcher.poke();
+    }
     return { commit, refusal: null };
   }
 

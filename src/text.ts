@@ -4,7 +4,10 @@ import { Buffer } from 'node:buffer';
  * The one UTF-8 boundary module. Three paths bound model-visible text by a byte
  * cap — tool results, assistant content and the git diff renderer — and a drift
  * between their cut rules would let one path split a character or miscount the
- * retained bytes, so the cut and the notice live here once.
+ * retained bytes, so the cut and the notice live here once. The single-line
+ * operator/model value — a refusal detail, a sidecar reason, a status line —
+ * has the same one-home rule: its strip class and cap are here, not copied into
+ * the three renderers.
  */
 
 /**
@@ -25,6 +28,38 @@ export type TruncationCapture =
  */
 export function decodeToolText(bytes: Uint8Array): string {
   return new TextDecoder('utf-8').decode(bytes);
+}
+
+/**
+ * The one unsafe class for a single-line value that may reach a model, an
+ * operator or a log: every Unicode control (`Cc`) and format (`Cf`) character —
+ * C0/DEL, C1, zero-width joiners, bidi controls and isolates, the BOM, tags,
+ * interlinear annotation — plus the line/paragraph separators and the variation
+ * selectors, which are not `Cf` but can still hide or spoof the text. Any of
+ * them can forge a second line or reorder what is displayed; none is content a
+ * refusal detail, a sidecar reason or a status line needs.
+ */
+const SINGLE_LINE_STRIP = /[\p{Cc}\p{Cf}\u2028\u2029\uFE00-\uFE0F\u{E0100}-\u{E01EF}]+/gu;
+
+/**
+ * One bounded single-line value: the unsafe class becomes a space, runs of
+ * whitespace collapse, and at most `maxCodePoints` code points survive. The
+ * cap is applied while walking the string, so a megabyte-scale hostile input
+ * allocates only the retained prefix rather than an array of every code point.
+ *
+ * Precondition: `text` has no lone surrogate (its sources are decoded bytes,
+ * validated payloads or enum labels), so the code-point walk is lossless.
+ */
+export function singleLine(text: string, maxCodePoints: number): string {
+  const cleaned = text.replace(SINGLE_LINE_STRIP, ' ');
+  let bounded = '';
+  let count = 0;
+  for (const ch of cleaned) {
+    if (count >= maxCodePoints) break;
+    bounded += ch;
+    count += 1;
+  }
+  return bounded.replace(/\s+/g, ' ').trim();
 }
 
 /**
