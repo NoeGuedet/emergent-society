@@ -15,6 +15,7 @@ import { dispatchCalls } from './tools/dispatch.js';
 import type { ExtendPort } from './tools/extend.js';
 import type { RunSupervisorEvents } from './packages/supervisor.js';
 import type { ProviderAdapter } from '../provider/adapter.js';
+import { mkdir } from 'node:fs/promises';
 import type { AgentConfig, ProjectionState, RequestId } from '../context/contracts.js';
 import { MAX_CAPTURE_BYTES } from './gate.js';
 import type { BoundaryGate, DriverHooks, DurableWatermark } from './gate.js';
@@ -85,7 +86,11 @@ export type RuntimeOptions = {
      * An unusable sandbox fails every `execute` closed as `spawn-failed`
      * (kernel.md:84), never a silent unconfined shell.
      */
-    readonly sandbox?: false | { readonly launcherPath?: string };
+    readonly sandbox?: false | {
+      readonly launcherPath?: string;
+      /** The shell's cgroup leaf; absent = no cgroup attach (Landlock-only). */
+      readonly cgroupPath?: string;
+    };
   };
   /** Kernel-mediated web tools; when absent, offered web calls resolve as `denied`. */
   readonly webTools?: WebTools;
@@ -410,12 +415,18 @@ class Runtime implements AgentRuntime {
     if (terminal.create !== undefined) return terminal.create(cwd, terminal.env);
     const sandbox = terminal.sandbox;
     if (sandbox === false) return new PtyTerminalRuntime(cwd, terminal.env, 'off');
+    if (sandbox?.cgroupPath !== undefined) {
+      // The leaf must exist before the launcher joins it; the naming and the
+      // tree belong to the host layer, which passes the path as a string.
+      await mkdir(sandbox.cgroupPath, { recursive: true });
+    }
     const spec = await buildSandboxSpec({
       world: cwd,
       home: this.options.home,
       uid: this.options.uid,
       // exactOptionalPropertyTypes: an absent override, never an explicit undefined.
       ...(sandbox?.launcherPath !== undefined ? { launcherPath: sandbox.launcherPath } : {}),
+      ...(sandbox?.cgroupPath !== undefined ? { cgroupPath: sandbox.cgroupPath } : {}),
     });
     return new PtyTerminalRuntime(cwd, terminal.env, spec);
   }

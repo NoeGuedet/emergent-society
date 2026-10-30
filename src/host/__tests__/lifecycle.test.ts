@@ -49,7 +49,12 @@ const idleReply: ReplyBody = {
 const existingConfig = validateAgentConfig({
   ...defaultAgentConfig(), model: 'first-light-test', heading: 'First light.',
 });
-const hostDeps = { installSignals: false, keepAlive: false } as const;
+const hostDeps = {
+  installSignals: false, keepAlive: false,
+  // The cgroup layer is exercised by cgroups.test.ts with its own harness; the
+  // lifecycle cases must never move this worker into a cgroup tree.
+  attachToCell: async () => ({ ok: false as const, reason: 'test-stub' }),
+} as const;
 
 /** The captured stderr lines, keyed by the log that wrote them. */
 const capturedLines = new WeakMap<HostLog, string[]>();

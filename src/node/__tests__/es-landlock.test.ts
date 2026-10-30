@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -123,6 +124,50 @@ suite('es-landlock launcher', () => {
       'rejects a missing -- before the program',
       () => {
         expectLauncherFailure(run(['--ro', '/usr']), 'missing --');
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    it(
+      'rejects --cgroup without a value',
+      () => {
+        expectLauncherFailure(run(['--cgroup']), 'requires a directory');
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    it(
+      'rejects a duplicate --cgroup',
+      () => {
+        expectLauncherFailure(
+          run(['--cgroup', world, '--cgroup', world, '--', '/bin/sh', '-c', 'true']),
+          'may appear only once',
+        );
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    it(
+      'rejects --cgroup combined with --probe',
+      () => {
+        expectLauncherFailure(
+          run([
+            '--cgroup', world,
+            '--probe', '--probe-deny', secret, '--probe-rw', world,
+          ]),
+          '--probe cannot take --cgroup',
+        );
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    it(
+      'fails closed when the cgroup leaf does not exist',
+      () => {
+        expectLauncherFailure(
+          run(['--cgroup', join(world, 'no-such-leaf'), '--', '/bin/sh', '-c', 'true']),
+          'cgroup:',
+        );
       },
       TEST_TIMEOUT_MS,
     );

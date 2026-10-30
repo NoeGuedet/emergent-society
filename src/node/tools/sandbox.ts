@@ -35,6 +35,8 @@ export type SandboxSpec = {
   readonly spawnArgv: readonly string[];
   readonly env: { readonly HOME: string; readonly TMPDIR: string; readonly HISTFILE: '/dev/null' };
   readonly scratchDir: string;
+  /** The cgroup leaf the launcher joins before restricting itself; absent = no attach. */
+  readonly cgroupPath?: string;
 };
 
 export type SandboxStatus =
@@ -223,6 +225,7 @@ export async function buildSandboxSpec(opts: {
   readonly home: string;
   readonly uid: string;
   readonly launcherPath?: string;
+  readonly cgroupPath?: string;
 }): Promise<SandboxSpec> {
   // The runtime validates the uid before constructing the sandbox; repeating it
   // here keeps the scratch leaf a single path segment by construction.
@@ -330,11 +333,15 @@ export async function buildSandboxSpec(opts: {
   ];
   const spawnArgv: readonly string[] = [
     ...grantArgs,
+    ...(opts.cgroupPath !== undefined ? ['--cgroup', opts.cgroupPath] : []),
     '--', '/bin/bash', '--noprofile', '--norc', '-i',
   ];
   const env: SandboxSpec['env'] = { HOME: world, TMPDIR: scratchDir, HISTFILE: '/dev/null' };
 
-  return { launcherPath, probeArgv, spawnArgv, env, scratchDir };
+  return {
+    launcherPath, probeArgv, spawnArgv, env, scratchDir,
+    ...(opts.cgroupPath !== undefined ? { cgroupPath: opts.cgroupPath } : {}),
+  };
 }
 
 /**
@@ -352,6 +359,8 @@ export type RunSandboxSpec = {
   readonly probeArgv: readonly string[];
   /** The grant prefix; the supervisor appends `--` and the interpreter argv. */
   readonly grantArgs: readonly string[];
+  /** The cgroup attach flags (`--cgroup <leaf>`), or empty; before `--`. */
+  readonly cgroupArg: readonly string[];
   /** An allowlist constructed from nothing: the leaf twice, and no inherited var. */
   readonly env: { readonly HOME: string; readonly TMPDIR: string };
   readonly interpreterPath: string;
@@ -372,6 +381,7 @@ export async function buildRunSandboxSpec(opts: {
   readonly runLeaf: string;
   readonly interpreterPath: string;
   readonly launcherPath?: string;
+  readonly cgroupPath?: string;
 }): Promise<RunSandboxSpec> {
   let uid: string;
   try {
@@ -493,6 +503,7 @@ export async function buildRunSandboxSpec(opts: {
     launcherPath,
     probeArgv,
     grantArgs,
+    cgroupArg: opts.cgroupPath !== undefined ? ['--cgroup', opts.cgroupPath] : [],
     env: { HOME: leaf, TMPDIR: leaf },
     interpreterPath: interpreter,
   };

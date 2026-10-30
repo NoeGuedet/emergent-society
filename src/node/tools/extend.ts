@@ -288,9 +288,12 @@ function renderInspect(
       + ' svc.execute.'
     : 'a Run\'s file reach: none — unconfined (sandbox OFF above); the world'
       + ' and the cell home are as reachable as to the kernel.');
-  lines.push('no rlimits or cgroups exist: the caps above are the availability'
-    + ' physics. Egress from a Run is open (unmediated); svc.web_search/'
-    + 'svc.web_fetch is the credential-backed, frontier-visible form.');
+  lines.push('cgroup membership, freeze and kill exist for the shell and Runs'
+    + ' when the cell has a tree (a host without cgroup v2 runs Landlock-only);'
+    + ' memory/pids limits are not written yet — they arrive with the delegated'
+    + ' launch. The caps above are the availability physics until then. Egress'
+    + ' from a Run is open (unmediated); svc.web_search/svc.web_fetch is the'
+    + ' credential-backed, frontier-visible form.');
   return lines.join('\n');
 }
 

@@ -103,6 +103,12 @@ export type RunSupervisorDeps = {
   /** The bootstrap artifact; default is the compiled sibling, tests pass the .ts source. */
   readonly bootstrapPath?: string;
   readonly launcherPath?: string;
+  /**
+   * Creates (and returns the path of) this Run's cgroup leaf, when the cell
+   * has a cgroup tree. The host layer owns the naming and the tree; the
+   * supervisor only joins it via the launcher's `--cgroup`.
+   */
+  readonly prepareCgroupLeaf?: (runId: string) => Promise<string>;
 };
 
 /** The compiled bootstrap beside this module; tests inject the .ts source. */
@@ -371,13 +377,18 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
           const interpreter = await realpath(process.execPath);
           const runArgs = [packageId, sourceSha, packageLeaf, join(leaf, 'output.log')];
           if (deps.sandbox) {
+            // The Run's own cgroup leaf (a sibling of the shell's), when the
+            // cell has a tree; the launcher joins it before restricting.
+            const cgroupPath = deps.prepareCgroupLeaf !== undefined
+              ? await deps.prepareCgroupLeaf(runId) : undefined;
             const spec = await buildRunSandboxSpec({
               home: deps.home, uid: deps.uid, runLeaf: leaf, interpreterPath: interpreter,
               ...(deps.launcherPath !== undefined ? { launcherPath: deps.launcherPath } : {}),
+              ...(cgroupPath !== undefined ? { cgroupPath } : {}),
             });
             lastProbe = await probeSandbox(spec);
             program = spec.launcherPath;
-            argv = [...spec.grantArgs, '--', interpreter, bootstrapLeaf, ...runArgs];
+            argv = [...spec.grantArgs, ...spec.cgroupArg, '--', interpreter, bootstrapLeaf, ...runArgs];
             env = spec.env;
           } else {
             program = interpreter;

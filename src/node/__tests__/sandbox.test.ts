@@ -172,6 +172,30 @@ describe('buildSandboxSpec', () => {
   );
 
   it(
+    'places --cgroup after the grants and before the program, never in the probe',
+    async () => {
+      const launcher = await launcherStub();
+      const leaf = '/sys/fs/cgroup/es-probe/leaf';
+      const spec = await buildSandboxSpec({
+        world, home, uid: 'node-a', launcherPath: launcher, cgroupPath: leaf,
+      });
+      expect(spec.cgroupPath).toBe(leaf);
+      const cg = spec.spawnArgv.indexOf('--cgroup');
+      expect(cg).toBeGreaterThan(-1);
+      expect(spec.spawnArgv[cg + 1]).toBe(leaf);
+      expect(spec.spawnArgv[spec.spawnArgv.length - 1]).toBe('-i');
+      // The attach flags sit between the grant tail and the `--` separator.
+      expect(spec.spawnArgv.slice(0, cg)).toEqual(spec.probeArgv.slice(7));
+      expect(spec.spawnArgv.slice(cg + 2)).toEqual([
+        '--', '/bin/bash', '--noprofile', '--norc', '-i',
+      ]);
+      expect(spec.probeArgv).not.toContain('--cgroup');
+      expect(spec.probeArgv).not.toContain(leaf);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
     'creates the scratch leaf 0700 and reuses it on a second build',
     async () => {
       const launcher = await launcherStub();

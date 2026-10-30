@@ -63,7 +63,12 @@ is still stopping.
   for both: a sandbox that cannot be built or probed makes every `execute` close as
   `spawn-failed` and every `extend run` as `run/spawn-failed`. The kernel process itself
   (journal, git, provider and web mediation) is never confined; its git subprocesses run
-  unconfined by design; the only confined children are the shell and the Runs.
+  unconfined by design; the only confined children are the shell and the Runs. A cell
+  additionally builds a cgroup tree at boot (kernel in `svc/`, one leaf per shell/Run):
+  the launcher joins its leaf before restricting itself, and `cgroup.freeze`/`kill` are
+  the fence and reaper primitives. This layer is additive and degrading — a host
+  without cgroup v2 runs Landlock-only with one bounded diagnostic, never a refused
+  shell; memory/pids limits arrive only with the delegated service launch (not written yet).
 - Journaled configs win: a cell journaled before the Package layer keeps its four-tool
   offering until a fresh cell home is initialized (`init` is idempotent — re-running it
   on an existing home changes nothing) — no auto-migration exists or is planned.

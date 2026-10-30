@@ -26,6 +26,8 @@ import {
   assertCellLayout, assertHomeOutsideCheckout, assertHomePermissions, cellPaths,
 } from './layout.js';
 import type { HostLog } from './observe.js';
+import { attachCell, bootHygiene, ensureLeaf, nodeLeaf, runLeaf } from './cgroups.js';
+import type { CellCgroup } from './cgroups.js';
 import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
 
 /**
@@ -73,7 +75,9 @@ export type CellOptions = {
   readonly home: string; readonly uid: string;
   readonly config: AgentConfig; readonly credential: LlmCredential;
   readonly providers: ProviderRegistry;
-  readonly sandbox: false | { readonly launcherPath?: string };
+  readonly sandbox: false | {
+    readonly launcherPath?: string; readonly cgroupRoot?: string;
+  };
   readonly pollMs?: number; readonly log: HostLog;
 };
 
@@ -120,9 +124,14 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
     const store = await createPackageStore({
       home, uid, worldDir: paths.world, scratchDir: join(home, 'tmp', uid),
     });
+    const cgroupRoot = sandbox !== false ? sandbox.cgroupRoot : undefined;
+    const shellSandbox = sandbox === false ? false : {
+      ...(sandbox.launcherPath !== undefined ? { launcherPath: sandbox.launcherPath } : {}),
+      ...(cgroupRoot !== undefined ? { cgroupPath: nodeLeaf(cgroupRoot, uid) } : {}),
+    };
     const runtime = createAgentRuntime({
       home, uid, world, initialConfig: config, adapter,
-      terminal: { env: DEFAULT_TERMINAL_ENV, sandbox },
+      terminal: { env: DEFAULT_TERMINAL_ENV, sandbox: shellSandbox },
       ...(webTools !== undefined ? { webTools } : {}),
       extend: (events, ports) => ({
         store,
@@ -151,6 +160,15 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
           ...(sandbox !== false && typeof sandbox === 'object'
             && sandbox.launcherPath !== undefined
             ? { launcherPath: sandbox.launcherPath } : {}),
+          ...(cgroupRoot !== undefined
+            ? {
+              prepareCgroupLeaf: async (runId: string): Promise<string> => {
+                const leaf = runLeaf(cgroupRoot, runId);
+                await ensureLeaf(leaf);
+                return leaf;
+              },
+            }
+            : {}),
         }),
         sandbox: sandbox !== false,
       }),
@@ -232,17 +250,52 @@ export function wrapHandler(handler: TurnHandler, log: HostLog): TurnHandler {
   };
 }
 
+/**
+ * Builds the cell's cgroup tree and moves the kernel into `svc/`, once per
+ * host boot. Degrading by design: a host without cgroup v2 (or without write
+ * access to its own cgroup) runs Landlock-only with one bounded diagnostic —
+ * the shell never fails closed for an additive containment layer.
+ */
+async function attachSandbox(
+  home: string,
+  uid: string,
+  sandbox: HostOptions['sandbox'],
+  log: HostLog,
+  deps: HostDeps,
+): Promise<HostOptions['sandbox']> {
+  if (sandbox === false) return sandbox;
+  try {
+    const attach = await (deps.attachToCell ?? attachCell)(home);
+    if (!attach.ok) {
+      log.emit('host/degraded', { home, uid, reason: attach.reason });
+      return sandbox;
+    }
+    await bootHygiene(attach.root);
+    return { ...sandbox, cgroupRoot: attach.root };
+  } catch (err) {
+    // The additive layer must never turn a boot into a failure.
+    log.emit('host/degraded', {
+      home, uid, reason: err instanceof Error ? err.message : String(err),
+    });
+    return sandbox;
+  }
+}
+
 /** What one host run was asked to do; every field is the CLI's validated value. */
 export type HostOptions = {
   readonly home: string; readonly uid: string; readonly command: HostCommand;
   readonly model?: string; readonly heading?: string; readonly charterFile?: string;
-  readonly sandbox: false | { readonly launcherPath?: string };
+  readonly sandbox: false | {
+    readonly launcherPath?: string; readonly cgroupRoot?: string;
+  };
   readonly pollMs?: number; readonly log: HostLog;
 };
 
 /** The host's process-level seams; absent fields mean the production behavior. */
 export type HostDeps = {
   readonly installSignals?: boolean; readonly keepAlive?: boolean;
+  /** The cell-tree attach seam; production builds the cgroup tree, tests stub it. */
+  readonly attachToCell?: (home: string) => Promise<CellCgroup>;
   readonly compose?: (options: CellOptions) => Promise<Cell>;
   readonly now?: () => number;
   readonly proc?: ProcessHandlersTarget;
@@ -545,10 +598,11 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         uid, command, ...(deps.now !== undefined ? { now: deps.now } : {}),
         sandbox: sandbox === false ? 'off' : 'landlock',
       });
+      const cellSandbox = await attachSandbox(home, uid, sandbox, log, deps);
       const providers = await loadProviderStore(home);
       const credential = llmCredentialFrom(providers);
       cell = await (deps.compose ?? composeCell)({
-        home, uid, config, credential, providers, sandbox, log,
+        home, uid, config, credential, providers, sandbox: cellSandbox, log,
         ...(pollMs !== undefined ? { pollMs } : {}),
       });
       log.emit('host/boot', {

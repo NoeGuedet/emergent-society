@@ -24,6 +24,7 @@
 #include <linux/landlock.h>
 #include <signal.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,6 +131,37 @@ static _Noreturn void die_errno(const char *ctx)
 
 	dprintf(STDERR_FILENO, "es-landlock: %s: %s\n", ctx, strerror(err));
 	_exit(125);
+}
+
+
+/*
+ * Joins the cgroup leaf named by --cgroup. The write MUST happen before
+ * ll_restrict_self: cgroupfs is not granted by the policy and must never be
+ * granted (a confined shell with cgroupfs write access could move itself out
+ * of its own leaf, or rewrite its limits). A failed attach is fail-closed:
+ * `es-landlock: cgroup: ...` on one stderr line, exit 125.
+ */
+static void join_cgroup(const char *dir)
+{
+	char procs[PATH_MAX];
+	char buf[32];
+	int fd;
+	int n;
+	int len;
+
+	len = snprintf(procs, sizeof(procs), "%s/cgroup.procs", dir);
+	if (len < 0 || len >= (int)sizeof(procs))
+		die_msg("cgroup", "path too long");
+	fd = open(procs, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		die_errno("cgroup");
+	n = snprintf(buf, sizeof(buf), "%ld\n", (long)getpid());
+	if (write(fd, buf, (size_t)n) != n) {
+		close(fd);
+		die_errno("cgroup");
+	}
+	if (close(fd) != 0)
+		die_errno("cgroup");
 }
 
 static void *xrealloc(void *ptr, size_t size)
@@ -358,6 +390,7 @@ int main(int argc, char **argv)
 	size_t probe_rw_count = 0;
 	const char *probe_deny_path = NULL;
 	int probe = 0;
+	const char *cgroup_dir = NULL;
 	int prog_index = -1;
 	pid_t parent = 0;
 	long abi_raw;
@@ -397,6 +430,12 @@ int main(int argc, char **argv)
 			if (++j >= argc)
 				die_msg("usage", "--rw requires a path");
 			push_grant(&grants, &grant_count, argv[j], GRANT_RW);
+		} else if (strcmp(arg, "--cgroup") == 0) {
+			if (++j >= argc)
+				die_msg("usage", "--cgroup requires a directory");
+			if (cgroup_dir != NULL)
+				die_msg("usage", "--cgroup may appear only once");
+			cgroup_dir = argv[j];
 		} else {
 			die_msg("usage", "unknown argument");
 		}
@@ -410,6 +449,8 @@ int main(int argc, char **argv)
 			die_msg("usage", "--probe requires --probe-deny");
 		if (probe_rw_count == 0)
 			die_msg("usage", "--probe requires at least one --probe-rw");
+		if (cgroup_dir != NULL)
+			die_msg("usage", "--probe cannot take --cgroup");
 	} else {
 		if (probe_deny_path != NULL || probe_rw_count != 0)
 			die_msg("usage",
@@ -447,6 +488,15 @@ int main(int argc, char **argv)
 		opened[i].is_dir = S_ISDIR(st.st_mode);
 		opened[i].kind = grants[i].kind;
 	}
+
+	/*
+	 * Attach to the cell cgroup leaf before any restriction. Placed with the
+	 * grants open and long before ll_restrict_self, for the reason documented
+	 * on join_cgroup: cgroupfs is never granted, so a post-restriction write
+	 * would be EACCES by design.
+	 */
+	if (cgroup_dir != NULL)
+		join_cgroup(cgroup_dir);
 
 	if (probe) {
 		/*
