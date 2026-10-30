@@ -13,7 +13,7 @@ import {
   sha256HexOf,
 } from '../../journal/index.js';
 import {
-  failFrontierFlushes, openTestFrontier, readFrontier,
+  TEST_STORAGE, failFrontierFlushes, openTestFrontier, readFrontier,
 } from '../../frontier/__tests__/helpers.js';
 import {
   FRONTIER_EVENT_TYPES, FRONTIER_MAX_BODY_BYTES, WORLD_HEAD_RE, openFrontierJournal,
@@ -288,13 +288,14 @@ describe('the composition root', () => {
       const frontier = await openFrontierJournal(home, {
         worldHead: () => world.headHash(),
         now: Date.now,
+        storage: TEST_STORAGE,
       });
       journal = frontier;
 
       // One frontier per home: while the host holds it, a second opener is
       // refused by the writer's single-writer lock.
       await expect(openFrontierJournal(home, {
-        worldHead: () => world.headHash(), now: Date.now,
+        worldHead: () => world.headHash(), now: Date.now, storage: TEST_STORAGE,
       })).rejects.toBeInstanceOf(SessionAlreadyOwnedError);
 
       const webTools = webToolsFromProviders(await loadProviders(home), frontier.gate);
@@ -382,7 +383,7 @@ describe('the composition root', () => {
       await frontier.close();
       journal = null;
       reopened = await openFrontierJournal(home, {
-        worldHead: () => world.headHash(), now: Date.now,
+        worldHead: () => world.headHash(), now: Date.now, storage: TEST_STORAGE,
       });
     } finally {
       // Teardown closes any open frontier before removing the home; a close
@@ -1032,12 +1033,12 @@ describe('proof 8: the world join', () => {
     try {
       const throwing = await openFrontierJournal(home, {
         worldHead: () => Promise.reject(new Error('world unreadable')),
-        now: Date.now, batchWindowMs: 60000,
+        now: Date.now, batchWindowMs: 60000, storage: TEST_STORAGE,
       });
       await begin(throwing);
       const nonHex = await openFrontierJournal(home, {
         worldHead: async () => 'not-a-head',
-        now: Date.now, batchWindowMs: 60000,
+        now: Date.now, batchWindowMs: 60000, storage: TEST_STORAGE,
       });
       await begin(nonHex);
 

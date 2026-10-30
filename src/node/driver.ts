@@ -3,6 +3,8 @@ import {
   isBlobRef, readVerifiedBlob, repair,
   type EventDataFor, type EventEnvelope, type JsonValue, type JournalWriterOptions,
 } from '../journal/index.js';
+import { StorageError, checkStorage, type StorageConfig } from '../storage.js';
+import { DEFAULT_STORAGE } from './storage-probe.js';
 import { systemClock } from '../util.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
 import { NodeStateError, WorldReconciliationError, GitCommandError } from './errors.js';
@@ -174,10 +176,34 @@ export interface NodeDriverOptions extends JournalWriterOptions {
    * no doctor ran or it failed — a diagnostic, never a refused boot.
    */
   doctor?: DoctorReport;
+  /**
+   * The cancellable wait after a turn-start storage refusal, in ms. Production
+   * is `DEFAULT_STORAGE_RETRY_MS`; a test injects a short one so the deferral's
+   * retry is deterministic. The wait only ever ends early on `stop()`.
+   */
+  storageRetryMs?: number;
 }
 
 /** The bounded self-retry delays: three attempts, then the cell stays parked. */
 const RETRY_DELAYS_MS: readonly number[] = [1000, 4000, 16000];
+
+/** The turn-start storage retry wait (W0-d): the production default, no switch. */
+const DEFAULT_STORAGE_RETRY_MS = 5_000;
+
+/** The one bounded diagnostic a deferred turn emits: a fixed label, no payload. */
+const STORAGE_DEFERRED_LABEL = 'turn deferred: storage low';
+
+/**
+ * The named turn-start deferral: a stable class name so the host's bounded
+ * `driver/error` channel records a fact (never the generic `Error`), and the
+ * message stays the fixed label.
+ */
+export class StorageDeferredError extends Error {
+  constructor() {
+    super(STORAGE_DEFERRED_LABEL);
+    this.name = 'StorageDeferredError';
+  }
+}
 
 /** One commit attempt as the driver sees it: a hash to join, or a typed refusal. */
 type DriverCommitAttempt = {
@@ -240,6 +266,11 @@ export class NodeDriver {
   private retryAttempt = 0;
   /** The pending retry wake's cancel, or null; cleared on park, stop and success. */
   private retryTimer: (() => void) | null = null;
+  /** The storage circuit breaker shared by the local writer and the turn start. */
+  private readonly storage: StorageConfig;
+  /** The cancellable storage wait's cancel, or null; cleared when it settles. */
+  private storageWait: (() => void) | null = null;
+  private readonly storageRetryMs: number;
 
   /**
    * The ordered durable observation list (T2 seam). Every gate or driver append
@@ -286,6 +317,8 @@ export class NodeDriver {
     this.home = home;
     this.hooks = opts.hooks;
     this.schedule = opts.schedule ?? defaultSchedule;
+    this.storage = opts.storage ?? DEFAULT_STORAGE;
+    this.storageRetryMs = opts.storageRetryMs ?? DEFAULT_STORAGE_RETRY_MS;
     this.lookup = (source: Source): EventEnvelope | null =>
       this.receipts.get(`${source.seq}:${source.hash}`) ?? null;
   }
@@ -311,15 +344,20 @@ export class NodeDriver {
       }
       checkedKnownTypes(Object.keys(opts.hooks.registry), opts.knownTypes);
     }
+    // The effective storage seam: the caller's injection, or the production
+    // policy over the real probe. The local writer and the turn-start home must
+    // share it, so the resolved config is what the writer receives.
+    const storage = opts.storage ?? DEFAULT_STORAGE;
+    const writerOptions: NodeDriverOptions = { ...opts, storage };
     let writer: JournalWriter;
     try {
-      writer = await JournalWriter.open(home, uid, opts);
+      writer = await JournalWriter.open(home, uid, writerOptions);
     } catch (err) {
       if (!(err instanceof TornTailError)) throw err;
       await repair(home, uid);
-      writer = await JournalWriter.open(home, uid, opts);
+      writer = await JournalWriter.open(home, uid, writerOptions);
     }
-    const driver = new NodeDriver(writer, uid, handler, world, opts, home);
+    const driver = new NodeDriver(writer, uid, handler, world, writerOptions, home);
     try {
       await driver.resume(home);
     } catch (err) {
@@ -361,8 +399,10 @@ export class NodeDriver {
     if (this.nodeState === 'stopping' || this.nodeState === 'stopped') return;
     this.stopReason = reason;
     this.stopRequested = true;
-    // A pending self-retry must not wake a stopped node (or hold the process).
+    // A pending self-retry or storage wait must not wake a stopped node (or
+    // hold the process).
     this.clearRetryTimer();
+    this.storageWait?.();
     // Cancel the active turn immediately; the gate stays valid while the
     // handler's awaited cleanup settles (see `endTurnGate`).
     this.activeController?.abort();
@@ -389,6 +429,15 @@ export class NodeDriver {
         // that lands while the opening HEAD read is in flight has no controller
         // to cancel and would otherwise be lost, letting the handler start with
         // a live signal. Re-check after the read and open no turn at all.
+        if (this.stopRequested) break;
+        // The storage home (W0-d): a turn never opens on a low disk. A refusal
+        // waits a cancellable retry and re-checks the world and the probe on
+        // the next pass — no turn, no spin, and no end of the node.
+        if (!(await this.storageReady())) continue;
+        // A stop that landed while the storage probe was in flight (or during
+        // the deferral wait) must not open a full turn: the old controller was
+        // aborted by stop(), the new one would not be, and the handler must
+        // never start un-aborted.
         if (this.stopRequested) break;
         this.writeEvent('turn/start', {
           turn: this.turn, trigger, world: { from: world.from, to: world.to },
@@ -592,7 +641,10 @@ export class NodeDriver {
         await this.writer.flush();
         await this.verifyObservations(batch);
       } catch (err) {
-        this.durabilityFault = true;
+        // A typed storage refusal is not a durability fault: the writer keeps
+        // the batch pending by contract and the driver's turn-start home
+        // defers every effect until a later flush commits it.
+        if (!(err instanceof StorageError)) this.durabilityFault = true;
         throw err;
       }
       if (this.hooks !== undefined) await this.hooks.onDurable(batch);
@@ -621,6 +673,67 @@ export class NodeDriver {
       // this one sit at different trust transitions; neither is skipped.
       await readVerifiedBlob(ref, (hash) => this.readBlob(hash));
     }
+  }
+
+  /**
+   * The boot path's barrier (W0-d): a storage refusal leaves the batch pending
+   * by the writer's own contract and must not refuse the boot — the same rule
+   * as the turn-start home, and no effect can precede the durable boot because
+   * every turn is deferred until a flush commits it. Any other failure is the
+   * durability fault it always was.
+   */
+  private async flushBooting(): Promise<void> {
+    try {
+      await this.flushObservations();
+    } catch (err) {
+      if (!(err instanceof StorageError)) throw err;
+    }
+  }
+
+  /**
+   * The driver's storage home (W0-d): probe before the turn opens. A low disk
+   * emits one bounded diagnostic, sets `waiting` and waits a cancellable
+   * `storageRetryMs`; the caller then re-reads the world range and re-checks,
+   * so a high probe starts the turn and a low one keeps deferring without a
+   * spin. A probe that cannot read degrades: it never refuses.
+   *
+   * @returns true when the turn may open.
+   */
+  private async storageReady(): Promise<boolean> {
+    try {
+      await checkStorage(this.storage, this.home);
+    } catch (err) {
+      if (!(err instanceof StorageError)) throw err;
+      // A stop during the probe wins: no diagnostic, no fresh wait (stop()
+      // already cancelled the previous one), so shutdown is never delayed.
+      if (this.stopRequested) return false;
+      try { this.opts.onError?.(new StorageDeferredError()); }
+      catch { /* the diagnostic is not the deferral */ }
+      this.nodeState = 'waiting';
+      try {
+        await this.waitStorageRetry();
+      } finally {
+        if (!this.stopRequested) this.nodeState = 'active';
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /** The cancellable storage retry wait; `stop()` ends it before its timer. */
+  private waitStorageRetry(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      if (this.stopRequested) { resolve(); return; }
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        this.storageWait = null;
+        resolve();
+      };
+      const cancel = this.schedule(this.storageRetryMs, finish);
+      this.storageWait = () => { cancel(); finish(); };
+    });
   }
 
   /** Best-effort checkpoint at a durable turn boundary; never fatal. */
@@ -708,6 +821,9 @@ export class NodeDriver {
   }
 
   private durableError(err: unknown): string {
+    // A typed storage refusal is a bounded kernel fact (its kind, never a
+    // message that could carry a payload), and it is not a write failure.
+    if (err instanceof StorageError) return `storage refused (${err.kind})`;
     // A git failure is never a kernel invariant failure: it is the world's
     // mechanism refusing, and the closed vocabulary already has its own label.
     // (A turn's commit refusal never reaches here; this covers a git fault on
@@ -1046,6 +1162,9 @@ export class NodeDriver {
   private async shutdown(prior: unknown): Promise<unknown> {
     let failure: unknown = null;
     this.clearRetryTimer();
+    // The loop has already left any storage wait; the cancel is defensive so a
+    // shutdown can never be held by a timer.
+    this.storageWait?.();
     this.nodeState = 'stopping';
     try {
       this.writeEvent('node/shutdown', {
@@ -1119,7 +1238,7 @@ export class NodeDriver {
         this.observations.push(event);
         applyLifecycle(event.type, event.data);
       }
-      await this.flushObservations();
+      await this.flushBooting();
       // Only after the whole history is delivered can the handler prove the last
       // range it durably perceived; that proof, not the last turn/start, is the
       // rebuilt watermark.
@@ -1152,13 +1271,19 @@ export class NodeDriver {
       // A closer is a closer, synthetic or not: durable before the boot is
       // journaled on top of it, so a crash between the two still leaves the
       // commit it names attributable (kernel.md §3).
-      await this.flushObservations();
+      await this.flushBooting();
       if (attempt.refusal !== null) {
-        await this.recordCommitRefusal(attempt.refusal, openTurn, false);
+        // The refusal fact's own barrier is part of the boot: a storage
+        // refusal leaves it pending rather than refusing the boot.
+        try {
+          await this.recordCommitRefusal(attempt.refusal, openTurn, false);
+        } catch (err) {
+          if (!(err instanceof StorageError)) throw err;
+        }
       }
     }
     this.writeEvent('node/boot', { reason: sawAny ? 'resume' : 'start' });
-    await this.flushObservations();
+    await this.flushBooting();
     await this.readyPhase();
   }
 
@@ -1206,8 +1331,16 @@ export class NodeDriver {
     if (this.hooks === undefined) return;
     const created = this.makeGate('ready', null, new AbortController().signal);
     try {
-      await this.hooks.onReady(created.gate);
-      await this.flushObservations();
+      try {
+        // The handler's ready phase flushes through its gate (the journaled
+        // config, the recovery facts): on a low disk that refusal leaves the
+        // batch pending exactly like the driver's own boot barrier, and the
+        // boot still completes — no turn opens until a flush commits it.
+        await this.hooks.onReady(created.gate);
+      } catch (err) {
+        if (!(err instanceof StorageError)) throw err;
+      }
+      await this.flushBooting();
     } finally {
       created.close();
     }

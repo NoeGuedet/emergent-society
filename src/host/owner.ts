@@ -62,6 +62,13 @@ export type HostCommand = 'start' | 'resume';
  */
 export type OwnerFence = 'available' | 'unavailable';
 
+/**
+ * The host-lifetime storage fact: `quoted` only when a quota record was
+ * injected (test-only), `unquoted` for every production cell. Written with the
+ * fence at host composition; never a refusal.
+ */
+export type OwnerStorage = 'quoted' | 'unquoted';
+
 /** The on-disk shape of `<home>/host.json`: seven keys, plus the optional host facts. */
 export type HostOwnerRecord = {
   readonly v: 1; readonly pid: number; readonly startTime: number | null;
@@ -84,6 +91,11 @@ export type HostOwnerRecord = {
   readonly fence?: OwnerFence;
   /** One bounded class label for an unavailable fence; never a path or payload. */
   readonly fenceReason?: string;
+  /**
+   * The storage fact (W0-d): whether this host booted with an injected quota.
+   * Optional so every record from before the field stays valid.
+   */
+  readonly storage?: OwnerStorage;
 };
 
 /**
@@ -118,15 +130,16 @@ export interface OwnerHandle {
   readonly record: HostOwnerRecord;
   release(): Promise<void>;
   /**
-   * Adds the host-lifetime fence fact to the published record, atomically
-   * (0600 tmp + rename) and only while the record at `<home>/host.json` still
-   * carries this handle's `(pid, token)` — a record a reclaim swapped in is
-   * never overwritten. A no-op after release or after the record is no longer
-   * ours. The reason, when present, is bounded here.
+   * Adds the host-lifetime fence and storage facts to the published record,
+   * atomically (0600 tmp + rename) and only while the record at
+   * `<home>/host.json` still carries this handle's `(pid, token)` — a record a
+   * reclaim swapped in is never overwritten. A no-op after release or after the
+   * record is no longer ours. The reason, when present, is bounded here.
    */
   annotate(input: {
     readonly fence: OwnerFence;
     readonly fenceReason?: string;
+    readonly storage?: OwnerStorage;
   }): Promise<void>;
 }
 
@@ -143,13 +156,13 @@ export const PAUSE_POLL_MS = 100;
 const OWNER_BASENAME = 'host.json';
 /**
  * Every key a record may carry: the seven required pre-mode keys plus the
- * optional host facts (`sandbox`, `fence`, `fenceReason`). They live here so the
- * unknown-key guard accepts them; each presence is validated separately in
- * `parseRecord`.
+ * optional host facts (`sandbox`, `fence`, `fenceReason`, `storage`). They live
+ * here so the unknown-key guard accepts them; each presence is validated
+ * separately in `parseRecord`.
  */
 const RECORD_KEYS = [
   'v', 'pid', 'startTime', 'token', 'uid', 'command', 'startedAt',
-  'sandbox', 'fence', 'fenceReason',
+  'sandbox', 'fence', 'fenceReason', 'storage',
 ] as const;
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 const RESTORE_ATTEMPTS = 3;
@@ -241,6 +254,10 @@ function parseRecord(raw: unknown): HostOwnerRecord | null {
   if (fence !== undefined && fence !== 'available' && fence !== 'unavailable') return null;
   const fenceReasonValue = fields['fenceReason'];
   if (fenceReasonValue !== undefined && typeof fenceReasonValue !== 'string') return null;
+  const storageValue = fields['storage'];
+  if (storageValue !== undefined && storageValue !== 'quoted' && storageValue !== 'unquoted') {
+    return null;
+  }
   return {
     v: 1, pid, startTime, token, uid, command, startedAt,
     ...(sandbox === undefined ? {} : { sandbox }),
@@ -248,6 +265,7 @@ function parseRecord(raw: unknown): HostOwnerRecord | null {
     ...(fenceReasonValue === undefined
       ? {}
       : { fenceReason: boundedFenceReason(fenceReasonValue) }),
+    ...(storageValue === undefined ? {} : { storage: storageValue }),
   };
 }
 
@@ -645,6 +663,7 @@ class Claim implements OwnerHandle {
   async annotate(input: {
     readonly fence: OwnerFence;
     readonly fenceReason?: string;
+    readonly storage?: OwnerStorage;
   }): Promise<void> {
     if (this.released) return;
     const target = ownerPath(this.home);
@@ -671,6 +690,11 @@ class Claim implements OwnerHandle {
       ...(input.fenceReason === undefined
         ? {}
         : { fenceReason: boundedFenceReason(input.fenceReason) }),
+      // The storage fact is preserved when an annotation does not present it
+      // (the fence-only test calls), and replaced when it does.
+      ...(input.storage !== undefined
+        ? { storage: input.storage }
+        : current.record.storage === undefined ? {} : { storage: current.record.storage }),
     };
     await atomicWriteFile(target, JSON.stringify(next));
     await syncPath(this.home);

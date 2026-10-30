@@ -7,7 +7,7 @@ import { JournalReader, frontierLayout } from '../journal/index.js';
 import { singleLine } from '../text.js';
 import { WorldRepo } from '../node/world.js';
 import { readWorldState } from '../node/world-state.js';
-import { readOwner } from './owner.js';
+import { readOwner, type OwnerStorage } from './owner.js';
 import { HostConfigError } from './errors.js';
 
 /**
@@ -55,6 +55,14 @@ export type StatusReport = {
     readonly fence?: 'available' | 'unavailable';
     /** One bounded class label for an unavailable fence, when the record has one. */
     readonly fenceReason?: string;
+    /**
+     * The host-lifetime storage fact from the owner record: `quoted` only when
+     * a quota record was injected, `unquoted` for every production cell. The
+     * human line prints `storage=unquoted` only (the degraded fact). Unlike the
+     * fence (surfaced only while a host holds the record), the storage fact
+     * survives the host: a stale record still carries it.
+     */
+    readonly storage?: OwnerStorage;
   };
   readonly frontier: {
     readonly present: boolean; readonly count: number; readonly lastHash: string | null;
@@ -158,10 +166,12 @@ async function hostOf(home: string): Promise<StatusReport['host']> {
     readonly sandbox?: 'landlock' | 'off';
     readonly fence?: 'available' | 'unavailable';
     readonly fenceReason?: string;
-  }): Pick<StatusReport['host'], 'sandbox' | 'fence' | 'fenceReason'> => ({
+    readonly storage?: OwnerStorage;
+  }): Pick<StatusReport['host'], 'sandbox' | 'fence' | 'fenceReason' | 'storage'> => ({
     ...(record.sandbox === undefined ? {} : { sandbox: record.sandbox }),
     ...(record.fence === undefined ? {} : { fence: record.fence }),
     ...(record.fenceReason === undefined ? {} : { fenceReason: record.fenceReason }),
+    ...(record.storage === undefined ? {} : { storage: record.storage }),
   });
   switch (owner.kind) {
     case 'live':
@@ -180,8 +190,12 @@ async function hostOf(home: string): Promise<StatusReport['host']> {
       };
     case 'stale':
       // No pid: the recorded process is gone, and repeating its pid would
-      // read as a live fact.
-      return { state: 'stale' };
+      // read as a live fact. The storage fact is a host-lifetime fact the
+      // record still carries, so it is not dropped with the pid.
+      return {
+        state: 'stale',
+        ...(owner.record?.storage === undefined ? {} : { storage: owner.record.storage }),
+      };
     case 'absent':
       return { state: 'idle' };
   }
@@ -379,25 +393,26 @@ function bounded(text: string, limit = 120): string {
 
 /**
  * The host line, one shape per owner state; `stale` carries no pid. The fence
- * field appears only for `unavailable`: a fenced host's line stays
- * byte-identical to the pre-fence report, and the unavailable fact is the one
- * degradation an operator must see.
+ * field appears only for `unavailable`, and the storage field only for
+ * `unquoted`: a fenced/quoted host's line stays byte-identical to the report
+ * before the fact existed, and those are the degradations an operator must see.
  */
 function hostLine(host: StatusReport['host']): string {
+  const storage = host.storage === 'unquoted' ? ' storage=unquoted' : '';
   const fence = host.fence === 'unavailable' ? ' fence=unavailable' : '';
   switch (host.state) {
     case 'running':
       return (host.sandbox === undefined
         ? `host: running pid=${host.pid} uid=${host.uid} command=${host.command}`
         : `host: running pid=${host.pid} uid=${host.uid} command=${host.command} sandbox=${host.sandbox}`)
-        + fence;
+        + storage + fence;
     case 'unverified':
       return (host.sandbox === undefined
         ? `host: unverified pid=${host.pid}`
         : `host: unverified pid=${host.pid} sandbox=${host.sandbox}`)
-        + fence;
+        + storage + fence;
     case 'stale':
-      return 'host: stale';
+      return 'host: stale' + storage;
     case 'idle':
       return 'host: idle';
   }

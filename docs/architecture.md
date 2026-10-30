@@ -35,10 +35,10 @@ not individually logged.
 | `main.ts` | Entry point: `runCli(argv)`, escaped errors exit 1 with a bounded label |
 | `cli.ts` | Command dispatch and exit codes ([AGENTS.md](../AGENTS.md)); `--no-sandbox` is the explicit confinement opt-out |
 | `options.ts` | Strict `parseArgs` parsing: five commands plus `--help` (`init`, `start`, `resume`, `pause`, `status`), no positionals, no unknown flags; relative `--home` and bad `--uid` are usage errors |
-| `host.ts` | Host lifetime: boots a cell (world doctor, frontier journal, runtime, terminal, sandbox, commit fence), builds the production `FencePort` from the attached cell root, annotates the owner record's fence fact after the attach, reports a boot leaf it could not thaw on `host/degraded`, replays the durable degraded-world sidecar into the `host/boot` `world` field, and owns stop/pause delivery. The C3 doctor runs between `WorldRepo.open` and the frontier open; its report is passed to `NodeDriver.open`, and a doctor failure is a bounded `world/doctor-failed` diagnostic |
-| `status.ts` | The read-only status report; degradation is reported, not thrown. `host.sandbox`/`host.fence` (and the bounded `fenceReason`) are surfaced while a host holds the record; the human host line prints `fence=unavailable` only when unavailable |
+| `host.ts` | Host lifetime: boots a cell (world doctor, frontier journal, runtime, terminal, sandbox, commit fence), builds the production `FencePort` from the attached cell root, annotates the owner record's fence and storage facts after the attach, reports a boot leaf it could not thaw or an unreadable storage probe on `host/degraded`, replays the durable degraded-world sidecar into the `host/boot` `world` field, and owns stop/pause delivery. The C3 doctor runs between `WorldRepo.open` and the frontier open; its report is passed to `NodeDriver.open`, and a doctor failure is a bounded `world/doctor-failed` diagnostic. The storage seam (`resolveStorage`: production policy + `statfsProbe`, no quota; the `HostDeps.freeSpace`/`storageQuota`/`storagePolicy` test seams) is composed once and passed to the frontier and the driver |
+| `status.ts` | The read-only status report; degradation is reported, not thrown. `host.sandbox`/`host.fence` (and the bounded `fenceReason`) are surfaced while a host holds the record; the `host.storage` fact is host-lifetime and survives a stale record (the fence does not). The human host line prints `fence=unavailable` and `storage=unquoted` only — the two degraded facts |
 | `credentials.ts` | The `providers.json` read side: regular file, mode 0600 (0400 accepted; group/other bits refused), owned by the process uid |
-| `owner.ts` | Pause delivery to the host owning a home; owner records. The optional `fence`/`fenceReason` host facts are annotated after the cgroup attach by a token/pid-checked atomic tmp+rename; pre-fence records stay valid |
+| `owner.ts` | Pause delivery to the host owning a home; owner records. The optional `fence`/`fenceReason` and `storage` host facts are annotated after composition by a token/pid-checked atomic tmp+rename; records predating either field stay valid |
 | `observe.ts` | Operator diagnostics: one bounded JSON object per line on stderr — never model text, tool output, headers or credentials |
 | `layout.ts` | Cell-home path layout |
 | `errors.ts` | The host error family |
@@ -48,14 +48,14 @@ not individually logged.
 
 | Module | Role |
 |---|---|
-| `driver.ts` | `NodeDriver`: the turn ritual, lifecycle states (`booting/active/waiting/stopping/stopped`), watermark, resume, park/wake, shutdown; hands the handler a narrow `TurnContext` (`{turn, trigger, world, gate, signal, now}` — no journal, no commit) so only the kernel emits. Holds the `FencePort` seam: one `acquire`/`release` wraps ONE `commitWorld` attempt (outside the queue and the git retries), `release` in `finally`, and any non-fenced outcome or a throwing acquire is the typed refusal `freeze-timeout` (only the absence of a port is the unfenced host). The optional `doctor` report is written as the ignorable local event `world/doctor` after `node/boot`; a write failure is diagnostic |
+| `driver.ts` | `NodeDriver`: the turn ritual, lifecycle states (`booting/active/waiting/stopping/stopped`), watermark, resume, park/wake, shutdown; hands the handler a narrow `TurnContext` (`{turn, trigger, world, gate, signal, now}` — no journal, no commit) so only the kernel emits. Holds the `FencePort` seam: one `acquire`/`release` wraps ONE `commitWorld` attempt (outside the queue and the git retries), `release` in `finally`, and any non-fenced outcome or a throwing acquire is the typed refusal `freeze-timeout` (only the absence of a port is the unfenced host). The storage home: the effective `StorageConfig` (injected or `DEFAULT_STORAGE`) is shared by the local writer and the turn start; a low probe defers the turn (one bounded diagnostic, `waiting`, a cancellable `storageRetryMs` wait, default 5 s), and the boot barriers tolerate a storage refusal so a low disk never refuses the boot. The optional `doctor` report is written as the ignorable local event `world/doctor` after `node/boot`; a write failure is diagnostic |
 | `loop.ts` | `createAgentRuntime`: the trusted handler — folds the local log, presents one bounded world perception per turn, assembles exactly one plan per logical request, sends it through the adapter, dispatches the resulting tool calls |
 | `gate.ts` | The trusted local effect boundary: chunking, artifact manifests, the claim-check inline threshold; `flush()` re-reads and digest/size-verifies every pending claim-check before the effect |
 | `world.ts` | `WorldRepo` — the façade the engine speaks to (author = uid policy) |
 | `world-git.ts` / `world-trust.ts` / `world-commit.ts` / `world-history.ts` / `world-diff.ts` / `world-types.ts` | The git process layer (git as an external process, one controlled environment, per-call deadlines, the world flock around mutating children, proven-stale `index.lock` cleanup); the trust layers `open` runs; the plumbing commit (CAS ref update, interrupted-turn reconciliation, the pre-add walk and post-add staged budgets); the history reads and the hermetic patch renderer (both bounded by their own read deadline); the shared shapes. No module outside the `world-*` family imports a sibling directly — with one named exception: the pure refusal helpers in `world-commit.ts` (`CommitRefusal`, `classifyCommitFailure`, `commitAllRefused`, `renderCommitRefusal`, `isCommitRefusal`) are imported by `driver.ts`, `context/fold.ts` and `node/events.ts`. They are pure shapes/predicates, not a consumer of the commit ritual |
 | `world-state.ts` | The durable degraded-world sidecar (`<home>/world-state.json`): an atomic 0600 projection written before a refused turn's closer, read at host composition and by `status` (the second named layering exception: host, status and driver import this pure projection directly), and cleared only when a commit is known to have succeeded — a commit that moved HEAD, never a no-op attempt; a missing/malformed/oversized/non-regular file reads healthy, and the read re-bounds the reason |
-| `world-doctor.ts` | The C3 boot doctor: the non-blocking world-lock probe and the age+flock `index.lock` removal, the structural-only index validation (unmerged stages, missing named blobs), the bounded dirty/tracked-unreadable report, and the bounded free-space-gated quarantine of untracked unstageable paths. Returns a serializable `DoctorReport` (counts, bounded relative names, no absolute path); it never opens a writer and never repairs divergence. Its replay validator is the fold's only consumer |
-| `limits.ts` | The node-side bounds: git deadlines, the walk/staged budgets, the doctor's quarantine/scan/age/free-space bounds, and `CommitLimits` with production defaults (injected parameters for tests; no environment switch) |
+| `world-doctor.ts` | The C3 boot doctor: the non-blocking world-lock probe and the age+flock `index.lock` removal, the structural-only index validation (unmerged stages, missing named blobs), the bounded dirty/tracked-unreadable report, and the bounded free-space-gated quarantine of untracked unstageable paths. Returns a serializable `DoctorReport` (counts, bounded relative names, no absolute path); it never opens a writer and never repairs divergence. Its replay validator is the fold's only consumer. Its 20 GiB `MIN_FREE_BYTES` is the REPORTED storage-health floor, not the enforcement breaker |
+| `limits.ts` | The node-side bounds: git deadlines, the walk/staged budgets, the doctor's quarantine/scan/age/free-space bounds, and `CommitLimits` with production defaults (injected parameters for tests; no environment switch). `MIN_FREE_BYTES = 20 GiB` here is the doctor's REPORT floor; the enforcement floors live in `src/storage.ts` |
 | `watcher.ts` / `latch.ts` | `HeadWatcher` (watches git HEAD, poke + unref'd interval) and `WakeLatch` (in-memory coalescing wake signal) |
 | `events.ts` | The node vocabulary: `node/boot`, `node/shutdown`, `turn/start`, `turn/end`, the ignorable `world/commit-refused`, and the ignorable `world/doctor` — six types only |
 | `errors.ts`, `index.ts` | The node error family; package exports |
@@ -94,8 +94,9 @@ SHA-256). Storage: `framing.ts` (zstd frames, torn/corrupt scan), `blobs.ts` (cl
 store), `lock.ts` + `lock-guard.mjs` (flock single-writer ownership with the durable
 owner record), `fsutil.ts` (fsync, atomic writes, durable directories), `layout.ts`
 (paths + head shape), `errors.ts`. Actors: `writer.ts` (`JournalWriter`: append, 200 ms
-timer, flush barrier, watermark, rollback, poison), `reader.ts` (+ `repair()`), `verify.ts`
-(`verifyChain`, shared reader↔writer). `index.ts` re-exports the public surface.
+timer, flush barrier, watermark, rollback, poison, the optional storage circuit breaker at
+`flushOnce`), `reader.ts` (+ `repair()`), `verify.ts` (`verifyChain`, shared reader↔writer).
+`index.ts` re-exports the public surface.
 
 ### `src/context/` — the durable context
 
@@ -122,12 +123,20 @@ retries), `transport.ts` (`OpenAITransport`: exact wire bytes, bounded body),
 
 `events.ts` (the `http/request` / `http/response` / `http/incomplete` vocabulary,
 validators, header allowlist, `FRONTIER_MAX_BODY_BYTES`), `journal.ts`
-(`openFrontierJournal(home, { worldHead, now })`: the gate whose `begin` is durable and
-read-back verified before the send and whose `complete` is durable before the caller
-proceeds, plus boot reconciliation), `index.ts` (exports).
+(`openFrontierJournal(home, { worldHead, now, storage })`: the gate whose `begin` checks
+the storage floor before the world-head stamp/blob/event, is durable and read-back
+verified before the send, and whose `complete` is durable before the caller proceeds,
+plus boot reconciliation), `index.ts` (exports).
 
 ### The rest of the tree
 
+- `src/storage.ts` — the pure storage circuit breaker (W0-d, lite): `StorageFree`,
+  `StorageQuota`, `StoragePolicy`, the enforcement floors + kernel reserve
+  (`STORAGE_MIN_FREE_BYTES`/`_INODES` + `KERNEL_RESERVE_*`), `DEFAULT_STORAGE_POLICY`,
+  `assertStorage`/`checkStorage`, the typed `StorageError` and the `storageFact`. No
+  imports, so `journal/` and `frontier/` can depend on it without a node-side import.
+  `src/node/storage-probe.ts` — `statfsProbe` (`bsize * bavail` bytes, `ffree` inodes,
+  clamped; `null` on a probe error) and `DEFAULT_STORAGE`.
 - `src/net/bounded-body.ts` — `readBoundedBody`: the single cap-and-prefix streamed-body
   read, shared by the provider transport and the web tools so the two captures cannot
   drift apart.
@@ -151,6 +160,7 @@ proceeds, plus boot reconciliation), `index.ts` (exports).
 | Canonical bytes | `src/journal/canon.ts` (RFC 8785, refusal of lossy values, data-only copy) |
 | "Model-visible means logged" | `begin`/`complete` in `src/frontier/journal.ts`, each flushed and read-back verified; the `flush()` barrier in `writer.ts` at `turn/start`/`turn/end` and around every gate capture |
 | Durability batching | `framing.ts` + the 200 ms timer in `writer.ts` |
+| Storage circuit breaker (lite) | `src/storage.ts` (policy/quota/`StorageError`) + `src/node/storage-probe.ts` (`statfs`), enforced at three homes before the effect: `writer.ts` `flushOnce`, `src/frontier/journal.ts` `begin`, and `driver.ts` turn start (deferral, no fail-closed boot); the `unquoted`/`quoted` fact on the owner record, `host/boot` and `status` |
 | Never lose an event silently | watermark + rollback + poison in `writer.ts`; frontier boot reconciliation appends `http/incomplete` for an open call |
 | Crash repair | `repair()` in `reader.ts` + the zstd-magic test in `framing.ts`, both layouts |
 | Claim-check | `blobs.ts` + `writer.ts` (local payloads; frontier bodies never claim-check-truncated); verified reads in `src/context/loader.ts`, the gate's flush, the frontier gate's read-back |

@@ -10,6 +10,7 @@ import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js
 import type { AgentConfig } from '../../context/contracts.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { FRONTIER_EVENT_TYPES, openFrontierJournal } from '../../frontier/index.js';
+import { TEST_STORAGE } from '../../frontier/__tests__/helpers.js';
 import { encodeBatch, scanBatches } from '../../journal/framing.js';
 import {
   JournalReader, JournalWriter, frontierLayout, nodeLayout, type EventEnvelope,
@@ -310,7 +311,9 @@ it('stops cleanly while parked and leaves no owner record', async () => {
   expect(lastType(events)).toBe('node/shutdown');
   expect((await readFile(join(home, 'nodes', 'node-0', 'log.v0.jsonl.zstd'))).byteLength)
     .toBeGreaterThan(0);
-  const reopened = await openFrontierJournal(home, { worldHead: async () => null, now: Date.now });
+  const reopened = await openFrontierJournal(home, {
+    worldHead: async () => null, now: Date.now, storage: TEST_STORAGE,
+  });
   await reopened.close();
 }, 20_000);
 

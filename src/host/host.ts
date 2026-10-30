@@ -22,6 +22,12 @@ import {
 import { ProviderAdapter } from '../provider/adapter.js';
 import { systemProviderPolicy } from '../provider/policy.js';
 import { OpenAITransport } from '../provider/transport.js';
+import {
+  DEFAULT_STORAGE_POLICY, storageFact,
+  type StorageConfig, type StorageFact, type StorageFree, type StoragePolicy,
+  type StorageProbe, type StorageQuota,
+} from '../storage.js';
+import { DEFAULT_STORAGE, statfsProbe } from '../node/storage-probe.js';
 import type { LlmCredential } from './credentials.js';
 import { llmCredentialFrom, loadProviderStore } from './credentials.js';
 import { HostConfigError } from './errors.js';
@@ -98,6 +104,15 @@ export type CellOptions = {
    * set by the CLI.
    */
   readonly fence?: FencePort;
+  /**
+   * The storage circuit breaker (W0-d): the enforcement policy and the probe
+   * shared by the frontier journal, the local log and the driver's turn start.
+   * The host always composes it (production default, no quota); a test may
+   * inject one through `HostDeps`, and a quota exists only through those
+   * test-only seams (`storageQuota`, or a `storagePolicy` that carries one).
+   * No env switch, no CLI flag.
+   */
+  readonly storage?: StorageConfig;
   readonly pollMs?: number; readonly log: HostLog;
 };
 
@@ -114,6 +129,12 @@ export type Cell = {
    * is a host-lifetime fact, never a per-commit one.
    */
   readonly fence: 'available' | 'unavailable';
+  /**
+   * The host-lifetime storage fact: `quoted` only when a quota record was
+   * injected, `unquoted` for every production cell (none is detected). The host
+   * records it in the owner record and on `host/boot`.
+   */
+  readonly storage: StorageFact;
   /**
    * The durable degraded-world sidecar read after `NodeDriver.open` (so a
    * boot-reconcile refusal is included), replayed at composition: the host
@@ -135,6 +156,11 @@ const UNSETTLED: ReadonlySet<string> = new Set(['active', 'waiting', 'stopping']
  */
 export async function composeCell(options: CellOptions): Promise<Cell> {
   const { home, uid, config, credential, providers, sandbox, pollMs, log } = options;
+  // The one storage seam for this cell: the production default (no quota) when
+  // the host injected nothing. The frontier writer + gate and the driver + its
+  // local writer all receive this same object, so their floors cannot drift.
+  const storage = options.storage ?? DEFAULT_STORAGE;
+  const storageState = storageFact(storage.policy);
   const paths = cellPaths(home, uid);
   const world = await WorldRepo.open(paths.world, { gitDir: paths.gitDir });
   // The world doctor (C3) runs between `WorldRepo.open` (which holds no
@@ -151,7 +177,7 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
     });
   }
   const frontier = await openFrontierJournal(home, {
-    worldHead: () => world.headHash(), now: Date.now,
+    worldHead: () => world.headHash(), now: Date.now, storage,
   });
   try {
     const webTools = webToolsFromProviders(providers, frontier.gate);
@@ -237,6 +263,7 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
       ...(pollMs !== undefined ? { worldPollMs: pollMs } : {}),
       ...(fencePort !== undefined ? { fence: fencePort } : {}),
       ...(doctor !== undefined ? { doctor } : {}),
+      storage,
       onError: (err) => log.emit('driver/error', { error: err.name }),
       onMaintenance: () => log.emit('host/parked'),
       schedule: (ms, callback) => {
@@ -278,6 +305,7 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
       world, frontier, runtime, driver, config: effective,
       webTools: webTools !== undefined, worldState,
       fence: fencePort !== undefined ? 'available' : 'unavailable',
+      storage: storageState,
       close,
     };
   } catch (err) {
@@ -393,6 +421,14 @@ export type HostDeps = {
    * fence.
    */
   readonly fence?: FencePort;
+  /**
+   * TEST-ONLY storage seams (W0-d). `freeSpace` replaces the real `statfs`
+   * probe, `storageQuota`/`storagePolicy` inject the quota record production
+   * never has. No env switch or CLI flag reaches them.
+   */
+  readonly freeSpace?: StorageProbe;
+  readonly storageQuota?: StorageQuota;
+  readonly storagePolicy?: StoragePolicy;
   readonly compose?: (options: CellOptions) => Promise<Cell>;
   readonly now?: () => number;
   readonly proc?: ProcessHandlersTarget;
@@ -617,6 +653,19 @@ async function resolveInitialConfig(options: HostOptions): Promise<AgentConfig> 
   return state.config;
 }
 
+/**
+ * The host's one composition of the storage seam (W0-d): the production default
+ * unless a test injects a policy or a quota record. The fact follows the
+ * effective policy, so `quoted` can only ever come from an injected quota.
+ */
+function resolveStorage(deps: HostDeps): StorageConfig {
+  const base = deps.storagePolicy ?? DEFAULT_STORAGE_POLICY;
+  const policy = deps.storageQuota === undefined
+    ? base
+    : { ...base, quota: deps.storageQuota };
+  return { policy, probe: deps.freeSpace ?? statfsProbe };
+}
+
 /** The bounded error label: a name, never a message and never a payload. */
 function errorName(err: unknown): string {
   return err instanceof Error && err.name !== '' ? err.name : 'Error';
@@ -691,6 +740,8 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       await assertHomePermissions(home);
       await assertCellLayout(home);
       const config = await resolveInitialConfig(options);
+      const storage = resolveStorage(deps);
+      const storageState = storageFact(storage.policy);
       owner = await acquireOwner(home, {
         uid, command, ...(deps.now !== undefined ? { now: deps.now } : {}),
         sandbox: sandbox === false ? 'off' : 'landlock',
@@ -710,6 +761,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       try {
         await owner.annotate({
           fence: fenceFact,
+          storage: storageState,
           ...(fenceFact === 'available'
             ? {}
             : { fenceReason: sandbox === false ? 'sandbox-off' : 'no-cell-cgroup' }),
@@ -720,10 +772,19 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         // carries the fact and the diagnostic names the step only.
         log.emit('host/degraded', { home, uid, reason: 'owner-annotate-failed' });
       }
+      // One boot-time storage probe: an unreadable reading is a bounded
+      // diagnostic, never a refusal, and never changes the quota fact.
+      let bootFree: StorageFree | null;
+      try {
+        bootFree = await storage.probe(home);
+      } catch {
+        bootFree = null;
+      }
+      if (bootFree === null) log.emit('host/degraded', { home, uid, reason: 'storage-probe' });
       const providers = await loadProviderStore(home);
       const credential = llmCredentialFrom(providers);
       cell = await (deps.compose ?? composeCell)({
-        home, uid, config, credential, providers, sandbox: cellSandbox, log,
+        home, uid, config, credential, providers, sandbox: cellSandbox, log, storage,
         ...(deps.fence !== undefined ? { fence: deps.fence } : {}),
         ...(pollMs !== undefined ? { pollMs } : {}),
       });
@@ -738,6 +799,9 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         // The commit fence is a host-lifetime fact, never per-commit: a host
         // that cannot fence commits unfenced and says so here.
         fence: cell.fence,
+        // The storage fact: no quota is ever detected, so production is
+        // `unquoted`; `quoted` exists only through the test seam.
+        storage: cell.storage,
         // The replayed degraded-world sidecar, read at composition: a status
         // projection, never a second truth.
         world: cell.worldState.degraded ? 'degraded' : 'healthy',

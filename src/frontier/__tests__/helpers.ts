@@ -10,6 +10,8 @@ import { encodeBatch, scanBatches } from '../../journal/framing.js';
 import { frontierLayout, type JournalLayout } from '../../journal/layout.js';
 import { JournalReader } from '../../journal/reader.js';
 import { JournalWriter } from '../../journal/writer.js';
+import { DEFAULT_STORAGE_POLICY, type StorageConfig } from '../../storage.js';
+import { statfsProbe } from '../../node/storage-probe.js';
 import { FRONTIER_EVENT_TYPES } from '../events.js';
 import { openFrontierJournal, type FrontierJournal } from '../journal.js';
 
@@ -42,18 +44,30 @@ export function useFrontierHome(prefix: string): () => string {
   return () => home;
 }
 
+/**
+ * The real storage seam for suites that do not exercise a refusal: the
+ * production enforcement policy over the real `statfs` probe, so every
+ * frontier/node test runs the same circuit breaker production does (a test
+ * home under `/tmp` passes the 2 GiB + 512 MiB / 100k + 10k floors).
+ */
+export const TEST_STORAGE: StorageConfig = {
+  policy: DEFAULT_STORAGE_POLICY, probe: statfsProbe,
+};
+
 /** The knobs `openTestFrontier` exposes on top of the journal's own options. */
 export type TestFrontierOptions = {
   readonly now?: () => number;
   readonly batchWindowMs?: number;
   readonly maxGroups?: number;
+  readonly storage?: StorageConfig;
 };
 
 /**
  * Opens a frontier journal for a test. The world-head callback defaults to
  * `null` (no world repo is needed by the gate suite); the write-behind window
  * defaults high because the gate flushes explicitly and a test must never race
- * a timer.
+ * a timer. The storage seam defaults to the real probe; a refusal case injects
+ * a low one.
  */
 export function openTestFrontier(
   home: string,
@@ -65,6 +79,7 @@ export function openTestFrontier(
     now: opts.now ?? (() => Date.now()),
     batchWindowMs: opts.batchWindowMs ?? 60_000,
     ...(opts.maxGroups === undefined ? {} : { maxGroups: opts.maxGroups }),
+    storage: opts.storage ?? TEST_STORAGE,
   });
 }
 

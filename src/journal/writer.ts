@@ -15,6 +15,7 @@ import { atomicWriteFile, ensureDurableDirectory, readFileOrNull, syncPath, writ
 import { assertLayoutNames, nodeLayout, type Head, type JournalLayout } from './layout.js';
 import { acquireLock, SessionAlreadyOwnedError, type JournalOwnership } from './lock.js';
 import { genesisState, verifyAll } from './verify.js';
+import { checkStorage, type StorageConfig } from '../storage.js';
 
 export { SessionAlreadyOwnedError };
 
@@ -127,6 +128,14 @@ export interface JournalWriterOptions {
    * the log it describes is committed. A callback that throws is swallowed.
    */
   onError?: (err: Error) => void;
+  /**
+   * The storage circuit breaker (W0-d). When present, a flush probes the home
+   * before capturing its batch and refuses with `StorageError` on a low disk:
+   * the batch, the watermark, the rollback and the poison streak are untouched,
+   * so a later flush retries the same batch. Absent means no guard (a bare
+   * writer in a unit test); the host and the driver always compose one.
+   */
+  storage?: StorageConfig;
 }
 
 export class JournalWriter {
@@ -162,6 +171,7 @@ export class JournalWriter {
     private readonly now: () => number,
     private readonly batchWindowMs: number,
     private readonly onError: ((err: Error) => void) | undefined,
+    private readonly storage: StorageConfig | undefined,
     private readonly log: FileHandle,
     private readonly ownership: JournalOwnership,
   ) {}
@@ -209,7 +219,8 @@ export class JournalWriter {
     }
     const w = new JournalWriter(
       layout, new BlobStore(layout.home),
-      opts.now ?? systemClock, opts.batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS, opts.onError, log, ownership,
+      opts.now ?? systemClock, opts.batchWindowMs ?? DEFAULT_BATCH_WINDOW_MS, opts.onError,
+      opts.storage, log, ownership,
     );
     try {
       // The log file was just created: fsync the directory so its entry is
@@ -404,7 +415,20 @@ export class JournalWriter {
 
   private async flushOnce(): Promise<void> {
     this.throwIfPoisoned();
+    // Cleared before the probe so a refused flush leaves no stale handle: the
+    // next append arms a fresh window, and the pending batch is retried by the
+    // next flush (never by a timer that can no longer fire).
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    // The storage circuit breaker (W0-d) sits at the top, before the batch is
+    // captured: a refusal touches neither the batch nor the rollback nor
+    // `writeFailureStreak`, so the poison never moves and the same batch is
+    // retried once the probe answers high. Only a writer with something to
+    // commit is refused — an empty flush is a trivially held barrier, and the
+    // boot replay flushes one for history delivery, where refusing would refuse
+    // an effect that does not exist.
+    if (this.storage !== undefined && (this.pending.length > 0 || this.pendingBlobs.size > 0)) {
+      await checkStorage(this.storage, this.layout.home);
+    }
     // Captured synchronously *before* the first await, so the batch and its blob
     // set are fixed together. Capturing after `drainBlobs` would let an append
     // that lands between the drain returning and the capture join a batch whose

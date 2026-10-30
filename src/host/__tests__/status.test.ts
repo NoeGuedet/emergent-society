@@ -13,6 +13,7 @@ import { encodeBatch, scanBatches } from '../../journal/framing.js';
 import {
   FRONTIER_EVENT_TYPES, openFrontierJournal as openWriter, type FrontierJournal,
 } from '../../frontier/index.js';
+import { TEST_STORAGE } from '../../frontier/__tests__/helpers.js';
 import { WorldRepo } from '../../node/world.js';
 import { clearWorldState, markWorldDegraded } from '../../node/world-state.js';
 import { commitAs } from '../../node/__tests__/helpers.js';
@@ -68,7 +69,8 @@ function openFrontierJournal(
     readonly now: () => number;
   },
 ): Promise<FrontierJournal> {
-  return openWriter(home, opts).then((journal: FrontierJournal) => {
+  // The real storage seam: a status fixture's home is fine, so no refusal.
+  return openWriter(home, { ...opts, storage: TEST_STORAGE }).then((journal: FrontierJournal) => {
     journals.push(journal);
     return journal;
   });
@@ -170,7 +172,15 @@ it('formats the exact lines and omits null last records', () => {
     'world: head=null',
   ]);
   expect(formatStatus({ ...base, host: { state: 'stale' as const } })).not.toContain('pid=');
+  // The storage fact survives a stale record (the host is gone, the fact is not).
+  expect(formatStatus({ ...base, host: { state: 'stale' as const, storage: 'unquoted' } }))
+    .toContain('host: stale storage=unquoted');
   expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9 } })).toContain('unverified pid=9');
+  // The degraded storage fact is printed on every host line that has a pid.
+  expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9, storage: 'unquoted' } }))
+    .toContain('unverified pid=9 storage=unquoted');
+  expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9, storage: 'quoted' } }))
+    .not.toContain('storage=');
   expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9, sandbox: 'off' } })).toContain('unverified pid=9 sandbox=off');
   expect(formatStatus({ ...full, host: { ...full.host, sandbox: 'landlock' } })).toContain('host: running pid=7 uid=node-0 command=start sandbox=landlock');
   // The fence field is printed only when unavailable: an available (or absent)
@@ -237,6 +247,9 @@ it('reports world HEAD, world absent and host owner states', async () => {
   await writeFile(join(home,'host.json'), JSON.stringify({ ...owner.record, pid: dead, token:'a'.repeat(32), startTime:1 }), { mode:0o600 });
   await chmod(join(home,'host.json'), 0o600);
   expect((await readStatus(home)).host).toEqual({ state:'stale' });
+  await writeFile(join(home,'host.json'), JSON.stringify({ ...owner.record, pid: dead, token:'a'.repeat(32), startTime:1, storage:'unquoted' }), { mode:0o600 });
+  await chmod(join(home,'host.json'), 0o600);
+  expect((await readStatus(home)).host).toEqual({ state:'stale', storage:'unquoted' });
 });
 it('surfaces the owner record\'s fence fact while a host holds it', async () => {
   const fenced = await acquireOwner(home, { uid: 'node-0', command: 'start' });
@@ -302,4 +315,26 @@ it('resolves with ChainBreakError and keeps the verified prefix counts', async (
   expect(r.frontier.error).toBe('ChainBreakError');
   expect(r.frontier.count).toBe(2);
   expect(r.frontier.counts['http/request']).toBe(2);
+});
+it('surfaces the storage fact in JSON, and in the human line only when unquoted', async () => {
+  const owner = await acquireOwner(home, { uid: 'node-0', command: 'start' });
+  await owner.annotate({ fence: 'available', storage: 'quoted' });
+  expect((await readStatus(home)).host).toEqual({
+    state: 'running', pid: owner.record.pid, uid: 'node-0', command: 'start',
+    fence: 'available', storage: 'quoted',
+  });
+  // A quoted host is not a degradation: the human line stays byte-identical.
+  expect(formatStatus(await readStatus(home))).not.toContain('storage=');
+  await owner.annotate({ fence: 'available', storage: 'unquoted' });
+  expect((await readStatus(home)).host).toMatchObject({ storage: 'unquoted' });
+  expect(formatStatus(await readStatus(home))).toContain('storage=unquoted');
+  await owner.release();
+  // A record without the optional fact (every pre-storage record) reports
+  // exactly what it did before: no fabricated field, no changed byte.
+  const legacy = await acquireOwner(home, { uid: 'node-0', command: 'start' });
+  expect((await readStatus(home)).host).toEqual({
+    state: 'running', pid: legacy.record.pid, uid: 'node-0', command: 'start',
+  });
+  expect(formatStatus(await readStatus(home))).not.toContain('storage=');
+  await legacy.release();
 });

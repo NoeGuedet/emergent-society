@@ -10,6 +10,7 @@ import {
   type BodyRef, type CallId, type FrontierCall, type FrontierOutcome,
   type FrontierRequestInput, type HttpRequest, type HttpResponse,
 } from './events.js';
+import { StorageError, checkStorage, type StorageConfig } from '../storage.js';
 
 /**
  * The frontier gate: the only writer of the frontier journal's exchange facts.
@@ -88,6 +89,8 @@ class Gate implements Frontier {
     private readonly worldHead: () => Promise<string | null>,
     private readonly now: () => number,
     private readonly maxGroups: number,
+    private readonly home: string,
+    private readonly storage: StorageConfig,
   ) {}
 
   async begin(raw: FrontierRequestInput): Promise<FrontierCall> {
@@ -98,6 +101,12 @@ class Gate implements Frontier {
         `invalid begin input: body exceeds the ${FRONTIER_MAX_BODY_BYTES}-byte frontier ceiling`,
       );
     }
+    // 2. The storage circuit breaker (W0-d): after the input is validated and
+    // before the world-head stamp, the body blob and the event. A low disk
+    // refuses an effect that never existed — no blob, no event, no retry-map
+    // entry — and a `null` probe degrades. `complete` is post-effect and adds
+    // no gate check; the writer's own home still guards the log.
+    await checkStorage(this.storage, this.home);
 
     const call = randomUUID();
     const group = input.group ?? randomUUID();
@@ -105,7 +114,7 @@ class Gate implements Frontier {
     this.assertAttempt(group, attempt);
     const startedAt = this.now();
 
-    // 2. Assemble and validate the payload; the world HEAD is a best-effort
+    // 3. Assemble and validate the payload; the world HEAD is a best-effort
     // stamp, never a failure (A1).
     const worldHead = await this.readWorldHead();
     const bytes = Buffer.from(input.body);
@@ -128,12 +137,12 @@ class Gate implements Frontier {
     };
     const validated = validateFrontierEvent('http/request', assembled);
 
-    // 3. The blob is durable before the event that references it...
+    // 4. The blob is durable before the event that references it...
     await this.blobs.put(bytes);
-    // 4. ...and the event is durable before the caller may send.
+    // 5. ...and the event is durable before the caller may send.
     this.writer.append('http/request', validated);
     await this.writer.flush();
-    // 5. The barrier means "durable and provably readable".
+    // 6. The barrier means "durable and provably readable".
     await this.verifyBlob(body);
 
     // Only now may the in-process maps learn about the call.
@@ -256,6 +265,12 @@ export async function openFrontierJournal(
     now: () => number;
     batchWindowMs?: number;
     maxGroups?: number;
+    /**
+     * The storage circuit breaker shared with the writer: the host composes it
+     * (production policy over the real probe, or the test seam) so `begin` and
+     * the flush cannot disagree about the floor.
+     */
+    storage: StorageConfig;
   },
 ): Promise<FrontierJournal> {
   const maxGroups = opts.maxGroups ?? DEFAULT_MAX_GROUPS;
@@ -266,6 +281,7 @@ export async function openFrontierJournal(
   await repairIn(layout);
   const writer = await JournalWriter.openIn(layout, {
     now: opts.now,
+    storage: opts.storage,
     ...(opts.batchWindowMs === undefined ? {} : { batchWindowMs: opts.batchWindowMs }),
   });
   try {
@@ -275,7 +291,9 @@ export async function openFrontierJournal(
     throw err;
   }
   return {
-    gate: new Gate(writer, new BlobStore(home), opts.worldHead, opts.now, maxGroups),
+    gate: new Gate(
+      writer, new BlobStore(home), opts.worldHead, opts.now, maxGroups, home, opts.storage,
+    ),
     close: () => writer.close(),
   };
 }
@@ -323,7 +341,15 @@ async function reconcile(writer: JournalWriter, layout: JournalLayout): Promise<
   const orphans = [...requests].filter((call) => !terminals.has(call));
   if (orphans.length === 0) return;
   for (const call of orphans) writer.append('http/incomplete', { call });
-  await writer.flush();
+  try {
+    await writer.flush();
+  } catch (err) {
+    // A storage refusal leaves the incomplete markers pending in the writer's
+    // batch (the writer's own contract) and must not fail the boot: a later
+    // flush commits them before any new request. Any other failure is the
+    // corruption/durability fault it always was.
+    if (!(err instanceof StorageError)) throw err;
+  }
 }
 
 /** Every validated frontier payload carries its call id. */

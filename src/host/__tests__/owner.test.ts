@@ -32,6 +32,11 @@ type OwnerJson = {
    */
   fence?: 'available' | 'unavailable';
   fenceReason?: string;
+  /**
+   * The operator-visible storage fact (`quoted` only through a test-injected
+   * quota record); absent from every record that predates the field.
+   */
+  storage?: 'quoted' | 'unquoted';
 };
 
 let home = '';
@@ -387,4 +392,34 @@ it('accepts a pre-fence record and rejects a bad fence value', async () => {
   expect((await readOwner(home)).kind).toBe('stale');
   await writeOwner({ fenceReason: 7 as unknown as string });
   expect((await readOwner(home)).kind).toBe('stale');
+});
+
+// The storage fact is the second C2 atomic annotation: host-lifetime, written
+// with the fence after composition, and optional so every older record parses.
+it('annotates and reads the optional storage fact, and rejects an unknown value', async () => {
+  const h = await acquireOwner(home, { uid: 'node-0', command: 'start' });
+  await h.annotate({ fence: 'available', storage: 'unquoted' });
+  const s = await readOwner(home);
+  expect(s.kind).toBe('live');
+  if (s.kind === 'live') {
+    expect(s.record.storage).toBe('unquoted');
+    expect(s.record.fence).toBe('available');
+    expect(s.record.token).toBe(h.record.token);
+  }
+  await h.annotate({ fence: 'available', storage: 'quoted' });
+  const quoted = await readOwner(home);
+  if (quoted.kind === 'live') expect(quoted.record.storage).toBe('quoted');
+  await h.release();
+
+  await writeOwner({ storage: 'quoted' });
+  const written = await readOwner(home);
+  expect(written.kind).toBe('live');
+  if (written.kind === 'live') expect(written.record.storage).toBe('quoted');
+  await writeOwner({ storage: 'sometimes' as unknown as 'quoted' });
+  expect((await readOwner(home)).kind).toBe('stale');
+  // A record without the key is still a valid live record.
+  await writeOwner({});
+  const legacy = await readOwner(home);
+  expect(legacy.kind).toBe('live');
+  if (legacy.kind === 'live') expect(legacy.record.storage).toBeUndefined();
 });

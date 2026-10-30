@@ -15,6 +15,7 @@ import {
 import {
   FRONTIER_EVENT_TYPES, FrontierValidationError, openFrontierJournal,
 } from '../../frontier/index.js';
+import { TEST_STORAGE } from '../../frontier/__tests__/helpers.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
 import type { BoundaryGate, TurnContext } from '../../node/index.js';
@@ -126,7 +127,9 @@ function start(cell: Cell): Promise<void> {
 
 /** Opens a second frontier journal over this cell's home and tracks it for teardown. */
 async function openFrontier(home: string): Promise<{ close(): Promise<void> }> {
-  const journal = await openFrontierJournal(home, { worldHead: async () => null, now: Date.now });
+  const journal = await openFrontierJournal(home, {
+    worldHead: async () => null, now: Date.now, storage: TEST_STORAGE,
+  });
   journals.push(journal);
   return journal;
 }
@@ -297,8 +300,9 @@ it('close shares one rejection across concurrent callers and still closes after 
     expect(rejected).toHaveLength(2);
     expect(rejected.every((outcome) => outcome.reason instanceof NodeStateError)).toBe(true);
     expect(rejected[0]!.reason).toBe(rejected[1]!.reason);
-    await expect(openFrontierJournal(home, { worldHead: async () => null, now: Date.now }))
-      .rejects.toBeInstanceOf(SessionAlreadyOwnedError);
+    await expect(openFrontierJournal(home, {
+      worldHead: async () => null, now: Date.now, storage: TEST_STORAGE,
+    })).rejects.toBeInstanceOf(SessionAlreadyOwnedError);
 
     // The refusal is not sticky: the same cell closes once the caller settles it.
     cell.driver.stop('stop-requested'); await run;
