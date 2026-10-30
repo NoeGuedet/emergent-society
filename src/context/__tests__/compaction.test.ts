@@ -10,7 +10,7 @@ import { COMPACTION_NOTICE, runCompaction, selectCompaction } from '../compactio
 import { defaultAgentConfig } from '../config.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../events.js';
 import { ContextFold } from '../fold.js';
-import { SAME, isBalancedGroup, sortUnique } from '../groups.js';
+import { SAME, groupCitations, isBalancedGroup, sortUnique } from '../groups.js';
 import { loadVerifiedEvents } from '../loader.js';
 import type { VerifiedEvents } from '../loader.js';
 import { useTempHome } from '../../journal/__tests__/helpers.js';
@@ -56,7 +56,11 @@ function testConfig(opts: {
 type Session = {
   readonly fold: ContextFold;
   gate(scope: { phase: 'ready' | 'turn'; turn: number | null }): { gate: BoundaryGate; close: () => void };
-  lifecycle(type: 'turn/start' | 'turn/end', data: JsonValue, opts?: { ignorable?: boolean }): EventEnvelope;
+  lifecycle(
+    type: 'turn/start' | 'turn/end' | 'world/commit-refused',
+    data: JsonValue,
+    opts?: { ignorable?: boolean },
+  ): EventEnvelope;
   flush(): Promise<void>;
   armFault(offset: number): void;
   armInject(offset: number, fn: () => Promise<void>): void;
@@ -626,4 +630,74 @@ describe('runCompaction transaction discipline', () => {
       }
     });
   }
+});
+
+
+// The C1 refusal carrier is a whole committed group (one system line), so it is
+// a legal, balanced compaction span member — the four-file contract's
+// `isBalancedGroup` branch is what makes this apply, not a dialogue fallback.
+describe('compaction: refusal groups are whole balanced units', () => {
+  it('compacts a perception plus a refusal carrier as balanced whole groups', async () => {
+    const writer = await JournalWriter.open(home(), 'n1');
+    try {
+      const config = defaultAgentConfig();
+      writer.append('system/message', {
+        version: 1, value: { kind: 'inline', value: config },
+      });
+      writer.append('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      writer.append('world/perception', {
+        turn: 0, range: { from: null, to: null }, value: { kind: 'inline', value: {
+          uid: 'n1', range: { from: null, to: null }, effectiveFrom: null, fallback: 'none',
+          renderer: { policy: 'commit-patches-v1', gitVersion: 'git version 2.43.0', attrSource: 'to' },
+          maxBytes: 32768, maxCommits: 4096, listTruncated: false,
+          commits: [], included: [], omittedOwn: [],
+          text: 'external evidence '.repeat(100), truncated: false,
+        } },
+      });
+      writer.append('turn/end', { turn: 0, outcome: 'waiting' });
+      writer.append('world/commit-refused', {
+        refusal: { reason: 'git-exit', detail: 'git add exited 128' }, turn: 0,
+      }, { ignorable: true });
+      await writer.flush();
+
+      const fold = new ContextFold();
+      await fold.observe(await eventsAt(home()));
+      const before = fold.snapshot();
+      const surface = before.surface;
+      if (surface === null) throw new Error('expected a folded surface');
+      const nodes = surface.nodes;
+      expect(nodes.map((node) => node.group.kind)).toEqual(['heading', 'perception', 'refusal']);
+      const span = [nodes[1]!.group, nodes[2]!.group];
+      expect(span.every((group) => isBalancedGroup(group))).toBe(true);
+      const citations = sortUnique(span.flatMap((group) => groupCitations(group)));
+      const shadow = Buffer.from(canonicalMessagesBytes(span.flatMap((group) => group.messages)));
+      const fields = {
+        revision: surface.revision,
+        groupIds: span.map((group) => group.id),
+        sources: citations,
+        shadowHash: sha256HexOf(shadow),
+        shadowBytes: shadow.length,
+      };
+      const candidate: CompactionStart = {
+        id: sha256HexOf(Buffer.from(canonicalBytes(fields))), ...fields,
+      };
+      writer.append('compaction/start', candidate);
+      const message = { role: 'user' as const, content: 'Older committed context was removed.' };
+      const summary = writer.append('compaction/summary', {
+        id: candidate.id, message, sources: candidate.sources,
+        replacementBytes: canonicalBytes([message]).length,
+      });
+      writer.append('compaction/end', { id: candidate.id, summary: source(summary) });
+      await writer.flush();
+
+      const complete = await eventsAt(home());
+      const rebuilt = new ContextFold();
+      await rebuilt.observe(complete);
+      const after = rebuilt.snapshot();
+      expect(after.surface?.nodes.map((node) => node.group.kind)).toEqual(['heading', 'summary']);
+      expect(after.surface?.nodes[1]?.group.messages[0]?.content).toBe(message.content);
+    } finally {
+      await writer.close();
+    }
+  });
 });

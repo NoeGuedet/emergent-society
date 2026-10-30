@@ -1,3 +1,5 @@
+import { chmod, mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   JournalWriter, UnknownEventTypeError, type EventEnvelope,
@@ -5,6 +7,7 @@ import {
 import { appendTear, collectEvents } from '../../journal/__tests__/helpers.js';
 import { NodeDriver, type TurnResult } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
+import { readWorldState } from '../world-state.js';
 import { useWorld } from './helpers.js';
 
 const fixture = useWorld('node-boot-');
@@ -52,6 +55,43 @@ describe('NodeDriver boot and resume', () => {
     expect(events[2]?.data).toEqual({ turn: 0, outcome: 'interrupted', synthetic: true });
     expect(events[3]?.data).toEqual({ reason: 'resume' });
     await closeIdle(d);
+  });
+
+  it('boots degraded when the interrupted turn\'s recovery commit is refused', async () => {
+    const { home, world } = fixture();
+    const w = await JournalWriter.open(home, 'n1');
+    w.append('node/boot', { reason: 'start' });
+    w.append('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+    await w.close(); // the crash shape: an open turn, no commit, no closer
+    // A world directory the walk cannot read is the raw-EACCES refusal, not a
+    // GitCommandError: the incident class that used to make the home unbootable.
+    const locked = join(world.path, 'locked');
+    await mkdir(locked);
+    await chmod(locked, 0o000);
+    try {
+      const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+      const events = await bootlog(home);
+      expect(events.map((e) => e.type)).toEqual([
+        'node/boot', 'turn/start', 'turn/end', 'world/commit-refused', 'node/boot',
+      ]);
+      // The synthetic closer is written WITHOUT a commit and the boot follows:
+      // a damaged home still boots.
+      expect(events[2]?.data).toEqual({
+        turn: 0, outcome: 'interrupted', synthetic: true,
+      });
+      const refusal = events[3]!;
+      expect(refusal.ignorable).toBe(true);
+      expect(refusal.data).toMatchObject({
+        turn: 0, refusal: { reason: 'walk-eacces' },
+      });
+      expect(events[4]?.data).toEqual({ reason: 'resume' });
+      const state = await readWorldState(home);
+      expect(state.degraded).toBe(true);
+      expect(state.reason).toBe('walk-eacces');
+      await closeIdle(d);
+    } finally {
+      await chmod(locked, 0o700).catch(() => {});
+    }
   });
 
   it('repairs a torn tail before resuming', async () => {

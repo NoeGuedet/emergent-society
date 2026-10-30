@@ -1,5 +1,8 @@
 import type { EventEnvelope } from '../journal/index.js';
 import type { GateScope, WorldAcknowledgement } from '../node/gate.js';
+import {
+  isCommitRefusal, renderCommitRefusal, type CommitRefusal,
+} from '../node/world-commit.js';
 import type { WorldRange } from '../node/world.js';
 import {
   eventKey, parseArtifactJson, requireCompleteArtifact, resolveArtifact, resolveStored, toJson,
@@ -292,6 +295,7 @@ export class ContextFold {
       case 'package/error':
       case 'package/service':
         this.onPackageEvent(event); return;
+      case 'world/commit-refused': this.onCommitRefused(event); return;
       default: return;
     }
   }
@@ -641,6 +645,48 @@ export class ContextFold {
       default:
         invariant(`unknown package event type ${JSON.stringify(type)}`);
     }
+  }
+
+  // --- commit refusals ---------------------------------------------------------
+
+  /**
+   * One refused commit, rendered as one bounded system line. The driver writes
+   * the event after the refused turn's closer, so the fold's open turn is null
+   * and the group takes the `turn = 0` label (`onPackageEvent`'s shape): it is
+   * an append after that turn's dialogue, part of the next turn's context, not
+   * a fact inside the turn that produced it. The detail is re-bounded here
+   * because a chain-valid event is not proof of a bounded payload.
+   *
+   * The rendered group is durable history: a later successful commit neither
+   * removes it nor re-renders it (the sidecar is the only state a success
+   * clears), and it is a balanced group like any other, so compaction may
+   * summarize it at the ordinary threshold.
+   */
+  private onCommitRefused(event: VerifiedEvent): void {
+    if (this.surface === null) invariant('world/commit-refused before any config');
+    const data = dataRecord(event.data, 'world/commit-refused data');
+    const refusalData = dataRecord(data['refusal'], 'world/commit-refused.refusal');
+    const reason = dataString(refusalData['reason'], 'world/commit-refused.refusal.reason');
+    const detail = dataString(refusalData['detail'], 'world/commit-refused.refusal.detail');
+    const candidate = { reason, detail };
+    if (!isCommitRefusal(candidate)) {
+      invariant(
+        `world/commit-refused.refusal.reason ${JSON.stringify(reason)}`
+        + ' is not a known refusal reason');
+    }
+    const refusal: CommitRefusal = candidate;
+    dataInt(data['turn'], 'world/commit-refused.turn');
+    const paths = data['paths'];
+    if (paths !== undefined) {
+      dataArray(paths, 'world/commit-refused.paths')
+        .forEach((entry, i) => dataString(entry, `world/commit-refused.paths[${i}]`));
+    }
+    const line = renderCommitRefusal(refusal);
+    this.surface.append(toJson({
+      id: sourceOf(event), kind: 'refusal',
+      turn: this.open === null ? 0 : this.open.turn,
+      messages: [{ role: 'system', content: line }], sources: [sourceOf(event)],
+    }) as unknown as SurfaceGroup);
   }
 
   // --- closers ----------------------------------------------------------------

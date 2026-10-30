@@ -50,6 +50,8 @@ function groupType(kind: SurfaceGroup['kind']): string | null {
     case 'heading': return 'system/message';
     // Each package group's id names its own package/* event — the family rule.
     case 'package': return 'package';
+    // The refusal carrier is one local-log fact: the group's id is its receipt.
+    case 'refusal': return 'world/commit-refused';
     default: return null;
   }
 }

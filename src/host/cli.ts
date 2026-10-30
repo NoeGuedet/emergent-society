@@ -176,7 +176,10 @@ async function runStatus(
   try {
     const report = await (deps.readStatus ?? readStatus)(command.home);
     out(command.json ? `${JSON.stringify(report)}\n` : `${formatStatus(report)}\n`);
-    return report.frontier.error !== null || report.world.error !== null ? 1 : 0;
+    // The documented rule: a produced but degraded report exits 1. A refused
+    // world commit is a third degradation source beside the two folded errors.
+    return report.frontier.error !== null || report.world.error !== null
+      || report.world.state === 'degraded' ? 1 : 0;
   } catch (error) {
     err(`error: ${failureOf(error)}\n`);
     return error instanceof HostConfigError ? 2 : 1;

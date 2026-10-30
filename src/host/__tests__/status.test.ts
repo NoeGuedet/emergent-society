@@ -14,6 +14,7 @@ import {
   FRONTIER_EVENT_TYPES, openFrontierJournal as openWriter, type FrontierJournal,
 } from '../../frontier/index.js';
 import { WorldRepo } from '../../node/world.js';
+import { clearWorldState, markWorldDegraded } from '../../node/world-state.js';
 import { commitAs } from '../../node/__tests__/helpers.js';
 
 /**
@@ -150,7 +151,7 @@ it('formats the exact lines and omits null last records', () => {
   const base = { home: '/h', host: { state: 'idle' as const },
     frontier: { present: false, count: 0, lastHash: null, counts: {}, openCalls: 0,
       lastRequest: null, lastResponse: null, error: null },
-    world: { present: true, head: null, error: null } };
+    world: { present: true, head: null, error: null, state: 'healthy' as const } };
   expect(formatStatus(base).split('\n')).toEqual([
     'home: /h', 'host: idle',
     'frontier: 0 events last=null http/request=0 http/response=0 http/incomplete=0 open=0',
@@ -172,14 +173,39 @@ it('formats the exact lines and omits null last records', () => {
   expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9 } })).toContain('unverified pid=9');
   expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9, sandbox: 'off' } })).toContain('unverified pid=9 sandbox=off');
   expect(formatStatus({ ...full, host: { ...full.host, sandbox: 'landlock' } })).toContain('host: running pid=7 uid=node-0 command=start sandbox=landlock');
-  expect(formatStatus({ ...base, world: { present: false, head: null, error: null } })).toContain('world: absent');
+  expect(formatStatus({ ...base, world: { present: false, head: null, error: null, state: 'healthy' as const } })).toContain('world: absent');
+});
+it('reports the durable degraded world sidecar, and only a successful commit clears it', async () => {
+  await markWorldDegraded(home, 'git-exit', 1);
+  const degraded = await readStatus(home);
+  expect(degraded.world).toEqual({
+    present: true, head: null, error: null, state: 'degraded', reason: 'git-exit',
+  });
+  expect(formatStatus(degraded).split('\n')).toEqual([
+    'home: ' + home, 'host: idle',
+    'frontier: 0 events last=null http/request=0 http/response=0 http/incomplete=0 open=0',
+    'world: head=null',
+    'world-state: degraded reason=git-exit',
+  ]);
+  // The report never opens the node log: a planted local-log sentinel and a
+  // fenced `nodes/` directory change no byte of the degraded report either.
+  await mkdir(join(home,'nodes'), { recursive: true });
+  await writeFile(join(home,'nodes','node-0.log'), 'LOCAL-SENTINEL', { mode: 0o600 });
+  expect(JSON.stringify(await readStatus(home))).not.toContain('LOCAL-SENTINEL');
+  await clearWorldState(home);
+  expect((await readStatus(home)).world).toEqual({
+    present: true, head: null, error: null, state: 'healthy',
+  });
+  expect(formatStatus(await readStatus(home))).not.toContain('world-state:');
 });
 it('reports world HEAD, world absent and host owner states', async () => {
   const head = await commitAs(world,'human',{'a.txt':'a'},'seed');
   const r = await readStatus(home);
-  expect(r.world).toEqual({ present: true, head, error: null });
+  expect(r.world).toEqual({ present: true, head, error: null, state: 'healthy' });
   await rm(join(home,'world.git'), { recursive: true, force: true });
-  expect((await readStatus(home)).world).toEqual({ present: false, head: null, error: null });
+  expect((await readStatus(home)).world).toEqual({
+    present: false, head: null, error: null, state: 'healthy',
+  });
   await mkdir(join(home,'world.git'));
   expect((await readStatus(home)).world).toMatchObject({ present: true, head: null,
     error: expect.stringMatching(/WorldNotARepo|NotARepo/) });

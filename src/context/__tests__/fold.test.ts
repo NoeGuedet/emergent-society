@@ -1594,3 +1594,106 @@ describe('fold: package events (the C1.5 vocabulary)', () => {
     }
   });
 });
+
+
+// The C1 refusal carrier: one ignorable local event written after the refused
+// turn's closer, rendered as a single system line in the model's next context.
+// The event is outside the turn (`turn = 0` label); the rendered group is
+// durable history that a later successful commit does not clear.
+describe('fold: commit refusals (the C1 refusal carrier)', () => {
+  const refusal = (detail = 'git add exited 128: Permission denied') => ({
+    refusal: { reason: 'git-exit' as const, detail }, turn: 0,
+  });
+
+  it('appends one system refusal group after the closer, replay-identically', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
+      s.lifecycle('world/commit-refused', refusal(), { ignorable: true });
+      await s.writer.flush();
+
+      const fold = await foldOf(home());
+      const nodes = fold.snapshot().surface?.nodes ?? [];
+      expect(nodes.map((node) => node.group.kind)).toEqual(['heading', 'refusal']);
+      const group = nodes[1]!.group;
+      expect(group.turn).toBe(0);
+      expect(group.messages).toEqual([{
+        role: 'system',
+        content: 'commit refused (git-exit): git add exited 128: Permission denied',
+      }]);
+      expect(group.sources).toHaveLength(1);
+
+      const rebuilt = await foldOf(home());
+      expect(rebuilt.snapshot()).toEqual(fold.snapshot());
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('bounds a forged long detail into one line', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
+      s.lifecycle('world/commit-refused', refusal(`x\ny\t${'z'.repeat(5000)}`), {
+        ignorable: true,
+      });
+      await s.writer.flush();
+
+      const fold = await foldOf(home());
+      const content = fold.snapshot().surface?.nodes[1]?.group.messages[0]?.content ?? '';
+      expect(content).not.toMatch(/[\n\t]/);
+      expect(content.length).toBeLessThanOrEqual(360);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('keeps the durable refusal group after a later successful commit', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
+      s.lifecycle('world/commit-refused', refusal(), { ignorable: true });
+      s.lifecycle('turn/start', { turn: 1, trigger: 'wakeup', world: { from: null, to: null } });
+      s.lifecycle('turn/end', { turn: 1, outcome: 'waiting', commit: 'a'.repeat(64) });
+      await s.writer.flush();
+
+      // A successful commit does not remove or duplicate the rendered carrier:
+      // only the degraded sidecar is cleared by success, never this history.
+      const fold = await foldOf(home());
+      expect(fold.snapshot().surface?.nodes.map((node) => node.group.kind))
+        .toEqual(['heading', 'refusal']);
+      expect(fold.snapshot().surface?.nodes).toHaveLength(2);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('poisons the fold on an unknown refusal reason', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
+      s.lifecycle('turn/end', { turn: 0, outcome: 'waiting' });
+      s.lifecycle('world/commit-refused', {
+        refusal: { reason: 'not-a-reason', detail: 'x' }, turn: 0,
+      }, { ignorable: true });
+      await s.writer.flush();
+      await expect(foldOf(home())).rejects.toThrow(/not a known refusal reason/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('poisons the fold on a refusal before any config', async () => {
+    const before = await openSession(home());
+    before.lifecycle('world/commit-refused', refusal(), { ignorable: true });
+    await before.close();
+    await expect(foldOf(home())).rejects.toThrow(/before any config/);
+  });
+});

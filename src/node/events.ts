@@ -1,3 +1,4 @@
+import type { CommitRefusal } from './world-commit.js';
 import type { WorldRange } from './world.js';
 
 /**
@@ -20,6 +21,19 @@ export interface NodeEventDataMap {
   'node/shutdown': { reason: ShutdownReason; error?: string };
   'turn/start': { turn: number; trigger: TurnTrigger; world: WorldRange };
   'turn/end': { turn: number; outcome: TurnEndOutcome; commit?: string; synthetic?: true; error?: string };
+  /**
+   * One refused commit, written after the turn's `turn/end` closer and
+   * ignorable: the turn ended `waiting`, the kernel survives, and the local
+   * log is the record of which turn's commit was refused and why. The fold
+   * renders it as one bounded system line in a durable `refusal` group — a
+   * later successful commit does NOT clear that group (it stays history and
+   * may be compacted); only the degraded sidecar is cleared by success.
+   * `turn` is the refused turn; `paths` is reserved for the later commit
+   * budgets.
+   */
+  'world/commit-refused': {
+    refusal: CommitRefusal; turn: number; paths?: string[];
+  };
 }
 
 declare module '../journal/envelope.js' {
@@ -29,6 +43,7 @@ declare module '../journal/envelope.js' {
 // Record<keyof NodeEventDataMap, true> rejects a missing or extra key at compile time.
 const REGISTERED: Record<keyof NodeEventDataMap, true> = {
   'node/boot': true, 'node/shutdown': true, 'turn/start': true, 'turn/end': true,
+  'world/commit-refused': true,
 };
 
 /** The runtime registry handed to `JournalReader.open` (its `knownTypes`). */

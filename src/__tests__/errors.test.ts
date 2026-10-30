@@ -37,7 +37,7 @@ describe('the kernel error root', () => {
   });
   it('threads cause through the NodeError subclass constructor', () => {
     const cause = new Error('root');
-    const err = new GitCommandError(['log'], 1, 'x', { cause });
+    const err = new GitCommandError(['log'], 1, 'x', { kind: 'exit', cause });
     expect(err.cause).toBe(cause);
   });
   it('isKernelError rejects plain and foreign values', () => {

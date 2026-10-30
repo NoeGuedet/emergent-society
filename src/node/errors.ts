@@ -39,16 +39,49 @@ export class WorldHeadError extends NodeError {
   }
 }
 
+/**
+ * Why a git invocation failed, as far as the process layer can tell. It is a
+ * discriminator, not a message: `exit` is a command that ran and returned
+ * non-zero, `spawn` a child that never started (ENOENT and friends), `timeout`
+ * a child the process layer killed at its deadline, and `abort` a call the
+ * caller's signal cancelled. Before it, `GitCommandError` carried only
+ * `exitCode: number | null`: a numeric exit and a spawn failure were told
+ * apart only by the null, and a timeout, an abort and the output-bound kill
+ * could not be named at all — so the commit boundary could not classify them.
+ */
+export type GitFailureKind = 'exit' | 'spawn' | 'timeout' | 'abort';
+
+/** The failure detail carried into a `GitCommandError`; `kind` is required. */
+export type GitCommandFailure = {
+  readonly kind: GitFailureKind;
+  /**
+   * The output bound killed the child (`ERR_CHILD_PROCESS_STDIO_MAXBUFFER`)
+   * rather than the command failing. It is the one kill that is neither a
+   * timeout nor an abort, so it is carried beside `kind` instead of widening
+   * the process-layer vocabulary.
+   */
+  readonly outputCapped?: boolean;
+  readonly cause?: unknown;
+};
+
 /** A git invocation against the world failed. */
 export class GitCommandError extends NodeError {
+  readonly kind: GitFailureKind;
+  readonly outputCapped: boolean;
+
   constructor(
     public readonly args: readonly string[],
     public readonly exitCode: number | null,
     public readonly stderr: string,
-    options?: { cause?: unknown },
+    failure: GitCommandFailure = { kind: 'exit' },
   ) {
     const exit = exitCode !== null ? ` (exit ${exitCode})` : '';
-    super(`git ${args.join(' ')} failed${exit}: ${stderr.trim()}`, options);
+    super(
+      `git ${args.join(' ')} failed${exit}: ${stderr.trim()}`,
+      failure.cause !== undefined ? { cause: failure.cause } : undefined,
+    );
+    this.kind = failure.kind;
+    this.outputCapped = failure.outputCapped === true;
   }
 }
 

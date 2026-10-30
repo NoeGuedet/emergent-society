@@ -1,3 +1,5 @@
+import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { BlobStore, JournalWriter } from '../../journal/index.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../../context/events.js';
@@ -7,6 +9,7 @@ import { NodeDriver, type TurnResult, type TurnTrigger } from '../driver.js';
 import type { EventEnvelope } from '../../journal/index.js';
 import { HeadWatcher } from '../watcher.js';
 import { GitCommandError, WorldReconciliationError } from '../errors.js';
+import { markWorldDegraded, readWorldState } from '../world-state.js';
 import { WorldRepo, type WorldRange } from '../world.js';
 import {
   commitAs, committedContent, gitIn, readNode, useWorld, worldLog, writeWorldFile,
@@ -865,5 +868,339 @@ describe('orphan commit reconciliation at resume', () => {
     await second.run();
     expect(await world.headHash()).toBe(head);
     expect((await readNode(home)).filter((e) => e.type === 'turn/end')).toHaveLength(1);
+  });
+
+  it('clears a stale degraded sidecar when the interrupted turn\'s commit already landed', async () => {
+    const { home, world } = fixture();
+    const base = await commitAs(world, 'n2', { 'n2/start.md': 'start' });
+    await openTurnOn(home, base);
+    await writeWorldFile(world, 'n1/kept.md', 'kept');
+    const landed = await world.commitAll('n1', 'turn 0');
+    // A previous refusal left the projection degraded; the turn's own commit
+    // landed before the crash, so the one-candidate recovery must clear it just
+    // as a fresh successful commit would.
+    await markWorldDegraded(home, 'world-head', 1);
+    expect((await readWorldState(home)).degraded).toBe(true);
+
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const closer = (await readNode(home)).find((e) => e.type === 'turn/end');
+    expect(closer?.data).toMatchObject({
+      turn: 0, outcome: 'interrupted', synthetic: true, commit: landed?.hash,
+    });
+    // Zero-candidate/recovery paths clear through `commitWorld`; the
+    // one-candidate path has no commit attempt, so it must clear explicitly.
+    expect(await readWorldState(home)).toMatchObject({ degraded: false });
+    d.stop();
+    await d.run();
+  });
+
+  it('boots when the recovery commit is refused by a detached HEAD', async () => {
+    const { home, world } = fixture();
+    const base = await commitAs(world, 'n2', { 'n2/start.md': 'start' });
+    await openTurnOn(home, base);
+    await writeWorldFile(world, 'n1/unfinished.md', 'unfinished');
+    await gitIn(world, ['checkout', '--detach', '--quiet', 'HEAD']);
+
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const events = await readNode(home);
+    const synthetic = events.find((e) => e.type === 'turn/end');
+    // The recovery commit is refused, so the synthetic closer names no commit
+    // and the boot still follows: a damaged home is not wedged.
+    expect(synthetic?.data).toEqual({
+      turn: 0, outcome: 'interrupted', synthetic: true,
+    });
+    expect(events.find((e) => e.type === 'world/commit-refused')?.data)
+      .toMatchObject({ turn: 0, refusal: { reason: 'world-head' } });
+    expect(events[events.length - 1]?.type).toBe('node/boot');
+    expect((await readWorldState(home)).reason).toBe('world-head');
+    d.stop();
+    await d.run();
+  });
+});
+
+// The C1 refusal path: a commit-path failure is a typed refusal the kernel
+// survives — the turn ends `waiting`, the local log records the refusal after
+// the closer, the sidecar is degraded, and no git failure is relabelled
+// `driver-error`. The bounded self-retry is driven by the injected schedule.
+describe('the commit boundary is a refusal, not a death', () => {
+  /** Plants an unreadable untracked file: `git add --all` fails with exit 128. */
+  async function blockGitAdd(world: WorldRepo): Promise<string> {
+    const path = join(world.path, 'blocked.txt');
+    await writeFile(path, 'unreadable');
+    await chmod(path, 0o000);
+    return path;
+  }
+
+  async function unblock(path: string): Promise<void> {
+    await chmod(path, 0o600).catch(() => {});
+    await rm(path, { force: true }).catch(() => {});
+  }
+
+  it('ends the turn waiting, records the refusal after the closer, and stays alive', async () => {
+    const { home, world } = fixture();
+    const blocked = await blockGitAdd(world);
+    // The production 1 s default would fire mid-assertion; the no-op schedule
+    // keeps this case about the refusal path, not the retry clock.
+    const d = await NodeDriver.open(home, 'n1', wait, world, {
+      worldPollMs: 0, schedule: () => () => {},
+    });
+    const running = d.run();
+    try {
+      await parked(d, world);
+      expect(d.state).toBe('waiting');
+
+      const events = await readNode(home);
+      const endIndex = events.findIndex((event) => event.type === 'turn/end');
+      const refusalIndex = events.findIndex((event) => event.type === 'world/commit-refused');
+      expect(endIndex).toBeGreaterThanOrEqual(0);
+      expect(refusalIndex).toBe(endIndex + 1);
+      const end = events[endIndex]!;
+      expect(end.data).toMatchObject({ turn: 0, outcome: 'waiting' });
+      expect('commit' in (end.data as object)).toBe(false);
+      const refusal = events[refusalIndex]!;
+      expect(refusal.ignorable).toBe(true);
+      expect(refusal.data).toMatchObject({
+        turn: 0, refusal: { reason: 'git-exit' },
+      });
+      const state = await readWorldState(home);
+      expect(state.degraded).toBe(true);
+      expect(state.reason).toBe('git-exit');
+    } finally {
+      d.stop();
+      await running;
+      await unblock(blocked);
+    }
+    expect(d.state).toBe('stopped');
+    const after = await readNode(home);
+    // The kernel survived: a clean stop, never a driver error.
+    expect(after.find((event) => event.type === 'node/shutdown')?.data)
+      .toEqual({ reason: 'stop-requested' });
+    expect(after.some((event) => event.type === 'turn/start'
+      && (event.data as { turn?: number }).turn === 1)).toBe(false);
+  });
+
+  it('classifies the walk\'s raw EACCES as its own reason', async () => {
+    const { home, world } = fixture();
+    const locked = join(world.path, 'locked');
+    await mkdir(locked);
+    await chmod(locked, 0o000);
+    const d = await NodeDriver.open(home, 'n1', wait, world, {
+      worldPollMs: 0, schedule: () => () => {},
+    });
+    const running = d.run();
+    try {
+      await parked(d, world);
+      const events = await readNode(home);
+      expect(events.find((event) => event.type === 'world/commit-refused')?.data)
+        .toMatchObject({ refusal: { reason: 'walk-eacces' } });
+      expect((await readWorldState(home)).reason).toBe('walk-eacces');
+    } finally {
+      d.stop();
+      await running;
+      await chmod(locked, 0o700).catch(() => {});
+    }
+  });
+
+  it('records a failed turn\'s refusal after its error closer, arming no retry', async () => {
+    const { home, world } = fixture();
+    const blocked = await blockGitAdd(world);
+    const delays: number[] = [];
+    const schedule = (ms: number, _callback: () => void): (() => void) => {
+      delays.push(ms);
+      return () => {};
+    };
+    try {
+      const d = await NodeDriver.open(home, 'n1', async () => {
+        throw new Error('handler exploded');
+      }, world, { worldPollMs: 0, schedule });
+      await expect(d.run()).rejects.toThrow('handler exploded');
+      // The handler's error is still the run's reason; the refusal is a fact
+      // recorded beside it, never a replacement for it and never a retry.
+      expect(d.state).toBe('stopped');
+      const events = await readNode(home);
+      const endIndex = events.findIndex((event) => event.type === 'turn/end');
+      const refusalIndex = events.findIndex((event) => event.type === 'world/commit-refused');
+      expect(endIndex).toBeGreaterThanOrEqual(0);
+      expect(refusalIndex).toBe(endIndex + 1);
+      const end = events[endIndex]!;
+      expect(end.data).toMatchObject({ turn: 0, outcome: 'error' });
+      expect((end.data as { error?: string }).error).toContain('handler exploded');
+      expect('commit' in (end.data as object)).toBe(false);
+      expect(events[refusalIndex]!.data)
+        .toMatchObject({ turn: 0, refusal: { reason: 'git-exit' } });
+      expect((await readWorldState(home)).reason).toBe('git-exit');
+      expect(events.find((event) => event.type === 'node/shutdown')?.data)
+        .toEqual({ reason: 'handler-error', error: 'Error: handler exploded' });
+      expect(delays).toEqual([]);
+    } finally {
+      await unblock(blocked);
+    }
+  });
+
+  it('writes the degraded sidecar before the closer is durable', async () => {
+    const { home, world } = fixture();
+    const blocked = await blockGitAdd(world);
+    // The ordering is the crash-window guarantee: if the closer were durable
+    // first, a crash before the sidecar would leave a turn that looks closed
+    // with no degraded fact and no boot reconcile to retry it. `onDurable`
+    // delivers the closer only at its flush, so reading the sidecar there
+    // observes exactly that ordering.
+    let closerSawDegraded: boolean | null = null;
+    const hooks: DriverHooks = {
+      registry: createBoundaryRegistry(),
+      onDurable: async (events) => {
+        if (events.some((event) => event.type === 'turn/end')) {
+          closerSawDegraded = (await readWorldState(home)).degraded;
+        }
+      },
+      onReady: async () => {},
+      onTurnStart: async () => {},
+      readHistory: (path, uid, knownTypes) => loadVerifiedEvents(path, uid, knownTypes),
+      readBlob: (hash) => new BlobStore(home).get(hash),
+      acknowledgedWorld: () => null,
+    };
+    const d = await NodeDriver.open(home, 'n1', wait, world, {
+      knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0, schedule: () => () => {},
+    });
+    const running = d.run();
+    try {
+      await parked(d, world);
+      expect(closerSawDegraded).toBe(true);
+    } finally {
+      d.stop();
+      await running;
+      await unblock(blocked);
+    }
+  });
+
+  it('parks and stays alive when the world HEAD is detached', async () => {
+    const { home, world } = fixture();
+    await commitAs(world, 'n2', { 'n2/start.md': 'start' });
+    // A human's or a peer's checkout detaches HEAD: publishing to one named
+    // branch has no safe answer, but the world can become publishable again,
+    // so this is the commit boundary's refusal, not a driver death.
+    await gitIn(world, ['checkout', '--detach', '--quiet', 'HEAD']);
+    const delays: number[] = [];
+    const schedule = (ms: number, _callback: () => void): (() => void) => {
+      delays.push(ms);
+      return () => {};
+    };
+    const d = await NodeDriver.open(home, 'n1', async () => {
+      await writeWorldFile(world, 'n1/detached.md', 'x');
+      return acted();
+    }, world, { worldPollMs: 0, schedule });
+    const running = d.run();
+    try {
+      await parked(d, world);
+      expect(d.state).toBe('waiting');
+      const events = await readNode(home);
+      const end = events.find((event) => event.type === 'turn/end');
+      expect(end?.data).toMatchObject({ turn: 0, outcome: 'waiting' });
+      expect('commit' in (end?.data as object)).toBe(false);
+      expect(events.find((event) => event.type === 'world/commit-refused')?.data)
+        .toMatchObject({ refusal: { reason: 'world-head' } });
+      expect((await readWorldState(home)).reason).toBe('world-head');
+      expect(delays).toEqual([1000]);
+    } finally {
+      d.stop();
+      await running;
+    }
+  });
+
+  it('retries at 1 s/4 s/16 s and then stops arming', async () => {
+    const { home, world } = fixture();
+    const blocked = await blockGitAdd(world);
+    type Timer = { readonly ms: number; readonly fire: () => void; cancelled: boolean };
+    const timers: Timer[] = [];
+    const schedule = (ms: number, callback: () => void): (() => void) => {
+      const timer: Timer = { ms, fire: callback, cancelled: false };
+      timers.push(timer);
+      return () => { timer.cancelled = true; };
+    };
+    try {
+      const turns: number[] = [];
+      const d = await NodeDriver.open(home, 'n1', async (ctx) => {
+        turns.push(ctx.turn);
+        return wait();
+      }, world, { worldPollMs: 0, schedule });
+      const running = d.run();
+      await parked(d, world);
+      expect(timers.map((timer) => timer.ms)).toEqual([1000]);
+
+      timers[0]!.fire();
+      await vi.waitFor(() => expect(turns).toEqual([0, 1]));
+      await parked(d, world);
+      expect(timers.map((timer) => timer.ms)).toEqual([1000, 4000]);
+
+      timers[1]!.fire();
+      await vi.waitFor(() => expect(turns).toEqual([0, 1, 2]));
+      await parked(d, world);
+      expect(timers.map((timer) => timer.ms)).toEqual([1000, 4000, 16000]);
+
+      timers[2]!.fire();
+      await vi.waitFor(() => expect(turns).toEqual([0, 1, 2, 3]));
+      await parked(d, world);
+      // Three attempts spent: the cell stays parked; a foreign wake can still
+      // reach it, but the refusal streak arms nothing more.
+      expect(timers).toHaveLength(3);
+
+      d.stop();
+      await running;
+    } finally {
+      await unblock(blocked);
+    }
+  });
+
+  it('clears a pending retry on stop and resets the streak on a successful commit', async () => {
+    const { home, world } = fixture();
+    const blocked = await blockGitAdd(world);
+    type Timer = { readonly ms: number; readonly fire: () => void; cancelled: boolean };
+    const timers: Timer[] = [];
+    const schedule = (ms: number, callback: () => void): (() => void) => {
+      const timer: Timer = { ms, fire: callback, cancelled: false };
+      timers.push(timer);
+      return () => { timer.cancelled = true; };
+    };
+    try {
+      const turns: number[] = [];
+      const d = await NodeDriver.open(home, 'n1', async (ctx) => {
+        turns.push(ctx.turn);
+        // The second turn repairs the world: the commit path succeeds and the
+        // sidecar is cleared without a commit of its own.
+        if (ctx.turn === 1) await unblock(blocked);
+        return wait();
+      }, world, { worldPollMs: 0, schedule });
+      const running = d.run();
+      await parked(d, world);
+      expect(timers).toHaveLength(1);
+
+      timers[0]!.fire();
+      await vi.waitFor(() => expect(turns).toEqual([0, 1]));
+      await parked(d, world);
+      expect((await readWorldState(home)).degraded).toBe(false);
+      expect(timers).toHaveLength(1);
+
+      // A foreign commit wakes the node; a new refusal must start the streak
+      // over at 1 s, not continue at 4 s.
+      await commitAs(world, 'n2', { 'n2/hello.md': 'hi' });
+      const blockedAgain = await blockGitAdd(world);
+      try {
+        await HeadWatcher.for(world).check();
+        await vi.waitFor(() => expect(turns).toEqual([0, 1, 2]));
+        await parked(d, world);
+        expect(timers).toHaveLength(2);
+        expect(timers[1]!.ms).toBe(1000);
+        expect((await readWorldState(home)).degraded).toBe(true);
+
+        // A pending retry is cancelled on stop.
+        d.stop();
+        expect(timers[1]!.cancelled).toBe(true);
+        await running;
+      } finally {
+        await unblock(blockedAgain);
+      }
+    } finally {
+      await unblock(blocked);
+    }
   });
 });

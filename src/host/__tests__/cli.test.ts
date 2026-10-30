@@ -149,7 +149,7 @@ it('dispatches status: the report prints first, then the exit code it earns', as
       present: false, count: 0, lastHash: null, counts: {}, openCalls: 0,
       lastRequest: null, lastResponse: null, error: null,
     },
-    world: { present: false, head: null, error: null },
+    world: { present: false, head: null, error: null, state: 'healthy' as const },
   };
   const clean = { ...deps, readStatus: async () => report };
   expect(await runCli(['status', '--home', '/x', '--json'], clean)).toBe(0);
@@ -169,6 +169,23 @@ it('dispatches status: the report prints first, then the exit code it earns', as
   );
   // The human lines never print an error name; the exit code is the signal.
   expect(stdout.join('')).not.toContain('ChainBreakError');
+
+  // The third degradation term: a produced report whose durable world sidecar
+  // is degraded exits 1, and the human report grows exactly one bounded line.
+  stdout.length = 0;
+  const worldDegraded = {
+    ...report,
+    world: { ...report.world, state: 'degraded' as const, reason: 'git-exit' },
+  };
+  const failingWorld = { ...deps, readStatus: async () => worldDegraded };
+  expect(await runCli(['status', '--home', '/x'], failingWorld)).toBe(1);
+  expect(stdout.join('')).toBe(
+    'home: /x\n'
+    + 'host: idle\n'
+    + 'frontier: 0 events last=null http/request=0 http/response=0 http/incomplete=0 open=0\n'
+    + 'world: absent\n'
+    + 'world-state: degraded reason=git-exit\n',
+  );
 });
 
 it('maps status failures: a missing home to 2, any other throw to 1 with a bounded label', async () => {

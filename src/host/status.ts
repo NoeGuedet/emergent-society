@@ -5,6 +5,7 @@ import {
 } from '../frontier/index.js';
 import { JournalReader, frontierLayout } from '../journal/index.js';
 import { WorldRepo } from '../node/world.js';
+import { readWorldState } from '../node/world-state.js';
 import { readOwner } from './owner.js';
 import { HostConfigError } from './errors.js';
 
@@ -12,9 +13,11 @@ import { HostConfigError } from './errors.js';
  * The read-only `status` report: one cell home, observed, never perturbed.
  *
  * `readStatus` gathers three sections — the host owner record, the frontier
- * journal and the world repository — and `formatStatus` renders the human
- * lines. Nothing here writes, takes a lock, reconciles, resolves a blob,
- * opens the local node log or touches the network: the frontier is served by
+ * journal and the world repository (including the durable degraded-world
+ * sidecar, a projection read through its own total reader) — and
+ * `formatStatus` renders the human lines. Nothing here writes, takes a lock,
+ * reconciles, resolves a blob, opens the local node log or touches the network:
+ * the frontier is served by
  * the journal's own reader, which loads the whole log once per report
  * (O(journal) — a streaming reader is handoff debt, not this command), and
  * the world is read through the repository's own HEAD plumbing. No clock and
@@ -50,7 +53,16 @@ export type StatusReport = {
     readonly lastResponse: { call: string; status: number | null; error: string | null; durationMs: number } | null;
     readonly error: string | null;
   };
-  readonly world: { readonly present: boolean; readonly head: string | null; readonly error: string | null };
+  readonly world: {
+    readonly present: boolean; readonly head: string | null; readonly error: string | null;
+    /**
+     * The durable degraded-world projection, read from `<home>/world-state.json`
+     * (a missing or malformed file is healthy). It is not a record and never
+     * affects `world.head`/`world.error`.
+     */
+    readonly state: 'healthy' | 'degraded';
+    readonly reason?: string;
+  };
 };
 
 /** The delay before the world read's single retry. */
@@ -235,7 +247,9 @@ async function frontierOf(home: string): Promise<StatusReport['frontier']> {
  * partial pair reads absent: status invents no third state, `init` is the
  * component that refuses a partial layout.
  */
-async function worldOf(home: string): Promise<StatusReport['world']> {
+async function worldOf(home: string): Promise<{
+  readonly present: boolean; readonly head: string | null; readonly error: string | null;
+}> {
   const worldDir = join(home, 'world');
   const gitDir = join(home, 'world.git');
   const [worldEntry, gitEntry] = await Promise.all([statOrNull(worldDir), statOrNull(gitDir)]);
@@ -282,7 +296,17 @@ export async function readStatus(home: string): Promise<StatusReport> {
   }
   const host = await hostOf(home);
   const frontier = await frontierOf(home);
-  const world = await worldOf(home);
+  const observedWorld = await worldOf(home);
+  // The sidecar is a total read (missing/malformed = healthy), so a damaged
+  // projection can never turn the report itself into a failure. It is read
+  // after the world probes, so the fields describe one point in time.
+  const worldState = await readWorldState(home);
+  const world: StatusReport['world'] = worldState.degraded
+    ? {
+      ...observedWorld, state: 'degraded',
+      ...(worldState.reason !== undefined ? { reason: worldState.reason } : {}),
+    }
+    : { ...observedWorld, state: 'healthy' };
   return { home, host, frontier, world };
 }
 
@@ -291,7 +315,9 @@ export async function readStatus(home: string): Promise<StatusReport> {
  * adds the final one). The two `last-*` lines are omitted entirely when
  * their record is null, the frontier line always prints its three exchange
  * counts, and no line ever prints an error name — `frontier.error` and
- * `world.error` are `--json` fields; the exit code is the human signal.
+ * `world.error` are `--json` fields; the exit code is the human signal. A
+ * healthy world adds no line; a degraded sidecar adds one bounded
+ * `world-state:` line.
  */
 export function formatStatus(report: StatusReport): string {
   const lines = [`home: ${report.home}`];
@@ -318,7 +344,21 @@ export function formatStatus(report: StatusReport): string {
     );
   }
   lines.push(report.world.present ? `world: head=${report.world.head}` : 'world: absent');
+  // Healthy adds no line (the report is quiet when nothing is degraded); a
+  // degraded world adds one bounded operator line, never an error name.
+  if (report.world.state === 'degraded') {
+    lines.push(`world-state: degraded reason=${bounded(report.world.reason ?? 'unknown')}`);
+  }
   return lines.join('\n');
+}
+
+/** One bounded single-line operator value for the human report. */
+function bounded(text: string, limit = 120): string {
+  return Array.from(text.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' '))
+    .slice(0, limit)
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /** The host line, one shape per owner state; `stale` carries no pid. */

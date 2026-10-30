@@ -180,7 +180,9 @@ function foreignAuthorIn(
       const room = MAX_GIT_STDERR_BYTES - stderr.length;
       if (room > 0) stderr += chunk.slice(0, room);
     });
-    child.on('error', (err) => settle(new GitCommandError(args, null, String(err)), 'empty'));
+    child.on('error', (err) => settle(
+      new GitCommandError(args, null, String(err), { kind: 'spawn' }), 'empty',
+    ));
     child.on('close', (code) => {
       if (settled) return;
       // A trailing record without its separator is only possible from a
@@ -193,7 +195,7 @@ function foreignAuthorIn(
         }
       }
       if (code === 0) settle(null, seen ? 'self-only' : 'empty');
-      else settle(new GitCommandError(args, code, stderr), 'empty');
+      else settle(new GitCommandError(args, code, stderr, { kind: 'exit' }), 'empty');
     });
   });
 }

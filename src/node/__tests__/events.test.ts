@@ -6,9 +6,9 @@ import { NODE_EVENT_TYPES } from '../events.js';
 const home = useTempHome('node-events-');
 
 describe('node event types', () => {
-  it('registers exactly the four driver types', () => {
+  it('registers exactly the five driver types', () => {
     expect([...NODE_EVENT_TYPES].sort()).toEqual([
-      'node/boot', 'node/shutdown', 'turn/end', 'turn/start',
+      'node/boot', 'node/shutdown', 'turn/end', 'turn/start', 'world/commit-refused',
     ]);
   });
 
@@ -22,10 +22,18 @@ describe('node event types', () => {
     const w = await JournalWriter.open(home(), 'n1');
     w.append('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
     w.append('turn/end', { turn: 0, outcome: 'waiting' }, { ignorable: true });
+    w.append('world/commit-refused', {
+      refusal: { reason: 'git-exit', detail: 'git add exited 128' }, turn: 0,
+    }, { ignorable: true });
     await w.close();
     const events = await collectEvents(home(), NODE_EVENT_TYPES);
-    expect(events.map((e) => e.type)).toEqual(['turn/start', 'turn/end']);
+    expect(events.map((e) => e.type))
+      .toEqual(['turn/start', 'turn/end', 'world/commit-refused']);
     expect(events[0]?.data).toEqual({ turn: 0, trigger: 'boot', world: { from: null, to: null } });
     expect(events[1]?.ignorable).toBe(true);
+    expect(events[2]?.ignorable).toBe(true);
+    expect(events[2]?.data).toEqual({
+      refusal: { reason: 'git-exit', detail: 'git add exited 128' }, turn: 0,
+    });
   });
 });

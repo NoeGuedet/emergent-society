@@ -8,6 +8,7 @@ import { loadVerifiedEvents } from '../context/loader.js';
 import { openFrontierJournal, type FrontierJournal } from '../frontier/index.js';
 import { nodeLayout } from '../journal/index.js';
 import { createPackageStore, createRunSupervisor } from '../node/packages/index.js';
+import { readWorldState, type WorldState } from '../node/world-state.js';
 import { fileURLToPath } from 'node:url';
 import type { ProviderRegistry } from '../node/tools/providers.js';
 import { DEFAULT_TERMINAL_ENV } from '../node/tools/terminal.js';
@@ -90,6 +91,12 @@ export type Cell = {
   readonly runtime: AgentRuntime; readonly driver: NodeDriver;
   /** The effective journaled config after the ready phase, not necessarily `CellOptions.config`. */
   readonly config: AgentConfig; readonly webTools: boolean;
+  /**
+   * The durable degraded-world sidecar read after `NodeDriver.open` (so a
+   * boot-reconcile refusal is included), replayed at composition: the host
+   * logs it on `host/boot` and never fabricates it from a missing file.
+   */
+  readonly worldState: WorldState;
   close(): Promise<void>;
 };
 
@@ -186,7 +193,15 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
       ...(pollMs !== undefined ? { worldPollMs: pollMs } : {}),
       onError: (err) => log.emit('driver/error', { error: err.name }),
       onMaintenance: () => log.emit('host/parked'),
+      schedule: (ms, callback) => {
+        const timer = setTimeout(callback, ms);
+        return () => { clearTimeout(timer); };
+      },
     });
+    // The sidecar is read AFTER the driver opened: a boot-reconcile refusal is
+    // written during `open`, so composition sees the state the host actually
+    // booted with (a missing file reads healthy, never fabricated).
+    const worldState = await readWorldState(home);
     // The ready phase has already folded the journal during `open`, so a resume
     // reports the config the journal holds, not the one this call supplied.
     const effective = runtime.snapshot().config?.value ?? config;
@@ -215,7 +230,7 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
     };
     return {
       world, frontier, runtime, driver, config: effective,
-      webTools: webTools !== undefined, close,
+      webTools: webTools !== undefined, worldState, close,
     };
   } catch (err) {
     await frontier.close().catch(() => {});
@@ -633,6 +648,9 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         limits: cellSandbox !== false && cellSandbox.leafLimits !== undefined
           ? 'available' : 'unavailable',
         reap: launchMode,
+        // The replayed degraded-world sidecar, read at composition: a status
+        // projection, never a second truth.
+        world: cell.worldState.degraded ? 'degraded' : 'healthy',
       });
       if (stopRequested) cell.driver.stop('stop-requested');
       await cell.driver.run();

@@ -179,7 +179,9 @@ function streamDiff(
       if (room > 0) stderr = Buffer.concat([stderr, chunk.subarray(0, room)]);
     });
     child.on('error', (err) => {
-      if (!capped) rejectPromise(new GitCommandError(args, null, String(err)));
+      if (!capped) {
+        rejectPromise(new GitCommandError(args, null, String(err), { kind: 'spawn' }));
+      }
     });
     child.on('close', (code, signal) => {
       if (capped) {
@@ -196,7 +198,9 @@ function streamDiff(
         if (prefix.text.length < tail.length) truncated = true;
       }
       if (signal !== null || code !== 0) {
-        rejectPromise(new GitCommandError(args, code ?? null, stderr.toString('utf8')));
+        rejectPromise(new GitCommandError(
+          args, code ?? null, stderr.toString('utf8'), { kind: 'exit' },
+        ));
         return;
       }
       resolvePromise({ text, truncated, bytesRetained: bytes });

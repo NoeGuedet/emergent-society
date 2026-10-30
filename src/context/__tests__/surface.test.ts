@@ -90,6 +90,27 @@ describe('Surface append provenance and membership', () => {
       .toEqual(['heading', 'perception', 'dialogue']);
   });
 
+  it('appends a refusal group whose id resolves to its own world/commit-refused receipt', () => {
+    const { lookup, add } = makeLookup();
+    const heading = add('system/message', 0);
+    const surface = new Surface({ text: 'h', source: heading }, lookup);
+    const refusal = add('world/commit-refused', 1);
+    surface.append({
+      id: refusal, kind: 'refusal', turn: 0,
+      messages: [{ role: 'system', content: 'commit refused (git-exit): x' }], sources: [refusal],
+    });
+    expect(surface.snapshot().nodes.map((node) => node.group.kind))
+      .toEqual(['heading', 'refusal']);
+
+    // The kind's id rule is its own event type, never a package-family or a
+    // perception receipt: a forged kind/source pair is refused.
+    const wrong = add('world/perception', 2);
+    expect(() => surface.append({
+      id: wrong, kind: 'refusal', turn: 0,
+      messages: [{ role: 'system', content: 'x' }], sources: [wrong],
+    })).toThrow(SurfacePolicyError);
+  });
+
   it('refuses empty sources, an unknown source and a duplicate group id', () => {
     const { lookup, add } = makeLookup();
     const heading = add('system/message', 0);

@@ -30,4 +30,19 @@ describe('the node error family', () => {
     expect(new GitCommandError(['log'], 1, 'no such ref').message)
       .toBe('git log failed (exit 1): no such ref');
   });
+
+  it('carries the failure kind, defaulting to a plain exit', () => {
+    // The default keeps every pre-discriminator construction site valid: only
+    // the process layer knows when a failure is a spawn, a timeout or an abort.
+    expect(new GitCommandError(['log'], 1, 'no such ref').kind).toBe('exit');
+    expect(new GitCommandError(['log'], 1, 'no such ref').outputCapped).toBe(false);
+    for (const kind of ['exit', 'spawn', 'timeout', 'abort'] as const) {
+      const err = new GitCommandError(['add'], null, '', { kind });
+      expect(err.kind).toBe(kind);
+      expect(err.exitCode).toBeNull();
+    }
+    const capped = new GitCommandError(['log'], null, '', { kind: 'exit', outputCapped: true });
+    expect(capped.outputCapped).toBe(true);
+    expect(capped.kind).toBe('exit');
+  });
 });

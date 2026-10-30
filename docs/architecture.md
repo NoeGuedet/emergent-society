@@ -35,7 +35,7 @@ not individually logged.
 | `main.ts` | Entry point: `runCli(argv)`, escaped errors exit 1 with a bounded label |
 | `cli.ts` | Command dispatch and exit codes ([AGENTS.md](../AGENTS.md)); `--no-sandbox` is the explicit confinement opt-out |
 | `options.ts` | Strict `parseArgs` parsing: five commands plus `--help` (`init`, `start`, `resume`, `pause`, `status`), no positionals, no unknown flags; relative `--home` and bad `--uid` are usage errors |
-| `host.ts` | Host lifetime: boots a cell (frontier journal, runtime, terminal, sandbox) and owns stop/pause delivery |
+| `host.ts` | Host lifetime: boots a cell (frontier journal, runtime, terminal, sandbox), replays the durable degraded-world sidecar into the `host/boot` `world` field, and owns stop/pause delivery |
 | `status.ts` | The read-only status report; degradation is reported, not thrown |
 | `credentials.ts` | The `providers.json` read side: regular file, mode 0600 (0400 accepted; group/other bits refused), owned by the process uid |
 | `owner.ts` | Pause delivery to the host owning a home; owner records |
@@ -51,9 +51,10 @@ not individually logged.
 | `loop.ts` | `createAgentRuntime`: the trusted handler — folds the local log, presents one bounded world perception per turn, assembles exactly one plan per logical request, sends it through the adapter, dispatches the resulting tool calls |
 | `gate.ts` | The trusted local effect boundary: chunking, artifact manifests, the claim-check inline threshold; `flush()` re-reads and digest/size-verifies every pending claim-check before the effect |
 | `world.ts` | `WorldRepo` — the façade the engine speaks to (author = uid policy) |
-| `world-git.ts` / `world-trust.ts` / `world-commit.ts` / `world-history.ts` / `world-diff.ts` / `world-types.ts` | The git process layer (git as an external process, one controlled environment); the trust layers `open` runs; the plumbing commit (CAS ref update, interrupted-turn reconciliation); the history reads; the hermetic patch renderer; the shared shapes. No module outside the `world-*` family imports a sibling directly |
+| `world-git.ts` / `world-trust.ts` / `world-commit.ts` / `world-history.ts` / `world-diff.ts` / `world-types.ts` | The git process layer (git as an external process, one controlled environment); the trust layers `open` runs; the plumbing commit (CAS ref update, interrupted-turn reconciliation); the history reads; the hermetic patch renderer; the shared shapes. No module outside the `world-*` family imports a sibling directly — with one named exception: the pure refusal helpers in `world-commit.ts` (`CommitRefusal`, `classifyCommitFailure`, `commitAllRefused`, `renderCommitRefusal`, `isCommitRefusal`) are imported by `driver.ts`, `context/fold.ts` and `node/events.ts`. They are pure shapes/predicates, not a consumer of the commit ritual |
+| `world-state.ts` | The durable degraded-world sidecar (`<home>/world-state.json`): an atomic 0600 projection written before a refused turn's closer, read at host composition and by `status`, and cleared only when a commit is known to have succeeded; a missing/malformed/non-regular file reads healthy |
 | `watcher.ts` / `latch.ts` | `HeadWatcher` (watches git HEAD, poke + unref'd interval) and `WakeLatch` (in-memory coalescing wake signal) |
-| `events.ts` | The node vocabulary: `node/boot`, `node/shutdown`, `turn/start`, `turn/end` — four types only |
+| `events.ts` | The node vocabulary: `node/boot`, `node/shutdown`, `turn/start`, `turn/end`, and the ignorable `world/commit-refused` — five types only |
 | `errors.ts`, `index.ts` | The node error family; package exports |
 
 ### `src/node/tools/` — the mounted tools
@@ -178,7 +179,7 @@ proceeds, plus boot reconciliation), `index.ts` (exports).
 | Package lifecycle | the boot scan and host-stop disposal in `src/node/loop.ts`; composition in `src/host/host.ts` |
 | Only the kernel emits | the narrow `TurnContext` (`driver.ts`) for the local log; the frontier gate (`src/frontier/journal.ts`) for the exchanges |
 | The provider-parameter contract | `src/context/parameters.ts` (bounds) + `src/context/contracts.ts` (payload shapes) |
-| The two observation surfaces joined | `world_head` on every `http/request` (`src/frontier/events.ts`) + the commit hash in `turn/end` (`src/node/events.ts`) |
+| The two observation surfaces joined | `world_head` on every `http/request` (`src/frontier/events.ts`) + the commit hash in `turn/end` (`src/node/events.ts`) when the turn's commit succeeded; a refused or empty closer carries no hash |
 | The typed-error root | `src/errors.ts` |
 
 ## 4. The two records in the code
@@ -198,7 +199,9 @@ lifecycle and registry types).
 
 Each turn: open on the world range `{from: watermark, to: HEAD}`, append `turn/start` and
 flush, run the handler with the narrow `TurnContext`, commit the world with the node's uid
-as author, append `turn/end` with the commit hash and flush, then chain or park. A crash
+as author, append `turn/end` with the commit hash when the commit succeeded (a refused
+commit writes the closer without one, sets the degraded sidecar and records
+`world/commit-refused` after it) and flush, then chain or park. A crash
 is the absence of `node/shutdown`; resume closes an interrupted turn synthetically and
 reconciles it against the world's commits (subject `turn N`, bounded walk). The watcher
 announces HEAD movement, each parked node evaluates its own predicate, and the latch

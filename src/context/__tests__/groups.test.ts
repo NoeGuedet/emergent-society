@@ -114,6 +114,32 @@ describe('isBalancedGroup: exactly the units compaction may remove', () => {
 
   it.each([
     {
+      name: 'one system line in a refusal carrier',
+      kind: 'refusal' as const,
+      messages: [{ role: 'system' as const, content: 'commit refused (git-exit): x' }],
+      expected: true,
+    },
+    {
+      name: 'a refusal carrier with a user line',
+      kind: 'refusal' as const,
+      messages: [{ role: 'user' as const, content: 'x' }],
+      expected: false,
+    },
+    {
+      name: 'two system lines in a refusal carrier',
+      kind: 'refusal' as const,
+      messages: [
+        { role: 'system' as const, content: 'x' },
+        { role: 'system' as const, content: 'y' },
+      ],
+      expected: false,
+    },
+  ])('$name', ({ kind, messages, expected }) => {
+    expect(isBalancedGroup(group({ kind, messages }))).toBe(expected);
+  });
+
+  it.each([
+    {
       name: 'an assistant with no calls',
       messages: [assistant([])],
       expected: true,

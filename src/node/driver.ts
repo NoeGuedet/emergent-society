@@ -7,6 +7,8 @@ import { systemClock } from '../util.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
 import { NodeStateError, WorldReconciliationError, GitCommandError } from './errors.js';
 import { WakeLatch } from './latch.js';
+import { commitAllRefused, type CommitRefusal } from './world-commit.js';
+import { clearWorldState, markWorldDegraded } from './world-state.js';
 import {
   createBoundaryGate,
   type BoundaryGate, type BoundaryRegistry, type DurableWatermark, type DriverHooks,
@@ -112,6 +114,28 @@ export interface NodeDriverOptions extends JournalWriterOptions {
   hooks?: DriverHooks;
   /** Best-effort checkpoint at each durable completed turn boundary. */
   onCheckpoint?: (mark: DurableWatermark) => Promise<void> | void;
+  /**
+   * The retry seam: schedules one callback after `ms` and returns its cancel.
+   * Production is `setTimeout`/`clearTimeout`; tests inject a manual clock so
+   * the bounded refusal retry (1 s/4 s/16 s) is deterministic. It is the
+   * supervisor's own seam, applied one layer up.
+   */
+  schedule?: (ms: number, callback: () => void) => () => void;
+}
+
+/** The bounded self-retry delays: three attempts, then the cell stays parked. */
+const RETRY_DELAYS_MS: readonly number[] = [1000, 4000, 16000];
+
+/** One commit attempt as the driver sees it: a hash to join, or a typed refusal. */
+type DriverCommitAttempt = {
+  readonly commit: string | null;
+  readonly refusal: CommitRefusal | null;
+};
+
+/** The production schedule seam; the one place this module spells `setTimeout`. */
+function defaultSchedule(ms: number, callback: () => void): () => void {
+  const timer = setTimeout(callback, ms);
+  return () => { clearTimeout(timer); };
 }
 
 /**
@@ -158,6 +182,11 @@ export class NodeDriver {
   private readonly now: () => number;
   private readonly home: string;
   private readonly hooks: DriverHooks | undefined;
+  private readonly schedule: (ms: number, callback: () => void) => () => void;
+  /** How many bounded self-retries this refusal streak has spent (0..3). */
+  private retryAttempt = 0;
+  /** The pending retry wake's cancel, or null; cleared on park, stop and success. */
+  private retryTimer: (() => void) | null = null;
 
   /**
    * The ordered durable observation list (T2 seam). Every gate or driver append
@@ -203,6 +232,7 @@ export class NodeDriver {
     this.watcher = HeadWatcher.for(world, opts.worldPollMs);
     this.home = home;
     this.hooks = opts.hooks;
+    this.schedule = opts.schedule ?? defaultSchedule;
     this.lookup = (source: Source): EventEnvelope | null =>
       this.receipts.get(`${source.seq}:${source.hash}`) ?? null;
   }
@@ -265,6 +295,8 @@ export class NodeDriver {
     if (this.nodeState === 'stopping' || this.nodeState === 'stopped') return;
     this.stopReason = reason;
     this.stopRequested = true;
+    // A pending self-retry must not wake a stopped node (or hold the process).
+    this.clearRetryTimer();
     // Cancel the active turn immediately; the gate stays valid while the
     // handler's awaited cleanup settles (see `endTurnGate`).
     this.activeController?.abort();
@@ -339,8 +371,16 @@ export class NodeDriver {
           }
           // The world is committed before the closer is written, so the closer
           // can carry the hash that joins the node's local log to the world's
-          // history (kernel.md §3, §5.2).
-          const commit = await this.commitWorld(this.turn);
+          // history (kernel.md §3, §5.2). A refused commit is not a death: the
+          // turn ends `waiting` (the fold treats waiting as success), the
+          // refusal becomes a local fact, and the node parks.
+          const attempt = await this.commitWorld(this.turn);
+          const commit = attempt.commit;
+          const refusal = attempt.refusal;
+          // The degraded sidecar precedes the closer. A crash between the two
+          // must still leave the degraded fact behind: a durable closer makes
+          // the turn look closed, so no boot reconcile would retry it.
+          if (refusal !== null) await this.markCommitRefusal(refusal);
           const toolCalls = this.hooks !== undefined ? this.turnToolCalls > 0 : result.toolCalls;
           if (result.outcome === 'error') {
             const status = result.error.status;
@@ -352,8 +392,12 @@ export class NodeDriver {
             // A normal, nonignorable error closer: failed-turn evidence survives.
             this.writeEvent('turn/end', end);
           } else {
+            // The handler may have reported `chained`; a refusal overrides it
+            // to `waiting` and parks, never continues.
+            const outcome: 'chained' | 'waiting' =
+              refusal !== null ? 'waiting' : result.outcome;
             const end: EventDataFor<'turn/end'> = {
-              turn: this.turn, outcome: result.outcome,
+              turn: this.turn, outcome,
               ...(commit !== null ? { commit } : {}),
             };
             // Empty (kernel.md §5.4): no tool call and nothing committed. It is
@@ -369,9 +413,10 @@ export class NodeDriver {
           // the node's local log, the only record of which turn produced it, does
           // not reference.
           await this.flushObservations();
+          if (refusal !== null) await this.recordCommitRefusal(refusal, this.turn, true);
           await this.checkpoint();
           this.endTurnGate();
-          if (result.outcome === 'chained') {
+          if (result.outcome === 'chained' && refusal === null) {
             trigger = 'chain';
             this.turn += 1;
             continue;
@@ -401,13 +446,13 @@ export class NodeDriver {
     } catch (err) {
       failure = err;
       // The loop died outside the handler's contract — a failed barrier, a
-      // maintenance hook that rejected, a git failure on the turn's commit — so
-      // the run's reason becomes 'driver-error' unless the handler's own turn
-      // already set one. The check is by value, so an explicit stop() (which
-      // carries the same default) is relabelled too: accepted, since a stop WAS
-      // requested and the error still reaches the caller. A clean stop keeps the
-      // plain label and journals no `error` field, the run having failed
-      // nowhere.
+      // maintenance hook that rejected, a commit failure the refusal boundary
+      // cannot name — so the run's reason becomes 'driver-error' unless the
+      // handler's own turn already set one. The check is by value, so an
+      // explicit stop() (which carries the same default) is relabelled too:
+      // accepted, since a stop WAS requested and the error still reaches the
+      // caller. A clean stop keeps the plain label and journals no `error`
+      // field, the run having failed nowhere.
       if (this.stopReason === 'stop-requested') this.stopReason = 'driver-error';
     }
     const shutdownFailure = await this.shutdown(failure);
@@ -597,6 +642,11 @@ export class NodeDriver {
   }
 
   private durableError(err: unknown): string {
+    // A git failure is never a kernel invariant failure: it is the world's
+    // mechanism refusing, and the closed vocabulary already has its own label.
+    // (A turn's commit refusal never reaches here; this covers a git fault on
+    // a path outside the commit boundary, such as the wake predicate.)
+    if (err instanceof GitCommandError) return `git failure (${err.kind})`;
     if (this.hooks === undefined) return String(err);
     // Only a bounded fixed label ever reaches the journal under C1.3 hooks; the
     // original exception is retained and rethrown to its trusted caller. The
@@ -634,8 +684,12 @@ export class NodeDriver {
       await this.latch.wait();
     } finally {
       unsubscribe();
-      // The park is over: an evaluation still in flight for it must not arm the
-      // latch of the park that follows.
+      // The park is over: a pending self-retry must not wake the park that
+      // follows (the refusal that armed it is this park's, and the next turn
+      // either re-arms it or a successful commit clears it).
+      this.clearRetryTimer();
+      // An evaluation still in flight for this park must not arm the latch of
+      // the park that follows.
       this.parkEpoch += 1;
     }
   }
@@ -704,19 +758,91 @@ export class NodeDriver {
   }
 
   /**
-   * Commits the world as this node. Committing is kernel mechanism, not a tool:
-   * an agent cannot end a turn without its effects being committed and
-   * attributed (kernel.md §5.2).
+   * Commits the world as this node, classifying every failure the commit
+   * boundary can name as a typed refusal. Committing is kernel mechanism, not a
+   * tool: a turn's effects are committed and attributed before its closer
+   * (kernel.md §5.2) — or, when the boundary refuses, the refusal is recorded
+   * and the turn ends without a commit.
    *
-   * @returns the commit hash, or null when the turn changed nothing.
-   * @throws GitCommandError when git fails; an unattributed effect is not a fact
-   * to shrug off, so the loop dies on it (driver-error).
+   * A successful attempt resets the bounded self-retry and clears the durable
+   * degraded sidecar (the only clear); a refusal is returned, never thrown, so
+   * the caller decides. Unknown failures still throw.
    */
-  private async commitWorld(turn: number): Promise<string | null> {
-    const commit = await this.world.commitAll(this.uid, `turn ${turn}`);
-    if (commit === null) return null;
-    this.watcher.poke();
-    return commit.hash;
+  private async commitWorld(turn: number): Promise<DriverCommitAttempt> {
+    const attempt = await commitAllRefused(
+      () => this.world.commitAll(this.uid, `turn ${turn}`),
+    );
+    if (attempt.refusal !== null) return { commit: null, refusal: attempt.refusal };
+    this.retryAttempt = 0;
+    this.clearRetryTimer();
+    await this.clearWorldDegraded();
+    const commit = attempt.commit?.hash ?? null;
+    if (commit !== null) this.watcher.poke();
+    return { commit, refusal: null };
+  }
+
+  /**
+   * Writes the durable degraded sidecar for a refusal. It must happen BEFORE
+   * the refused turn's closer: a crash between the two then still leaves the
+   * degraded fact, whereas a crash after a durable closer but before the
+   * sidecar would leave a turn that looks successfully closed with no retry
+   * queued at boot. A failed write is diagnostic only — the local event is the
+   * node's fact.
+   */
+  private async markCommitRefusal(refusal: CommitRefusal): Promise<void> {
+    try {
+      await markWorldDegraded(this.home, refusal.reason, this.now());
+    } catch {
+      try { this.opts.onError?.(new Error('world-state write failed')); } catch { /* diagnostic */ }
+    }
+  }
+
+  /**
+   * Writes the refusal fact after the refused turn's closer and flushed: the
+   * event is ignorable (an older reader skips it) and outside the turn, so the
+   * fold renders it into the next turn's context. The bounded self-retry is
+   * armed only on the run path — a boot reconcile is followed by its own first
+   * turn, so it needs no timer.
+   */
+  private async recordCommitRefusal(
+    refusal: CommitRefusal, turn: number, retry: boolean,
+  ): Promise<void> {
+    this.writeEvent('world/commit-refused', { refusal, turn }, { ignorable: true });
+    await this.flushObservations();
+    if (retry) this.scheduleRetry();
+  }
+
+  /** Clears the sidecar after a successful commit; a failure is diagnostic only. */
+  private async clearWorldDegraded(): Promise<void> {
+    try {
+      await clearWorldState(this.home);
+    } catch {
+      try { this.opts.onError?.(new Error('world-state clear failed')); } catch { /* diagnostic */ }
+    }
+  }
+
+  /**
+   * Arms the next bounded self-retry (1 s/4 s/16 s), never while a stop is
+   * requested. The timer only requests the latch: the next turn is an ordinary
+   * `wakeup`, so the retry takes the same path as a foreign commit.
+   */
+  private scheduleRetry(): void {
+    if (this.stopRequested) return;
+    if (this.retryAttempt >= RETRY_DELAYS_MS.length) return;
+    const delay = RETRY_DELAYS_MS[this.retryAttempt]!;
+    this.retryAttempt += 1;
+    this.clearRetryTimer();
+    this.retryTimer = this.schedule(delay, () => {
+      this.retryTimer = null;
+      if (!this.stopRequested) this.latch.request();
+    });
+  }
+
+  /** Cancels a pending retry wake; idempotent. */
+  private clearRetryTimer(): void {
+    const cancel = this.retryTimer;
+    this.retryTimer = null;
+    if (cancel !== null) cancel();
   }
 
   /**
@@ -733,11 +859,20 @@ export class NodeDriver {
    */
   private async endFailedTurn(turn: number, err: unknown): Promise<void> {
     let commit: string | null = null;
+    let refusal: CommitRefusal | null = null;
     try {
-      commit = await this.commitWorld(turn);
+      // The failed-turn path keeps its own policy: a refusal (or any commit
+      // fault) must not displace the handler's error, which is the one that
+      // ended the run. The writes stay in the tree for the next commit.
+      const attempt = await this.commitWorld(turn);
+      commit = attempt.commit;
+      refusal = attempt.refusal;
     } catch {
       commit = null;
     }
+    // The sidecar precedes the closer here too: a crash after the error closer
+    // must not leave a degraded world that no later boot would notice.
+    if (refusal !== null) await this.markCommitRefusal(refusal);
     const end: EventDataFor<'turn/end'> = {
       turn, outcome: 'error', error: this.durableError(err),
       ...(commit !== null ? { commit } : {}),
@@ -753,6 +888,17 @@ export class NodeDriver {
       // fault must not displace it. The writes stay in the tree for the next
       // commit of this world (§5.3), and the next restart reconciles the turn
       // left open here.
+    }
+    // The refusal is recorded after the closer (or after its failed attempt),
+    // exactly like the clean path, but WITHOUT arming a retry: the run is
+    // ending, and the next process retries through the boot reconcile. A
+    // failed record must not displace the handler's error either.
+    if (refusal !== null) {
+      try {
+        await this.recordCommitRefusal(refusal, turn, false);
+      } catch {
+        // The handler error outranks a journal write failure on this path.
+      }
     }
   }
 
@@ -770,6 +916,7 @@ export class NodeDriver {
    */
   private async shutdown(prior: unknown): Promise<unknown> {
     let failure: unknown = null;
+    this.clearRetryTimer();
     this.nodeState = 'stopping';
     try {
       this.writeEvent('node/shutdown', {
@@ -863,16 +1010,23 @@ export class NodeDriver {
       // The interrupted turn never closed. Its own commit may already have
       // landed — the driver committed the world, then crashed before the closer
       // — so the closer first looks for that commit in the turn's own range and
-      // names it rather than making a second one.
-      const commit = await this.reconcileInterrupted(openTurn, openRangeTo);
+      // names it rather than making a second one. A refused recovery commit is
+      // the incident's own path: the sidecar is set before the synthetic closer,
+      // the closer is written WITHOUT a commit, and the host still boots. The
+      // refused turn's writes stay in the tree for the next turn to retry.
+      const attempt = await this.reconcileInterrupted(openTurn, openRangeTo);
+      if (attempt.refusal !== null) await this.markCommitRefusal(attempt.refusal);
       this.writeEvent('turn/end', {
         turn: openTurn, outcome: 'interrupted', synthetic: true,
-        ...(commit !== null ? { commit } : {}),
+        ...(attempt.commit !== null ? { commit: attempt.commit } : {}),
       });
       // A closer is a closer, synthetic or not: durable before the boot is
       // journaled on top of it, so a crash between the two still leaves the
       // commit it names attributable (kernel.md §3).
       await this.flushObservations();
+      if (attempt.refusal !== null) {
+        await this.recordCommitRefusal(attempt.refusal, openTurn, false);
+      }
     }
     this.writeEvent('node/boot', { reason: sawAny ? 'resume' : 'start' });
     await this.flushObservations();
@@ -889,17 +1043,27 @@ export class NodeDriver {
    * because `commitWorld` stages everything (`git add --all`), a peer's dirty
    * files are swept in with the node's own — commit-granular attribution, the
    * accepted behavior of the zero-candidate path. Exactly one candidate is
-   * named as-is and stages nothing. A bounded-out search and an unreachable
-   * base are refused by `commitsForTurn`; more than one match is returned by it
-   * and refused here.
+   * named as-is and stages nothing — a commit already succeeded, so any stale
+   * degraded sidecar is cleared here exactly as a fresh successful commit
+   * would clear it. A bounded-out search and an unreachable base are refused by
+   * `commitsForTurn`; more than one match is returned by it and refused here.
    */
-  private async reconcileInterrupted(turn: number, base: string | null): Promise<string | null> {
+  private async reconcileInterrupted(
+    turn: number, base: string | null,
+  ): Promise<DriverCommitAttempt> {
     const candidates = await this.world.commitsForTurn(base, this.uid, turn);
     if (candidates.length > 1) {
       throw new WorldReconciliationError(
         `interrupted turn ${turn} names ${candidates.length} matching commits`);
     }
-    if (candidates.length === 1) return candidates[0]!.hash;
+    if (candidates.length === 1) {
+      // The turn's commit landed before the crash: that is a successful commit,
+      // so the sidecar a refused attempt may have left must not outlive it.
+      this.retryAttempt = 0;
+      this.clearRetryTimer();
+      await this.clearWorldDegraded();
+      return { commit: candidates[0]!.hash, refusal: null };
+    }
     return this.commitWorld(turn);
   }
 

@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { GitCommandError } from './errors.js';
+import { GitCommandError, type GitFailureKind } from './errors.js';
 import type { ObjectFormat } from './world-types.js';
 
 /**
@@ -129,11 +129,61 @@ export function isFullHex(format: ObjectFormat, value: string): boolean {
 }
 
 /**
+ * The process-layer shape of one failed git child: why it failed and whether
+ * the output bound, not the command, ended it.
+ *
+ * Before the discriminator, `GitCommandError` carried only
+ * `exitCode: number | null`: a numeric code and a spawn failure were
+ * distinguishable only by the null, and a timeout, an abort and the
+ * output-bound kill had no name at all. This is the one classification; the
+ * construction sites apply it rather than repeat it.
+ */
+export type GitFailure = {
+  readonly kind: GitFailureKind;
+  readonly outputCapped: boolean;
+};
+
+/**
+ * Classifies one `execFile`/`spawn` failure without relying on a message.
+ *
+ * `timeout` and `abort` are reserved for C3: no production git call site passes
+ * a timeout or an abort signal yet, so today those kinds are reachable only
+ * through this classifier's own tests. The order below is load-bearing for
+ * when they are wired: a future timeout error carries both `killed`/`signal`
+ * and a string code (`ETIMEDOUT`), and the kill is the stronger fact.
+ */
+export function classifyGitFailure(err: unknown): GitFailure {
+  const e = (typeof err === 'object' && err !== null ? err : {}) as {
+    readonly name?: unknown; readonly code?: unknown;
+    readonly killed?: unknown; readonly signal?: unknown;
+  };
+  // `execFile`'s own maxBuffer guard raises a RangeError with this code; the
+  // child was killed, but it is neither a deadline nor a spawn failure.
+  if (e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+    return { kind: 'exit', outputCapped: true };
+  }
+  if (e.name === 'AbortError' || e.code === 'ABORT_ERR') {
+    return { kind: 'abort', outputCapped: false };
+  }
+  // A process-layer kill first: `execFile`'s timeout sets `killed`, a
+  // signal-killed child carries its signal. Both end the command, and either
+  // may arrive with a string code (ETIMEDOUT), so they outrank the errno arm.
+  if (e.killed === true) return { kind: 'timeout', outputCapped: false };
+  if (typeof e.signal === 'string' && e.signal !== '') {
+    return { kind: 'timeout', outputCapped: false };
+  }
+  // A string code left over is the spawn layer's errno (ENOENT, EACCES, ...);
+  // a numeric code is git's own exit status.
+  if (typeof e.code === 'string') return { kind: 'spawn', outputCapped: false };
+  return { kind: 'exit', outputCapped: false };
+}
+
+/**
  * Runs one git command with `dir` as its working directory and returns stdout.
  *
  * @throws GitCommandError on any non-zero exit or spawn failure, carrying the
- * exit code and stderr so a caller can tell a policy failure (an unborn branch,
- * a staged-nothing index) from an environment one.
+ * exit code, stderr and the failure's `kind` so a caller can tell a policy
+ * failure (an unborn branch, a staged-nothing index) from an environment one.
  */
 export async function runGit(
   dir: string, args: readonly string[], env?: Record<string, string>,
@@ -150,7 +200,9 @@ export async function runGit(
       (err, stdout, stderr) => {
         if (err !== null) {
           const code = (err as { code?: number | string }).code;
-          reject(new GitCommandError(args, typeof code === 'number' ? code : null, stderr));
+          reject(new GitCommandError(
+            args, typeof code === 'number' ? code : null, stderr, classifyGitFailure(err),
+          ));
           return;
         }
         resolvePromise(stdout);
@@ -171,10 +223,12 @@ export async function runGitWithStdin(
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => { stdout += chunk; });
     child.stderr.on('data', (chunk: string) => { stderr += chunk; });
-    child.on('error', (err) => reject(new GitCommandError(args, null, String(err))));
+    child.on('error', (err) => reject(
+      new GitCommandError(args, null, String(err), classifyGitFailure(err)),
+    ));
     child.on('close', (code) => {
       if (code === 0) resolvePromise(stdout);
-      else reject(new GitCommandError(args, code, stderr));
+      else reject(new GitCommandError(args, code, stderr, { kind: 'exit' }));
     });
     child.stdin.end(input);
   });

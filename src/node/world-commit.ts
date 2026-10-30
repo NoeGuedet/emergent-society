@@ -4,7 +4,8 @@ import { assertNodeUid } from '../journal/index.js';
 import { NOOP, delay } from '../util.js';
 import { GitCommandError, WorldHeadError, WorldReconciliationError } from './errors.js';
 import {
-  FIELD, commitExists, emptyTree, hashLength, isAncestor, isFullHex, treeOf, type WorldIo,
+  FIELD, MAX_GIT_OUTPUT_BYTES, commitExists, emptyTree, hashLength, isAncestor, isFullHex,
+  treeOf, type WorldIo,
 } from './world-git.js';
 import type { WorldCommitInfo } from './world-types.js';
 
@@ -82,6 +83,152 @@ function identity(author: string): Record<string, string> {
     GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: email,
     GIT_COMMITTER_NAME: author, GIT_COMMITTER_EMAIL: email,
   };
+}
+
+/**
+ * The typed shape of a refused commit: what stopped the commit path, in a
+ * bounded form a local-log event and a status projection can carry.
+ *
+ * A refusal is not an error path with a different label — it is the commit
+ * boundary's answer for every failure the boundary can name, so the driver can
+ * end the turn `waiting` (the kernel survives) instead of relabelling a git
+ * failure as `driver-error`. `git-exit` is a command that ran and refused,
+ * `git-spawn` a child that never started, `git-timeout`/`git-abort` a child the
+ * process layer ended, `output-cap` the kernel's own output bound, `walk-eacces`
+ * the world walk's raw permission failure (not a `GitCommandError`), `world-head`
+ * a HEAD the kernel cannot publish to (detached, outside `refs/heads/`, or
+ * switched during the attempt), and `budget`/`freeze-timeout` the later
+ * commit-boundary budgets and fence.
+ */
+export type CommitRefusal = {
+  readonly reason: 'walk-eacces' | 'git-exit' | 'git-spawn' | 'git-timeout' | 'git-abort'
+    | 'output-cap' | 'world-head' | 'budget' | 'freeze-timeout';
+  readonly detail: string;
+};
+
+/**
+ * The closed refusal vocabulary: the reasons this module classifies plus the
+ * ones a later commit-boundary stage throws already typed (the staged budget,
+ * the fence), which `isCommitRefusal` must pass through.
+ */
+const COMMIT_REFUSAL_REASONS: ReadonlySet<string> = new Set([
+  'walk-eacces', 'git-exit', 'git-spawn', 'git-timeout', 'git-abort',
+  'output-cap', 'world-head', 'budget', 'freeze-timeout',
+]);
+
+/** The rendered detail bound: one bounded line, never a payload. */
+export const MAX_COMMIT_REFUSAL_DETAIL = 300;
+
+/**
+ * One bounded, single-line refusal detail: control characters become spaces
+ * and the code-point count is capped. The event payload and the rendered
+ * carrier both come through here, so neither can grow with a git stderr or a
+ * path from a hostile world.
+ */
+export function boundedRefusalDetail(detail: string): string {
+  return Array.from(detail.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' '))
+    .slice(0, MAX_COMMIT_REFUSAL_DETAIL)
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** The one model-visible rendering of a refusal: one bounded line. */
+export function renderCommitRefusal(refusal: CommitRefusal): string {
+  return `commit refused (${refusal.reason}): ${boundedRefusalDetail(refusal.detail)}`;
+}
+
+/** True for a value already carrying the refusal shape (a later stage's throw). */
+export function isCommitRefusal(value: unknown): value is CommitRefusal {
+  if (typeof value !== 'object' || value === null) return false;
+  const fields = value as { readonly reason?: unknown; readonly detail?: unknown };
+  return typeof fields.reason === 'string'
+    && COMMIT_REFUSAL_REASONS.has(fields.reason)
+    && typeof fields.detail === 'string';
+}
+
+/**
+ * Classifies one failure of the whole commit path into a typed refusal, or
+ * `null` when it is not a class this boundary can name (a programming error, a
+ * malformed uid, a reconciliation ambiguity) — the caller decides, and the
+ * classifier never swallows.
+ *
+ * The sources are recognized by shape and class, not by one shared predicate:
+ * a typed refusal passes through by its fields, a `GitCommandError` by its
+ * class and process kind, a `WorldHeadError` by its class, and the
+ * nested-repository walk's raw `EACCES`/`EPERM` by its code (it fails before
+ * any git child exists).
+ */
+export function classifyCommitFailure(err: unknown): CommitRefusal | null {
+  if (isCommitRefusal(err)) {
+    return { reason: err.reason, detail: boundedRefusalDetail(err.detail) };
+  }
+  // HEAD that cannot be published to is a property of the world, not of a git
+  // command: it must be a refusal so the driver parks and retries (the branch
+  // may return) instead of dying as a driver error.
+  if (err instanceof WorldHeadError) {
+    return { reason: 'world-head', detail: boundedRefusalDetail(err.reason) };
+  }
+  if (err instanceof GitCommandError) {
+    const command = err.args[0] ?? 'git';
+    if (err.outputCapped) {
+      return {
+        reason: 'output-cap',
+        detail: boundedRefusalDetail(
+          `git ${command} output exceeded ${MAX_GIT_OUTPUT_BYTES} bytes`),
+      };
+    }
+    switch (err.kind) {
+      case 'spawn':
+        return {
+          reason: 'git-spawn',
+          detail: boundedRefusalDetail(`git ${command} could not be spawned: ${err.stderr}`),
+        };
+      case 'timeout':
+        return { reason: 'git-timeout', detail: boundedRefusalDetail(`git ${command} timed out`) };
+      case 'abort':
+        return { reason: 'git-abort', detail: boundedRefusalDetail(`git ${command} was aborted`) };
+      case 'exit':
+        return {
+          reason: 'git-exit',
+          detail: boundedRefusalDetail(
+            `git ${command} exited ${err.exitCode ?? 'unknown'}: ${err.stderr}`),
+        };
+    }
+  }
+  // The walk's only raw filesystem failure; every other read in the commit
+  // path goes through a git child and is a GitCommandError.
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (code === 'EACCES' || code === 'EPERM') {
+    return {
+      reason: 'walk-eacces',
+      detail: boundedRefusalDetail(err instanceof Error ? err.message : String(err)),
+    };
+  }
+  return null;
+}
+
+/** The discriminated result of one commit attempt: a commit, or a typed refusal. */
+export type CommitAttempt = {
+  readonly commit: WorldCommitInfo | null;
+  readonly refusal: CommitRefusal | null;
+};
+
+/**
+ * Wraps one commit attempt (the driver's call into `WorldRepo.commitAll`) in
+ * the one refusal classifier. It catches only failures the boundary can name;
+ * anything else is rethrown unchanged, so a programming error stays loud.
+ */
+export async function commitAllRefused(
+  attempt: () => Promise<WorldCommitInfo | null>,
+): Promise<CommitAttempt> {
+  try {
+    return { commit: await attempt(), refusal: null };
+  } catch (err) {
+    const refusal = classifyCommitFailure(err);
+    if (refusal === null) throw err;
+    return { commit: null, refusal };
+  }
 }
 
 /**

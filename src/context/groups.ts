@@ -58,9 +58,10 @@ export function sameSourceSet(a: readonly Source[], b: readonly Source[]): boole
 /**
  * A group is balanced when its messages are a complete unit: a dialogue is an
  * assistant followed by exactly its advertised results, in call order; a
- * perception, summary or package group is a single user message; a heading is
- * never a removable unit. An unbalanced group is never a legal compaction span
- * (assistant + all results is indivisible).
+ * perception, summary or package group is a single user message; a refusal
+ * carrier is a single system line; a heading is never a removable unit. An
+ * unbalanced group is never a legal compaction span (assistant + all results
+ * is indivisible).
  */
 export function isBalancedGroup(group: SurfaceGroup): boolean {
   switch (group.kind) {
@@ -71,6 +72,13 @@ export function isBalancedGroup(group: SurfaceGroup): boolean {
     case 'package': {
       const only = group.messages[0];
       return group.messages.length === 1 && only !== undefined && only.role === 'user';
+    }
+    // The refusal carrier is one system line. It must have its own branch:
+    // an unknown kind falls into the dialogue case below, which would classify
+    // a one-message group as unbalanced and make it never compactable.
+    case 'refusal': {
+      const only = group.messages[0];
+      return group.messages.length === 1 && only !== undefined && only.role === 'system';
     }
     default: {
       const assistant = group.messages[0];

@@ -924,3 +924,40 @@ describe('snapshots: package groups', () => {
     expect(read?.val.surface?.nodes[1]?.group.kind).toBe('package');
   });
 });
+
+
+// The refusal group kind round-trips through the checkpoint validator: a
+// projection state carrying a refusal carrier is a state this module writes
+// and reads back, exactly like a package group.
+describe('snapshots: refusal groups', () => {
+  it('round-trips a checkpoint carrying a refusal group', async () => {
+    const path = home();
+    const events = await seedJournal(path);
+    const state = await stateOf(events);
+    const mark = state.watermark!;
+    if (state.surface === null) throw new Error('expected a folded surface');
+    const heading = state.surface.heading;
+    const nodes = [
+      state.surface.nodes[0]!,
+      {
+        position: 1,
+        group: {
+          id: { seq: mark.seq, hash: mark.hash }, kind: 'refusal' as const, turn: 0,
+          messages: [{ role: 'system' as const, content: 'commit refused (git-exit): x' }],
+          sources: [{ seq: mark.seq, hash: mark.hash }],
+        },
+      },
+    ];
+    const revision = sha256HexOf(Buffer.from(canonicalBytes({ heading, nodes })));
+    const enriched = {
+      ...clone(state),
+      surface: { heading, nodes, revision },
+    } as unknown as ProjectionState;
+    const snap: Snapshot = { ver: 1, seq: mark.seq, hash: mark.hash, val: enriched };
+
+    await expect(writeSnapshot(path, 'n1', snap)).resolves.toBe(true);
+    const read = await readSnapshot(path, 'n1', events);
+    expect(read).toEqual(snap);
+    expect(read?.val.surface?.nodes[1]?.group.kind).toBe('refusal');
+  });
+});
