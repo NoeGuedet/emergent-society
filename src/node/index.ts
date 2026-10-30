@@ -14,6 +14,8 @@
 
 export {
   NodeDriver,
+  type FenceOutcome,
+  type FencePort,
   type NodeDriverOptions,
   type NodeState,
   type TurnContext,

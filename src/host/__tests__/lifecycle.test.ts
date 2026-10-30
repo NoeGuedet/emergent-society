@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
-  link, mkdtemp, readdir, readFile, rm, symlink, writeFile,
+  link, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -25,6 +25,7 @@ import {
 } from '../host.js';
 import { createHostLog, type HostLog } from '../observe.js';
 import { readOwner } from '../owner.js';
+import { formatStatus, readStatus } from '../status.js';
 
 /**
  * The host lifetime's acceptance: one process owns one cell from the signal
@@ -486,7 +487,7 @@ it('reclaims a stale owner whose pid was reaped', async () => {
   expect(logged(log)).toContainEqual(
     expect.objectContaining({
       event: 'host/boot', sandbox: 'off', launch: 'direct',
-      limits: 'unavailable', reap: 'direct',
+      limits: 'unavailable', reap: 'direct', fence: 'unavailable',
     }),
   );
   const live = await readOwner(home);
@@ -494,6 +495,7 @@ it('reclaims a stale owner whose pid was reaped', async () => {
   if (live.kind === 'live') {
     expect(live.record.pid).not.toBe(dead);
     expect(live.record.sandbox).toBe('off');
+    expect(live.record.fence).toBe('unavailable');
   }
   expect((await readdir(home)).filter((name) => name.startsWith('.host.'))).toEqual([]);
   h.stop();
@@ -508,6 +510,78 @@ it('records the launched Landlock mode in the owner record', async () => {
   const live = await readOwner(home);
   expect(live.kind).toBe('live');
   if (live.kind === 'live') expect(live.record.sandbox).toBe('landlock');
+  h.stop();
+  expect(await h.done).toBe(0);
+}, 20_000);
+
+// C2: an unfenced host is a durable, operator-visible fact. With the cgroup
+// attach degraded (the stub), the cell has no fence port; the boot line, the
+// owner record and `status` all carry `fence=unavailable`, and no successful
+// commit can clear it. The record is annotated after the attach, so `status`
+// reads it while the host is live.
+it('records an unavailable fence in the owner record, boot line and status', async () => {
+  await serve();
+  const h = track(startHost({ ...opts, sandbox: {} }, hostDeps));
+  await waitForLog(log, 'host/parked');
+  expect(logged(log)).toContainEqual(
+    expect.objectContaining({ event: 'host/boot', fence: 'unavailable', limits: 'unavailable' }),
+  );
+  const live = await readOwner(home);
+  expect(live.kind).toBe('live');
+  if (live.kind === 'live') {
+    expect(live.record.fence).toBe('unavailable');
+    expect(live.record.fenceReason).toBe('no-cell-cgroup');
+  }
+  const report = await readStatus(home);
+  expect(report.host).toMatchObject({ state: 'running', fence: 'unavailable' });
+  expect(formatStatus(report)).toContain('fence=unavailable');
+  h.stop();
+  expect(await h.done).toBe(0);
+  expect((await readOwner(home)).kind).toBe('absent');
+}, 20_000);
+
+it('reports a boot leaf it could not thaw on host/degraded', async () => {
+  await serve();
+  const root = await mkdtemp(join(tmpdir(), 'es-boot-stuck-'));
+  const stuck = join(root, 'node-stuck');
+  await mkdir(stuck);
+  await writeFile(join(stuck, 'keep'), 'x');
+  try {
+    const h = track(startHost({ ...opts, sandbox: {} }, {
+      ...hostDeps,
+      attachToCell: async () => ({ ok: true as const, root, limits: false }),
+    }));
+    await waitForLog(log, 'host/parked');
+    expect(logged(log)).toContainEqual(expect.objectContaining({
+      event: 'host/degraded',
+      reason: expect.stringContaining('boot-thaw-failed: node-stuck'),
+    }));
+    h.stop();
+    expect(await h.done).toBe(0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+it('a test-injected fence port makes the host fence-available', async () => {
+  await serve();
+  const fake = {
+    acquire: async () => ({ fenced: true as const, leaves: 0 }),
+    release: async () => {},
+  };
+  const h = track(startHost({ ...opts, sandbox: {} }, { ...hostDeps, fence: fake }));
+  await waitForLog(log, 'host/parked');
+  expect(logged(log)).toContainEqual(
+    expect.objectContaining({ event: 'host/boot', fence: 'available' }),
+  );
+  const live = await readOwner(home);
+  expect(live.kind).toBe('live');
+  if (live.kind === 'live') {
+    expect(live.record.fence).toBe('available');
+    expect(live.record.fenceReason).toBeUndefined();
+  }
+  // An available fence adds no human field: the healthy line stays byte-identical.
+  expect(formatStatus(await readStatus(home))).not.toContain('fence=');
   h.stop();
   expect(await h.done).toBe(0);
 }, 20_000);

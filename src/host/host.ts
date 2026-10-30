@@ -8,6 +8,7 @@ import { loadVerifiedEvents } from '../context/loader.js';
 import { openFrontierJournal, type FrontierJournal } from '../frontier/index.js';
 import { nodeLayout } from '../journal/index.js';
 import { createPackageStore, createRunSupervisor } from '../node/packages/index.js';
+import { singleLine } from '../text.js';
 import { readWorldState, type WorldState } from '../node/world-state.js';
 import { fileURLToPath } from 'node:url';
 import type { ProviderRegistry } from '../node/tools/providers.js';
@@ -15,7 +16,7 @@ import { DEFAULT_TERMINAL_ENV } from '../node/tools/terminal.js';
 import { webToolsFromProviders } from '../node/tools/web.js';
 import {
   NodeDriver, NodeStateError, WorldRepo, createAgentRuntime,
-  type AgentRuntime, type TurnHandler, type TurnResult,
+  type AgentRuntime, type FencePort, type TurnHandler, type TurnResult,
 } from '../node/index.js';
 import { ProviderAdapter } from '../provider/adapter.js';
 import { systemProviderPolicy } from '../provider/policy.js';
@@ -31,6 +32,7 @@ import {
   attachCell, bootHygiene, detectLaunchMode, ensureLeaf, LIMITS, limitLeaf, nodeLeaf, runLeaf,
 } from './cgroups.js';
 import type { CellCgroup } from './cgroups.js';
+import { createFencePort } from './fence.js';
 import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
 
 /**
@@ -71,6 +73,11 @@ import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
  * whether tools ran, and for a recoverable failure the failure's code and
  * status). A thrown handler is `turn/error` with the error's *name* only, and
  * the throw propagates unchanged for the driver to classify.
+ *
+ * The commit fence (C2) is built here, from the attached cell root and the node
+ * uid, and injected into `NodeDriver.open`; a test-only `CellOptions.fence` wins
+ * over it. The returned `Cell.fence` is the host-lifetime availability fact the
+ * lifetime records in the owner record and on `host/boot`.
  */
 
 /** Everything one cell needs to exist; every field is already validated. */
@@ -82,6 +89,14 @@ export type CellOptions = {
     readonly launcherPath?: string; readonly cgroupRoot?: string;
     readonly leafLimits?: { readonly memoryMaxBytes: number; readonly pidsMax: number };
   };
+  /**
+   * TEST-ONLY fence injection (the fence-off control and the driver's unit
+   * suites): it wins over the production port, which is built from
+   * `sandbox.cgroupRoot` when the attach succeeded. There is no production
+   * switch — `HostDeps.fence` is the only other seam, and it is likewise never
+   * set by the CLI.
+   */
+  readonly fence?: FencePort;
   readonly pollMs?: number; readonly log: HostLog;
 };
 
@@ -91,6 +106,13 @@ export type Cell = {
   readonly runtime: AgentRuntime; readonly driver: NodeDriver;
   /** The effective journaled config after the ready phase, not necessarily `CellOptions.config`. */
   readonly config: AgentConfig; readonly webTools: boolean;
+  /**
+   * Whether this cell committed under a fence: the production port was built
+   * from the attached cell root or a test-only port was injected. The host
+   * records this fact in the owner record and on `host/boot`; an unfenced cell
+   * is a host-lifetime fact, never a per-commit one.
+   */
+  readonly fence: 'available' | 'unavailable';
   /**
    * The durable degraded-world sidecar read after `NodeDriver.open` (so a
    * boot-reconcile refusal is included), replayed at composition: the host
@@ -135,6 +157,14 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
       home, uid, worldDir: paths.world, scratchDir: join(home, 'tmp', uid),
     });
     const cgroupRoot = sandbox !== false ? sandbox.cgroupRoot : undefined;
+    // The commit fence (C2): the production port is built from the attached
+    // cell root; a test-only injected port wins. Absent means this cell has no
+    // fence (a degraded attach or an off cell), and `Cell.fence` tells the
+    // operator-facing surfaces so — the unfenced fact is host-lifetime, never
+    // a silent per-commit property.
+    const fencePort = options.fence ?? (cgroupRoot !== undefined
+      ? createFencePort({ root: cgroupRoot, uid, log })
+      : undefined);
     const shellSandbox = sandbox === false ? false : {
       ...(sandbox.launcherPath !== undefined ? { launcherPath: sandbox.launcherPath } : {}),
       ...(cgroupRoot !== undefined ? { cgroupPath: nodeLeaf(cgroupRoot, uid) } : {}),
@@ -191,6 +221,7 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
       knownTypes: C13_EVENT_TYPES,
       hooks: runtime.hooks,
       ...(pollMs !== undefined ? { worldPollMs: pollMs } : {}),
+      ...(fencePort !== undefined ? { fence: fencePort } : {}),
       onError: (err) => log.emit('driver/error', { error: err.name }),
       onMaintenance: () => log.emit('host/parked'),
       schedule: (ms, callback) => {
@@ -230,7 +261,9 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
     };
     return {
       world, frontier, runtime, driver, config: effective,
-      webTools: webTools !== undefined, worldState, close,
+      webTools: webTools !== undefined, worldState,
+      fence: fencePort !== undefined ? 'available' : 'unavailable',
+      close,
     };
   } catch (err) {
     await frontier.close().catch(() => {});
@@ -292,7 +325,16 @@ async function attachSandbox(
       log.emit('host/degraded', { home, uid, reason: attach.reason });
       return sandbox;
     }
-    await bootHygiene(attach.root);
+    const hygiene = await bootHygiene(attach.root);
+    if (hygiene.failed.length > 0) {
+      // A leaf that survived the thaw/kill keeps a possibly frozen process on
+      // disk: never boot silently over it. The names are leaf basenames, never
+      // paths; the reason is bounded like every host diagnostic.
+      const names = hygiene.failed.slice(0, 8).join(',');
+      log.emit('host/degraded', {
+        home, uid, reason: singleLine(`boot-thaw-failed: ${names}`, 200),
+      });
+    }
     return {
       ...sandbox,
       cgroupRoot: attach.root,
@@ -329,6 +371,13 @@ export type HostDeps = {
   readonly installSignals?: boolean; readonly keepAlive?: boolean;
   /** The cell-tree attach seam; production builds the cgroup tree, tests stub it. */
   readonly attachToCell?: (home: string) => Promise<CellCgroup>;
+  /**
+   * TEST-ONLY fence injection (the fence-off control). It wins over the
+   * production port built from the attached cell root; no env switch or CLI
+   * flag reaches it, so production can never run unfenced while claiming a
+   * fence.
+   */
+  readonly fence?: FencePort;
   readonly compose?: (options: CellOptions) => Promise<Cell>;
   readonly now?: () => number;
   readonly proc?: ProcessHandlersTarget;
@@ -634,10 +683,33 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       // Read the launch mode before the attach moves this process into svc/.
       const launchMode = detectLaunchMode();
       const cellSandbox = await attachSandbox(home, uid, sandbox, log, deps);
+      // The fence fact is known only after the attach: an attached cell root
+      // (or a test-only injected port) means this host commits fenced; an off
+      // cell or a degraded attach commits unfenced and says so. It is written
+      // to the owner record here, never cleared by a later successful commit,
+      // and repeated on `host/boot` and in `status`.
+      const fenceFact: 'available' | 'unavailable' =
+        (cellSandbox !== false && cellSandbox.cgroupRoot !== undefined)
+          || deps.fence !== undefined
+          ? 'available' : 'unavailable';
+      try {
+        await owner.annotate({
+          fence: fenceFact,
+          ...(fenceFact === 'available'
+            ? {}
+            : { fenceReason: sandbox === false ? 'sandbox-off' : 'no-cell-cgroup' }),
+        });
+      } catch {
+        // The owner record is liveness metadata, not a truth artifact: a failed
+        // annotate must not turn a boot into a failure. `host/boot` still
+        // carries the fact and the diagnostic names the step only.
+        log.emit('host/degraded', { home, uid, reason: 'owner-annotate-failed' });
+      }
       const providers = await loadProviderStore(home);
       const credential = llmCredentialFrom(providers);
       cell = await (deps.compose ?? composeCell)({
         home, uid, config, credential, providers, sandbox: cellSandbox, log,
+        ...(deps.fence !== undefined ? { fence: deps.fence } : {}),
         ...(pollMs !== undefined ? { pollMs } : {}),
       });
       log.emit('host/boot', {
@@ -648,6 +720,9 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         limits: cellSandbox !== false && cellSandbox.leafLimits !== undefined
           ? 'available' : 'unavailable',
         reap: launchMode,
+        // The commit fence is a host-lifetime fact, never per-commit: a host
+        // that cannot fence commits unfenced and says so here.
+        fence: cell.fence,
         // The replayed degraded-world sidecar, read at composition: a status
         // projection, never a second truth.
         world: cell.worldState.degraded ? 'degraded' : 'healthy',

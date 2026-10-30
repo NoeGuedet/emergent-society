@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, statfsSync } from 'node:fs';
 import {
-  mkdir, readdir, readFile, rmdir, writeFile,
+  lstat, mkdir, readdir, readFile, rmdir, writeFile,
 } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
@@ -294,6 +294,36 @@ export async function ensureLeaf(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true });
 }
 
+/**
+ * The cell's Run leaves under `root`, sorted, as absolute paths. Strictly
+ * non-destructive: one `readdir`, never a thaw, kill or removal, so the commit
+ * fence can enumerate what to freeze without racing the boot hygiene or the
+ * reaper. Only directories are leaves (cgroupfs exposes its control files at
+ * every level); a missing root lists as empty, and a Run leaf created after the
+ * list is simply not fenced by this attempt — it was not inside the critical
+ * section's snapshot. The node's own leaf is named explicitly by the caller
+ * (it may not exist yet and is created by the fence).
+ */
+export async function listLeaves(root: string): Promise<readonly string[]> {
+  let entries: string[];
+  try {
+    entries = await readdir(root);
+  } catch {
+    return [];
+  }
+  const names: string[] = [];
+  for (const name of entries) {
+    if (!name.startsWith('run-')) continue;
+    try {
+      const entry = await lstat(join(root, name));
+      if (entry.isDirectory()) names.push(name);
+    } catch {
+      // A leaf removed between readdir and lstat is gone, not a failure.
+    }
+  }
+  return names.sort().map((name) => join(root, name));
+}
+
 export type FreezeVerdict =
   | { readonly ok: true }
   | { readonly ok: false; readonly reason: string };
@@ -302,6 +332,12 @@ export type FreezeVerdict =
  * Freezes the given leaves and waits for `cgroup.events` to report `frozen 1`
  * on each, bounded by the deadline. On any failure it thaws everything and
  * returns a typed refusal — a caller must never be left frozen.
+ *
+ * A leaf that vanishes between the freeze write and a poll is GONE, not
+ * pending: a removed cgroup has no process left to freeze, so its `ENOENT`
+ * removes it from the wait instead of holding every other leaf (or a commit)
+ * to the full deadline. An unreadable events file that is not ENOENT is still
+ * not proof of a freeze and keeps waiting; only the deadline ends that wait.
  */
 export async function freezeSet(
   leaves: readonly string[],
@@ -321,17 +357,29 @@ export async function freezeSet(
     }
   }
   const deadline = Date.now() + opts.deadlineMs;
+  let waiting = [...leaves];
   for (;;) {
     let pending = 0;
-    for (const leaf of leaves) {
+    const gone: string[] = [];
+    for (const leaf of waiting) {
       let frozen = false;
       try {
         const events = await readFile(join(leaf, 'cgroup.events'), 'utf8');
         frozen = /^\s*frozen\s+1\s*$/mu.test(events);
-      } catch {
-        // An unreadable events file is not proof of a freeze; keep waiting.
+      } catch (err) {
+        // ENOENT is "the leaf no longer exists": nothing in it can move, and
+        // waiting for its events could only end at the deadline.
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          gone.push(leaf);
+          continue;
+        }
+        // Any other unreadable events file is not proof of a freeze; keep
+        // waiting rather than report a freeze we cannot see.
       }
       if (!frozen) pending += 1;
+    }
+    if (gone.length > 0) {
+      waiting = waiting.filter((leaf) => !gone.includes(leaf));
     }
     if (pending === 0) return { ok: true };
     if (Date.now() >= deadline) {
@@ -369,19 +417,33 @@ function isSvcLeaf(leaf: string): boolean {
 }
 
 /**
+ * What boot hygiene proved: the leaves it visited, and the ones it could not
+ * remove. A leaf that survives `rmdir` (a process outlived the kill, or the
+ * thaw write failed) is named here; the host reports it on `host/degraded`
+ * instead of booting silently over a possibly frozen leaf.
+ */
+export type BootHygiene = {
+  readonly reaped: number;
+  readonly failed: readonly string[];
+};
+
+/**
  * Boot hygiene: every leaf of this home's cell root is thawed and killed at
  * composition — a `cgroup.freeze` bit persists across a crash, so a leaf left
  * frozen by a dead kernel would freeze the next node on entry. `svc/` is
- * skipped: it holds the kernel itself.
+ * skipped: it holds the kernel itself. A leaf that cannot be removed after the
+ * thaw/kill is not swallowed: it is returned in `failed` so the host can emit a
+ * bounded diagnostic (the frozen or busy leaf stays on disk).
  */
-export async function bootHygiene(root: string): Promise<number> {
+export async function bootHygiene(root: string): Promise<BootHygiene> {
   let entries: string[];
   try {
     entries = await readdir(root);
   } catch {
-    return 0;
+    return { reaped: 0, failed: [] };
   }
   let reaped = 0;
+  const failed: string[] = [];
   for (const name of entries) {
     // readdir on a cgroup also lists its control files (cgroup.controllers,
     // …); only the leaf directories are children of the cell.
@@ -389,10 +451,16 @@ export async function bootHygiene(root: string): Promise<number> {
     const leaf = join(root, name);
     await thawSet([leaf]);
     await killLeaves([leaf]);
-    await rmdir(leaf).catch(() => {});
+    try {
+      await rmdir(leaf);
+    } catch {
+      // Still present after thaw+kill: a surviving process or a failed thaw.
+      // The name (a leaf basename, never a path) is the bounded diagnostic.
+      if (await lstat(leaf).then(() => true, () => false)) failed.push(name);
+    }
     reaped += 1;
   }
-  return reaped;
+  return { reaped, failed };
 }
 
 /** Best-effort removal of the cell tree (the self-move leaf first, then the root). */

@@ -1,13 +1,17 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFileSync, realpathSync } from 'node:fs';
-import { lstat, mkdir, readFile, rmdir, writeFile } from 'node:fs/promises';
+import {
+  lstat, mkdir, mkdtemp, readFile, rm, rmdir, writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   attachCell, bootHygiene, cellHash, cellRootUnder, cellUnitName,
   cgroupCapabilities, detectLaunchMode, enableControllers, ensureLeaf, freezeSet,
-  killLeaves, launchModeFromCgroup, limitLeaf, nodeLeaf, resolveAnchor, runLeaf, svcDir,
+  killLeaves, launchModeFromCgroup, limitLeaf, listLeaves, nodeLeaf, resolveAnchor,
+  runLeaf, svcDir,
 } from '../cgroups.js';
 
 /**
@@ -253,7 +257,7 @@ describe.skipIf(freezeLeaf === null)('cgroup attach, freeze and kill', () => {
       await ensureLeaf(b);
       await ensureLeaf(svcDir(root));
       await writeFile(join(a, 'cgroup.freeze'), '1');
-      expect(await bootHygiene(root)).toBe(2);
+      expect(await bootHygiene(root)).toEqual({ reaped: 2, failed: [] });
       expect((await lstat(a).catch(() => null))).toBeNull();
       expect((await lstat(b).catch(() => null))).toBeNull();
       expect((await lstat(svcDir(root)).catch(() => null))).not.toBeNull();
@@ -261,6 +265,22 @@ describe.skipIf(freezeLeaf === null)('cgroup attach, freeze and kill', () => {
       await removeTree(root);
     }
   }, 15_000);
+
+  it('reports a leaf it could not remove after the thaw/kill', async () => {
+    // A plain directory shaped like a cgroup leaf: the thaw/kill writes create
+    // their control files, and the extra file keeps rmdir from succeeding. The
+    // host must name it rather than boot silently over it.
+    const root = await mkdtemp(join(tmpdir(), 'es-boot-stuck-'));
+    try {
+      const stuck = join(root, 'node-stuck');
+      await mkdir(stuck);
+      await writeFile(join(stuck, 'keep'), 'x');
+      expect(await bootHygiene(root)).toEqual({ reaped: 1, failed: ['node-stuck'] });
+      expect(await lstat(stuck).catch(() => null)).not.toBeNull();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   it('reports both capability classes without mutating the anchor', async () => {
     const caps = await cgroupCapabilities(anchor as string);
@@ -271,5 +291,76 @@ describe.skipIf(freezeLeaf === null)('cgroup attach, freeze and kill', () => {
     expect(caps.limits).toBe(limitsAvailable);
     const own = await readFile('/proc/self/cgroup', 'utf8');
     expect(own).toMatch(new RegExp((anchor as string).split('/').pop() as string, 'u'));
+  });
+
+  // G2: the commit fence freezes an EMPTY node leaf on a boot-reconcile or an
+  // idle turn, before any shell has run. The transition must be a tested fact,
+  // not an assumption: an empty cgroup still reports `frozen 1` promptly.
+  it('freezes an empty leaf: no process, frozen 1, then thaw', async () => {
+    const root = await freshRoot();
+    const leaf = join(root, 'node-empty');
+    try {
+      await ensureLeaf(leaf);
+      const started = Date.now();
+      expect(await freezeSet([leaf], { deadlineMs: 2000, pollMs: 20 })).toEqual({ ok: true });
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(await readFile(join(leaf, 'cgroup.events'), 'utf8')).toMatch(/frozen 1/u);
+      expect((await readFile(join(leaf, 'cgroup.procs'), 'utf8')).trim()).toBe('');
+      await writeFile(join(leaf, 'cgroup.freeze'), '0');
+      expect(await readFile(join(leaf, 'cgroup.events'), 'utf8')).toMatch(/^\s*frozen\s+0\s*$/mu);
+    } finally {
+      await writeFile(join(leaf, 'cgroup.freeze'), '0').catch(() => {});
+      await removeTree(root);
+    }
+  }, 15_000);
+});
+
+// The fence's enumeration and vanished-leaf semantics are filesystem facts, not
+// cgroup facts: they run on a plain temp directory so every host exercises them.
+describe('leaf enumeration and vanished leaves', () => {
+  it('lists only run-* directories, sorted, and never mutates them', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'es-listleaves-'));
+    try {
+      await mkdir(join(root, 'run-b'));
+      await mkdir(join(root, 'run-a'));
+      await mkdir(join(root, 'node-node-0'));
+      await mkdir(join(root, 'svc'));
+      await writeFile(join(root, 'run-file'), 'not a leaf');
+      expect(await listLeaves(root)).toEqual([join(root, 'run-a'), join(root, 'run-b')]);
+      // Non-destructive: readdir/lstat only, nothing thawed, killed or removed.
+      for (const name of ['run-a', 'run-b', 'node-node-0', 'svc', 'run-file']) {
+        expect((await lstat(join(root, name))).isDirectory()).toBe(name !== 'run-file');
+      }
+      expect(await listLeaves(join(root, 'missing'))).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a leaf whose events file vanished as gone, not as a timeout', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'es-vanish-'));
+    const leaf = join(root, 'run-gone');
+    try {
+      await mkdir(leaf); // no cgroup.events: the leaf is "gone" after the write
+      const started = Date.now();
+      expect(await freezeSet([leaf], { deadlineMs: 500, pollMs: 20 })).toEqual({ ok: true });
+      expect(Date.now() - started).toBeLessThan(400);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('times out a leaf that never reports frozen, and thaws it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'es-nofreeze-'));
+    const leaf = join(root, 'run-stuck');
+    try {
+      await mkdir(leaf);
+      await writeFile(join(leaf, 'cgroup.events'), 'frozen 0\n');
+      expect(await freezeSet([leaf], { deadlineMs: 100, pollMs: 10 }))
+        .toEqual({ ok: false, reason: 'freeze-timeout' });
+      expect((await readFile(join(leaf, 'cgroup.freeze'), 'utf8')).trim()).toBe('0');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

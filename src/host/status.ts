@@ -46,6 +46,15 @@ export type StatusReport = {
     /** Present only when the running record carries it (any host that records
      * its mode); never fabricated for an idle or stale home. */
     readonly sandbox?: 'landlock' | 'off';
+    /**
+     * The host-lifetime commit-fence fact from the owner record, surfaced while
+     * a host holds the record. A host with an available fence prints no human
+     * field (healthy lines stay byte-identical); `unavailable` is the one
+     * operator-visible degradation, never cleared by a later successful commit.
+     */
+    readonly fence?: 'available' | 'unavailable';
+    /** One bounded class label for an unavailable fence, when the record has one. */
+    readonly fenceReason?: string;
   };
   readonly frontier: {
     readonly present: boolean; readonly count: number; readonly lastHash: string | null;
@@ -144,6 +153,16 @@ function isIncompletePayload(data: unknown): data is { readonly call: string } {
  */
 async function hostOf(home: string): Promise<StatusReport['host']> {
   const owner = await readOwner(home);
+  /** The host facts beyond identity, present only when the record carries them. */
+  const facts = (record: {
+    readonly sandbox?: 'landlock' | 'off';
+    readonly fence?: 'available' | 'unavailable';
+    readonly fenceReason?: string;
+  }): Pick<StatusReport['host'], 'sandbox' | 'fence' | 'fenceReason'> => ({
+    ...(record.sandbox === undefined ? {} : { sandbox: record.sandbox }),
+    ...(record.fence === undefined ? {} : { fence: record.fence }),
+    ...(record.fenceReason === undefined ? {} : { fenceReason: record.fenceReason }),
+  });
   switch (owner.kind) {
     case 'live':
       return {
@@ -151,13 +170,13 @@ async function hostOf(home: string): Promise<StatusReport['host']> {
         pid: owner.record.pid,
         uid: owner.record.uid,
         command: owner.record.command,
-        ...(owner.record.sandbox === undefined ? {} : { sandbox: owner.record.sandbox }),
+        ...facts(owner.record),
       };
     case 'unverified':
       return {
         state: 'unverified',
         pid: owner.record.pid,
-        ...(owner.record.sandbox === undefined ? {} : { sandbox: owner.record.sandbox }),
+        ...facts(owner.record),
       };
     case 'stale':
       // No pid: the recorded process is gone, and repeating its pid would
@@ -358,17 +377,25 @@ function bounded(text: string, limit = 120): string {
   return singleLine(text, limit);
 }
 
-/** The host line, one shape per owner state; `stale` carries no pid. */
+/**
+ * The host line, one shape per owner state; `stale` carries no pid. The fence
+ * field appears only for `unavailable`: a fenced host's line stays
+ * byte-identical to the pre-fence report, and the unavailable fact is the one
+ * degradation an operator must see.
+ */
 function hostLine(host: StatusReport['host']): string {
+  const fence = host.fence === 'unavailable' ? ' fence=unavailable' : '';
   switch (host.state) {
     case 'running':
-      return host.sandbox === undefined
+      return (host.sandbox === undefined
         ? `host: running pid=${host.pid} uid=${host.uid} command=${host.command}`
-        : `host: running pid=${host.pid} uid=${host.uid} command=${host.command} sandbox=${host.sandbox}`;
+        : `host: running pid=${host.pid} uid=${host.uid} command=${host.command} sandbox=${host.sandbox}`)
+        + fence;
     case 'unverified':
-      return host.sandbox === undefined
+      return (host.sandbox === undefined
         ? `host: unverified pid=${host.pid}`
-        : `host: unverified pid=${host.pid} sandbox=${host.sandbox}`;
+        : `host: unverified pid=${host.pid} sandbox=${host.sandbox}`)
+        + fence;
     case 'stale':
       return 'host: stale';
     case 'idle':

@@ -7,7 +7,9 @@ import { systemClock } from '../util.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
 import { NodeStateError, WorldReconciliationError, GitCommandError } from './errors.js';
 import { WakeLatch } from './latch.js';
-import { commitAllRefused, type CommitRefusal } from './world-commit.js';
+import {
+  boundedRefusalDetail, commitAllRefused, type CommitRefusal,
+} from './world-commit.js';
 import { clearWorldState, markWorldDegraded } from './world-state.js';
 import {
   createBoundaryGate,
@@ -84,6 +86,40 @@ export interface TurnContext {
 
 export type TurnHandler = (ctx: TurnContext) => Promise<TurnResult> | TurnResult;
 
+/**
+ * What one fence attempt proved. `fenced` names how many leaves are frozen (the
+ * node leaf plus every Run leaf that existed at acquire time); a non-fenced
+ * outcome is either `unavailable` — the host has no usable fence, so the commit
+ * may proceed unfenced and the host records why — or `freeze-failed`, a fence
+ * that was attempted and could not be established (a runtime cgroup failure),
+ * which is a typed commit refusal, never an unfenced commit.
+ */
+export type FenceOutcome =
+  | { readonly fenced: true; readonly leaves: number }
+  | {
+    readonly fenced: false;
+    readonly reason: 'unavailable' | 'freeze-failed';
+    readonly detail?: string;
+  };
+
+/**
+ * The commit fence: the host's cgroup port that freezes every shell/Run leaf
+ * around the commit's critical section (walk → add → write-tree → commit-tree →
+ * update-ref), so a writer inside a leaf cannot change the tree between staging
+ * and tree creation.
+ *
+ * `acquire` is called once per `commitWorld` attempt, outside the commit queue
+ * and the internal git retries; `release` is called exactly once in a `finally`
+ * and is idempotent — the driver guarantees it runs before the closer and
+ * shutdown even when the commit or the turn failed. A port must never let a
+ * caller end up frozen: a failed acquire thaws what it froze. `release` never
+ * throws; the driver also guards it, so a broken port cannot displace a commit.
+ */
+export interface FencePort {
+  acquire(): Promise<FenceOutcome>;
+  release(): Promise<void>;
+}
+
 export interface NodeDriverOptions extends JournalWriterOptions {
   /**
    * The inherited write-behind/head diagnostic sink, and also the driver's
@@ -121,6 +157,14 @@ export interface NodeDriverOptions extends JournalWriterOptions {
    * supervisor's own seam, applied one layer up.
    */
   schedule?: (ms: number, callback: () => void) => () => void;
+  /**
+   * The commit fence (C2). Absent means the host has no usable cgroup fence
+   * (a degraded attach or an off cell): the commit proceeds unfenced, and the
+   * host records that degradation in the owner record and on its boot line.
+   * Present means one `acquire`/`release` wraps the whole commit attempt; a
+   * runtime freeze failure becomes the typed refusal `freeze-timeout`.
+   */
+  fence?: FencePort;
 }
 
 /** The bounded self-retry delays: three attempts, then the cell stays parked. */
@@ -770,20 +814,75 @@ export class NodeDriver {
    * but it publishes nothing, so a held ref lock can still block the next real
    * commit and the degraded projection must stay. A refusal is returned, never
    * thrown, so the caller decides. Unknown failures still throw.
+   *
+   * The commit fence (C2): when a port is present, one `acquire`/`release`
+   * wraps this WHOLE attempt — outside the commit queue and the internal git
+   * retries, so a retry does not thaw between attempts. `release` runs in a
+   * `finally`, before the closer is written, and never displaces the attempt's
+   * own outcome. A present port that cannot hold the cell — a freeze failure, a
+   * port that reports `unavailable`, or an acquire that throws — is the typed
+   * refusal `freeze-timeout`, and `commitAll` never runs: a fence that was
+   * available at boot and cannot be established now never degrades into an
+   * unfenced commit. Only the ABSENCE of a port is the host's unfenced case,
+   * and that fact is carried by the owner record from boot.
    */
   private async commitWorld(turn: number): Promise<DriverCommitAttempt> {
-    const attempt = await commitAllRefused(
-      () => this.world.commitAll(this.uid, `turn ${turn}`),
-    );
-    if (attempt.refusal !== null) return { commit: null, refusal: attempt.refusal };
-    const commit = attempt.commit?.hash ?? null;
-    if (commit !== null) {
-      this.retryAttempt = 0;
-      this.clearRetryTimer();
-      await this.clearWorldDegraded();
-      this.watcher.poke();
+    const fence = this.opts.fence;
+    try {
+      if (fence !== undefined) {
+        let outcome: FenceOutcome;
+        try {
+          outcome = await fence.acquire();
+        } catch {
+          return {
+            commit: null,
+            refusal: {
+              reason: 'freeze-timeout',
+              detail: boundedRefusalDetail('the commit fence could not be acquired'),
+            },
+          };
+        }
+        if (!outcome.fenced) {
+          return {
+            commit: null,
+            refusal: {
+              reason: 'freeze-timeout',
+              detail: boundedRefusalDetail(
+                outcome.detail ?? (outcome.reason === 'unavailable'
+                  ? 'the commit fence is unavailable'
+                  : 'the commit fence could not freeze the cell')),
+            },
+          };
+        }
+      }
+      const attempt = await commitAllRefused(
+        () => this.world.commitAll(this.uid, `turn ${turn}`),
+      );
+      if (attempt.refusal !== null) return { commit: null, refusal: attempt.refusal };
+      const commit = attempt.commit?.hash ?? null;
+      if (commit !== null) {
+        this.retryAttempt = 0;
+        this.clearRetryTimer();
+        await this.clearWorldDegraded();
+        this.watcher.poke();
+      }
+      return { commit, refusal: null };
+    } finally {
+      // The contract is that `release` never throws; the guard keeps a broken
+      // port from displacing the commit's own answer, and the diagnostic is a
+      // fixed label — a release fault is not a commit refusal.
+      if (fence !== undefined) {
+        try {
+          await fence.release();
+        } catch {
+          // A named fault, so the host's name-only diagnostic keeps the step:
+          // the fixed label is the only payload a release failure contributes.
+          const fault = new Error('fence release failed');
+          fault.name = 'FenceReleaseError';
+          try { this.opts.onError?.(fault); } catch { /* diagnostic */ }
+        }
+      }
     }
-    return { commit, refusal: null };
   }
 
   /**

@@ -173,6 +173,18 @@ it('formats the exact lines and omits null last records', () => {
   expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9 } })).toContain('unverified pid=9');
   expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9, sandbox: 'off' } })).toContain('unverified pid=9 sandbox=off');
   expect(formatStatus({ ...full, host: { ...full.host, sandbox: 'landlock' } })).toContain('host: running pid=7 uid=node-0 command=start sandbox=landlock');
+  // The fence field is printed only when unavailable: an available (or absent)
+  // fence changes no byte of a healthy line.
+  expect(formatStatus({ ...full, host: { ...full.host, fence: 'available' as const } }))
+    .toBe(formatStatus(full));
+  expect(formatStatus({ ...full, host: { ...full.host, fence: 'unavailable' as const } }))
+    .toBe(formatStatus(full).replace(
+      'host: running pid=7 uid=node-0 command=start',
+      'host: running pid=7 uid=node-0 command=start fence=unavailable',
+    ));
+  expect(formatStatus({
+    ...base, host: { state: 'unverified' as const, pid: 9, fence: 'unavailable' as const },
+  })).toContain('unverified pid=9 fence=unavailable');
   expect(formatStatus({ ...base, world: { present: false, head: null, error: null, state: 'healthy' as const } })).toContain('world: absent');
 });
 it('reports the durable degraded world sidecar, and only a successful commit clears it', async () => {
@@ -225,6 +237,34 @@ it('reports world HEAD, world absent and host owner states', async () => {
   await writeFile(join(home,'host.json'), JSON.stringify({ ...owner.record, pid: dead, token:'a'.repeat(32), startTime:1 }), { mode:0o600 });
   await chmod(join(home,'host.json'), 0o600);
   expect((await readStatus(home)).host).toEqual({ state:'stale' });
+});
+it('surfaces the owner record\'s fence fact while a host holds it', async () => {
+  const fenced = await acquireOwner(home, { uid: 'node-0', command: 'start' });
+  await fenced.annotate({ fence: 'available' });
+  expect((await readStatus(home)).host).toEqual({
+    state: 'running', pid: fenced.record.pid, uid: 'node-0', command: 'start',
+    fence: 'available',
+  });
+  // The available fact adds no human field; `--json` carries it.
+  expect(formatStatus(await readStatus(home)))
+    .not.toContain('fence=');
+  await fenced.release();
+  // A record with no fence key (every pre-fence record) is reported exactly as
+  // before — no fabricated field.
+  const unfenced = await acquireOwner(home, { uid: 'node-0', command: 'start' });
+  expect((await readStatus(home)).host).toEqual({
+    state: 'running', pid: unfenced.record.pid, uid: 'node-0', command: 'start',
+  });
+  await unfenced.annotate({ fence: 'unavailable', fenceReason: 'no-cell-cgroup' });
+  const degraded = await readStatus(home);
+  expect(degraded.host).toEqual({
+    state: 'running', pid: unfenced.record.pid, uid: 'node-0', command: 'start',
+    fence: 'unavailable', fenceReason: 'no-cell-cgroup',
+  });
+  expect(formatStatus(degraded).split('\n')[1])
+    .toBe(`host: running pid=${unfenced.record.pid} uid=node-0 command=start fence=unavailable`);
+  await unfenced.release();
+  expect((await readStatus(home)).host).toEqual({ state: 'idle' });
 });
 it('throws HostConfigError for a missing home and for a non-directory home', async () => {
   await expect(readStatus(join(home,'nope'))).rejects.toBeInstanceOf(HostConfigError);

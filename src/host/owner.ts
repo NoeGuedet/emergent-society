@@ -4,8 +4,9 @@ import {
   link, lstat, open, readFile, rename, unlink,
 } from 'node:fs/promises';
 import { join } from 'node:path';
-import { assertNodeUid } from '../journal/index.js';
+import { assertNodeUid, atomicWriteFile, syncPath } from '../journal/index.js';
 import { processStartTime } from '../journal/lock.js';
+import { singleLine } from '../text.js';
 import {
   HostAlreadyRunningError, HostConfigError, HostPauseError,
 } from './errors.js';
@@ -53,7 +54,15 @@ import {
 /** The command a host was asked to run; carried in the record for `status`. */
 export type HostCommand = 'start' | 'resume';
 
-/** The on-disk shape of `<home>/host.json`: seven keys, or eight with the optional sandbox mode. */
+/**
+ * The host-lifetime fence fact: whether this boot commits under a cgroup fence.
+ * It is known only after the attach, so it is annotated onto the record once the
+ * cell tree exists (or is known absent), and no later successful commit clears
+ * it — an unfenced commit stays an operator-visible fact for the host's life.
+ */
+export type OwnerFence = 'available' | 'unavailable';
+
+/** The on-disk shape of `<home>/host.json`: seven keys, plus the optional host facts. */
 export type HostOwnerRecord = {
   readonly v: 1; readonly pid: number; readonly startTime: number | null;
   readonly token: string; readonly uid: string;
@@ -67,6 +76,14 @@ export type HostOwnerRecord = {
    * module exists to prevent).
    */
   readonly sandbox?: 'landlock' | 'off';
+  /**
+   * Whether this host booted with a usable commit fence. Written after the
+   * cgroup attach (availability is known only then); optional so every record
+   * from before the field stays valid, and the same upgrade guarantee applies.
+   */
+  readonly fence?: OwnerFence;
+  /** One bounded class label for an unavailable fence; never a path or payload. */
+  readonly fenceReason?: string;
 };
 
 /**
@@ -100,6 +117,17 @@ export type OwnerLivenessDeps = {
 export interface OwnerHandle {
   readonly record: HostOwnerRecord;
   release(): Promise<void>;
+  /**
+   * Adds the host-lifetime fence fact to the published record, atomically
+   * (0600 tmp + rename) and only while the record at `<home>/host.json` still
+   * carries this handle's `(pid, token)` — a record a reclaim swapped in is
+   * never overwritten. A no-op after release or after the record is no longer
+   * ours. The reason, when present, is bounded here.
+   */
+  annotate(input: {
+    readonly fence: OwnerFence;
+    readonly fenceReason?: string;
+  }): Promise<void>;
 }
 
 /** The result of asking a host to stop. `exited` means released, not reaped. */
@@ -114,17 +142,21 @@ export const PAUSE_POLL_MS = 100;
 
 const OWNER_BASENAME = 'host.json';
 /**
- * Every key a record may carry: the seven required pre-mode keys plus the one
- * optional mode key. `sandbox` lives here so the unknown-key guard accepts it;
- * its presence is still validated separately in `parseRecord`.
+ * Every key a record may carry: the seven required pre-mode keys plus the
+ * optional host facts (`sandbox`, `fence`, `fenceReason`). They live here so the
+ * unknown-key guard accepts them; each presence is validated separately in
+ * `parseRecord`.
  */
 const RECORD_KEYS = [
-  'v', 'pid', 'startTime', 'token', 'uid', 'command', 'startedAt', 'sandbox',
+  'v', 'pid', 'startTime', 'token', 'uid', 'command', 'startedAt',
+  'sandbox', 'fence', 'fenceReason',
 ] as const;
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 const RESTORE_ATTEMPTS = 3;
 const RESTORE_DELAY_MS = 10;
 const MAX_DIAGNOSTIC = 200;
+/** The fence reason's bound; the reader re-bounds it like a written value. */
+const MAX_FENCE_REASON = 120;
 
 function ownerPath(home: string): string {
   return join(home, OWNER_BASENAME);
@@ -166,10 +198,10 @@ async function readClaim(path: string): Promise<ClaimRead> {
 /**
  * Total validation: only known keys, `v === 1`, a safe-int pid > 0, a safe-int
  * `startTime` ≥ 0 or null, a 32-hex token, a journal-valid uid, a known command,
- * a safe-int `startedAt`, and — when present — a known sandbox mode. The seven
- * pre-mode keys stay required; `sandbox` is the one optional key, so a record
- * from any generation parses and an unknown ninth key still fails. Anything
- * else is `null`, never a throw.
+ * a safe-int `startedAt`, and — when present — a known sandbox mode, a known
+ * fence state and a string fence reason. The seven pre-mode keys stay required;
+ * the host facts are optional, so a record from any generation parses and an
+ * unknown key still fails. Anything else is `null`, never a throw.
  */
 function parseRecord(raw: unknown): HostOwnerRecord | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
@@ -205,9 +237,23 @@ function parseRecord(raw: unknown): HostOwnerRecord | null {
   if (startedAt === null) return null;
   const sandbox = fields['sandbox'];
   if (sandbox !== undefined && sandbox !== 'landlock' && sandbox !== 'off') return null;
-  return sandbox === undefined
-    ? { v: 1, pid, startTime, token, uid, command, startedAt }
-    : { v: 1, pid, startTime, token, uid, command, startedAt, sandbox };
+  const fence = fields['fence'];
+  if (fence !== undefined && fence !== 'available' && fence !== 'unavailable') return null;
+  const fenceReasonValue = fields['fenceReason'];
+  if (fenceReasonValue !== undefined && typeof fenceReasonValue !== 'string') return null;
+  return {
+    v: 1, pid, startTime, token, uid, command, startedAt,
+    ...(sandbox === undefined ? {} : { sandbox }),
+    ...(fence === undefined ? {} : { fence }),
+    ...(fenceReasonValue === undefined
+      ? {}
+      : { fenceReason: boundedFenceReason(fenceReasonValue) }),
+  };
+}
+
+/** The one bounded spelling of a fence reason: one line, no payload growth. */
+function boundedFenceReason(reason: string): string {
+  return singleLine(reason, MAX_FENCE_REASON);
 }
 
 /** `/proc/<pid>/stat`'s state character, or `null` when it cannot be read. */
@@ -586,6 +632,48 @@ class Claim implements OwnerHandle {
     if (this.released) return;
     await releaseRecord(this.home, this.record, this.deps);
     this.released = true;
+  }
+
+  /**
+   * Annotates the published record with the fence fact. The current file is
+   * re-read and must still carry this handle's `(pid, token)`; otherwise this
+   * handle no longer owns the home and the write is skipped rather than
+   * overwrite a record a reclaim swapped in. The replacement is atomic
+   * (`atomicWriteFile`: 0600 tmp, fsync, rename) with the home entry synced
+   * after, so `status` sees either the old record or the annotated one.
+   */
+  async annotate(input: {
+    readonly fence: OwnerFence;
+    readonly fenceReason?: string;
+  }): Promise<void> {
+    if (this.released) return;
+    const target = ownerPath(this.home);
+    const current = await readClaim(target);
+    if (
+      current.kind !== 'record'
+      || current.record.pid !== this.record.pid
+      || current.record.token !== this.record.token
+    ) {
+      return;
+    }
+    // Rebuilt explicitly, not spread: a second annotate must not carry a stale
+    // `fenceReason` from the previous one when the new fact has none.
+    const next: HostOwnerRecord = {
+      v: current.record.v,
+      pid: current.record.pid,
+      startTime: current.record.startTime,
+      token: current.record.token,
+      uid: current.record.uid,
+      command: current.record.command,
+      startedAt: current.record.startedAt,
+      ...(current.record.sandbox === undefined ? {} : { sandbox: current.record.sandbox }),
+      fence: input.fence,
+      ...(input.fenceReason === undefined
+        ? {}
+        : { fenceReason: boundedFenceReason(input.fenceReason) }),
+    };
+    await atomicWriteFile(target, JSON.stringify(next));
+    await syncPath(this.home);
   }
 }
 

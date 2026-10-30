@@ -26,6 +26,12 @@ type OwnerJson = {
    * must accept both shapes as valid (the upgrade guarantee).
    */
   sandbox?: 'landlock' | 'off';
+  /**
+   * The host-lifetime fence fact, written after the cgroup attach; absent from
+   * every record that predates the field, which the reader must accept.
+   */
+  fence?: 'available' | 'unavailable';
+  fenceReason?: string;
 };
 
 let home = '';
@@ -300,4 +306,85 @@ it('maps kill ESRCH to exited and any other kill failure to HostPauseError', asy
       },
     },
   })).rejects.toBeInstanceOf(HostPauseError);
+});
+
+// The C2 host fact: the fence availability is known only after the cgroup
+// attach, so it is annotated onto the live owner record — atomically, and only
+// while the record is still this handle's. The reader accepts records with and
+// without the fields, so the upgrade guarantee holds.
+it('annotates the live record with the fence fact, atomically and 0600', async () => {
+  const h = await acquireOwner(home, { uid: 'node-0', command: 'start' });
+  await h.annotate({ fence: 'unavailable', fenceReason: 'no-cell-cgroup' });
+  expect((await stat(join(home, 'host.json'))).mode & 0o077).toBe(0);
+  expect((await readdir(home)).filter((n) => n.startsWith('.host.'))).toEqual([]);
+  const s = await readOwner(home);
+  expect(s.kind).toBe('live');
+  if (s.kind === 'live') {
+    expect(s.record.fence).toBe('unavailable');
+    expect(s.record.fenceReason).toBe('no-cell-cgroup');
+    expect(s.record.token).toBe(h.record.token);
+  }
+  // A later annotation replaces the fact in place (still this handle's record).
+  await h.annotate({ fence: 'available' });
+  const again = await readOwner(home);
+  expect(again.kind).toBe('live');
+  if (again.kind === 'live') {
+    expect(again.record.fence).toBe('available');
+    // A second annotate must not carry the previous reason.
+    expect(again.record.fenceReason).toBeUndefined();
+  }
+  // The handle's own record still releases the annotated file by token.
+  await h.release();
+  expect((await readOwner(home)).kind).toBe('absent');
+});
+
+it('bounds the fence reason on write and on read', async () => {
+  const h = await acquireOwner(home, { uid: 'node-0', command: 'start' });
+  await h.annotate({ fence: 'unavailable', fenceReason: `bad\n${'x'.repeat(400)}` });
+  const s = await readOwner(home);
+  expect(s.kind).toBe('live');
+  if (s.kind === 'live') {
+    expect(s.record.fenceReason).toBeDefined();
+    expect((s.record.fenceReason as string).length).toBeLessThanOrEqual(120);
+    expect((s.record.fenceReason as string)).not.toContain('\n');
+  }
+  // A hand-edited record is re-bounded by the reader, never trusted as written.
+  await writeOwner({ fence: 'unavailable', fenceReason: 'y'.repeat(400) });
+  const handEdited = await readOwner(home).catch(() => null);
+  expect(handEdited?.kind).toBe('live');
+  if (handEdited?.kind === 'live') {
+    expect((handEdited.record.fenceReason as string).length).toBe(120);
+  }
+  await h.release();
+});
+
+it('annotate never overwrites a record that is no longer this handle\'s', async () => {
+  const h = await acquireOwner(home, { uid: 'node-0', command: 'start' });
+  const other = { ...h.record, token: 'b'.repeat(32), fence: 'unavailable' as const };
+  await writeFile(join(home, 'host.json'), JSON.stringify(other), { mode: 0o600 });
+  const before = await readFile(join(home, 'host.json'), 'utf8');
+  await h.annotate({ fence: 'available' });
+  expect(await readFile(join(home, 'host.json'), 'utf8')).toBe(before);
+});
+
+it('annotate after release is a no-op', async () => {
+  const h = await acquireOwner(home, { uid: 'node-0', command: 'start' });
+  await h.release();
+  await h.annotate({ fence: 'available' });
+  expect((await readOwner(home)).kind).toBe('absent');
+});
+
+it('accepts a pre-fence record and rejects a bad fence value', async () => {
+  await writeOwner({ sandbox: 'landlock' });
+  const s = await readOwner(home);
+  expect(s.kind).toBe('live');
+  if (s.kind === 'live') expect(s.record.fence).toBeUndefined();
+  await writeOwner({ fence: 'available' });
+  const fenced = await readOwner(home);
+  expect(fenced.kind).toBe('live');
+  if (fenced.kind === 'live') expect(fenced.record.fence).toBe('available');
+  await writeOwner({ fence: 'sometimes' as unknown as 'available' });
+  expect((await readOwner(home)).kind).toBe('stale');
+  await writeOwner({ fenceReason: 7 as unknown as string });
+  expect((await readOwner(home)).kind).toBe('stale');
 });

@@ -35,19 +35,20 @@ not individually logged.
 | `main.ts` | Entry point: `runCli(argv)`, escaped errors exit 1 with a bounded label |
 | `cli.ts` | Command dispatch and exit codes ([AGENTS.md](../AGENTS.md)); `--no-sandbox` is the explicit confinement opt-out |
 | `options.ts` | Strict `parseArgs` parsing: five commands plus `--help` (`init`, `start`, `resume`, `pause`, `status`), no positionals, no unknown flags; relative `--home` and bad `--uid` are usage errors |
-| `host.ts` | Host lifetime: boots a cell (frontier journal, runtime, terminal, sandbox), replays the durable degraded-world sidecar into the `host/boot` `world` field, and owns stop/pause delivery |
-| `status.ts` | The read-only status report; degradation is reported, not thrown |
+| `host.ts` | Host lifetime: boots a cell (frontier journal, runtime, terminal, sandbox, commit fence), builds the production `FencePort` from the attached cell root, annotates the owner record's fence fact after the attach, reports a boot leaf it could not thaw on `host/degraded`, replays the durable degraded-world sidecar into the `host/boot` `world` field, and owns stop/pause delivery |
+| `status.ts` | The read-only status report; degradation is reported, not thrown. `host.sandbox`/`host.fence` (and the bounded `fenceReason`) are surfaced while a host holds the record; the human host line prints `fence=unavailable` only when unavailable |
 | `credentials.ts` | The `providers.json` read side: regular file, mode 0600 (0400 accepted; group/other bits refused), owned by the process uid |
-| `owner.ts` | Pause delivery to the host owning a home; owner records |
+| `owner.ts` | Pause delivery to the host owning a home; owner records. The optional `fence`/`fenceReason` host facts are annotated after the cgroup attach by a token/pid-checked atomic tmp+rename; pre-fence records stay valid |
 | `observe.ts` | Operator diagnostics: one bounded JSON object per line on stderr — never model text, tool output, headers or credentials |
 | `layout.ts` | Cell-home path layout |
 | `errors.ts` | The host error family |
+| `fence.ts` | The production commit fence: a host-built `FencePort` that freezes the node leaf (created first if absent) plus every existing `run-*` leaf around one commit attempt, maps every failure to `freeze-failed` after thawing, thaws on release, and logs one bounded `host/fence` line per acquire — never a path |
 
 ### `src/node/` — a node's engine
 
 | Module | Role |
 |---|---|
-| `driver.ts` | `NodeDriver`: the turn ritual, lifecycle states (`booting/active/waiting/stopping/stopped`), watermark, resume, park/wake, shutdown; hands the handler a narrow `TurnContext` (`{turn, trigger, world, gate, signal, now}` — no journal, no commit) so only the kernel emits |
+| `driver.ts` | `NodeDriver`: the turn ritual, lifecycle states (`booting/active/waiting/stopping/stopped`), watermark, resume, park/wake, shutdown; hands the handler a narrow `TurnContext` (`{turn, trigger, world, gate, signal, now}` — no journal, no commit) so only the kernel emits. Holds the `FencePort` seam: one `acquire`/`release` wraps ONE `commitWorld` attempt (outside the queue and the git retries), `release` in `finally`, and any non-fenced outcome or a throwing acquire is the typed refusal `freeze-timeout` (only the absence of a port is the unfenced host) |
 | `loop.ts` | `createAgentRuntime`: the trusted handler — folds the local log, presents one bounded world perception per turn, assembles exactly one plan per logical request, sends it through the adapter, dispatches the resulting tool calls |
 | `gate.ts` | The trusted local effect boundary: chunking, artifact manifests, the claim-check inline threshold; `flush()` re-reads and digest/size-verifies every pending claim-check before the effect |
 | `world.ts` | `WorldRepo` — the façade the engine speaks to (author = uid policy) |
