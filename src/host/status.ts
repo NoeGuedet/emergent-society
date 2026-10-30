@@ -39,6 +39,9 @@ export type StatusReport = {
   readonly host: {
     readonly state: 'running' | 'idle' | 'stale' | 'unverified';
     readonly pid?: number; readonly uid?: string; readonly command?: 'start' | 'resume';
+    /** Present only when the running record carries it (any host that records
+     * its mode); never fabricated for an idle or stale home. */
+    readonly sandbox?: 'landlock' | 'off';
   };
   readonly frontier: {
     readonly present: boolean; readonly count: number; readonly lastHash: string | null;
@@ -135,9 +138,14 @@ async function hostOf(home: string): Promise<StatusReport['host']> {
         pid: owner.record.pid,
         uid: owner.record.uid,
         command: owner.record.command,
+        ...(owner.record.sandbox === undefined ? {} : { sandbox: owner.record.sandbox }),
       };
     case 'unverified':
-      return { state: 'unverified', pid: owner.record.pid };
+      return {
+        state: 'unverified',
+        pid: owner.record.pid,
+        ...(owner.record.sandbox === undefined ? {} : { sandbox: owner.record.sandbox }),
+      };
     case 'stale':
       // No pid: the recorded process is gone, and repeating its pid would
       // read as a live fact.
@@ -317,9 +325,13 @@ export function formatStatus(report: StatusReport): string {
 function hostLine(host: StatusReport['host']): string {
   switch (host.state) {
     case 'running':
-      return `host: running pid=${host.pid} uid=${host.uid} command=${host.command}`;
+      return host.sandbox === undefined
+        ? `host: running pid=${host.pid} uid=${host.uid} command=${host.command}`
+        : `host: running pid=${host.pid} uid=${host.uid} command=${host.command} sandbox=${host.sandbox}`;
     case 'unverified':
-      return `host: unverified pid=${host.pid}`;
+      return host.sandbox === undefined
+        ? `host: unverified pid=${host.pid}`
+        : `host: unverified pid=${host.pid} sandbox=${host.sandbox}`;
     case 'stale':
       return 'host: stale';
     case 'idle':

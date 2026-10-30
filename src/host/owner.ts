@@ -53,11 +53,20 @@ import {
 /** The command a host was asked to run; carried in the record for `status`. */
 export type HostCommand = 'start' | 'resume';
 
-/** The exact on-disk shape of `<home>/host.json`. */
+/** The on-disk shape of `<home>/host.json`: seven keys, or eight with the optional sandbox mode. */
 export type HostOwnerRecord = {
   readonly v: 1; readonly pid: number; readonly startTime: number | null;
   readonly token: string; readonly uid: string;
   readonly command: HostCommand; readonly startedAt: number;
+  /**
+   * The confinement mode this host was started with, so `status` can surface
+   * it without reading any journal. Optional: every record written before the
+   * mode was recorded is a 7-key record and the reader accepts both shapes —
+   * the upgrade guarantee, without which an old live record would read
+   * `stale` and a new `start` would reclaim it (the lost-record hazard this
+   * module exists to prevent).
+   */
+  readonly sandbox?: 'landlock' | 'off';
 };
 
 /**
@@ -104,7 +113,14 @@ export const PAUSE_TIMEOUT_MS = 10_000;
 export const PAUSE_POLL_MS = 100;
 
 const OWNER_BASENAME = 'host.json';
-const RECORD_KEYS = ['v', 'pid', 'startTime', 'token', 'uid', 'command', 'startedAt'] as const;
+/**
+ * Every key a record may carry: the seven required pre-mode keys plus the one
+ * optional mode key. `sandbox` lives here so the unknown-key guard accepts it;
+ * its presence is still validated separately in `parseRecord`.
+ */
+const RECORD_KEYS = [
+  'v', 'pid', 'startTime', 'token', 'uid', 'command', 'startedAt', 'sandbox',
+] as const;
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 const RESTORE_ATTEMPTS = 3;
 const RESTORE_DELAY_MS = 10;
@@ -148,15 +164,17 @@ async function readClaim(path: string): Promise<ClaimRead> {
 }
 
 /**
- * Total validation: exact keys, `v === 1`, a safe-int pid > 0, a safe-int
- * `startTime` ≥ 0 or null, a 32-hex token, a journal-valid uid, a known command
- * and a safe-int `startedAt`. Anything else is `null`, never a throw.
+ * Total validation: only known keys, `v === 1`, a safe-int pid > 0, a safe-int
+ * `startTime` ≥ 0 or null, a 32-hex token, a journal-valid uid, a known command,
+ * a safe-int `startedAt`, and — when present — a known sandbox mode. The seven
+ * pre-mode keys stay required; `sandbox` is the one optional key, so a record
+ * from any generation parses and an unknown ninth key still fails. Anything
+ * else is `null`, never a throw.
  */
 function parseRecord(raw: unknown): HostOwnerRecord | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
   const fields = raw as Record<string, unknown>;
   const keys = Object.keys(fields);
-  if (keys.length !== RECORD_KEYS.length) return null;
   if (!keys.every((key) => (RECORD_KEYS as readonly string[]).includes(key))) return null;
   if (fields['v'] !== 1) return null;
   const pidValue = fields['pid'];
@@ -185,7 +203,11 @@ function parseRecord(raw: unknown): HostOwnerRecord | null {
     ? startedAtValue
     : null;
   if (startedAt === null) return null;
-  return { v: 1, pid, startTime, token, uid, command, startedAt };
+  const sandbox = fields['sandbox'];
+  if (sandbox !== undefined && sandbox !== 'landlock' && sandbox !== 'off') return null;
+  return sandbox === undefined
+    ? { v: 1, pid, startTime, token, uid, command, startedAt }
+    : { v: 1, pid, startTime, token, uid, command, startedAt, sandbox };
 }
 
 /** `/proc/<pid>/stat`'s state character, or `null` when it cannot be read. */
@@ -277,6 +299,7 @@ export async function acquireOwner(
   home: string,
   input: {
     readonly uid: string; readonly command: HostCommand; readonly now?: () => number;
+    readonly sandbox?: 'landlock' | 'off';
     readonly deps?: OwnerLivenessDeps;
   },
 ): Promise<OwnerHandle> {
@@ -297,6 +320,7 @@ export async function acquireOwner(
     uid,
     command: input.command,
     startedAt: (input.now ?? Date.now)(),
+    ...(input.sandbox === undefined ? {} : { sandbox: input.sandbox }),
   };
   const target = ownerPath(home);
   const tmp = join(home, `.host.${record.pid}.${record.token}.tmp`);

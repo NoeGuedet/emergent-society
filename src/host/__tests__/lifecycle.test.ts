@@ -478,14 +478,30 @@ it('reclaims a stale owner whose pid was reaped', async () => {
   await writeOwner(home, { pid: dead, startTime: 1 });
   const h = track(startHost(opts, hostDeps));
   await waitForLog(log, 'host/parked');
-  expect(logged(log)).toContainEqual(expect.objectContaining({ event: 'host/boot' }));
+  expect(logged(log)).toContainEqual(
+    expect.objectContaining({ event: 'host/boot', sandbox: 'off' }),
+  );
   const live = await readOwner(home);
   expect(live.kind).toBe('live');
-  if (live.kind === 'live') expect(live.record.pid).not.toBe(dead);
+  if (live.kind === 'live') {
+    expect(live.record.pid).not.toBe(dead);
+    expect(live.record.sandbox).toBe('off');
+  }
   expect((await readdir(home)).filter((name) => name.startsWith('.host.'))).toEqual([]);
   h.stop();
   expect(await h.done).toBe(0);
   expect((await readOwner(home)).kind).toBe('absent');
+}, 20_000);
+
+it('records the launched Landlock mode in the owner record', async () => {
+  await serve();
+  const h = track(startHost({ ...opts, sandbox: {} }, hostDeps));
+  await waitForLog(log, 'host/parked');
+  const live = await readOwner(home);
+  expect(live.kind).toBe('live');
+  if (live.kind === 'live') expect(live.record.sandbox).toBe('landlock');
+  h.stop();
+  expect(await h.done).toBe(0);
 }, 20_000);
 
 it('logs an unhandled rejection through the injected proc and exits 1', async () => {

@@ -170,6 +170,8 @@ it('formats the exact lines and omits null last records', () => {
   ]);
   expect(formatStatus({ ...base, host: { state: 'stale' as const } })).not.toContain('pid=');
   expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9 } })).toContain('unverified pid=9');
+  expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9, sandbox: 'off' } })).toContain('unverified pid=9 sandbox=off');
+  expect(formatStatus({ ...full, host: { ...full.host, sandbox: 'landlock' } })).toContain('host: running pid=7 uid=node-0 command=start sandbox=landlock');
   expect(formatStatus({ ...base, world: { present: false, head: null, error: null } })).toContain('world: absent');
 });
 it('reports world HEAD, world absent and host owner states', async () => {
@@ -187,6 +189,9 @@ it('reports world HEAD, world absent and host owner states', async () => {
   expect((await readStatus(home)).host).toEqual({ state:'running', pid: owner.record.pid, uid:'node-0', command:'start' });
   await owner.release();
   expect((await readStatus(home)).host).toEqual({ state:'idle' });
+  const offOwner = await acquireOwner(home, { uid:'node-0', command:'start', sandbox:'off' });
+  expect((await readStatus(home)).host).toEqual({ state:'running', pid: offOwner.record.pid, uid:'node-0', command:'start', sandbox:'off' });
+  await offOwner.release();
   await writeFile(join(home,'host.json'), JSON.stringify({ ...owner.record, token:'a'.repeat(32), startTime:null }), { mode:0o600 });
   await chmod(join(home,'host.json'), 0o600);
   expect((await readStatus(home)).host).toEqual({ state:'unverified', pid: process.pid });

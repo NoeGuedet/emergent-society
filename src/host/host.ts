@@ -543,6 +543,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       const config = await resolveInitialConfig(options);
       owner = await acquireOwner(home, {
         uid, command, ...(deps.now !== undefined ? { now: deps.now } : {}),
+        sandbox: sandbox === false ? 'off' : 'landlock',
       });
       const providers = await loadProviderStore(home);
       const credential = llmCredentialFrom(providers);

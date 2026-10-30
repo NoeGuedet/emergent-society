@@ -20,6 +20,12 @@ import {
 type OwnerJson = {
   v: 1; pid: number; startTime: number | null; token: string;
   uid: string; command: 'start' | 'resume'; startedAt: number;
+  /**
+   * Present in records written by a host that records its sandbox mode; absent
+   * from every record written before that generation, which is why the reader
+   * must accept both shapes as valid (the upgrade guarantee).
+   */
+  sandbox?: 'landlock' | 'off';
 };
 
 let home = '';
@@ -86,6 +92,45 @@ it('refuses a second live owner and leaves the first record intact', async () =>
   expect(String(err)).toMatch(/uid=node-0/);
   expect(await readFile(join(home, 'host.json'), 'utf8')).toBe(before);
   await a.release();
+});
+
+it('records the sandbox mode when given and reads it back live', async () => {
+  const h = await acquireOwner(home, { uid: 'node-0', command: 'start', sandbox: 'off' });
+  const s = await readOwner(home);
+  expect(s.kind).toBe('live');
+  if (s.kind === 'live') expect(s.record.sandbox).toBe('off');
+  await h.release();
+});
+
+it('accepts a pre-sandbox 7-key record as live (the upgrade guarantee)', async () => {
+  await writeOwner({});
+  const raw = JSON.parse(await readFile(join(home, 'host.json'), 'utf8')) as Record<string, unknown>;
+  expect(Object.keys(raw).length).toBe(7);
+  const s = await readOwner(home);
+  expect(s.kind).toBe('live');
+  if (s.kind === 'live') expect(s.record.sandbox).toBeUndefined();
+});
+
+it('still requires every pre-sandbox key: a deleted required key reads stale', async () => {
+  await writeOwner({});
+  for (const key of ['startedAt', 'token', 'command']) {
+    const base = JSON.parse(await readFile(join(home, 'host.json'), 'utf8')) as Record<string, unknown>;
+    const without = { ...base };
+    delete without[key];
+    await writeFile(join(home, 'host.json'), JSON.stringify(without), { mode: 0o600 });
+    expect((await readOwner(home)).kind).toBe('stale');
+  }
+});
+
+it('rejects an unknown key and a bad sandbox value, but accepts an 8-key record', async () => {
+  await writeOwner({ sandbox: 'landlock' });
+  expect((await readOwner(home)).kind).toBe('live');
+  await writeOwner({ sandbox: 'sometimes' as unknown as 'landlock' });
+  expect((await readOwner(home)).kind).toBe('stale');
+  await writeOwner({});
+  const base = JSON.parse(await readFile(join(home, 'host.json'), 'utf8')) as Record<string, unknown>;
+  await writeFile(join(home, 'host.json'), JSON.stringify({ ...base, extra: true }), { mode: 0o600 });
+  expect((await readOwner(home)).kind).toBe('stale');
 });
 
 it('exactly one of two concurrent acquisitions wins; the winner release removes its record', async () => {
