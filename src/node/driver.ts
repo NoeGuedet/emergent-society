@@ -11,6 +11,7 @@ import {
   boundedRefusalDetail, commitAllRefused, type CommitRefusal,
 } from './world-commit.js';
 import { clearWorldState, markWorldDegraded } from './world-state.js';
+import type { DoctorReport } from './world-doctor.js';
 import {
   createBoundaryGate,
   type BoundaryGate, type BoundaryRegistry, type DurableWatermark, type DriverHooks,
@@ -165,6 +166,14 @@ export interface NodeDriverOptions extends JournalWriterOptions {
    * runtime freeze failure becomes the typed refusal `freeze-timeout`.
    */
   fence?: FencePort;
+  /**
+   * The boot-time world doctor's report (C3), when composition ran it. It is
+   * written once after `node/boot` as the ignorable local event
+   * `world/doctor`; the driver is the writer because the node journal does not
+   * exist before `open`, and the doctor itself never opens one. Absent means
+   * no doctor ran or it failed — a diagnostic, never a refused boot.
+   */
+  doctor?: DoctorReport;
 }
 
 /** The bounded self-retry delays: three attempts, then the cell stays parked. */
@@ -327,6 +336,19 @@ export class NodeDriver {
         await writer.close();
       } catch { /* the resume error stands */ }
       throw err;
+    }
+    if (opts.doctor !== undefined) {
+      // After `node/boot` (and its flush): the report is a boot-time fact of
+      // this open, written by the one writer the driver owns. A failure here
+      // is diagnostic — the node is already booted and the report is not a
+      // load-bearing fact (the fold renders nothing).
+      try {
+        driver.writeEvent('world/doctor', { report: opts.doctor }, { ignorable: true });
+        await driver.flushObservations();
+      } catch (err) {
+        try { opts.onError?.(err instanceof Error ? err : new Error('world/doctor write failed')); }
+        catch { /* the diagnostic is not the boot */ }
+      }
     }
     return driver;
   }
@@ -774,10 +796,13 @@ export class NodeDriver {
     }
   }
 
-  /** The bounded label for a failed wake read: a kind and, for git, its exit status. */
+  /** The bounded label for a failed wake read: a kind and, for a plain exit, its status. */
   private wakeDiagnostic(err: unknown): Error {
     if (err instanceof GitCommandError) {
-      return new Error(`wake predicate failed: git exit ${err.exitCode ?? 'none'}`);
+      const label = err.kind === 'timeout'
+        ? 'git timeout'
+        : err.kind === 'spawn' ? 'git spawn' : `git exit ${err.exitCode ?? 'none'}`;
+      return new Error(`wake predicate failed: ${label}`);
     }
     return new Error('wake predicate failed: world read failed');
   }

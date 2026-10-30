@@ -3,6 +3,7 @@ import type { GateScope, WorldAcknowledgement } from '../node/gate.js';
 import {
   isCommitRefusal, renderCommitRefusal, type CommitRefusal,
 } from '../node/world-commit.js';
+import { parseDoctorReport } from '../node/world-doctor.js';
 import type { WorldRange } from '../node/world.js';
 import {
   eventKey, parseArtifactJson, requireCompleteArtifact, resolveArtifact, resolveStored, toJson,
@@ -296,6 +297,7 @@ export class ContextFold {
       case 'package/service':
         this.onPackageEvent(event); return;
       case 'world/commit-refused': this.onCommitRefused(event); return;
+      case 'world/doctor': this.onWorldDoctor(event); return;
       default: return;
     }
   }
@@ -687,6 +689,24 @@ export class ContextFold {
       turn: this.open === null ? 0 : this.open.turn,
       messages: [{ role: 'system', content: line }], sources: [sourceOf(event)],
     }) as unknown as SurfaceGroup);
+  }
+
+  /**
+   * One boot-time world doctor report: a VALIDATED, non-rendered fact. The
+   * report is diagnostic only — it changes no surface, no config and no
+   * sequencing state — so replay is identical whether the event is present or
+   * an older reader (without the type in its known set) skips it. A payload
+   * that fails the report's total validator is still an invariant breach.
+   */
+  private onWorldDoctor(event: VerifiedEvent): void {
+    const data = dataRecord(event.data, 'world/doctor data');
+    const keys = Object.keys(data);
+    if (keys.length !== 1 || keys[0] !== 'report') {
+      invariant('world/doctor data must carry exactly the report key');
+    }
+    if (parseDoctorReport(data['report']) === null) {
+      invariant('world/doctor report is not a valid DoctorReport');
+    }
   }
 
   // --- closers ----------------------------------------------------------------

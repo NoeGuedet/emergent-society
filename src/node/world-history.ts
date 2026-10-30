@@ -1,7 +1,8 @@
 import { GitCommandError } from './errors.js';
+import { GIT_READ_TIMEOUT_MS } from './limits.js';
 import {
-  FIELD, MAX_GIT_STDERR_BYTES, assertHash, commitExists, isAncestor, spawnGit, verifyCommit,
-  type WorldIo,
+  FIELD, MAX_GIT_STDERR_BYTES, assertHash, commitExists, isAncestor, killGitTree, spawnGit,
+  verifyCommit, type WorldIo,
 } from './world-git.js';
 import type { CommitRange, WorldCommitInfo, WorldRange } from './world-types.js';
 
@@ -70,7 +71,11 @@ export async function commitsSince(
     // a gc). The node cannot prove it has seen the current history, so it is
     // given all of it: a spurious wake costs a turn, a missed commit costs a
     // fact, and the two are not symmetric.
-    if (from !== null && err instanceof GitCommandError) return commitsSince(io, null);
+    // A deadline is not a watermark problem: retrying the whole history after a
+    // bounded read would only double the bound. The timeout propagates typed.
+    if (from !== null && err instanceof GitCommandError && err.kind !== 'timeout') {
+      return commitsSince(io, null);
+    }
     throw err;
   }
 }
@@ -95,22 +100,27 @@ export async function commitsSince(
  */
 export async function hasForeignCommit(
   io: WorldIo, from: string | null, author: string,
+  timeoutMs: number = GIT_READ_TIMEOUT_MS,
 ): Promise<boolean> {
   const head = await io.head();
   if (head === null || head === from) return false;
   try {
     const scan = await foreignAuthorIn(
-      io, from === null ? ['HEAD'] : [`${from}..HEAD`], author);
+      io, from === null ? ['HEAD'] : [`${from}..HEAD`], author, timeoutMs);
     if (scan === 'foreign') return true;
     // An empty `head !== from` range cannot be forward movement: HEAD may have
     // moved backward behind the watermark (a peer's force-reset). The node
     // cannot prove what it has seen, so the whole history answers instead.
     if (from !== null && scan === 'empty' && (await isAncestor(io, head, from))) {
-      return (await foreignAuthorIn(io, ['HEAD'], author)) === 'foreign';
+      return (await foreignAuthorIn(io, ['HEAD'], author, timeoutMs)) === 'foreign';
     }
     return false;
   } catch (err) {
-    if (from !== null && err instanceof GitCommandError) return hasForeignCommit(io, null, author);
+    // Same rule as `commitsSince`: a deadline is not an unprovable watermark,
+    // and retrying the whole history would double the bound.
+    if (from !== null && err instanceof GitCommandError && err.kind !== 'timeout') {
+      return hasForeignCommit(io, null, author, timeoutMs);
+    }
     throw err;
   }
 }
@@ -129,7 +139,7 @@ export async function hasForeignCommit(
  * reports the empty author as `''` and the wake predicate refuses it.
  */
 function foreignAuthorIn(
-  io: WorldIo, spec: readonly string[], author: string,
+  io: WorldIo, spec: readonly string[], author: string, timeoutMs: number,
 ): Promise<'foreign' | 'empty' | 'self-only'> {
   const args = [...io.baseArgs(), 'log', '--format=format:%an%x00', ...spec];
   return new Promise<'foreign' | 'empty' | 'self-only'>((resolvePromise, reject) => {
@@ -140,11 +150,19 @@ function foreignAuthorIn(
     let stderr = '';
     let seen = false;
     let settled = false;
+    let timedOut = false;
+    // The wake scan is a read like any other: its deadline is bounded and a
+    // slow child is the typed `timeout`, never a hung boot.
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      killGitTree(child);
+    }, timeoutMs);
     const settle = (
       failure: GitCommandError | null, answer: 'foreign' | 'empty' | 'self-only',
     ): void => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       if (failure !== null) reject(failure);
       else resolvePromise(answer);
     };
@@ -163,7 +181,7 @@ function foreignAuthorIn(
         partial = partial.slice(end + 1);
         seen = true;
         if (foreign(record)) {
-          child.kill();
+          killGitTree(child, 'SIGTERM');
           settle(null, 'foreign');
           return;
         }
@@ -172,7 +190,7 @@ function foreignAuthorIn(
       // An unterminated record past the bound cannot be a uid: answer foreign
       // rather than hold an unbounded identity in memory.
       if (partial.length > MAX_AUTHOR_RECORD_CHARS) {
-        child.kill();
+        killGitTree(child, 'SIGTERM');
         settle(null, 'foreign');
       }
     });
@@ -185,6 +203,10 @@ function foreignAuthorIn(
     ));
     child.on('close', (code) => {
       if (settled) return;
+      if (timedOut) {
+        settle(new GitCommandError(args, code, stderr, { kind: 'timeout' }), 'empty');
+        return;
+      }
       // A trailing record without its separator is only possible from a
       // truncated stream; classify it the same conservative way.
       if (partial !== '') {

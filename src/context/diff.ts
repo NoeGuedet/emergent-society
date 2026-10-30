@@ -1,3 +1,4 @@
+import { GitCommandError } from '../node/errors.js';
 import type {
   CommitRange, DiffCapture, RecordedCommit, WorldRepo, WorldRange,
 } from '../node/world.js';
@@ -138,7 +139,12 @@ export async function presentWorld(
   // oldest-to-newest below. The preamble already consumed part of the working
   // budget, so the walk starts there; the dropped commits are always a
   // contiguous oldest prefix, which the omission notice counts from `commits[0]`.
-  type Block = { readonly commit: RecordedCommit; readonly text: string; readonly own: boolean };
+  type Block = {
+    readonly commit: RecordedCommit; readonly text: string; readonly own: boolean;
+    /** False when the patch could not be read (a deadline): the header is shown
+     * but the commit is not counted as included. */
+    readonly patchRead?: boolean;
+  };
   const kept: Block[] = [];
   let keptBytes = work;
   let omittedOlder = 0;
@@ -158,7 +164,21 @@ export async function presentWorld(
       continue;
     }
 
-    const parent = await world.firstParent(commit.hash);
+    let parent: string | null;
+    try {
+      parent = await world.firstParent(commit.hash);
+    } catch (err) {
+      // A read deadline is a bounded degradation of the perception, not a
+      // handler death: the turn keeps its world range and the notice says the
+      // patch could not be read. The next wake retries.
+      if (isReadTimeout(err)) {
+        truncated = true;
+        patchNotice = 'world diff unavailable: git read timeout\n';
+        omittedOlder = i + 1;
+        break;
+      }
+      throw err;
+    }
     const header = `commit ${commit.hash}\nauthor ${commit.author}\n` +
       `${parent === null ? 'parent none' : `parent ${parent}`}\n`;
     if (keptBytes + byteLength(header) > workingLimit) {
@@ -178,7 +198,21 @@ export async function presentWorld(
       break;
     }
 
-    const capture: DiffCapture = await world.diff({ from: parent, to: commit.hash }, remainingWork);
+    let capture: DiffCapture;
+    try {
+      capture = await world.diff({ from: parent, to: commit.hash }, remainingWork);
+    } catch (err) {
+      if (isReadTimeout(err)) {
+        truncated = true;
+        // Keep the commit's header (the tree facts are known) so the notice
+        // has a block to follow; the patch was never read.
+        kept.push({ commit, text: header, own: false, patchRead: false });
+        patchNotice = 'world diff unavailable: git read timeout\n';
+        omittedOlder = i;
+        break;
+      }
+      throw err;
+    }
     keptBytes += byteLength(capture.text);
     kept.push({ commit, text: header + capture.text, own: false });
     if (capture.truncated) {
@@ -200,7 +234,7 @@ export async function presentWorld(
   for (let i = 0; i < kept.length; i += 1) {
     const block = kept[i] as Block;
     parts.push(block.text);
-    if (!block.own) included.push(block.commit.hash);
+    if (!block.own && block.patchRead !== false) included.push(block.commit.hash);
     // The truncated commit is always the oldest kept, so its notice follows
     // the cut patch tail immediately — the adjacency the pre-v2 order had,
     // now after the first emitted block instead of the last.
@@ -211,6 +245,11 @@ export async function presentWorld(
   return build(uid, range, rangeInfo, gitVersion, maxBytes, maxCommits, {
     text: parts.join(''), included, omittedOwn, truncated,
   });
+}
+
+/** Whether a read failure is the process layer's deadline (not a policy failure). */
+function isReadTimeout(err: unknown): boolean {
+  return err instanceof GitCommandError && err.kind === 'timeout';
 }
 
 interface Rendered {

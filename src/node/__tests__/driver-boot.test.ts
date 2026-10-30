@@ -8,6 +8,10 @@ import { appendTear, collectEvents } from '../../journal/__tests__/helpers.js';
 import { NodeDriver, type TurnResult } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
 import { readWorldState } from '../world-state.js';
+import { runWorldDoctor } from '../world-doctor.js';
+import { C13_EVENT_TYPES } from '../../context/events.js';
+import { ContextFold } from '../../context/fold.js';
+import { loadVerifiedEvents } from '../../context/loader.js';
 import { useWorld } from './helpers.js';
 
 const fixture = useWorld('node-boot-');
@@ -147,5 +151,64 @@ describe('NodeDriver boot and resume', () => {
     expect(events.map((e) => e.type)).toEqual([
       'node/boot', 'future/thing', 'node/boot', 'node/shutdown',
     ]);
+  });
+});
+
+describe('the world/doctor carrier (C3)', () => {
+  it('journals the report after node/boot as an ignorable local event', async () => {
+    const { home, world } = fixture();
+    const report = await runWorldDoctor(world, {
+      home, freeSpace: async () => ({ bytes: 100 * 1024 ** 3, inodes: 1_000_000 }),
+    });
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0, doctor: report });
+    const events = await bootlog(home);
+    expect(events.map((event) => event.type)).toEqual(['node/boot', 'world/doctor']);
+    expect(events[1]!.ignorable).toBe(true);
+    expect(events[1]!.data).toEqual({ report });
+    await closeIdle(d);
+  });
+
+  it('renders nothing and replays identically; an older reader skips the type', async () => {
+    const { home, world } = fixture();
+    const report = await runWorldDoctor(world, {
+      home, freeSpace: async () => ({ bytes: 100 * 1024 ** 3, inodes: 1_000_000 }),
+    });
+    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0, doctor: report });
+    await closeIdle(d);
+
+    // An older reader whose known set lacks the type still rebuilds: the
+    // envelope is ignorable, which is the whole compatibility contract.
+    const older = new Set([...C13_EVENT_TYPES].filter((type) => type !== 'world/doctor'));
+    const events = await loadVerifiedEvents(home, 'n1', older);
+    const doctor = events.find((event) => event.type === 'world/doctor');
+    expect(doctor).toBeDefined();
+
+    const withReport = new ContextFold();
+    await withReport.observe(events);
+    // The valid comparison is a PREFIX fold (seq 1 only), not a filtered event
+    // list: the fold requires a gap-free chain, and the doctor is the last
+    // event. A non-rendered fact leaves the projection byte-identical.
+    const beforeDoctor = new ContextFold();
+    await beforeDoctor.observe(events.filter((event) => event.seq === 0));
+    // The watermark is the fold's observation pointer, not its projection: an
+    // event advances it whether or not it renders. Everything the projection
+    // is made of must stay identical.
+    const { watermark: afterWatermark, ...afterProjection } = withReport.snapshot();
+    const { watermark: beforeWatermark, ...beforeProjection } = beforeDoctor.snapshot();
+    expect(afterProjection).toEqual(beforeProjection);
+    expect(afterWatermark?.seq).toBe(events.at(-1)!.seq);
+    expect(beforeWatermark?.seq).toBe(0);
+    expect(withReport.snapshot().surface).toBeNull();
+  });
+
+  it('poisons the fold on a malformed report payload', async () => {
+    const { home } = fixture();
+    const w = await JournalWriter.open(home, 'n1');
+    w.append('node/boot', { reason: 'start' });
+    w.append('world/doctor', { report: { lock: 'nope' } } as never, { ignorable: true });
+    await w.close();
+    const events = await loadVerifiedEvents(home, 'n1', C13_EVENT_TYPES);
+    await expect(new ContextFold().observe(events))
+      .rejects.toThrow(/world\/doctor report is not a valid DoctorReport/);
   });
 });

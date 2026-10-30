@@ -3,8 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { utf8Prefix } from '../text.js';
 import { GitCommandError } from './errors.js';
+import { GIT_READ_TIMEOUT_MS } from './limits.js';
 import {
-  MAX_GIT_STDERR_BYTES, assertHash, commitExists, emptyTree, spawnGit, treeOf, type WorldIo,
+  MAX_GIT_STDERR_BYTES, assertHash, commitExists, emptyTree, killGitTree, spawnGit, treeOf,
+  type WorldIo,
 } from './world-git.js';
 import type { BoundedText, DiffCapture, WorldRange } from './world-types.js';
 
@@ -63,6 +65,7 @@ const HERMETIC_DIFF_ARGS: readonly string[] = [
  */
 export async function renderDiff(
   io: WorldIo, range: WorldRange, maxBytes: number,
+  timeoutMs: number = GIT_READ_TIMEOUT_MS,
 ): Promise<DiffCapture> {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
     throw new Error(`maxBytes must be a positive integer, got ${maxBytes}`);
@@ -95,7 +98,7 @@ export async function renderDiff(
       GIT_ATTR_SOURCE: range.to,
     };
     const args = [`--git-dir=${scratch}`, ...HERMETIC_CONFIG, ...HERMETIC_DIFF_ARGS, fromTree, toTree, '--'];
-    result = await streamDiff(io, args, env, maxBytes);
+    result = await streamDiff(io, args, env, maxBytes, timeoutMs);
   } catch (err) {
     failed = true;
     failure = err;
@@ -150,6 +153,7 @@ async function openScratchView(io: WorldIo): Promise<string> {
  */
 function streamDiff(
   io: WorldIo, args: readonly string[], env: Record<string, string>, maxBytes: number,
+  timeoutMs: number,
 ): Promise<BoundedText> {
   return new Promise<BoundedText>((resolvePromise, rejectPromise) => {
     const child = spawnGit([
@@ -160,7 +164,16 @@ function streamDiff(
     let bytes = 0;
     let truncated = false;
     let capped = false;
+    let timedOut = false;
     let stderr = Buffer.alloc(0);
+    // The streaming read is bounded like every other git child: a slow render
+    // is a typed `timeout` failure, never a handler hang. `spawnGit` starts
+    // git in its own group, so the kill also reaps a helper that inherited the
+    // pipes (otherwise the close would never fire).
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      killGitTree(child);
+    }, timeoutMs);
 
     child.stdout.on('data', (chunk: Buffer) => {
       if (capped) return;
@@ -171,7 +184,7 @@ function streamDiff(
       if (prefix.text.length < decoded.length) {
         capped = true;
         truncated = true;
-        child.kill('SIGKILL');
+        killGitTree(child);
       }
     });
     child.stderr.on('data', (chunk: Buffer) => {
@@ -179,11 +192,13 @@ function streamDiff(
       if (room > 0) stderr = Buffer.concat([stderr, chunk.subarray(0, room)]);
     });
     child.on('error', (err) => {
+      clearTimeout(deadline);
       if (!capped) {
         rejectPromise(new GitCommandError(args, null, String(err), { kind: 'spawn' }));
       }
     });
     child.on('close', (code, signal) => {
+      clearTimeout(deadline);
       if (capped) {
         resolvePromise({ text, truncated: true, bytesRetained: bytes });
         return;
@@ -196,6 +211,12 @@ function streamDiff(
         text += prefix.text;
         bytes += prefix.bytes;
         if (prefix.text.length < tail.length) truncated = true;
+      }
+      if (timedOut) {
+        rejectPromise(new GitCommandError(
+          args, code ?? null, stderr.toString('utf8'), { kind: 'timeout' },
+        ));
+        return;
       }
       if (signal !== null || code !== 0) {
         rejectPromise(new GitCommandError(

@@ -1,4 +1,5 @@
 import type { CommitRefusal } from './world-commit.js';
+import type { DoctorReport } from './world-doctor.js';
 import type { WorldRange } from './world.js';
 
 /**
@@ -34,6 +35,15 @@ export interface NodeEventDataMap {
   'world/commit-refused': {
     refusal: CommitRefusal; turn: number; paths?: string[];
   };
+  /**
+   * The boot-time world doctor's report, written once after `node/boot` when
+   * composition ran the doctor. It is an ignorable, non-rendered fact: the
+   * fold validates the payload and renders nothing, so replay is identical
+   * whether the report is present or an older reader skips it. The report
+   * carries counts and bounded relative names — never an absolute path, never
+   * a payload.
+   */
+  'world/doctor': { report: DoctorReport };
 }
 
 declare module '../journal/envelope.js' {
@@ -43,7 +53,7 @@ declare module '../journal/envelope.js' {
 // Record<keyof NodeEventDataMap, true> rejects a missing or extra key at compile time.
 const REGISTERED: Record<keyof NodeEventDataMap, true> = {
   'node/boot': true, 'node/shutdown': true, 'turn/start': true, 'turn/end': true,
-  'world/commit-refused': true,
+  'world/commit-refused': true, 'world/doctor': true,
 };
 
 /** The runtime registry handed to `JournalReader.open` (its `knownTypes`). */

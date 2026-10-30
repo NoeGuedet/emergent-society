@@ -183,6 +183,16 @@ it('composes one cell and runs one real turn end to end', async () => {
     const boots = of('node/boot');
     expect(boots).toHaveLength(1);
     expect(boots[0]!.data).toMatchObject({ reason: 'start' });
+    // The world doctor ran in composition, before the frontier open, and its
+    // report is the ignorable local fact written after node/boot.
+    const doctors = of('world/doctor');
+    expect(doctors).toHaveLength(1);
+    expect(doctors[0]!.ignorable).toBe(true);
+    expect(doctors[0]!.data).toMatchObject({
+      report: { lock: 'free', index: { readable: true } },
+    });
+    expect(events.findIndex((event) => event.type === 'world/doctor'))
+      .toBeGreaterThan(events.findIndex((event) => event.type === 'node/boot'));
     // The composed cell logs through `wrapHandler`: its turn boundaries reach
     // the injected sink, not process.stderr.
     const logged = lines.map((line) => JSON.parse(line) as { readonly event: string });

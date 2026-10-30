@@ -10,6 +10,7 @@ import { nodeLayout } from '../journal/index.js';
 import { createPackageStore, createRunSupervisor } from '../node/packages/index.js';
 import { singleLine } from '../text.js';
 import { readWorldState, type WorldState } from '../node/world-state.js';
+import { runWorldDoctor, type DoctorReport } from '../node/world-doctor.js';
 import { fileURLToPath } from 'node:url';
 import type { ProviderRegistry } from '../node/tools/providers.js';
 import { DEFAULT_TERMINAL_ENV } from '../node/tools/terminal.js';
@@ -136,6 +137,19 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
   const { home, uid, config, credential, providers, sandbox, pollMs, log } = options;
   const paths = cellPaths(home, uid);
   const world = await WorldRepo.open(paths.world, { gitDir: paths.gitDir });
+  // The world doctor (C3) runs between `WorldRepo.open` (which holds no
+  // closeable resource) and the frontier open, so it can act on a lock and an
+  // index BEFORE any boot-reconcile commit. It never opens a writer: the
+  // report is handed to `NodeDriver.open`, which writes it after `node/boot`.
+  // A doctor failure is a bounded host diagnostic, never a refused boot.
+  let doctor: DoctorReport | undefined;
+  try {
+    doctor = await runWorldDoctor(world, { home });
+  } catch (err) {
+    log.emit('world/doctor-failed', {
+      reason: err instanceof Error ? err.name : 'Error',
+    });
+  }
   const frontier = await openFrontierJournal(home, {
     worldHead: () => world.headHash(), now: Date.now,
   });
@@ -222,6 +236,7 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
       hooks: runtime.hooks,
       ...(pollMs !== undefined ? { worldPollMs: pollMs } : {}),
       ...(fencePort !== undefined ? { fence: fencePort } : {}),
+      ...(doctor !== undefined ? { doctor } : {}),
       onError: (err) => log.emit('driver/error', { error: err.name }),
       onMaintenance: () => log.emit('host/parked'),
       schedule: (ms, callback) => {

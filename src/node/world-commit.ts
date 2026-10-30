@@ -1,9 +1,10 @@
-import { readdir } from 'node:fs/promises';
+import { lstat, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { assertNodeUid } from '../journal/index.js';
 import { singleLine } from '../text.js';
 import { NOOP, delay } from '../util.js';
 import { GitCommandError, WorldHeadError, WorldReconciliationError } from './errors.js';
+import { DEFAULT_COMMIT_LIMITS, type CommitLimits } from './limits.js';
 import {
   FIELD, MAX_GIT_OUTPUT_BYTES, commitExists, emptyTree, hashLength, isAncestor, isFullHex,
   treeOf, type WorldIo,
@@ -86,8 +87,29 @@ export class WorldWalkError extends Error {
   }
 }
 
-/** What git says when another process holds the index or the ref, or when a branch compare-and-swap loses its race. */
-const LOCK_CONTENTION = /index\.lock|cannot lock ref|Another git process seems to be running/i;
+/**
+ * One pre-add or post-add budget overrun. It carries the refusal's own reason
+ * and a bounded detail, so `commitAllRefused` classifies it as the typed
+ * `budget` without a second mapping: the walk runs before any git child, and
+ * the staged budget runs after `add` with the index deliberately left staged
+ * for the operator or the agent to shrink.
+ */
+export class CommitBudgetError extends Error {
+  readonly reason = 'budget' as const;
+  constructor(readonly detail: string) {
+    super(detail);
+    this.name = 'CommitBudgetError';
+  }
+}
+
+/**
+ * What a held lock looks like: git's own index/ref contention, a lost
+ * compare-and-swap, or the world flock's reserved conflict exit (the wrapper
+ * rewrites it into this same wording). All of them are retryable: the holder
+ * is another turn-end, and the commit machinery retries the whole attempt.
+ */
+const LOCK_CONTENTION =
+  /index\.lock|cannot lock ref|Another git process seems to be running|world lock is held/i;
 
 /**
  * Commit serialization, keyed by the repo's canonical root. Two drivers
@@ -325,6 +347,7 @@ export async function commitAllRefused(
  */
 export async function commitAll(
   io: WorldIo, author: string, message: string,
+  limits: CommitLimits = DEFAULT_COMMIT_LIMITS,
 ): Promise<WorldCommitInfo | null> {
   // The author becomes the commit's git identity, so it must be a uid the
   // kernel can vouch for: a separator or a control character here is a
@@ -332,7 +355,7 @@ export async function commitAll(
   // before `add`, before anything exists to undo. History already written by
   // someone else is never re-validated: foreign author names stay facts.
   assertNodeUid(author);
-  return serialize(io.path, () => commitRetrying(io, author, message));
+  return serialize(io.path, () => commitRetrying(io, author, message, limits));
 }
 
 /**
@@ -411,11 +434,11 @@ export async function commitsForTurn(
  * failure surfaces unchanged.
  */
 async function commitRetrying(
-  io: WorldIo, author: string, message: string,
+  io: WorldIo, author: string, message: string, limits: CommitLimits,
 ): Promise<WorldCommitInfo | null> {
   for (let attempt = 1; ; attempt += 1) {
     try {
-      return await commitOnce(io, author, message);
+      return await commitOnce(io, author, message, limits);
     } catch (err) {
       const contended = err instanceof GitCommandError && LOCK_CONTENTION.test(err.stderr);
       if (!contended || attempt >= COMMIT_ATTEMPTS) throw err;
@@ -438,7 +461,7 @@ async function commitRetrying(
  * nothing is reset, and no object is pruned.
  */
 async function commitOnce(
-  io: WorldIo, author: string, message: string,
+  io: WorldIo, author: string, message: string, limits: CommitLimits,
 ): Promise<WorldCommitInfo | null> {
   const ref = await headRef(io);
   const before = await io.head();
@@ -449,7 +472,7 @@ async function commitOnce(
   // agent's repo — a durable tree that references an unresolvable object and
   // whose subtree content is never committed. The pathspec exclusion is the
   // load-bearing half; the index sweep below is the belt.
-  const nested = await nestedRepoDirs(io);
+  const nested = await nestedRepoDirs(io, limits);
   // A nested repository is excluded from the staging sweep: staging it would
   // either fail on its unborn HEAD or record a gitlink whose object lives only
   // in the agent's repo. The belt below removes any gitlink that survived.
@@ -464,9 +487,19 @@ async function commitOnce(
   // is passed verbatim: `update-index` takes literal file names, not
   // pathspecs, so a `*`/`?`/`[` in the path removes only that entry (adding
   // `:(literal)` here would name a nonexistent file and remove nothing).
-  for (const rel of await stagedGitlinks(io)) {
-    await io.git(['update-index', '--force-remove', '--', rel]);
+  const staged = await stagedEntries(io);
+  for (const entry of staged) {
+    if (entry.mode === '160000') {
+      await io.git(['update-index', '--force-remove', '--', entry.path]);
+    }
   }
+  // The staged budget is post-`add` and pre-`write-tree`: an overrun refuses
+  // typed and leaves the index staged (never a reset), so the content stays
+  // attributable and the operator or the agent can shrink it. It measures the
+  // TURN'S staged delta against HEAD, never the whole index: a large but
+  // already-committed world must keep committing one-file turns, and a no-op
+  // turn must never hit the budget.
+  await assertStagedBudget(io, await stagedDelta(io, before), limits);
   if (await io.nothingStaged()) return null;
   const tree = (await io.git(['write-tree'])).trim();
   // The net-change guard: a tree identical to the parent's would be an empty
@@ -501,17 +534,30 @@ async function commitOnce(
  * created. The world root itself is skipped: a stray root-level `.git` is never
  * read by the explicit pair and is never staged by git.
  *
+ * The walk is also the commit path's pre-add budget. `maxWalkEntries` is
+ * enforced after each directory's readdir and before any descent — the one
+ * residual is that Node has no streaming readdir, so a single flat directory
+ * is materialized before the count is known (documented; the acceptance uses a
+ * directory distribution). `maxFileApparentBytes` is checked with `lstat` on
+ * regular files, so a sparse 2 GB file is refused by its apparent size before
+ * `add` allocates anything; symlinks and special files are not measured (git
+ * does not descend a symlink, and a FIFO can only be reached by the add's own
+ * reader, which the add deadline bounds).
+ *
  * A child past the walk's path budget is refused as `walk-too-deep`, not
  * skipped: the subtree may be git-reachable by relative paths, so dropping it
  * would be a silent partial commit; refusing keeps the effect attributable and
- * the kernel alive.
+ * the kernel alive. A budget overrun is the typed `budget` for the same
+ * reason: the world is larger than the commit boundary accepts, and the model
+ * can shrink it rather than lose an effect to an unbounded walk.
  */
-async function nestedRepoDirs(io: WorldIo): Promise<string[]> {
+async function nestedRepoDirs(io: WorldIo, limits: CommitLimits): Promise<string[]> {
   const nested: string[] = [];
+  let entriesSeen = 0;
   const visit = async (rel: string): Promise<void> => {
     const dir = rel === '' ? io.path : join(io.path, rel);
-    // The root is never refused by the budget: its readdir is the walk's entry
-    // point, and a root past PATH_MAX fails typed from readdir below.
+    // The root is never refused by the path budget: its readdir is the walk's
+    // entry point, and a root past PATH_MAX fails typed from readdir below.
     if (rel !== '' && Buffer.byteLength(dir, 'utf8') > MAX_WALK_PATH_BYTES) {
       throw new WorldWalkError('walk', 'ETOODEEP', rel);
     }
@@ -526,6 +572,11 @@ async function nestedRepoDirs(io: WorldIo): Promise<string[]> {
         'readdir', typeof code === 'string' ? code : 'unknown', rel,
       );
     }
+    entriesSeen += entries.length;
+    if (entriesSeen > limits.maxWalkEntries) {
+      throw new CommitBudgetError(
+        `world walk exceeds ${limits.maxWalkEntries} entries at ${rel === '' ? '.' : rel}`);
+    }
     if (rel !== '' && entries.some((entry) => entry.name === '.git')) {
       nested.push(rel);
       return;
@@ -533,25 +584,144 @@ async function nestedRepoDirs(io: WorldIo): Promise<string[]> {
     for (const entry of entries) {
       // Git's own metadata is not world content, and a symlink is not
       // descended by `add` either.
-      if (entry.name === '.git' || !entry.isDirectory()) continue;
-      await visit(rel === '' ? entry.name : `${rel}/${entry.name}`);
+      if (entry.name === '.git') continue;
+      const childRel = rel === '' ? entry.name : `${rel}/${entry.name}`;
+      if (entry.isFile()) {
+        const abs = join(dir, entry.name);
+        let stat;
+        try {
+          stat = await lstat(abs);
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          // A file a peer removed between the readdir and the stat is gone
+          // from the commit too; any other errno is the walk's typed class.
+          if (code === 'ENOENT' || code === 'ENOTDIR') continue;
+          throw new WorldWalkError(
+            'lstat', typeof code === 'string' ? code : 'unknown', childRel);
+        }
+        if (stat.isFile() && stat.size > limits.maxFileApparentBytes) {
+          throw new CommitBudgetError(
+            `world file is ${stat.size} bytes, over the ${limits.maxFileApparentBytes}-byte `
+            + `per-file budget: ${childRel}`);
+        }
+        continue;
+      }
+      if (!entry.isDirectory()) continue;
+      await visit(childRel);
     }
   };
   await visit('');
   return nested;
 }
 
-/** The staged paths whose index entry is a `160000` gitlink. */
-async function stagedGitlinks(io: WorldIo): Promise<string[]> {
-  const links: string[] = [];
+/** One parsed `git ls-files --stage -z` record. */
+type StagedEntry = {
+  readonly mode: string;
+  readonly object: string;
+  readonly stage: string;
+  readonly path: string;
+};
+
+/** The staged index entries, NUL-separated so a whitespace path stays whole. */
+async function stagedEntries(io: WorldIo): Promise<StagedEntry[]> {
+  const entries: StagedEntry[] = [];
   for (const record of (await io.git(['ls-files', '--stage', '-z'])).split('\0')) {
     if (record === '') continue;
     const tab = record.indexOf('\t');
-    const space = record.indexOf(' ');
-    if (tab === -1 || space === -1) continue;
-    if (record.slice(0, space) === '160000') links.push(record.slice(tab + 1));
+    if (tab === -1) continue;
+    // `<mode> <object> <stage>\t<path>`: parse the metadata before the tab so
+    // the stage never absorbs the path.
+    const metadata = record.slice(0, tab).split(' ');
+    if (metadata.length !== 3) continue;
+    entries.push({
+      mode: metadata[0]!,
+      object: metadata[1]!,
+      stage: metadata[2]!,
+      path: record.slice(tab + 1),
+    });
   }
-  return links;
+  return entries;
+}
+
+/** The turn's staged delta: changed paths and the new blob hashes behind them. */
+type StagedDelta = {
+  readonly paths: number;
+  readonly objects: readonly string[];
+};
+
+/**
+ * The TURN'S staged delta, not the whole index: `git diff --cached --raw -z
+ * --no-renames` against HEAD gives one record per changed path with its new
+ * blob hash (deletions carry the zero hash and contribute no bytes). An unborn
+ * branch has no parent tree, so every staged entry is the delta.
+ *
+ * A rename is two records (`A` + `D`); the new path's blob size counts, the
+ * deletion's zero does not. A mode-only change keeps its blob, so its content
+ * size counts — the bound is the staging size, not the object-store delta.
+ */
+async function stagedDelta(io: WorldIo, before: string | null): Promise<StagedDelta> {
+  if (before === null) {
+    const entries = (await stagedEntries(io)).filter((entry) => entry.mode !== '160000');
+    return { paths: entries.length, objects: entries.map((entry) => entry.object) };
+  }
+  const out = await io.git(['diff', '--cached', '--raw', '-z', '--no-renames']);
+  const parts = out.split('\0');
+  let paths = 0;
+  const objects: string[] = [];
+  for (let i = 0; i < parts.length; i += 1) {
+    const meta = parts[i]!;
+    if (!meta.startsWith(':')) continue;
+    const fields = meta.slice(1).split(' ');
+    if (fields.length !== 5) continue;
+    const newHash = fields[3]!;
+    const status = fields[4]!;
+    const path = parts[i + 1] ?? '';
+    i += 1;
+    if (path === '') continue;
+    paths += 1;
+    if (status === 'D' || /^0+$/.test(newHash)) continue;
+    objects.push(newHash);
+  }
+  return { paths, objects };
+}
+
+/**
+ * The post-add budget: the turn's staged path count, then the summed blob
+ * sizes of its new objects (`cat-file --batch-check` over their hashes, one
+ * child on stdin). It never uses `diff --cached --numstat`: numstat's numbers
+ * are line counts, not bytes, and a binary file is `-` there — the artifacts
+ * that actually blow up a world would contribute nothing.
+ *
+ * A missing object is not a budget overrun: `--batch-check` reports `missing`,
+ * the sum skips it, and `write-tree` fails typed on the structural problem.
+ * The sum is per changed path (a blob at two paths counts twice), which is
+ * conservative. The index is never touched here.
+ */
+async function assertStagedBudget(
+  io: WorldIo, delta: StagedDelta, limits: CommitLimits,
+): Promise<void> {
+  if (delta.paths > limits.maxStagedPaths) {
+    throw new CommitBudgetError(
+      `staged paths exceed ${limits.maxStagedPaths}: ${delta.paths}`);
+  }
+  if (delta.objects.length === 0) return;
+  const objects = delta.objects.join('\n') + '\n';
+  const out = await io.gitWithStdin(
+    ['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'],
+    Buffer.from(objects, 'utf8'),
+  );
+  let bytes = 0;
+  for (const line of out.split('\n')) {
+    const fields = line.split(' ');
+    if (fields.length !== 3) continue;
+    const size = Number(fields[2]);
+    if (!Number.isSafeInteger(size) || size < 0) continue;
+    bytes += size;
+    if (bytes > limits.maxStagedBytes) {
+      throw new CommitBudgetError(
+        `staged bytes exceed ${limits.maxStagedBytes}: ${bytes}`);
+    }
+  }
 }
 
 /**

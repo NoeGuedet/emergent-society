@@ -531,6 +531,26 @@ describe('the wake predicate', () => {
     await running;
   });
 
+  it('names a git timeout in the wake diagnostic, never "exit none"', async () => {
+    const { home, world } = fixture();
+    const diagnostics: Error[] = [];
+    const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
+    const d = await NodeDriver.open(home, 'n1', wait, world, {
+      worldPollMs: 0,
+      onError: (err) => { diagnostics.push(err); },
+      onMaintenance: () => {
+        spy.mockRejectedValue(new GitCommandError(['log'], null, '', { kind: 'timeout' }));
+      },
+    });
+    const running = d.run();
+    await parked(d, world);
+    await vi.waitFor(() => expect(diagnostics).toHaveLength(1));
+    expect(diagnostics[0]?.message).toBe('wake predicate failed: git timeout');
+    spy.mockRestore();
+    d.stop();
+    await running;
+  });
+
   it('swallows a throwing diagnostic reporter without changing the park policy', async () => {
     const { home, world } = fixture();
     const seen: number[] = [];

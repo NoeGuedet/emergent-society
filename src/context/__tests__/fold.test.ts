@@ -24,6 +24,7 @@ import type {
   Source, WorldPerception,
 } from '../contracts.js';
 import type { WorldRange } from '../../node/world.js';
+import type { DoctorReport } from '../../node/world-doctor.js';
 
 const home = useTempHome('c13-fold-');
 const fixture = useWorld('c13-fold-driver-');
@@ -1695,5 +1696,72 @@ describe('fold: commit refusals (the C1 refusal carrier)', () => {
     before.lifecycle('world/commit-refused', refusal(), { ignorable: true });
     await before.close();
     await expect(foldOf(home())).rejects.toThrow(/before any config/);
+  });
+});
+
+// The C3 world doctor: an ignorable, VALIDATED, non-rendered local fact. It
+// changes no surface, config or sequencing state, so a replay with the event is
+// identical to one without it — and an older reader whose known set lacks the
+// type skips it rather than refusing the rebuild.
+describe('fold: the world doctor report (a non-rendered fact)', () => {
+  const report = (): DoctorReport => ({
+    lock: 'free',
+    indexLock: 'absent',
+    index: { readable: true, unmerged: 0, missingBlobs: 0, blobsChecked: true },
+    dirty: { tracked: 0, untracked: 0, truncated: false, known: true },
+    trackedUnreadable: [],
+    quarantine: { files: 0, bytes: 0, paths: [], truncated: false },
+    freeSpace: { state: 'ok', bytes: 100 * 1024 ** 3 },
+  });
+
+  it('renders nothing and replays identically', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('world/doctor', { report: report() }, { ignorable: true });
+      await s.writer.flush();
+      const fold = await foldOf(home());
+      // Only the heading: the report added no group, no message, no source.
+      expect(fold.snapshot().surface?.nodes.map((node) => node.group.kind))
+        .toEqual(['heading']);
+      const rebuilt = await foldOf(home());
+      expect(rebuilt.snapshot()).toEqual(fold.snapshot());
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('is skipped by an older reader whose known set lacks the type', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('world/doctor', { report: report() }, { ignorable: true });
+      await s.writer.flush();
+      const older = new Set(
+        [...C13_EVENT_TYPES].filter((type) => type !== 'world/doctor'),
+      );
+      const events = await loadVerifiedEvents(home(), 'n1', older);
+      expect(events.map((event) => event.type)).toContain('world/doctor');
+      const fold = new ContextFold();
+      await fold.observe(events);
+      expect(fold.snapshot().surface?.nodes.map((node) => node.group.kind))
+        .toEqual(['heading']);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('poisons the fold on a malformed report', async () => {
+    const s = await openSession(home());
+    try {
+      await startConfig(s);
+      s.lifecycle('world/doctor', { report: { lock: 'free' } }, { ignorable: true });
+      await s.writer.flush();
+      await expect(foldOf(home())).rejects.toThrow(
+        /world\/doctor report is not a valid DoctorReport/,
+      );
+    } finally {
+      await s.close();
+    }
   });
 });

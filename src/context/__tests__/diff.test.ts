@@ -2,7 +2,8 @@ import { spawn } from 'node:child_process';
 import { access, chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { GitCommandError } from '../../node/errors.js';
 import { commitAs, gitIn, gitRaw, useWorld, writeWorldFile } from '../../node/__tests__/helpers.js';
 import { WorldRepo, gitEnv } from '../../node/world.js';
 import type { GateScope } from '../../node/gate.js';
@@ -42,6 +43,22 @@ async function commitBytes(world: WorldRepo, author: string, rel: string, bytes:
 }
 
 describe('presentWorld concrete rendering', () => {
+  it('degrades a diff read timeout into a truncated perception, never a throw', async () => {
+    const { world } = fixture();
+    const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
+    const spy = vi.spyOn(WorldRepo.prototype, 'diff').mockRejectedValue(
+      new GitCommandError(['diff'], null, '', { kind: 'timeout' }),
+    );
+    try {
+      const p = await presentWorld(world, 'n1', { from: null, to: c1 }, 4096, 4096);
+      expect(p.truncated).toBe(true);
+      expect(p.included).toEqual([]);
+      expect(p.text).toContain('world diff unavailable: git read timeout');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('includes a foreign first commit additions from the empty tree', async () => {
     const { world } = fixture();
     const c1 = await commitAs(world, 'n2', { 'a.txt': 'one\n' });
