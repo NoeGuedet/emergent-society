@@ -44,6 +44,15 @@ export interface NodeEventDataMap {
    * a payload.
    */
   'world/doctor': { report: DoctorReport };
+  /**
+   * The ratified direction this turn pins: the world commit the human authored
+   * and the pinned text's byte length (never the text itself — the world holds
+   * it, the frontier holds the exact request bytes). Ignorable and not
+   * rendered: the fold validates nothing beyond the shape and leaves the
+   * snapshot unchanged, so replay is identical whether the fact is present or
+   * an older reader skips it.
+   */
+  'direction/pinned': { commit: string; bytes: number };
 }
 
 declare module '../journal/envelope.js' {
@@ -53,7 +62,7 @@ declare module '../journal/envelope.js' {
 // Record<keyof NodeEventDataMap, true> rejects a missing or extra key at compile time.
 const REGISTERED: Record<keyof NodeEventDataMap, true> = {
   'node/boot': true, 'node/shutdown': true, 'turn/start': true, 'turn/end': true,
-  'world/commit-refused': true, 'world/doctor': true,
+  'world/commit-refused': true, 'world/doctor': true, 'direction/pinned': true,
 };
 
 /** The runtime registry handed to `JournalReader.open` (its `knownTypes`). */

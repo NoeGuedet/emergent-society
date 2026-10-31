@@ -6,10 +6,10 @@ import { NODE_EVENT_TYPES } from '../events.js';
 const home = useTempHome('node-events-');
 
 describe('node event types', () => {
-  it('registers exactly the six driver types', () => {
+  it('registers exactly the seven node types', () => {
     expect([...NODE_EVENT_TYPES].sort()).toEqual([
-      'node/boot', 'node/shutdown', 'turn/end', 'turn/start', 'world/commit-refused',
-      'world/doctor',
+      'direction/pinned', 'node/boot', 'node/shutdown', 'turn/end', 'turn/start',
+      'world/commit-refused', 'world/doctor',
     ]);
   });
 

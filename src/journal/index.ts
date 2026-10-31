@@ -70,7 +70,7 @@ export {
 
 // Layout, for callers that need to address a journal directly.
 export {
-  HEAD_FILE, LOG_FILE, LOCK_FILE, NODE_UID_RE, OWNER_FILE,
+  HEAD_FILE, HUMAN_AUTHOR, LOG_FILE, LOCK_FILE, NODE_UID_RE, OWNER_FILE,
   assertLayoutNames, assertNodeUid, frontierLayout, nodeDir, nodeLayout,
 } from './layout.js';
 

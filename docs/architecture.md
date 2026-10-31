@@ -39,6 +39,7 @@ not individually logged.
 | `status.ts` | The read-only status report; degradation is reported, not thrown. `host.sandbox`/`host.fence` (and the bounded `fenceReason`) are surfaced while a host holds the record; the `host.storage` fact is host-lifetime and survives a stale record (the fence does not). The human host line prints `fence=unavailable` and `storage=unquoted` only; an unintended fence is the degradation (a running host that requested confinement but carries `fence=unavailable` makes the produced report exit 1), while an explicit `sandbox=off` opt-out and `storage=unquoted` are not degradations |
 | `credentials.ts` | The `providers.json` read side: regular file, mode 0600 (0400 accepted; group/other bits refused), owned by the process uid |
 | `nodes.ts` | `--nodes-file`: strict JSON node-set parsing (≤ 16 entries, unique safe uids, start requires model/heading, resume takes only uids, optional absolute charter file); refusals are `HostConfigError` (exit 2) |
+| `chat.ts` | The agent-zero chat log (`chat.v0.jsonl`, 0600, append-only, outside the world): `speak`'s delivery surface, a projection of the frontier; torn tail dropped at open |
 | `owner.ts` | Pause delivery to the host owning a home; owner records. The optional `fence`/`fenceReason` and `storage` host facts are annotated after the cgroup attach and before composition by a token/pid-checked atomic tmp+rename; records predating either field stay valid |
 | `observe.ts` | Operator diagnostics: one bounded JSON object per line on stderr — never model text, tool output, headers or credentials |
 | `layout.ts` | Cell-home path layout: the home/world-pair checks and `initHome`; a legacy in-world `world/.git` with no `world.git` is refused with the sanitizing migration recipe and exit 2 (never "remove the world") |
@@ -70,6 +71,7 @@ not individually logged.
 | `sandbox.ts` | The Landlock policy: grants, scratch leaf, env ownership, the functional probe; builds the vendored launcher's argv |
 | `proc.ts` | The Linux x86-64 stdin-wait proof (`/proc`) |
 | `sanitize.ts` | PTY output sanitization for the model-facing render |
+| `direction.ts` | `readRatifiedDirection`: `DIRECTION.md` at the latest human-authored commit (two bounded git reads; ≤ 8 KiB pinned, truncation notice, empty/unborn → null); `HUMAN_AUTHOR` is reserved and can never be a node uid |
 | `web.ts` | `web_search`/`web_fetch`: the Tavily client, renderers, `webToolsFromProviders`; every invocation crosses the frontier |
 | `providers.ts` | `loadProviders`: the kernel-side `providers.json` store (see §7) |
 | `dispatch.ts` | `dispatchCalls`: completes tool dialogues through the gate; `wait` takes `{}` or an ISO-8601 `{until}` (1 s–7 days ahead, carried back as `wakeAt`); owns the extend verbs' recognition (seven verbs; `run`/`undefine` take name or id; `stop` takes name, id or nothing — the bare stop names THE live Run; `spawn` takes optional model/heading/charter/spawn) and the native-call bridge — a live-registered package tool called by its bare name runs through the funnel |
@@ -179,6 +181,8 @@ and before the send, a torn tail dropped at open), `index.ts` (exports).
 | One writer per stream | `src/journal/lock.ts` (flock sidecar + durable `{pid, startedAt, token}` owner record) |
 | N nodes on one home | `src/host/host.ts` `composeCellSet` + `src/host/nodes.ts`: one world/doctor/frontier/attribution, one runtime, driver, local log, scratch leaf and cgroup leaf per node; the fence freezes every `node-*` and `run-*` leaf |
 | Spawn and custody | `src/host/host.ts` `NodePool` + `src/node/tools/extend.ts` `SpawnPort`: a node's end unloads its descendants LIFO; caps 8 children / depth 3 / 16 nodes; a spawned node is in-memory (its local log survives) |
+| Ratified direction | `src/node/direction.ts`: the heading pin is `DIRECTION.md` at the latest human-authored commit, cited by `direction/pinned`; a node draft is history, not authority |
+| The human channel | `src/host/chat.ts` + `src/node/tools/extend.ts` `SpeakPort`: `speak` is agent-zero-only and delivered outside the world |
 | The world is the filesystem | `src/node/world.ts` (`WorldRepo`) over `world-git.ts`/`world-commit.ts` |
 | Wake-on-change | `src/node/watcher.ts` + `driver.ts`, asking `WorldRepo.hasForeignCommit` (`world-history.ts`) |
 | Perception is a diff | the watermark in `driver.ts` + `commitsIn`/`firstParent`/`diff` on `WorldRepo`, consumed by `presentWorld` (`src/context/diff.ts`); `WorldRepo.commitsSince` is a test seam |

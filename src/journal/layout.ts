@@ -37,14 +37,26 @@ import { InvalidJournalLayoutError, InvalidNodeUidError } from './errors.js';
 export const NODE_UID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 /**
+ * The git author reserved for the human ratifier in the shared world. It is
+ * never a node uid: a node that could commit under it could forge a
+ * ratification, so `assertNodeUid` refuses it and every world commit the
+ * kernel makes stays a node's.
+ */
+export const HUMAN_AUTHOR = 'human';
+
+/**
  * Validates a node uid, returning it unchanged.
  *
- * @throws InvalidNodeUidError when it is empty, too long, or carries a
- * character that is not safe in a path segment and a git identity.
+ * @throws InvalidNodeUidError when it is empty, too long, carries a character
+ * that is not safe in a path segment and a git identity, or claims the
+ * reserved human ratifier name.
  */
 export function assertNodeUid(uid: string): string {
   if (typeof uid !== 'string' || !NODE_UID_RE.test(uid)) {
     throw new InvalidNodeUidError(String(uid), 'must match /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/');
+  }
+  if (uid === HUMAN_AUTHOR) {
+    throw new InvalidNodeUidError(uid, 'is reserved for the human ratifier and can never be a node uid');
   }
   return uid;
 }

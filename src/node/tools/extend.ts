@@ -46,6 +46,11 @@ export type ExtendPort = {
    * host owns composition, custody and the caps.
    */
   readonly spawn?: SpawnPort;
+  /**
+   * The human channel (A4), when this node is agent zero (the cell's root).
+   * Delivery is outside the world; the frontier already holds the call.
+   */
+  readonly speak?: SpeakPort;
 };
 
 /** One spawn request, already typed: the host validates it against the caps. */
@@ -75,6 +80,22 @@ export class SpawnRefusedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'SpawnRefusedError';
+  }
+}
+
+/** The human-channel message ceiling: a message, not a document. */
+export const MAX_SPEAK_BYTES = 8192;
+
+/** The human channel's kernel seam: deliver one message, or refuse bounded. */
+export type SpeakPort = {
+  speak(text: string): Promise<void>;
+};
+
+/** A bounded, path-free channel refusal the executor renders as denied. */
+export class SpeakRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SpeakRefusedError';
   }
 }
 
@@ -110,7 +131,8 @@ export type ExtendDecision =
     readonly kind: 'extend'; readonly verb: 'spawn';
     readonly model?: string; readonly heading?: string;
     readonly charter?: string; readonly spawn?: boolean;
-  };
+  }
+  | { readonly kind: 'extend'; readonly verb: 'speak'; readonly text: string };
 
 /** A schema violation the funnel refuses with, naming the field. */
 function schemaViolation(args: unknown, schema: unknown, where: string): string | null {
@@ -392,6 +414,28 @@ export async function executeExtend(opts: {
       renderInspect(config, port, definitions.map((pkg) => ({
         id: pkg.id, name: pkg.name, purpose: pkg.purpose, sourceBytes: pkg.sourceBytes,
       }))), false, max);
+    return;
+  }
+
+  if (decision.verb === 'speak') {
+    if (port.speak === undefined) {
+      await appendResult(gate, id, callId,
+        'denied: this node was not granted the human channel', true, max);
+      return;
+    }
+    try {
+      await port.speak.speak(decision.text);
+      await appendResult(gate, id, callId,
+        `spoken to the human (${Buffer.byteLength(decision.text, 'utf8')} bytes)`,
+        false, max);
+    } catch (err) {
+      if (err instanceof SpeakRefusedError) {
+        await appendResult(gate, id, callId,
+          `denied: ${singleLine(err.message, 200)}`, true, max);
+        return;
+      }
+      throw err;
+    }
     return;
   }
 

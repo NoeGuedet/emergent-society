@@ -298,6 +298,10 @@ export class ContextFold {
         this.onPackageEvent(event); return;
       case 'world/commit-refused': this.onCommitRefused(event); return;
       case 'world/doctor': this.onWorldDoctor(event); return;
+      // The pinned direction is a world fact cited by the heading block; the
+      // fold's surface keeps the journaled heading (the runtime overrides the
+      // plan's heading at assembly), so replay is identical with or without it.
+      case 'direction/pinned': return;
       default: return;
     }
   }

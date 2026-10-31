@@ -24,6 +24,7 @@ import {
 import type { SafeFailure, Source } from '../context/contracts.js';
 import type { VerifiedEvent } from '../context/loader.js';
 import { HeadWatcher } from './watcher.js';
+import { readRatifiedDirection, type DirectionPin } from './direction.js';
 import { DEFAULT_WAKE_BUDGET_PER_HOUR } from '../context/config.js';
 import type { WorldRange, WorldRepo } from './world.js';
 
@@ -91,6 +92,12 @@ export interface TurnContext {
   readonly gate: BoundaryGate;
   /** The turn's cancellation signal; `stop()` aborts it immediately. */
   readonly signal: AbortSignal;
+  /**
+   * The ratified direction this turn pins, with its local-log receipt: the
+   * assembler uses it as the heading block instead of the journaled seed. Absent
+   * when no human-authored `DIRECTION.md` exists (the seed stays authoritative).
+   */
+  readonly direction?: { readonly text: string; readonly source: Source };
   now(): number;
 }
 
@@ -176,6 +183,13 @@ export interface NodeDriverOptions extends JournalWriterOptions {
    */
   wakeBudgetPerHour?: number;
   /**
+   * The ratified-direction seam (A4): production reads the latest
+   * human-authored `DIRECTION.md` from the world's history. A failure is the
+   * wake path's failure policy — one bounded diagnostic and the turn pins the
+   * journaled seed instead — never a refused turn.
+   */
+  readDirection?: (world: WorldRepo) => Promise<DirectionPin | null>;
+  /**
    * The commit fence (C2). Absent means the host has no usable cgroup fence
    * (a degraded attach or an off cell): the commit proceeds unfenced, and the
    * host records that degradation in the owner record and on its boot line.
@@ -232,6 +246,14 @@ export class WakeBudgetExhaustedError extends Error {
   constructor() {
     super('timer wake refused: sliding-hour budget exhausted');
     this.name = 'WakeBudgetExhaustedError';
+  }
+}
+
+/** The bounded label for a failed ratified-direction read (never a path). */
+export class DirectionUnavailableError extends Error {
+  constructor() {
+    super('the ratified direction could not be read');
+    this.name = 'DirectionUnavailableError';
   }
 }
 
@@ -303,6 +325,7 @@ export class NodeDriver {
   /** The timer fires inside the sliding hour; per process, reset by a restart. */
   private timerWakes: number[] = [];
   private readonly wakeBudgetPerHour: number;
+  private readonly readDirection: (world: WorldRepo) => Promise<DirectionPin | null>;
   /** The storage circuit breaker shared by the local writer and the turn start. */
   private readonly storage: StorageConfig;
   /** The cancellable storage wait's cancel, or null; cleared when it settles. */
@@ -351,6 +374,7 @@ export class NodeDriver {
   ) {
     this.now = opts.now ?? systemClock;
     this.wakeBudgetPerHour = opts.wakeBudgetPerHour ?? DEFAULT_WAKE_BUDGET_PER_HOUR;
+    this.readDirection = opts.readDirection ?? readRatifiedDirection;
     this.watcher = HeadWatcher.for(world, opts.worldPollMs);
     this.home = home;
     this.hooks = opts.hooks;
@@ -486,9 +510,20 @@ export class NodeDriver {
         // aborted by stop(), the new one would not be, and the handler must
         // never start un-aborted.
         if (this.stopRequested) break;
+        // The ratified direction is a world fact read at the turn boundary,
+        // before the turn's opening is durable: the event it writes cites the
+        // pinned block, and a failed read pins the journaled seed instead.
+        const direction = await this.currentDirection();
         this.writeEvent('turn/start', {
           turn: this.turn, trigger, world: { from: world.from, to: world.to },
         });
+        let pinned: TurnContext['direction'];
+        if (direction !== null) {
+          const receipt = this.writeEvent('direction/pinned', {
+            commit: direction.commit, bytes: Buffer.byteLength(direction.text, 'utf8'),
+          }, { ignorable: true });
+          pinned = { text: direction.text, source: { seq: receipt.seq, hash: receipt.hash } };
+        }
         const controller = new AbortController();
         this.activeController = controller;
         this.turnToolCalls = 0;
@@ -497,6 +532,7 @@ export class NodeDriver {
         const ctx: TurnContext = {
           turn: this.turn, trigger, world, now: () => this.now(),
           gate: created.gate, signal: controller.signal,
+          ...(pinned !== undefined ? { direction: pinned } : {}),
         };
         try {
           // Barrier: the turn's opening is durable and observed before the handler
@@ -1164,6 +1200,21 @@ export class NodeDriver {
   }
 
   /** Cancels a pending retry wake; idempotent. */
+  /**
+   * The ratified direction, with the wake path's failure policy: a failed read
+   * is one bounded diagnostic and a null pin (the journaled seed stays the
+   * heading), never a refused turn. The read happens at every turn boundary:
+   * the world is the authority, so a ratification lands on the next turn.
+   */
+  private async currentDirection(): Promise<DirectionPin | null> {
+    try {
+      return await this.readDirection(this.world);
+    } catch {
+      try { this.opts.onError?.(new DirectionUnavailableError()); } catch { /* the label is not the failure */ }
+      return null;
+    }
+  }
+
   /**
    * Arms the wake the turn asked for. A commit wake ends the park first and
    * cancels this timer in `park`'s exit, so the two wake paths coalesce onto

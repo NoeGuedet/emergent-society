@@ -51,6 +51,7 @@ it('rejects a relative home, a missing flag, an unknown flag and an invalid uid 
     ['pause', '--home', '/x', '--uid', 'node-0'],
     ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--bogus'],
     ['start', '--home', '/x', '--uid', '../x', '--model', 'm', '--heading', 'h'],
+    ['start', '--home', '/x', '--uid', 'human', '--model', 'm', '--heading', 'h'],
     ['resume', '--home', '/x', '--model', 'm'],
     ['resume', '--home', '/x', '--charter-file', '/tmp/charter.txt'],
     ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--charter-file', 'rel.txt'],

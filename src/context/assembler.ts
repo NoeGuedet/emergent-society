@@ -23,7 +23,15 @@ import type {
  */
 
 /** The input of one assembly: the logical request and the state it is built from. */
-export type AssembleInput = { readonly id: RequestId; readonly state: ProjectionState };
+export type AssembleInput = {
+  readonly id: RequestId; readonly state: ProjectionState;
+  /**
+   * The ratified direction this turn pins, when the driver read one. Its text
+   * replaces the journaled heading and its local-log receipt is the heading
+   * block's citation; absent means the journaled heading (the boot seed).
+   */
+  readonly direction?: { readonly text: string; readonly source: Source };
+};
 
 function refuse(message: string): never {
   throw new Error(`cannot assemble: ${message}`);
@@ -87,10 +95,12 @@ export function assemble(input: AssembleInput): RequestPlan {
     historySources.push(...open.sources);
   }
 
+  const headingText = input.direction?.text ?? surface.heading.text;
+  const headingSource = input.direction?.source ?? surface.heading.source;
   const sections: PlanSection[] = [
     { name: 'tools', cache: 'stable', sources: [source] },
     { name: 'charter', cache: 'stable', sources: [source] },
-    { name: 'heading', cache: 'stable', sources: [surface.heading.source] },
+    { name: 'heading', cache: 'stable', sources: [headingSource] },
     { name: 'history', cache: 'advance', sources: sortUnique(historySources) },
     { name: 'queue', cache: 'volatile', sources: sortUnique(queueSources) },
   ];
@@ -108,7 +118,7 @@ export function assemble(input: AssembleInput): RequestPlan {
     history,
     queue,
     charter: config.value.charter,
-    heading: surface.heading.text,
+    heading: headingText,
   };
   return toJson(plan) as unknown as RequestPlan;
 }

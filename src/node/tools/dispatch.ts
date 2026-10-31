@@ -3,12 +3,13 @@ import type {
 } from '../../context/contracts.js';
 import { isRecord } from '../../util.js';
 import type { BoundaryGate } from '../gate.js';
+import { Buffer } from 'node:buffer';
 import { sanitizePtyText } from './sanitize.js';
 import type { CommandOutcome, TerminalPort } from './terminal.js';
 import { boundToolText, decodeToolText } from './text.js';
 import { renderExtract, renderSearch } from './web.js';
 import type { WebOutcome, WebTools } from './web.js';
-import { executeExtend, type ExtendDecision, type ExtendPort } from './extend.js';
+import { MAX_SPEAK_BYTES, executeExtend, type ExtendDecision, type ExtendPort } from './extend.js';
 
 /**
  * Tool dispatch (T7, kernel.md §4).
@@ -215,10 +216,12 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
 
   // `extend`: the seven verbs, each with its exact key set (the funnel's
   // argument shapes are validated here — the one-decision-point rule).
-  const verbs = ['inspect', 'define', 'run', 'call', 'stop', 'undefine', 'spawn'];
+  const verbs = ['inspect', 'define', 'run', 'call', 'stop', 'undefine', 'spawn', 'speak'];
   const verb = parsed['verb'];
   if (typeof verb !== 'string' || !verbs.includes(verb)) {
-    return invalidDetail('verb must be one of inspect, define, run, call, stop, undefine, spawn');
+    return invalidDetail(
+      'verb must be one of inspect, define, run, call, stop, undefine, spawn, speak',
+    );
   }
   const keys = Object.keys(parsed);
   const only = (...allowed: string[]): boolean =>
@@ -227,6 +230,19 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
     return only('verb')
       ? { kind: 'extend', verb: 'inspect' }
       : invalidDetail('inspect takes only verb');
+  }
+  if (verb === 'speak') {
+    // The human channel: exactly one non-blank message, bounded like the
+    // kernel's chat line. The delivery is the host's; dispatch only shapes it.
+    if (!only('verb', 'text')) return invalidDetail('speak takes verb and text');
+    const text = parsed['text'];
+    if (typeof text !== 'string' || text.trim() === '') {
+      return invalidDetail('text must be a non-blank string');
+    }
+    if (Buffer.byteLength(text, 'utf8') > MAX_SPEAK_BYTES) {
+      return invalidDetail(`text must be at most ${MAX_SPEAK_BYTES} bytes`);
+    }
+    return { kind: 'extend', verb: 'speak', text };
   }
   if (verb === 'spawn') {
     // The kernel capability: the child inherits the parent's tools and budget,

@@ -43,8 +43,10 @@ import {
 import type { BootHygiene, CellCgroup } from './cgroups.js';
 import { createFencePort } from './fence.js';
 import {
-  SpawnRefusedError, type SpawnCaps, type SpawnPort, type SpawnRequest,
+  SpeakRefusedError, SpawnRefusedError,
+  type SpeakPort, type SpawnCaps, type SpawnPort, type SpawnRequest,
 } from '../node/tools/extend.js';
+import { ChatLog } from './chat.js';
 import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
 import { MAX_NODES, readNodesFile, type NodeSpec } from './nodes.js';
 import { HostAlreadyRunningError, HostConfigError } from './errors.js';
@@ -133,6 +135,8 @@ export type CellOptions = {
    * only through an explicit grant.
    */
   readonly spawn?: SpawnPort;
+  /** The human channel, granted to agent zero (the first booted node) only. */
+  readonly speak?: SpeakPort;
   readonly pollMs?: number; readonly log: HostLog;
 };
 
@@ -192,6 +196,8 @@ export type CellSetOptions = {
   readonly doctorRunner?: CellOptions['doctorRunner'];
   /** The spawn capability, granted to the first node of the set only. */
   readonly spawn?: SpawnPort;
+  /** The human channel, granted to agent zero (the first booted node) only. */
+  readonly speak?: SpeakPort;
   readonly pollMs?: number; readonly log: HostLog;
 };
 
@@ -333,6 +339,7 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
       }),
       sandbox: sandbox !== false,
       ...(options.spawn !== undefined ? { spawn: options.spawn } : {}),
+      ...(options.speak !== undefined ? { speak: options.speak } : {}),
     }),
   });
   const driver = await NodeDriver.open(home, uid, wrapHandler(runtime.handler, log), world, {
@@ -434,7 +441,10 @@ export async function composeCellSet(options: CellSetOptions): Promise<CellSet> 
   try {
     for (const [index, spec] of options.nodes.entries()) {
       nodes.push(await composeNode(
-        nodeOptionsOf(options, spec, index === 0 ? options.spawn : undefined), shared,
+        nodeOptionsOf(
+          options, spec, index === 0 ? options.spawn : undefined,
+          index === 0 ? options.speak : undefined,
+        ), shared,
       ));
     }
   } catch (err) {
@@ -463,13 +473,14 @@ export async function composeCellSet(options: CellSetOptions): Promise<CellSet> 
 /** One node's composition options from the set's shared fields. */
 function nodeOptionsOf(
   options: CellSetOptions, spec: { readonly uid: string; readonly config: AgentConfig },
-  spawn?: SpawnPort,
+  spawn?: SpawnPort, speak?: SpeakPort,
 ): CellOptions {
   return {
     home: options.home, uid: spec.uid, config: spec.config,
     credential: options.credential, providers: options.providers,
     sandbox: options.sandbox, log: options.log,
     ...(spawn !== undefined ? { spawn } : {}),
+    ...(speak !== undefined ? { speak } : {}),
     ...(options.fence !== undefined ? { fence: options.fence } : {}),
     ...(options.storage !== undefined ? { storage: options.storage } : {}),
     ...(options.doctorRunner !== undefined ? { doctorRunner: options.doctorRunner } : {}),
@@ -1117,6 +1128,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
     close(): Promise<void>;
   } | null = null;
   let pool: NodePool | null = null;
+  let chat: ChatLog | null = null;
   let owner: OwnerHandle | null = null;
   let clearKeepAlive: (() => void) | null = null;
   let detach: (() => void) | null = null;
@@ -1151,6 +1163,10 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       await assertHomeOutsideCheckout(home);
       await assertHomePermissions(home);
       await assertCellLayout(home);
+      // The human channel's delivery surface, opened once per host: outside the
+      // world, kernel-owned, and independent of composition. A failed open is a
+      // refused boot (a kernel-owned record that cannot be read is not reset).
+      chat = await ChatLog.open(home);
       // The boot's node set: one solo spec from the flags, or the operator's
       // nodes file. It is read before the owner record (a malformed file is an
       // exit-2 refusal that never writes one) and validated entry by entry.
@@ -1223,6 +1239,18 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
           ? { available: false, childrenLeft: 0, nodesLeft: 0, depthLeft: 0 }
           : pool.caps(primaryUid)),
       };
+      // The human channel, granted to the root only (agent zero). Delivery is
+      // the chat log; the frontier already holds the exact call bytes.
+      const rootSpeak: SpeakPort = {
+        speak: async (text) => {
+          if (chat === null) throw new SpeakRefusedError('the human channel is not open');
+          try {
+            await chat.append(primaryUid, text, Date.now());
+          } catch {
+            throw new SpeakRefusedError('the human channel could not be written');
+          }
+        },
+      };
       // The composition seams are the solo cell's or the set's; both receive
       // the same validated providers/credential and the one attached sandbox.
       const sharedOptions = {
@@ -1233,7 +1261,8 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       };
       if (specs.length === 1) {
         const cell = await (deps.compose ?? composeCell)({
-          ...sharedOptions, uid: specs[0]!.uid, config: configs[0]!, spawn: rootSpawn,
+          ...sharedOptions, uid: specs[0]!.uid, config: configs[0]!,
+          spawn: rootSpawn, speak: rootSpeak,
         });
         composed = {
           nodes: [cell], world: cell.world, frontier: cell.frontier,
@@ -1241,7 +1270,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         };
       } else {
         composed = await (deps.composeSet ?? composeCellSet)({
-          ...sharedOptions, spawn: rootSpawn,
+          ...sharedOptions, spawn: rootSpawn, speak: rootSpeak,
           nodes: specs.map((spec, index) => ({ uid: spec.uid, config: configs[index]! })),
         });
       }
@@ -1322,6 +1351,13 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       if (owner !== null) {
         try {
           await owner.release();
+        } catch {
+          code = 1;
+        }
+      }
+      if (chat !== null) {
+        try {
+          await chat.close();
         } catch {
           code = 1;
         }

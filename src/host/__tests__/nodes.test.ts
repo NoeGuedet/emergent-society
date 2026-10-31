@@ -90,6 +90,9 @@ it('refuses an unknown key, an unsafe uid, a repeated uid and a missing model', 
   await refusal(await fileOf('uid.json', JSON.stringify([
     { uid: '../node', model: 'm', heading: 'h' },
   ])), 'start');
+  await refusal(await fileOf('human.json', JSON.stringify([
+    { uid: 'human', model: 'm', heading: 'h' },
+  ])), 'start');
   await refusal(await fileOf('dup.json', JSON.stringify([
     { uid: 'node-0', model: 'm', heading: 'h' },
     { uid: 'node-0', model: 'm', heading: 'h' },

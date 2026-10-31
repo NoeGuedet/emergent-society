@@ -526,7 +526,10 @@ class Runtime implements AgentRuntime {
     for (let step = 0; step < config.policy.stepsPerTurn; step += 1) {
       await runCompaction(this.fold, ctx.gate);
       const id: RequestId = { turn: ctx.turn, ordinal };
-      const plan = assemble({ id, state: this.fold.snapshot() });
+      const plan = assemble({
+        id, state: this.fold.snapshot(),
+        ...(ctx.direction !== undefined ? { direction: ctx.direction } : {}),
+      });
       const bytes = canonicalBytes(plan).length;
       if (bytes >= MAX_CAPTURE_BYTES) {
         ctx.gate.append('request/refused', { id, bytes, limit: MAX_CAPTURE_BYTES, phase: 'plan' });

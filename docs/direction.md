@@ -1,6 +1,6 @@
 # Chat & direction — the co-negotiation system
 
-This document specifies how the direction is negotiated, carried and revised: the physical roles, the artifact that holds the direction, the act that makes a version authoritative, and the channel that carries it. Current state: the kernel pins a heading outside compaction and re-injects it verbatim on every request (implemented). Agent zero, the versioned letter, the ratification event and the chat itself are specified, not implemented. The technical realization belongs to [kernel.md](kernel.md); the seed-side consequences to [seed.md](seed.md).
+This document specifies how the direction is negotiated, carried and revised: the physical roles, the artifact that holds the direction, the act that makes a version authoritative, and the channel that carries it. Current state: the kernel pins a heading outside compaction and re-injects it verbatim on every request, and the pinned heading is the world's `DIRECTION.md` at the latest human-authored commit (a node draft is not authoritative); agent zero's human channel (`speak`) is implemented as an `extend` verb granted to the root, delivered outside the world. The rich versioned letter, the ratification event and the chat co-negotiation itself are specified, not implemented. The technical realization belongs to [kernel.md](kernel.md); the seed-side consequences to [seed.md](seed.md).
 
 ## 1. Three physical roles, no mixing
 
