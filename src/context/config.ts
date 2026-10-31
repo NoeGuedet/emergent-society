@@ -12,6 +12,9 @@ import type { AgentConfig, SeedPolicy, ToolSchema } from './contracts.js';
  * Every numeric limit is expanded here — defaults are never re-applied during
  * replay — and the value is deeply frozen so a caller cannot mutate the pin.
  */
+/** The factory timer-wake budget: a proactive hour, never a cap on change. */
+export const DEFAULT_WAKE_BUDGET_PER_HOUR = 12;
+
 export function defaultAgentConfig(): AgentConfig {
   return toJson({
     version: 1,
@@ -33,8 +36,12 @@ export function defaultAgentConfig(): AgentConfig {
       },
       {
         name: 'wait',
-        description: 'End the turn and park until a foreign world commit lands (a commit you did not author; your own commits never wake you). Costs no tokens while parked. The next turn opens with a bounded patch view of the foreign commits since your last wake — read that first.',
-        parameters: { type: 'object', properties: {}, additionalProperties: false },
+        description: 'End the turn and park until a foreign world commit lands (a commit you did not author; your own commits never wake you). Costs no tokens while parked. Pass an ISO-8601 instant in until (for example 2026-11-01T09:00:00Z) to also wake on a schedule: the timer is physics, not a task — nothing is queued, the next turn simply opens at that time even if the world is still. The sliding-hour timer budget bounds proactive wakes; a foreign commit always wakes you. The next turn opens with a bounded patch view of the foreign commits since your last wake — read that first.',
+        parameters: {
+          type: 'object',
+          properties: { until: { type: 'string', minLength: 1 } },
+          additionalProperties: false,
+        },
       },
       {
         name: 'web_search',
@@ -86,6 +93,7 @@ export function defaultAgentConfig(): AgentConfig {
       maxShellCaptureBytes: 16777216,
       maxDiffBytes: 32768, maxCommits: 4096, maxAssistantBytes: 32768,
       maxToolResultBytes: 65536, maxToolArgumentBytes: 262144, maxCallsPerResponse: 32,
+      wakeBudgetPerHour: DEFAULT_WAKE_BUDGET_PER_HOUR,
     },
   }) as unknown as AgentConfig;
 }
@@ -129,13 +137,18 @@ const POLICY_KEYS = [
   'stepsPerTurn', 'compactAfterBytes', 'keepRecentGroups', 'maxAttempts', 'retryDelayMs',
   'requestTimeoutMs', 'shellTimeoutMs', 'killGraceMs', 'maxCaptureBytes', 'maxRequestBytes',
   'maxShellCaptureBytes', 'maxDiffBytes', 'maxCommits', 'maxAssistantBytes',
-  'maxToolResultBytes', 'maxToolArgumentBytes', 'maxCallsPerResponse',
+  'maxToolResultBytes', 'maxToolArgumentBytes', 'maxCallsPerResponse', 'wakeBudgetPerHour',
 ] as const;
+
+/** The policy keys a config journaled before the timer may legitimately omit. */
+const OPTIONAL_POLICY_KEYS: ReadonlySet<string> = new Set(['wakeBudgetPerHour']);
 
 export function validateSeedPolicy(value: unknown, where = 'policy'): SeedPolicy {
   const o = record(value, where);
   onlyKeys(o, POLICY_KEYS, where);
-  for (const key of POLICY_KEYS) if (!(key in o)) fail(`policy.${key}: missing`);
+  for (const key of POLICY_KEYS) {
+    if (!(key in o) && !OPTIONAL_POLICY_KEYS.has(key)) fail(`policy.${key}: missing`);
+  }
   return {
     stepsPerTurn: safeInt(o['stepsPerTurn'], 'policy.stepsPerTurn', 1),
     compactAfterBytes: safeInt(o['compactAfterBytes'], 'policy.compactAfterBytes', 1),
@@ -157,6 +170,9 @@ export function validateSeedPolicy(value: unknown, where = 'policy'): SeedPolicy
     maxToolResultBytes: safeInt(o['maxToolResultBytes'], 'policy.maxToolResultBytes', 256, 256 * 1024),
     maxToolArgumentBytes: safeInt(o['maxToolArgumentBytes'], 'policy.maxToolArgumentBytes', 1, 256 * 1024),
     maxCallsPerResponse: safeInt(o['maxCallsPerResponse'], 'policy.maxCallsPerResponse', 1, 32),
+    ...(o['wakeBudgetPerHour'] !== undefined
+      ? { wakeBudgetPerHour: safeInt(o['wakeBudgetPerHour'], 'policy.wakeBudgetPerHour', 0, 1000) }
+      : {}),
   };
 }
 

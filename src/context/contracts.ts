@@ -105,6 +105,12 @@ export type SeedPolicy = {
   readonly maxAssistantBytes: number;
   readonly maxToolResultBytes: number; readonly maxToolArgumentBytes: number;
   readonly maxCallsPerResponse: number;
+  /**
+   * The timer-wake budget: at most this many proactive wakes in a sliding hour.
+   * Optional because a config journaled before the timer existed has no such
+   * key; absent reads as the factory default (`12`), never as a rewrite.
+   */
+  readonly wakeBudgetPerHour?: number;
 };
 
 export type AgentConfig = {

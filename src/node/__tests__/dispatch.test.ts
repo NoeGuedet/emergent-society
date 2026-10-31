@@ -395,7 +395,13 @@ describe('dispatchCalls: argument validation', () => {
       id: 'j', type: 'function', function: { name: 'execute', arguments: '{bad' },
     }, 'the arguments are not valid JSON'],
     ['non-object arguments', call('k', 'execute', '[]'), 'the arguments must be a JSON object'],
-    ['wait with keys', call('w', 'wait', '{"ms":1}'), 'wait takes an empty object'],
+    ['wait with an unknown key', call('w', 'wait', '{"ms":1}'), 'wait takes {} or {until}'],
+    ['wait with a malformed until', call('u1', 'wait', '{"until":"tomorrow"}'),
+      'until must be an ISO-8601 instant'],
+    ['wait with a past until', call('u2', 'wait', '{"until":"2020-01-01T00:00:00Z"}'),
+      'until must be at least one second in the future'],
+    ['wait with a too-distant until', call('u3', 'wait', '{"until":"2099-01-01T00:00:00Z"}'),
+      'until must be at most seven days ahead'],
     ['execute with an extra key', call('x', 'execute', '{"cmd":"ls","extra":1}'),
       'execute takes only cmd'],
     ['execute with a wrong-typed cmd', call('y', 'execute', '{"cmd":3}'),
@@ -535,6 +541,27 @@ describe('dispatchCalls: wait', () => {
       expect(results[1]!.raw).not.toBeNull();
     } finally {
       await terminal.dispose(100);
+      await s.shutdown();
+    }
+  }, 15000);
+});
+
+describe('dispatchCalls: wait with a timer', () => {
+  it('carries the requested timer instant as wakeAt', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    const NOW = 1_800_000_000_000;
+    try {
+      const until = new Date(NOW + 60_000).toISOString();
+      const proj = projection([call('w2', 'wait', JSON.stringify({ until }))]);
+      const result = await dispatchCalls(
+        proj, ID, s.gate('turn', 0), config(), neverTerminal,
+        undefined, undefined, () => NOW,
+      );
+      expect(result).toEqual({ waited: true, called: 1, wakeAt: NOW + 60_000 });
+      const data = await firstResult(home);
+      expect(data.message.content).toBe('Waiting until a foreign world commit');
+    } finally {
       await s.shutdown();
     }
   }, 15000);

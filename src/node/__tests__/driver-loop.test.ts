@@ -2,8 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { collectEvents, withFailingWrite } from '../../journal/__tests__/helpers.js';
 import type { TurnContext, TurnTrigger } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
+import { HeadWatcher } from '../watcher.js';
 import { WorldRepo } from '../world.js';
-import { useWorld, openTestDriver } from './helpers.js';
+import { commitAs, useWorld, openTestDriver } from './helpers.js';
 
 const fixture = useWorld('node-loop-');
 
@@ -15,6 +16,104 @@ type LooseWriter = { append: (...args: unknown[]) => unknown; close(): Promise<u
 function log(home: string) {
   return collectEvents(home, NODE_EVENT_TYPES, 'n1');
 }
+
+describe('NodeDriver timer', () => {
+  it('arms the scheduled wake and opens the next turn with trigger timer', async () => {
+    const { home, world } = fixture();
+    const NOW = 1_800_000_000_000;
+    const schedules: { ms: number; fire: () => void }[] = [];
+    const triggers: TurnTrigger[] = [];
+    let turns = 0;
+    const d = await openTestDriver(home, 'n1', (ctx) => {
+      triggers.push(ctx.trigger);
+      turns += 1;
+      return turns === 1
+        ? { outcome: 'waiting', toolCalls: false, wakeAt: NOW + 60_000 }
+        : { outcome: 'waiting', toolCalls: false };
+    }, world, {
+      worldPollMs: 0,
+      now: () => NOW,
+      schedule: (ms, callback) => {
+        schedules.push({ ms, fire: callback });
+        return () => {};
+      },
+    });
+    const running = d.run();
+    await vi.waitFor(() => expect(d.state).toBe('waiting'));
+    // The turn asked for a wake one minute out; the driver armed exactly that.
+    expect(schedules.map((entry) => entry.ms)).toEqual([60_000]);
+    schedules[0]!.fire();
+    await vi.waitFor(() => expect(triggers).toEqual(['boot', 'timer']));
+    d.stop();
+    await running;
+    const starts = (await log(home)).filter((event) => event.type === 'turn/start');
+    expect(starts.map((event) => (event.data as { trigger: string }).trigger))
+      .toEqual(['boot', 'timer']);
+  });
+
+  it('refuses a timer wake past the sliding-hour budget and stays parked', async () => {
+    const { home, world } = fixture();
+    const NOW = 1_800_000_000_000;
+    const timers: (() => void)[] = [];
+    const errors: Error[] = [];
+    const triggers: TurnTrigger[] = [];
+    const d = await openTestDriver(home, 'n1', (ctx) => {
+      triggers.push(ctx.trigger);
+      return { outcome: 'waiting', toolCalls: false, wakeAt: NOW + 60_000 };
+    }, world, {
+      worldPollMs: 0,
+      now: () => NOW,
+      wakeBudgetPerHour: 1,
+      onError: (err) => errors.push(err),
+      schedule: (_ms, callback) => {
+        timers.push(callback);
+        return () => {};
+      },
+    });
+    const running = d.run();
+    await vi.waitFor(() => expect(d.state).toBe('waiting'));
+    timers[0]!();
+    await vi.waitFor(() => expect(triggers).toEqual(['boot', 'timer']));
+    // The timer turn re-armed one more; within the same hour it is refused.
+    await vi.waitFor(() => expect(timers).toHaveLength(2));
+    timers[1]!();
+    await vi.waitFor(() => expect(errors.map((err) => err.name))
+      .toContain('WakeBudgetExhaustedError'));
+    expect(triggers).toEqual(['boot', 'timer']);
+    d.stop();
+    await running;
+  });
+
+  it('cancels the armed timer when a foreign commit wakes the node first', async () => {
+    const { home, world } = fixture();
+    const NOW = 1_800_000_000_000;
+    let cancelled = 0;
+    const timers: (() => void)[] = [];
+    const triggers: TurnTrigger[] = [];
+    const d = await openTestDriver(home, 'n1', (ctx) => {
+      triggers.push(ctx.trigger);
+      return { outcome: 'waiting', toolCalls: false, wakeAt: NOW + 60_000 };
+    }, world, {
+      worldPollMs: 0,
+      now: () => NOW,
+      schedule: (_ms, callback) => {
+        timers.push(callback);
+        return () => { cancelled += 1; };
+      },
+    });
+    const running = d.run();
+    await vi.waitFor(() => expect(d.state).toBe('waiting'));
+    expect(timers).toHaveLength(1);
+    await commitAs(world, 'human', { 'peer.txt': 'peer\n' }, 'peer');
+    HeadWatcher.for(world, 0).poke();
+    await vi.waitFor(() => expect(triggers).toEqual(['boot', 'wakeup']));
+    // The commit wake superseded the timer: its cancel ran before the next park
+    // armed the next turn's own timer.
+    expect(cancelled).toBeGreaterThanOrEqual(1);
+    d.stop();
+    await running;
+  });
+});
 
 describe('NodeDriver run loop', () => {
   it('chains turns with trigger chain until the handler waits', async () => {

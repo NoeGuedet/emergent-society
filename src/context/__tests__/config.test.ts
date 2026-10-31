@@ -30,8 +30,12 @@ describe('defaultAgentConfig', () => {
         },
         {
           name: 'wait',
-          description: 'End the turn and park until a foreign world commit lands (a commit you did not author; your own commits never wake you). Costs no tokens while parked. The next turn opens with a bounded patch view of the foreign commits since your last wake — read that first.',
-          parameters: { type: 'object', properties: {}, additionalProperties: false },
+          description: 'End the turn and park until a foreign world commit lands (a commit you did not author; your own commits never wake you). Costs no tokens while parked. Pass an ISO-8601 instant in until (for example 2026-11-01T09:00:00Z) to also wake on a schedule: the timer is physics, not a task — nothing is queued, the next turn simply opens at that time even if the world is still. The sliding-hour timer budget bounds proactive wakes; a foreign commit always wakes you. The next turn opens with a bounded patch view of the foreign commits since your last wake — read that first.',
+          parameters: {
+            type: 'object',
+            properties: { until: { type: 'string', minLength: 1 } },
+            additionalProperties: false,
+          },
         },
         {
           name: 'web_search',
@@ -83,6 +87,7 @@ describe('defaultAgentConfig', () => {
         maxShellCaptureBytes: 16777216,
         maxDiffBytes: 32768, maxCommits: 4096, maxAssistantBytes: 32768,
         maxToolResultBytes: 65536, maxToolArgumentBytes: 262144, maxCallsPerResponse: 32,
+        wakeBudgetPerHour: 12,
       },
     });
   });
@@ -102,6 +107,20 @@ describe('defaultAgentConfig', () => {
 describe('validateAgentConfig', () => {
   it('accepts the default configuration', () => {
     expect(validateAgentConfig(base())).toEqual(base());
+  });
+
+  it('accepts a pre-timer policy (no wakeBudgetPerHour) and validates one when present', () => {
+    const cfg = base();
+    const policy: Record<string, unknown> = { ...cfg.policy };
+    delete policy['wakeBudgetPerHour'];
+    const validated = validateAgentConfig({ ...cfg, policy });
+    // Absent stays absent: the reader applies the factory default, never a
+    // rewrite of the journaled config.
+    expect('wakeBudgetPerHour' in validated.policy).toBe(false);
+    expect(validateAgentConfig(withPolicy({ wakeBudgetPerHour: 3 })).policy.wakeBudgetPerHour)
+      .toBe(3);
+    expect(() => validateAgentConfig(withPolicy({ wakeBudgetPerHour: -1 }))).toThrow();
+    expect(() => validateAgentConfig(withPolicy({ wakeBudgetPerHour: 1.5 }))).toThrow();
   });
 
   it('rejects a missing or malformed shape', () => {

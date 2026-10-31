@@ -41,11 +41,22 @@ import { executeExtend, type ExtendDecision, type ExtendPort } from './extend.js
  * `tool/call`).
  */
 
-export type DispatchResult = { readonly waited: boolean; readonly called: number };
+export type DispatchResult = {
+  readonly waited: boolean; readonly called: number;
+  /** The requested timer wake, epoch ms, when `wait` carried an `until`. */
+  readonly wakeAt?: number;
+};
+
+/** The furthest a `until` may reach: longer than this is not a turn, and the
+ * driver's timer must stay inside the platform's delay range. */
+const MAX_WAIT_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** An ISO-8601 instant: a date-time with seconds and an explicit zone. */
+const ISO_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 
 type Decision =
   | { readonly kind: 'execute'; readonly cmd: string }
-  | { readonly kind: 'wait' }
+  | { readonly kind: 'wait'; readonly until?: number }
   | { readonly kind: 'web_search'; readonly query: string;
       readonly maxResults: number | undefined }
   | { readonly kind: 'web_fetch'; readonly url: string }
@@ -86,7 +97,7 @@ function nativeBridgeDecision(call: FunctionCall, extend: ExtendPort): ExtendDec
  * by the config and has a handler here; an offered-but-denied name is `denied`,
  * and any other name is `unknown-tool` — never a shell command.
  */
-function decide(call: FunctionCall, config: AgentConfig): Decision {
+function decide(call: FunctionCall, config: AgentConfig, now: () => number): Decision {
   const name = call.function.name;
   const offered = config.tools.some((tool) => tool.name === name);
   const hasHandler = name === 'execute' || name === 'wait'
@@ -129,10 +140,30 @@ function decide(call: FunctionCall, config: AgentConfig): Decision {
   }
 
   if (name === 'wait') {
-    // `wait` accepts only an empty object.
-    return Object.keys(parsed).length === 0
-      ? { kind: 'wait' }
-      : invalidDetail('wait takes an empty object — call it as {} to end the turn');
+    // `{}` parks until a foreign commit; `{until}` also arms a timer. The
+    // instant is strict ISO-8601, at least one second ahead (an immediate
+    // re-wake would spin) and at most seven days out (the timer is not a
+    // calendar and must not overflow the platform delay).
+    const keys = Object.keys(parsed);
+    if (keys.length === 0) return { kind: 'wait' };
+    if (keys.length !== 1 || keys[0] !== 'until') {
+      return invalidDetail('wait takes {} or {until} — call it as {} to end the turn');
+    }
+    const until = parsed['until'];
+    if (typeof until !== 'string' || !ISO_INSTANT_RE.test(until)) {
+      return invalidDetail('until must be an ISO-8601 instant, for example 2026-11-01T09:00:00Z');
+    }
+    const at = Date.parse(until);
+    if (!Number.isSafeInteger(at)) {
+      return invalidDetail('until is not a valid instant');
+    }
+    if (at <= now() + 1000) {
+      return invalidDetail('until must be at least one second in the future');
+    }
+    if (at > now() + MAX_WAIT_MS) {
+      return invalidDetail('until must be at most seven days ahead');
+    }
+    return { kind: 'wait', until: at };
   }
 
   if (name === 'web_search') {
@@ -443,10 +474,12 @@ async function appendWebResult(
 export async function dispatchCalls(
   projection: AssistantProjection, id: RequestId, gate: BoundaryGate,
   config: AgentConfig, terminal: TerminalPort, web?: WebTools, extend?: ExtendPort,
+  now: () => number = Date.now,
 ): Promise<DispatchResult> {
   const calls = projection.message.tool_calls;
   let called = 0;
   let waited = false;
+  let wakeAt: number | undefined;
 
   for (let i = 0; i < calls.length; i++) {
     const call = calls[i]!;
@@ -462,7 +495,7 @@ export async function dispatchCalls(
     await gate.flush();
     called += 1;
 
-    const decision = decide(call, config);
+    const decision = decide(call, config, now);
     if (decision.kind === 'error') {
       // The native-call bridge: a live-registered package tool attempted by
       // its bare name is dispatched through the funnel — the same executor,
@@ -510,6 +543,7 @@ export async function dispatchCalls(
     }
     if (decision.kind === 'wait') {
       waited = true;
+      if (decision.until !== undefined) wakeAt = decision.until;
       appendWaitResult(gate, id, call.id);
       await gate.flush();
       continue;
@@ -544,5 +578,5 @@ export async function dispatchCalls(
     await gate.flush();
   }
 
-  return { waited, called };
+  return { waited, called, ...(wakeAt !== undefined ? { wakeAt } : {}) };
 }

@@ -24,6 +24,7 @@ import {
 import type { SafeFailure, Source } from '../context/contracts.js';
 import type { VerifiedEvent } from '../context/loader.js';
 import { HeadWatcher } from './watcher.js';
+import { DEFAULT_WAKE_BUDGET_PER_HOUR } from '../context/config.js';
 import type { WorldRange, WorldRepo } from './world.js';
 
 export type NodeState = 'booting' | 'active' | 'waiting' | 'stopping' | 'stopped';
@@ -67,7 +68,11 @@ export type { TurnTrigger } from './events.js';
  * rather than shutting the node down as an ordinary thrown exception does.
  */
 export type TurnResult =
-  | { readonly outcome: 'chained' | 'waiting'; readonly toolCalls: boolean }
+  | {
+      readonly outcome: 'chained' | 'waiting'; readonly toolCalls: boolean;
+      /** The instant the handler asked to be woken at, when `wait` carried one. */
+      readonly wakeAt?: number;
+    }
   | { readonly outcome: 'error'; readonly toolCalls: boolean; readonly error: SafeFailure };
 
 /** The handler's whole world: no writer, no commit — the clock is the injected `now`. */
@@ -164,6 +169,13 @@ export interface NodeDriverOptions extends JournalWriterOptions {
    */
   schedule?: (ms: number, callback: () => void) => () => void;
   /**
+   * The timer-wake budget: at most this many proactive wakes inside a sliding
+   * hour. Absent reads as the factory default (`12`). A foreign commit is never
+   * bounded by it — the budget is cost physics for self-initiated turns, never
+   * a cap on observation.
+   */
+  wakeBudgetPerHour?: number;
+  /**
    * The commit fence (C2). Absent means the host has no usable cgroup fence
    * (a degraded attach or an off cell): the commit proceeds unfenced, and the
    * host records that degradation in the owner record and on its boot line.
@@ -193,6 +205,9 @@ const RETRY_DELAYS_MS: readonly number[] = [1000, 4000, 16000];
 /** The turn-start storage retry wait (W0-d): the production default, no switch. */
 const DEFAULT_STORAGE_RETRY_MS = 5_000;
 
+/** The sliding window the timer-wake budget counts over. */
+const WAKE_BUDGET_WINDOW_MS = 60 * 60 * 1000;
+
 /** The one bounded diagnostic a deferred turn emits: a fixed label, no payload. */
 const STORAGE_DEFERRED_LABEL = 'turn deferred: storage low';
 
@@ -205,6 +220,18 @@ export class StorageDeferredError extends Error {
   constructor() {
     super(STORAGE_DEFERRED_LABEL);
     this.name = 'StorageDeferredError';
+  }
+}
+
+/**
+ * The named timer-budget refusal: a stable class name for the host's bounded
+ * `driver/error` channel. A refused proactive wake is not a fault — the node
+ * stays parked and still wakes on any foreign commit.
+ */
+export class WakeBudgetExhaustedError extends Error {
+  constructor() {
+    super('timer wake refused: sliding-hour budget exhausted');
+    this.name = 'WakeBudgetExhaustedError';
   }
 }
 
@@ -269,6 +296,13 @@ export class NodeDriver {
   private retryAttempt = 0;
   /** The pending retry wake's cancel, or null; cleared on park, stop and success. */
   private retryTimer: (() => void) | null = null;
+  /** The armed timer wake, if any; cancelled whenever the park ends. */
+  private wakeTimer: (() => void) | null = null;
+  /** Whether the last park ended on a timer, so the next turn says 'timer'. */
+  private timerFired = false;
+  /** The timer fires inside the sliding hour; per process, reset by a restart. */
+  private timerWakes: number[] = [];
+  private readonly wakeBudgetPerHour: number;
   /** The storage circuit breaker shared by the local writer and the turn start. */
   private readonly storage: StorageConfig;
   /** The cancellable storage wait's cancel, or null; cleared when it settles. */
@@ -316,6 +350,7 @@ export class NodeDriver {
     home: string,
   ) {
     this.now = opts.now ?? systemClock;
+    this.wakeBudgetPerHour = opts.wakeBudgetPerHour ?? DEFAULT_WAKE_BUDGET_PER_HOUR;
     this.watcher = HeadWatcher.for(world, opts.worldPollMs);
     this.home = home;
     this.hooks = opts.hooks;
@@ -410,9 +445,10 @@ export class NodeDriver {
     if (this.nodeState === 'stopping' || this.nodeState === 'stopped') return;
     this.stopReason = reason;
     this.stopRequested = true;
-    // A pending self-retry or storage wait must not wake a stopped node (or
-    // hold the process).
+    // A pending self-retry, storage wait or timer must not wake a stopped node
+    // (or hold the process).
     this.clearRetryTimer();
+    this.clearWakeTimer();
     this.storageWait?.();
     // Cancel the active turn immediately; the gate stays valid while the
     // handler's awaited cleanup settles (see `endTurnGate`).
@@ -585,10 +621,12 @@ export class NodeDriver {
             throw err;
           }
           if (this.stopRequested) break;
+          this.armWakeTimer(result);
           await this.park();
           if (this.stopRequested) break;
           this.nodeState = 'active';
-          trigger = 'wakeup';
+          trigger = this.timerFired ? 'timer' : 'wakeup';
+          this.timerFired = false;
           this.turn += 1;
         } finally {
           // Every exit from the turn — the barrier, a handler failure, a commit
@@ -907,8 +945,11 @@ export class NodeDriver {
       unsubscribe();
       // The park is over: a pending self-retry must not wake the park that
       // follows (the refusal that armed it is this park's, and the next turn
-      // either re-arms it or a successful commit clears it).
+      // either re-arms it or a successful commit clears it). The wake timer is
+      // cancelled the same way: a commit wake supersedes it, and the next turn
+      // re-arms its own.
       this.clearRetryTimer();
+      this.clearWakeTimer();
       // An evaluation still in flight for this park must not arm the latch of
       // the park that follows.
       this.parkEpoch += 1;
@@ -1123,6 +1164,44 @@ export class NodeDriver {
   }
 
   /** Cancels a pending retry wake; idempotent. */
+  /**
+   * Arms the wake the turn asked for. A commit wake ends the park first and
+   * cancels this timer in `park`'s exit, so the two wake paths coalesce onto
+   * the one latch instead of racing.
+   */
+  private armWakeTimer(result: TurnResult): void {
+    this.clearWakeTimer();
+    if (result.outcome !== 'waiting' || result.wakeAt === undefined) return;
+    const delay = Math.max(0, result.wakeAt - this.now());
+    this.wakeTimer = this.schedule(delay, () => {
+      this.wakeTimer = null;
+      this.fireTimerWake();
+    });
+  }
+
+  /**
+   * One timer fire: the sliding-hour budget is checked first, then the latch is
+   * requested. An exhausted budget refuses the proactive wake and reports one
+   * bounded label; the node stays parked and any foreign commit still wakes it.
+   */
+  private fireTimerWake(): void {
+    const at = this.now();
+    this.timerWakes = this.timerWakes.filter((time) => time > at - WAKE_BUDGET_WINDOW_MS);
+    if (this.timerWakes.length >= this.wakeBudgetPerHour) {
+      try { this.opts.onError?.(new WakeBudgetExhaustedError()); } catch { /* the label is not the failure */ }
+      return;
+    }
+    this.timerWakes.push(at);
+    this.timerFired = true;
+    this.latch.request();
+  }
+
+  private clearWakeTimer(): void {
+    const cancel = this.wakeTimer;
+    this.wakeTimer = null;
+    cancel?.();
+  }
+
   private clearRetryTimer(): void {
     const cancel = this.retryTimer;
     this.retryTimer = null;

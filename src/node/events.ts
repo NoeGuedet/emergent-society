@@ -12,7 +12,7 @@ import type { WorldRange } from './world.js';
  * `turn/end` carries (§5.2).
  */
 
-export type TurnTrigger = 'boot' | 'chain' | 'wakeup';
+export type TurnTrigger = 'boot' | 'chain' | 'wakeup' | 'timer';
 export type TurnEndOutcome = 'chained' | 'waiting' | 'error' | 'interrupted';
 export type ShutdownReason = 'stop-requested' | 'handler-error' | 'maintenance-error' | 'driver-error';
 

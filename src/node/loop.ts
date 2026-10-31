@@ -549,11 +549,11 @@ class Runtime implements AgentRuntime {
       const calls = sent.projection.message.tool_calls;
       this.packageGateHolder.gate = ctx.gate;
       this.flushPackageFacts(ctx.gate);
-      let dispatched: { waited: boolean; called: number };
+      let dispatched: { waited: boolean; called: number; wakeAt?: number };
       try {
         dispatched = await dispatchCalls(
           sent.projection, id, ctx.gate, config, this.terminalPort,
-          this.options.webTools, this.extendPort ?? undefined,
+          this.options.webTools, this.extendPort ?? undefined, ctx.now,
         );
       } finally {
         this.packageGateHolder.gate = null;
@@ -564,7 +564,12 @@ class Runtime implements AgentRuntime {
       // A stop during dispatch reconciles the group (dispatchCalls closes it) and
       // parks rather than opening another logical request.
       if (ctx.signal.aborted) return { outcome: 'waiting', toolCalls: accepted > 0 };
-      if (dispatched.waited) return { outcome: 'waiting', toolCalls: accepted > 0 };
+      if (dispatched.waited) {
+        return {
+          outcome: 'waiting', toolCalls: accepted > 0,
+          ...(dispatched.wakeAt !== undefined ? { wakeAt: dispatched.wakeAt } : {}),
+        };
+      }
     }
     return { outcome: 'chained', toolCalls: accepted > 0 };
   }

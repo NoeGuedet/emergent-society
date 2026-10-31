@@ -1,6 +1,8 @@
 import { lstat, open, stat, type FileHandle } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { defaultAgentConfig, validateAgentConfig } from '../context/config.js';
+import {
+  DEFAULT_WAKE_BUDGET_PER_HOUR, defaultAgentConfig, validateAgentConfig,
+} from '../context/config.js';
 import type { AgentConfig } from '../context/contracts.js';
 import { C13_EVENT_TYPES } from '../context/events.js';
 import { ContextFold } from '../context/fold.js';
@@ -328,6 +330,7 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
     ...(fencePort !== undefined ? { fence: fencePort } : {}),
     ...(doctor !== undefined ? { doctor } : {}),
     storage,
+    wakeBudgetPerHour: config.policy.wakeBudgetPerHour ?? DEFAULT_WAKE_BUDGET_PER_HOUR,
     onError: (err) => log.emit('driver/error', { error: err.name }),
     onMaintenance: () => log.emit('host/parked'),
     schedule: (ms, callback) => {
