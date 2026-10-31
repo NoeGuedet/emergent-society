@@ -76,6 +76,27 @@ it('parses status with --json and refuses the flags it does not own', () => {
   }
 });
 
+it('parses --nodes-file and refuses the solo flags it replaces', () => {
+  expect(parseHostCommand(['start', '--home', '/x', '--nodes-file', '/tmp/nodes.json'])).toEqual({
+    command: 'start', home: '/x', uid: 'node-0', noSandbox: false,
+    nodesFile: '/tmp/nodes.json',
+  });
+  expect(parseHostCommand(['resume', '--home', '/x', '--nodes-file', '/tmp/nodes.json'])).toEqual({
+    command: 'resume', home: '/x', uid: 'node-0', noSandbox: false,
+    nodesFile: '/tmp/nodes.json',
+  });
+  for (const argv of [
+    ['start', '--home', '/x', '--nodes-file', '/tmp/n.json', '--uid', 'node-1'],
+    ['start', '--home', '/x', '--nodes-file', '/tmp/n.json', '--model', 'm'],
+    ['start', '--home', '/x', '--nodes-file', '/tmp/n.json', '--heading', 'h'],
+    ['start', '--home', '/x', '--nodes-file', '/tmp/n.json', '--charter-file', '/tmp/c'],
+    ['start', '--home', '/x', '--nodes-file', 'rel.json'],
+    ['resume', '--home', '/x', '--nodes-file', '/tmp/n.json', '--uid', 'node-1'],
+  ]) {
+    expect(() => parseHostCommand(argv)).toThrow(UsageError);
+  }
+});
+
 it('USAGE lists the five commands, the exit codes and the eight disclosures', () => {
   for (const s of [
     'init', 'start', 'resume', 'pause', 'Exit codes: 0', 'interrupts in-flight',

@@ -114,11 +114,12 @@ async function runHost(command: HostRun, deps: CliDeps, err: Sink): Promise<numb
     log,
     ...(command.command === 'start'
       ? {
-          model: command.model,
-          heading: command.heading,
+          ...(command.model !== undefined ? { model: command.model } : {}),
+          ...(command.heading !== undefined ? { heading: command.heading } : {}),
           ...(command.charterFile !== undefined ? { charterFile: command.charterFile } : {}),
         }
       : {}),
+    ...(command.nodesFile !== undefined ? { nodesFile: command.nodesFile } : {}),
   });
   return await handle.done;
 }

@@ -62,6 +62,24 @@ it('freezes the created node leaf plus every run leaf and logs one bounded line'
   await port.release();
 });
 
+it('freezes every node leaf, not only the committing node\'s', async () => {
+  for (const name of ['node-node-0', 'node-node-1']) {
+    const leaf = join(root, name);
+    await mkdir(leaf);
+    await writeFile(join(leaf, 'cgroup.events'), 'frozen 1\n');
+  }
+  const port = createFencePort({ root, uid: 'node-0', log: log() });
+  expect(await port.acquire()).toEqual({ fenced: true, leaves: 2 });
+  for (const name of ['node-node-0', 'node-node-1']) {
+    expect((await readFile(join(root, name, 'cgroup.freeze'), 'utf8')).trim()).toBe('1');
+  }
+  expect(fenceLines()).toEqual([{ event: 'host/fence', state: 'fenced', leaves: 2, ms: expect.any(Number) }]);
+  await port.release();
+  for (const name of ['node-node-0', 'node-node-1']) {
+    expect((await readFile(join(root, name, 'cgroup.freeze'), 'utf8')).trim()).toBe('0');
+  }
+});
+
 it('freezes an empty node leaf and reports one leaf', async () => {
   const node = join(root, 'node-node-0');
   await mkdir(node);

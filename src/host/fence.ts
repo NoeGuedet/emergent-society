@@ -11,13 +11,15 @@ import type { HostLog } from './observe.js';
  * root and the node's uid and injected into `NodeDriver.open`.
  *
  * The commit's critical section (walk → add → write-tree → commit-tree →
- * update-ref) runs with every confined child of this cell frozen: the node's
- * own leaf `node-<uid>` — created first if it does not exist, because an idle
- * cell still commits before any shell has run — plus every existing `run-*`
- * leaf. Enumeration is read-only (`listLeaves`); a leaf that vanishes between
- * the list and the freeze write is gone, not a failure, and a leaf that
- * vanishes during the freeze wait is dropped from the wait rather than held to
- * the deadline.
+ * update-ref) runs with every confined child of this cell frozen: every node
+ * leaf `node-*` — the committing node's own leaf is created first if it does
+ * not exist, because an idle cell still commits before any shell has run — plus
+ * every existing `run-*` leaf. Under one host with several drivers the worktree
+ * is shared, so another node's shell must not write while any node commits:
+ * the critical section is the cell's, not the committer's. Enumeration is
+ * read-only (`listLeaves`); a leaf that vanishes between the list and the
+ * freeze write is gone, not a failure, and a leaf that vanishes during the
+ * freeze wait is dropped from the wait rather than held to the deadline.
  *
  * The port never throws and never leaves a caller frozen. `acquire` maps every
  * failure to `freeze-failed` with a bounded detail after thawing what it froze;
@@ -56,16 +58,17 @@ export function createFencePort(input: {
   const detail = (text: string): string => singleLine(text, MAX_FENCE_DETAIL);
 
   /**
-   * Every existing Run leaf plus the node leaf (created if absent). The
-   * enumeration runs first: a readdir/lstat failure other than ENOENT/ENOTDIR
-   * must refuse before any leaf is frozen, and a missing root still lists as
-   * empty so the node leaf can be created.
+   * Every existing node leaf plus every existing Run leaf; the committing
+   * node's own leaf is created if absent. The enumeration runs first: a
+   * readdir/lstat failure other than ENOENT/ENOTDIR must refuse before any
+   * leaf is frozen, and a missing root still lists as empty so the node leaf
+   * can be created.
    */
   async function currentLeaves(): Promise<string[]> {
-    const runs = await listLeaves(input.root);
     const node = nodeLeaf(input.root, input.uid);
+    const leaves = await listLeaves(input.root, ['node-', 'run-']);
     await ensureLeaf(node);
-    return [node, ...runs];
+    return [node, ...leaves.filter((leaf) => leaf !== node)];
   }
 
   /**
@@ -110,7 +113,8 @@ export function createFencePort(input: {
           // The node's own leaf may not vanish under a live cell — if it did,
           // the tree was detached and a subset freeze would not fence the shell.
           const node = nodeLeaf(input.root, input.uid);
-          const live = await existing([node, ...await listLeaves(input.root)]);
+          const listed = await listLeaves(input.root, ['node-', 'run-']);
+          const live = await existing([node, ...listed.filter((leaf) => leaf !== node)]);
           const changed = live.length !== leaves.length
             || live.some((leaf) => !leaves.includes(leaf));
           if (!live.includes(node)) {

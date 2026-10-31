@@ -18,8 +18,16 @@ machine default shell may be older, always select 24 via nvm first.
   opt-out; `--charter-file` is the base of the composed charter on a start into a cell with no
   journaled configuration (its content is journaled as configuration; the kernel appends the
   node identity sentence).
+- `start --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]` — boot a declared
+  node set on one home: a strict JSON array of at most 16 `{uid, model, heading,
+  charterFile?}` entries with unique uids, read at the config gate (exit 2 on a
+  malformed file). Each node gets its own local log, scratch leaf and cgroup leaf;
+  all share the home's world and frontier journal. `--nodes-file` replaces
+  `--uid`/`--model`/`--heading`/`--charter-file`.
 - `resume --home <abs-dir> [--uid node-0] [--no-sandbox]` — resume a parked node;
   `--model`/`--heading`/`--charter-file` are refused as unknown flags.
+- `resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]` — resume a
+  declared node set; entries declare only `uid` (the journaled config wins).
 - `pause --home <abs-dir>` — deliver a stop to the host owning the home; no `--uid` (one host
   owns a home).
 - `status --home <abs-dir> [--json]` — read-only report; a produced but degraded report

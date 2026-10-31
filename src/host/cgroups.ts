@@ -311,7 +311,9 @@ export async function ensureLeaf(dir: string): Promise<void> {
  * fence report `fenced: true` with an unstattable Run leaf outside the frozen
  * set.
  */
-export async function listLeaves(root: string): Promise<readonly string[]> {
+export async function listLeaves(
+  root: string, prefixes: readonly string[] = ['run-'],
+): Promise<readonly string[]> {
   let entries: string[];
   try {
     entries = await readdir(root);
@@ -322,7 +324,7 @@ export async function listLeaves(root: string): Promise<readonly string[]> {
   }
   const names: string[] = [];
   for (const name of entries) {
-    if (!name.startsWith('run-')) continue;
+    if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
     try {
       const entry = await lstat(join(root, name));
       if (entry.isDirectory()) names.push(name);

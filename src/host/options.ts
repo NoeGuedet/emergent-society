@@ -44,12 +44,12 @@ export type HostCliCommand =
   | { readonly command: 'init'; readonly home: string }
   | {
       readonly command: 'start'; readonly home: string; readonly uid: string;
-      readonly model: string; readonly heading: string; readonly noSandbox: boolean;
-      readonly charterFile?: string;
+      readonly model?: string; readonly heading?: string; readonly noSandbox: boolean;
+      readonly charterFile?: string; readonly nodesFile?: string;
     }
   | {
       readonly command: 'resume'; readonly home: string; readonly uid: string;
-      readonly noSandbox: boolean;
+      readonly noSandbox: boolean; readonly nodesFile?: string;
     }
   | { readonly command: 'pause'; readonly home: string }
   | { readonly command: 'status'; readonly home: string; readonly json: boolean };
@@ -58,7 +58,9 @@ export type HostCliCommand =
 export const USAGE = `Usage:
   node dist/host/main.js init   --home <abs-dir>
   node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--uid node-0] [--no-sandbox]
+  node dist/host/main.js start  --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> [--uid node-0] [--no-sandbox]
+  node dist/host/main.js resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]
   node dist/host/main.js pause  --home <abs-dir>
   node dist/host/main.js status --home <abs-dir> [--json]
 
@@ -72,6 +74,10 @@ A live or unverified host.json blocks a new host; delete it only if you are cert
 configuration (including the boot-recovery start); the kernel appends the node identity sentence;
 resume refuses it — the journaled config wins. The file's content is journaled as configuration;
 never point it at a secret-bearing file.
+--nodes-file is a JSON array of {uid, model, heading, charterFile?} entries (at most 16, unique
+uids): each node gets its own local log, scratch leaf and cgroup leaf, and all share the home's
+world and frontier journal. It replaces --uid/--model/--heading/--charter-file and is read at
+the config gate; on resume entries declare only uid — the journaled config wins.
 `;
 
 /**
@@ -138,6 +144,7 @@ function parseStart(args: readonly string[]): HostCliCommand {
     model: { type: 'string' },
     heading: { type: 'string' },
     'charter-file': { type: 'string' },
+    'nodes-file': { type: 'string' },
     uid: { type: 'string' },
     'no-sandbox': { type: 'boolean' },
   });
@@ -153,9 +160,24 @@ function parseStart(args: readonly string[]): HostCliCommand {
       throw new UsageError(`--charter-file must be an absolute path: ${charterFile}`);
     }
   }
+  const home = homeOf(values, 'start');
+  const nodesFile = nodesFileOf(values);
+  if (nodesFile !== undefined) {
+    // The file carries every node's config: a solo flag beside it would be
+    // ambiguous, so the parser refuses it rather than letting one silently win.
+    for (const flag of ['uid', 'model', 'heading', 'charter-file']) {
+      if (values[flag] !== undefined) {
+        throw new UsageError(`--nodes-file replaces --${flag}; pass it in the nodes file`);
+      }
+    }
+    return {
+      command: 'start', home, uid: DEFAULT_UID, noSandbox: values['no-sandbox'] === true,
+      nodesFile,
+    };
+  }
   return {
     command: 'start',
-    home: homeOf(values, 'start'),
+    home,
     uid: uidOf(values),
     model: textOf(values, 'model', 'start'),
     heading: textOf(values, 'heading', 'start'),
@@ -164,18 +186,37 @@ function parseStart(args: readonly string[]): HostCliCommand {
   };
 }
 
+/** `--nodes-file`, optional and absolute like the other operator paths. */
+function nodesFileOf(values: OptionValues): string | undefined {
+  const nodesFile = values['nodes-file'];
+  if (nodesFile === undefined) return undefined;
+  if (typeof nodesFile !== 'string' || nodesFile === '') {
+    throw new UsageError('--nodes-file takes a value');
+  }
+  if (!isAbsolute(nodesFile)) {
+    throw new UsageError(`--nodes-file must be an absolute path: ${nodesFile}`);
+  }
+  return nodesFile;
+}
+
 /** `--model`/`--heading` are absent from this table on purpose: resume refuses them. */
 function parseResume(args: readonly string[]): HostCliCommand {
   const values = parseStrict(args, {
     home: { type: 'string' },
+    'nodes-file': { type: 'string' },
     uid: { type: 'string' },
     'no-sandbox': { type: 'boolean' },
   });
+  const nodesFile = nodesFileOf(values);
+  if (nodesFile !== undefined && values['uid'] !== undefined) {
+    throw new UsageError('--nodes-file replaces --uid; pass the uids in the nodes file');
+  }
   return {
     command: 'resume',
     home: homeOf(values, 'resume'),
     uid: uidOf(values),
     noSandbox: values['no-sandbox'] === true,
+    ...(nodesFile !== undefined ? { nodesFile } : {}),
   };
 }
 

@@ -41,6 +41,7 @@ import {
 import type { BootHygiene, CellCgroup } from './cgroups.js';
 import { createFencePort } from './fence.js';
 import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
+import { readNodesFile, type NodeSpec } from './nodes.js';
 import { HostAlreadyRunningError, HostConfigError } from './errors.js';
 import { UnsafeWorldPathError, WorldNotARepoError } from '../node/errors.js';
 
@@ -126,6 +127,7 @@ export type CellOptions = {
 
 /** The composed cell: its durable parts, its live parts, and its one exit. */
 export type Cell = {
+  readonly uid: string;
   readonly world: WorldRepo; readonly frontier: FrontierJournal;
   readonly runtime: AgentRuntime; readonly driver: NodeDriver;
   /** The effective journaled config after the ready phase, not necessarily `CellOptions.config`. */
@@ -152,18 +154,55 @@ export type Cell = {
   close(): Promise<void>;
 };
 
+/**
+ * One node of a multi-node host: the same composed parts without the shared
+ * journal it does not own. `close` stops this node only; closing the set stops
+ * every node and then releases the frontier exactly once.
+ */
+export type NodeCell = Omit<Cell, 'frontier'>;
+
+/** The nodes of one home composed together: one world, one frontier, N nodes. */
+export type CellSet = {
+  readonly home: string;
+  readonly world: WorldRepo;
+  readonly frontier: FrontierJournal;
+  readonly nodes: readonly NodeCell[];
+  close(): Promise<void>;
+};
+
+/** Everything a multi-node composition needs; each node's config is resolved. */
+export type CellSetOptions = {
+  readonly home: string;
+  readonly nodes: readonly { readonly uid: string; readonly config: AgentConfig }[];
+  readonly credential: LlmCredential; readonly providers: ProviderRegistry;
+  readonly sandbox: CellOptions['sandbox'];
+  readonly fence?: FencePort;
+  readonly storage?: StorageConfig;
+  readonly doctorRunner?: CellOptions['doctorRunner'];
+  readonly pollMs?: number; readonly log: HostLog;
+};
+
 /** The states in which closing would cut a live turn's journal. */
 const UNSETTLED: ReadonlySet<string> = new Set(['active', 'waiting', 'stopping']);
 
+/** The parts one home shares across every node it runs. */
+type SharedCell = {
+  readonly world: WorldRepo;
+  readonly frontier: FrontierJournal;
+  readonly doctor: DoctorReport | undefined;
+  readonly storage: StorageConfig;
+  readonly storageState: StorageFact;
+};
+
 /**
- * Composes one node against its cell home and returns it ready to run.
- *
- * On any failure after the frontier journal is open, the journal is closed
- * before the error is rethrown, so the home is never left locked by a cell that
- * was never returned.
+ * Opens the parts one home shares across its nodes: the world repo, the one
+ * world-doctor pass, the one frontier journal (whose attribution sidecar every
+ * node's view writes to), and the storage seam. The journal is opened once per
+ * home: under a multi-node host the single writer lock is the host's, not a
+ * node's.
  */
-export async function composeCell(options: CellOptions): Promise<Cell> {
-  const { home, uid, config, credential, providers, sandbox, pollMs, log } = options;
+async function openCellShared(options: CellOptions): Promise<SharedCell> {
+  const { home, uid, log } = options;
   // The one storage seam for this cell: the production default (no quota) when
   // the host injected nothing. The frontier writer + gate and the driver + its
   // local writer all receive this same object, so their floors cannot drift.
@@ -187,145 +226,236 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
   const frontier = await openFrontierJournal(home, {
     worldHead: () => world.headHash(), now: Date.now, storage,
   });
-  try {
-    // Every mediator this node owns — the model adapter and the web tools —
-    // crosses the frontier through the node's attribution view, so each begun
-    // exchange carries this cell's uid in the sidecar beside the journal. The
-    // gate itself stays node-blind.
-    const nodeFrontier = frontier.attribute(uid);
-    const webTools = webToolsFromProviders(providers, nodeFrontier);
-    const transport = new OpenAITransport({
-      endpoint: credential.endpoint,
-      key: credential.key,
-      credentialId: credential.credentialId,
-    });
-    const adapter = new ProviderAdapter(transport, systemProviderPolicy, nodeFrontier);
-    // The extend port (C1.5): the host composes the store and the supervisor
-    // once per runtime over the cell's own roots. The supervisor is built
-    // INSIDE the factory: its event port is the loop's router and its service
-    // ports are the node's own — the allowedTools inheritance is decided here
-    // (a node without a tool passes a null port, so a package's svc call
-    // resolves denied).
-    const store = await createPackageStore({
-      home, uid, worldDir: paths.world, scratchDir: join(home, 'tmp', uid),
-    });
-    const cgroupRoot = sandbox !== false ? sandbox.cgroupRoot : undefined;
-    // The commit fence (C2): the production port is built from the attached
-    // cell root; a test-only injected port wins. Absent means this cell has no
-    // fence (a degraded attach or an off cell), and `Cell.fence` tells the
-    // operator-facing surfaces so — the unfenced fact is host-lifetime, never
-    // a silent per-commit property.
-    const fencePort = options.fence ?? (cgroupRoot !== undefined
-      ? createFencePort({ root: cgroupRoot, uid, log })
-      : undefined);
-    const shellSandbox = sandbox === false ? false : {
-      ...(sandbox.launcherPath !== undefined ? { launcherPath: sandbox.launcherPath } : {}),
-      ...(cgroupRoot !== undefined ? { cgroupPath: nodeLeaf(cgroupRoot, uid) } : {}),
-      ...(sandbox.leafLimits !== undefined ? { leafLimits: sandbox.leafLimits } : {}),
-    };
-    const runtime = createAgentRuntime({
-      home, uid, world, initialConfig: config, adapter,
-      terminal: { env: DEFAULT_TERMINAL_ENV, sandbox: shellSandbox },
-      ...(webTools !== undefined ? { webTools } : {}),
-      extend: (events, ports) => ({
-        store,
-        supervisor: createRunSupervisor({
-          home, uid,
-          sandbox: sandbox !== false,
-          shellTimeoutMs: config.policy.shellTimeoutMs,
-          killGraceMs: config.policy.killGraceMs,
-          maxShellCaptureBytes: config.policy.maxShellCaptureBytes,
-          now: () => Date.now(),
-          schedule: (ms, callback) => {
-            const timer = setTimeout(callback, ms);
-            return () => clearTimeout(timer);
-          },
-          terminal: config.allowedTools.includes('execute') ? ports.terminal : null,
-          web: config.allowedTools.includes('web_search')
-            || config.allowedTools.includes('web_fetch') ? ports.web : null,
-          webAllowance: {
-            search: config.allowedTools.includes('web_search'),
-            fetch: config.allowedTools.includes('web_fetch'),
-          },
-          events,
-          bootstrapPath: fileURLToPath(new URL(
-            '../node/packages/run-bootstrap.js', import.meta.url,
-          )),
-          ...(sandbox !== false && typeof sandbox === 'object'
-            && sandbox.launcherPath !== undefined
-            ? { launcherPath: sandbox.launcherPath } : {}),
-          ...(cgroupRoot !== undefined
-            ? {
-              prepareCgroupLeaf: async (runId: string): Promise<string> => {
-                const leaf = runLeaf(cgroupRoot, runId);
-                await ensureLeaf(leaf);
-                if (sandbox !== false && sandbox.leafLimits !== undefined) {
-                  await limitLeaf(leaf, sandbox.leafLimits);
-                }
-                return leaf;
-              },
-              reapCgroupLeaf: (leaf: string) => reapRunLeaf(leaf),
-            }
-            : {}),
-        }),
+  return { world, frontier, doctor, storage, storageState };
+}
+
+/**
+ * Composes one node on the home's shared parts. The node owns its runtime and
+ * its driver; `close` stops the driver and never closes the shared journal —
+ * the solo `composeCell` wrapper and the host's `CellSet` own that exit.
+ */
+async function composeNode(options: CellOptions, shared: SharedCell): Promise<NodeCell> {
+  const { home, uid, config, credential, providers, sandbox, pollMs, log } = options;
+  const { world, doctor, storage, storageState } = shared;
+  const paths = cellPaths(home, uid);
+  // Every mediator this node owns — the model adapter and the web tools —
+  // crosses the frontier through the node's attribution view, so each begun
+  // exchange carries this cell's uid in the sidecar beside the journal. The
+  // gate itself stays node-blind.
+  const nodeFrontier = shared.frontier.attribute(uid);
+  const webTools = webToolsFromProviders(providers, nodeFrontier);
+  const transport = new OpenAITransport({
+    endpoint: credential.endpoint,
+    key: credential.key,
+    credentialId: credential.credentialId,
+  });
+  const adapter = new ProviderAdapter(transport, systemProviderPolicy, nodeFrontier);
+  // The extend port (C1.5): the host composes the store and the supervisor
+  // once per runtime over the cell's own roots. The supervisor is built
+  // INSIDE the factory: its event port is the loop's router and its service
+  // ports are the node's own — the allowedTools inheritance is decided here
+  // (a node without a tool passes a null port, so a package's svc call
+  // resolves denied).
+  const store = await createPackageStore({
+    home, uid, worldDir: paths.world, scratchDir: join(home, 'tmp', uid),
+  });
+  const cgroupRoot = sandbox !== false ? sandbox.cgroupRoot : undefined;
+  // The commit fence (C2): the production port is built from the attached
+  // cell root; a test-only injected port wins. Absent means this cell has no
+  // fence (a degraded attach or an off cell), and `Cell.fence` tells the
+  // operator-facing surfaces so — the unfenced fact is host-lifetime, never
+  // a silent per-commit property.
+  const fencePort = options.fence ?? (cgroupRoot !== undefined
+    ? createFencePort({ root: cgroupRoot, uid, log })
+    : undefined);
+  const shellSandbox = sandbox === false ? false : {
+    ...(sandbox.launcherPath !== undefined ? { launcherPath: sandbox.launcherPath } : {}),
+    ...(cgroupRoot !== undefined ? { cgroupPath: nodeLeaf(cgroupRoot, uid) } : {}),
+    ...(sandbox.leafLimits !== undefined ? { leafLimits: sandbox.leafLimits } : {}),
+  };
+  const runtime = createAgentRuntime({
+    home, uid, world, initialConfig: config, adapter,
+    terminal: { env: DEFAULT_TERMINAL_ENV, sandbox: shellSandbox },
+    ...(webTools !== undefined ? { webTools } : {}),
+    extend: (events, ports) => ({
+      store,
+      supervisor: createRunSupervisor({
+        home, uid,
         sandbox: sandbox !== false,
+        shellTimeoutMs: config.policy.shellTimeoutMs,
+        killGraceMs: config.policy.killGraceMs,
+        maxShellCaptureBytes: config.policy.maxShellCaptureBytes,
+        now: () => Date.now(),
+        schedule: (ms, callback) => {
+          const timer = setTimeout(callback, ms);
+          return () => clearTimeout(timer);
+        },
+        terminal: config.allowedTools.includes('execute') ? ports.terminal : null,
+        web: config.allowedTools.includes('web_search')
+          || config.allowedTools.includes('web_fetch') ? ports.web : null,
+        webAllowance: {
+          search: config.allowedTools.includes('web_search'),
+          fetch: config.allowedTools.includes('web_fetch'),
+        },
+        events,
+        bootstrapPath: fileURLToPath(new URL(
+          '../node/packages/run-bootstrap.js', import.meta.url,
+        )),
+        ...(sandbox !== false && typeof sandbox === 'object'
+          && sandbox.launcherPath !== undefined
+          ? { launcherPath: sandbox.launcherPath } : {}),
+        ...(cgroupRoot !== undefined
+          ? {
+            prepareCgroupLeaf: async (runId: string): Promise<string> => {
+              const leaf = runLeaf(cgroupRoot, runId);
+              await ensureLeaf(leaf);
+              if (sandbox !== false && sandbox.leafLimits !== undefined) {
+                await limitLeaf(leaf, sandbox.leafLimits);
+              }
+              return leaf;
+            },
+            reapCgroupLeaf: (leaf: string) => reapRunLeaf(leaf),
+          }
+          : {}),
       }),
-    });
-    const driver = await NodeDriver.open(home, uid, wrapHandler(runtime.handler, log), world, {
-      knownTypes: C13_EVENT_TYPES,
-      hooks: runtime.hooks,
-      ...(pollMs !== undefined ? { worldPollMs: pollMs } : {}),
-      ...(fencePort !== undefined ? { fence: fencePort } : {}),
-      ...(doctor !== undefined ? { doctor } : {}),
-      storage,
-      onError: (err) => log.emit('driver/error', { error: err.name }),
-      onMaintenance: () => log.emit('host/parked'),
-      schedule: (ms, callback) => {
-        const timer = setTimeout(callback, ms);
-        return () => { clearTimeout(timer); };
-      },
-    });
-    // The sidecar is read AFTER the driver opened: a boot-reconcile refusal is
-    // written during `open`, so composition sees the state the host actually
-    // booted with (a missing file reads healthy, never fabricated).
-    const worldState = await readWorldState(home);
-    // The ready phase has already folded the journal during `open`, so a resume
-    // reports the config the journal holds, not the one this call supplied.
-    const effective = runtime.snapshot().config?.value ?? config;
-    let closing: Promise<void> | null = null;
-    const closeOnce = async (): Promise<void> => {
-      if (driver.state === 'booting') {
-        driver.stop();
-        await driver.run();
-      } else if (UNSETTLED.has(driver.state)) {
-        throw new NodeStateError(
-          `close() before run() settled: state is ${driver.state}`,
-        );
-      }
-      await frontier.close();
-    };
-    // One in-flight close for every caller. A rejection clears the memo, so a
-    // refused close leaves the cell closable by `stop(); await run(); close()`.
-    const close = (): Promise<void> => {
-      if (closing === null) {
-        closing = closeOnce().catch((err: unknown) => {
-          closing = null;
-          throw err;
-        });
-      }
-      return closing;
-    };
-    return {
-      world, frontier, runtime, driver, config: effective,
-      webTools: webTools !== undefined, worldState,
-      fence: fencePort !== undefined ? 'available' : 'unavailable',
-      storage: storageState,
-      close,
-    };
+      sandbox: sandbox !== false,
+    }),
+  });
+  const driver = await NodeDriver.open(home, uid, wrapHandler(runtime.handler, log), world, {
+    knownTypes: C13_EVENT_TYPES,
+    hooks: runtime.hooks,
+    ...(pollMs !== undefined ? { worldPollMs: pollMs } : {}),
+    ...(fencePort !== undefined ? { fence: fencePort } : {}),
+    ...(doctor !== undefined ? { doctor } : {}),
+    storage,
+    onError: (err) => log.emit('driver/error', { error: err.name }),
+    onMaintenance: () => log.emit('host/parked'),
+    schedule: (ms, callback) => {
+      const timer = setTimeout(callback, ms);
+      return () => { clearTimeout(timer); };
+    },
+  });
+  // The sidecar is read AFTER the driver opened: a boot-reconcile refusal is
+  // written during `open`, so composition sees the state the host actually
+  // booted with (a missing file reads healthy, never fabricated).
+  const worldState = await readWorldState(home);
+  // The ready phase has already folded the journal during `open`, so a resume
+  // reports the config the journal holds, not the one this call supplied.
+  const effective = runtime.snapshot().config?.value ?? config;
+  let closing: Promise<void> | null = null;
+  const closeOnce = async (): Promise<void> => {
+    if (driver.state === 'booting') {
+      driver.stop();
+      await driver.run();
+    } else if (UNSETTLED.has(driver.state)) {
+      throw new NodeStateError(
+        `close() before run() settled: state is ${driver.state}`,
+      );
+    }
+  };
+  // One in-flight close for every caller. A rejection clears the memo, so a
+  // refused close leaves the cell closable by `stop(); await run(); close()`.
+  const close = (): Promise<void> => {
+    if (closing === null) {
+      closing = closeOnce().catch((err: unknown) => {
+        closing = null;
+        throw err;
+      });
+    }
+    return closing;
+  };
+  return {
+    world, runtime, driver, config: effective,
+    uid, webTools: webTools !== undefined, worldState,
+    fence: fencePort !== undefined ? 'available' : 'unavailable',
+    storage: storageState,
+    close,
+  };
+}
+
+/**
+ * Composes one node against its cell home and returns it ready to run.
+ *
+ * On any failure after the frontier journal is open, the journal is closed
+ * before the error is rethrown, so the home is never left locked by a cell that
+ * was never returned.
+ */
+export async function composeCell(options: CellOptions): Promise<Cell> {
+  const shared = await openCellShared(options);
+  let node: NodeCell;
+  try {
+    node = await composeNode(options, shared);
   } catch (err) {
-    await frontier.close().catch(() => {});
+    await shared.frontier.close().catch(() => {});
     throw err;
   }
+  let closing: Promise<void> | null = null;
+  const close = (): Promise<void> => {
+    if (closing === null) {
+      closing = (async () => {
+        await node.close();
+        await shared.frontier.close();
+      })().catch((err: unknown) => {
+        closing = null;
+        throw err;
+      });
+    }
+    return closing;
+  };
+  return { ...node, frontier: shared.frontier, close };
+}
+
+/**
+ * Composes several nodes on one home: one world, one doctor pass, one frontier
+ * journal and its attribution sidecar, one runtime and driver per node (each
+ * with its own local log, scratch leaf and cgroup leaf). `close` stops every
+ * node and then closes the shared journal exactly once.
+ */
+export async function composeCellSet(options: CellSetOptions): Promise<CellSet> {
+  const first = options.nodes[0];
+  if (first === undefined) throw new Error('a cell set needs at least one node');
+  const shared = await openCellShared(nodeOptionsOf(options, first));
+  const nodes: NodeCell[] = [];
+  try {
+    for (const spec of options.nodes) {
+      nodes.push(await composeNode(nodeOptionsOf(options, spec), shared));
+    }
+  } catch (err) {
+    for (const node of nodes) await node.close().catch(() => {});
+    await shared.frontier.close().catch(() => {});
+    throw err;
+  }
+  let closing: Promise<void> | null = null;
+  const close = (): Promise<void> => {
+    if (closing === null) {
+      closing = (async () => {
+        for (const node of nodes) await node.close();
+        await shared.frontier.close();
+      })().catch((err: unknown) => {
+        closing = null;
+        throw err;
+      });
+    }
+    return closing;
+  };
+  return {
+    home: options.home, world: shared.world, frontier: shared.frontier, nodes, close,
+  };
+}
+
+/** One node's composition options from the set's shared fields. */
+function nodeOptionsOf(
+  options: CellSetOptions, spec: { readonly uid: string; readonly config: AgentConfig },
+): CellOptions {
+  return {
+    home: options.home, uid: spec.uid, config: spec.config,
+    credential: options.credential, providers: options.providers,
+    sandbox: options.sandbox, log: options.log,
+    ...(options.fence !== undefined ? { fence: options.fence } : {}),
+    ...(options.storage !== undefined ? { storage: options.storage } : {}),
+    ...(options.doctorRunner !== undefined ? { doctorRunner: options.doctorRunner } : {}),
+    ...(options.pollMs !== undefined ? { pollMs: options.pollMs } : {}),
+  };
 }
 
 /**
@@ -423,6 +553,13 @@ async function attachSandbox(
 export type HostOptions = {
   readonly home: string; readonly uid: string; readonly command: HostCommand;
   readonly model?: string; readonly heading?: string; readonly charterFile?: string;
+  /**
+   * A JSON nodes file declaring the whole boot: its uids (and, on a start, each
+   * model, heading and optional absolute charter file) replace the solo flags.
+   * The parser refuses `--nodes-file` together with `--uid`/`--model`/`--heading`/
+   * `--charter-file`; the host reads and validates the file at the config gate.
+   */
+  readonly nodesFile?: string;
   readonly sandbox: false | {
     readonly launcherPath?: string; readonly cgroupRoot?: string;
     readonly leafLimits?: { readonly memoryMaxBytes: number; readonly pidsMax: number };
@@ -451,6 +588,8 @@ export type HostDeps = {
   readonly storageQuota?: StorageQuota;
   readonly storagePolicy?: StoragePolicy;
   readonly compose?: (options: CellOptions) => Promise<Cell>;
+  /** The multi-node composition seam: production is `composeCellSet`. */
+  readonly composeSet?: (options: CellSetOptions) => Promise<CellSet>;
   readonly now?: () => number;
   readonly proc?: ProcessHandlersTarget;
   /**
@@ -470,7 +609,9 @@ export type HostDeps = {
    * runs, so a pause issued meanwhile targets this host. Production is
    * `resolveInitialConfig`.
    */
-  readonly readInitialConfig?: (options: HostOptions) => Promise<AgentConfig>;
+  readonly readInitialConfig?: (
+    home: string, command: HostCommand, spec: NodeSpec,
+  ) => Promise<AgentConfig>;
 };
 
 /** A running host: one idempotent stop and one promise that never rejects. */
@@ -653,8 +794,10 @@ async function readCharterFile(home: string, uid: string, path: string): Promise
  * it is refused; the file is read after the journaled-config refusal, so a
  * start on an already-configured cell never touches the operator's file.
  */
-async function resolveInitialConfig(options: HostOptions): Promise<AgentConfig> {
-  const { home, uid, command, model, heading, charterFile } = options;
+async function resolveNodeConfig(
+  home: string, command: HostCommand, spec: NodeSpec,
+): Promise<AgentConfig> {
+  const { uid, model, heading, charterFile } = spec;
   const state = await readCellConfig(home, uid);
   if (command === 'start') {
     if (model === undefined || model === '') throw new HostConfigError('start requires a model');
@@ -705,6 +848,16 @@ function resolveStorage(deps: HostDeps): StorageConfig {
   return { policy, probe: deps.freeSpace ?? statfsProbe };
 }
 
+/** The solo boot's one node, built from the validated flags. */
+function singleNodeSpec(options: HostOptions): NodeSpec {
+  return {
+    uid: options.uid,
+    ...(options.model !== undefined ? { model: options.model } : {}),
+    ...(options.heading !== undefined ? { heading: options.heading } : {}),
+    ...(options.charterFile !== undefined ? { charterFile: options.charterFile } : {}),
+  };
+}
+
 /** The bounded error label: a name, never a message and never a payload. */
 function errorName(err: unknown): string {
   return err instanceof Error && err.name !== '' ? err.name : 'Error';
@@ -745,10 +898,10 @@ function errorName(err: unknown): string {
  * resolved code, not a throw.
  */
 export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle {
-  const { home, uid, command, sandbox, pollMs, log } = options;
+  const { home, command, sandbox, pollMs, log } = options;
   let stopRequested = false;
   let faulted = false;
-  let cell: Cell | null = null;
+  let composed: { readonly nodes: readonly NodeCell[]; close(): Promise<void> } | null = null;
   let owner: OwnerHandle | null = null;
   let clearKeepAlive: (() => void) | null = null;
   let detach: (() => void) | null = null;
@@ -756,7 +909,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
   const stop = (): void => {
     if (stopRequested) return;
     stopRequested = true;
-    cell?.driver.stop('stop-requested');
+    for (const node of composed?.nodes ?? []) node.driver.stop('stop-requested');
   };
   const onUnhandled = (err: unknown): void => {
     faulted = true;
@@ -782,21 +935,30 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       await assertHomeOutsideCheckout(home);
       await assertHomePermissions(home);
       await assertCellLayout(home);
+      // The boot's node set: one solo spec from the flags, or the operator's
+      // nodes file. It is read before the owner record (a malformed file is an
+      // exit-2 refusal that never writes one) and validated entry by entry.
+      const specs: readonly NodeSpec[] = options.nodesFile === undefined
+        ? [singleNodeSpec(options)]
+        : await readNodesFile(options.nodesFile, command);
+      const primaryUid = specs[0]!.uid;
       // The owner record comes BEFORE the long config fold: a `pause` issued
       // while the boot is still reading the journal then targets a live host
       // instead of answering "no host" and letting the start proceed. The
       // fence/storage facts are annotated after the attach (below), so a boot
       // that fails in the fold releases the record in the one `finally`.
       owner = await acquireOwner(home, {
-        uid, command, ...(deps.now !== undefined ? { now: deps.now } : {}),
+        uid: primaryUid, command, ...(deps.now !== undefined ? { now: deps.now } : {}),
         sandbox: sandbox === false ? 'off' : 'landlock',
       });
-      const config = await (deps.readInitialConfig ?? resolveInitialConfig)(options);
+      const configs = await Promise.all(specs.map(
+        (spec) => (deps.readInitialConfig ?? resolveNodeConfig)(home, command, spec),
+      ));
       const storage = resolveStorage(deps);
       const storageState = storageFact(storage.policy);
       // Read the launch mode before the attach moves this process into svc/.
       const launchMode = detectLaunchMode();
-      const cellSandbox = await attachSandbox(home, uid, sandbox, log, deps);
+      const cellSandbox = await attachSandbox(home, primaryUid, sandbox, log, deps);
       // The fence fact is known only after the attach: an attached cell root
       // (or a test-only injected port) means this host commits fenced; an off
       // cell or a degraded attach commits unfenced and says so. It is written
@@ -818,7 +980,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         // The owner record is liveness metadata, not a truth artifact: a failed
         // annotate must not turn a boot into a failure. `host/boot` still
         // carries the fact and the diagnostic names the step only.
-        log.emit('host/degraded', { home, uid, reason: 'owner-annotate-failed' });
+        log.emit('host/degraded', { home, uid: primaryUid, reason: 'owner-annotate-failed' });
       }
       // One boot-time storage probe: an unreadable reading is a bounded
       // diagnostic, never a refusal, and never changes the quota fact.
@@ -828,35 +990,54 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       } catch {
         bootFree = null;
       }
-      if (bootFree === null) log.emit('host/degraded', { home, uid, reason: 'storage-probe' });
+      if (bootFree === null) {
+        log.emit('host/degraded', { home, uid: primaryUid, reason: 'storage-probe' });
+      }
       const providers = await loadProviderStore(home);
       const credential = llmCredentialFrom(providers);
-      cell = await (deps.compose ?? composeCell)({
-        home, uid, config, credential, providers, sandbox: cellSandbox, log, storage,
+      // The composition seams are the solo cell's or the set's; both receive
+      // the same validated providers/credential and the one attached sandbox.
+      const sharedOptions = {
+        home, credential, providers, sandbox: cellSandbox, log, storage,
         ...(deps.fence !== undefined ? { fence: deps.fence } : {}),
         ...(deps.doctorRunner !== undefined ? { doctorRunner: deps.doctorRunner } : {}),
         ...(pollMs !== undefined ? { pollMs } : {}),
-      });
-      log.emit('host/boot', {
-        home, uid, command, model: cell.config.model,
-        webTools: cell.webTools ? 'tavily' : 'off',
-        sandbox: sandbox === false ? 'off' : 'landlock',
-        launch: launchMode,
-        limits: cellSandbox !== false && cellSandbox.leafLimits !== undefined
-          ? 'available' : 'unavailable',
-        reap: launchMode,
-        // The commit fence is a host-lifetime fact, never per-commit: a host
-        // that cannot fence commits unfenced and says so here.
-        fence: cell.fence,
-        // The storage fact: no quota is ever detected, so production is
-        // `unquoted`; `quoted` exists only through the test seam.
-        storage: cell.storage,
-        // The replayed degraded-world sidecar, read at composition: a status
-        // projection, never a second truth.
-        world: cell.worldState.degraded ? 'degraded' : 'healthy',
-      });
-      if (stopRequested) cell.driver.stop('stop-requested');
-      await cell.driver.run();
+      };
+      if (specs.length === 1) {
+        const cell = await (deps.compose ?? composeCell)({
+          ...sharedOptions, uid: specs[0]!.uid, config: configs[0]!,
+        });
+        composed = { nodes: [cell], close: () => cell.close() };
+      } else {
+        composed = await (deps.composeSet ?? composeCellSet)({
+          ...sharedOptions,
+          nodes: specs.map((spec, index) => ({ uid: spec.uid, config: configs[index]! })),
+        });
+      }
+      for (const node of composed.nodes) {
+        log.emit('host/boot', {
+          home, uid: node.uid, command, model: node.config.model,
+          webTools: node.webTools ? 'tavily' : 'off',
+          sandbox: sandbox === false ? 'off' : 'landlock',
+          launch: launchMode,
+          limits: cellSandbox !== false && cellSandbox.leafLimits !== undefined
+            ? 'available' : 'unavailable',
+          reap: launchMode,
+          // The commit fence is a host-lifetime fact, never per-commit: a host
+          // that cannot fence commits unfenced and says so here.
+          fence: node.fence,
+          // The storage fact: no quota is ever detected, so production is
+          // `unquoted`; `quoted` exists only through the test seam.
+          storage: node.storage,
+          // The replayed degraded-world sidecar, read at composition: a status
+          // projection, never a second truth.
+          world: node.worldState.degraded ? 'degraded' : 'healthy',
+        });
+      }
+      if (stopRequested) {
+        for (const node of composed.nodes) node.driver.stop('stop-requested');
+      }
+      await Promise.all(composed.nodes.map((node) => node.driver.run()));
     } catch (err) {
       // A usage/config refusal is exit 2, matching AGENTS: the host's own
       // configuration classes plus the world open/trust family (a legacy or
@@ -876,9 +1057,9 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       // Both cleanup steps can reject, and neither may replace the code the
       // failure itself earned: a host that cannot close its cell or release its
       // owner has still failed, but the journal is the record of why.
-      if (cell !== null) {
+      if (composed !== null) {
         try {
-          await cell.close();
+          await composed.close();
         } catch {
           code = 1;
         }
