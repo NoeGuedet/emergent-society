@@ -13,7 +13,7 @@ import {
   type EventEnvelope,
 } from '../../journal/index.js';
 import {
-  FRONTIER_EVENT_TYPES, FrontierValidationError, openFrontierJournal,
+  FRONTIER_EVENT_TYPES, FrontierValidationError, openFrontierJournal, readAttribution,
 } from '../../frontier/index.js';
 import { TEST_STORAGE } from '../../frontier/__tests__/helpers.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
@@ -235,6 +235,12 @@ it('composes one cell and runs one real turn end to end', async () => {
     expect(requests[0]!.world_head).toBe(seed);
     expect(responses.map((response) => response.call))
       .toEqual(requests.map((request) => request.call));
+    // The composition root hands the node's own attribution view to every
+    // mediator: each begun exchange names this cell's uid, in call order.
+    const attribution = await readAttribution(home);
+    expect(attribution.map((record) => record.call))
+      .toEqual(requests.map((request) => request.call));
+    expect(attribution.every((record) => record.uid === 'node-0')).toBe(true);
 
     expect(cell.webTools).toBe(false);
     expect(cell.config.model).toBe('first-light-test');

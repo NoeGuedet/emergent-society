@@ -129,7 +129,9 @@ validators, header allowlist, `FRONTIER_MAX_BODY_BYTES`), `journal.ts`
 (`openFrontierJournal(home, { worldHead, now, storage })`: the gate whose `begin` checks
 the storage floor before the world-head stamp/blob/event, is durable and read-back
 verified before the send, and whose `complete` is durable before the caller proceeds,
-plus boot reconciliation), `index.ts` (exports).
+plus boot reconciliation), `attribution.ts` (the per-node gate view and the
+`{v, call, uid}` sidecar: one line per begun exchange, written after the durable request
+and before the send, a torn tail dropped at open), `index.ts` (exports).
 
 ### The rest of the tree
 
@@ -165,6 +167,7 @@ plus boot reconciliation), `index.ts` (exports).
 |---|---|
 | Frontier journal = the only truth | `src/frontier/` over `src/journal/`; the hash-chained stream and its payload blobs are the canonical record, everything else disposable |
 | Append-only / hash chain | `src/journal/envelope.ts`; one chain per cell home (frontier), one per node (local) |
+| Every exchange attributable to its node | `src/frontier/attribution.ts`; one `{v, call, uid}` line per begun exchange in `<home>/frontier/attribution.v0.jsonl`, written after the durable request and before the send |
 | Canonical bytes | `src/journal/canon.ts` (RFC 8785, refusal of lossy values, data-only copy) |
 | "Model-visible means logged" | `begin`/`complete` in `src/frontier/journal.ts`, each flushed and read-back verified; the `flush()` barrier in `writer.ts` at `turn/start`/`turn/end` and around every gate capture |
 | Durability batching | `framing.ts` + the 200 ms timer in `writer.ts` |

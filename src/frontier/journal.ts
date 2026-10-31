@@ -11,6 +11,7 @@ import {
   type FrontierRequestInput, type HttpRequest, type HttpResponse,
 } from './events.js';
 import { StorageError, checkStorage, type StorageConfig } from '../storage.js';
+import { AttributionLog, attributeFrontier } from './attribution.js';
 
 /**
  * The frontier gate: the only writer of the frontier journal's exchange facts.
@@ -74,6 +75,12 @@ export interface Frontier {
 
 export interface FrontierJournal {
   readonly gate: Frontier;
+  /**
+   * A view of the gate that records `uid` as the actor of every exchange begun
+   * through it, in the attribution sidecar beside the journal. Each node's
+   * mediator receives its own view; the gate itself stays node-blind.
+   */
+  attribute(uid: string): Frontier;
   close(): Promise<void>;
 }
 
@@ -247,7 +254,8 @@ class Gate implements Frontier {
 
 /**
  * Opens the cell's frontier journal: repairs a torn tail, takes the writer lock,
- * reconciles orphans, and returns the gate.
+ * reconciles orphans, repairs the attribution sidecar's tail, and returns the
+ * gate.
  *
  * A reconciliation failure closes the writer before propagating. Nothing is
  * pending at that point (the writer resumed a durable log), so the close is the
@@ -284,17 +292,43 @@ export async function openFrontierJournal(
     storage: opts.storage,
     ...(opts.batchWindowMs === undefined ? {} : { batchWindowMs: opts.batchWindowMs }),
   });
+  let attribution: AttributionLog;
   try {
-    await reconcile(writer, layout);
+    attribution = await AttributionLog.open(home);
   } catch (err) {
     await writer.close().catch(() => {});
     throw err;
   }
+  try {
+    await reconcile(writer, layout);
+  } catch (err) {
+    await attribution.close().catch(() => {});
+    await writer.close().catch(() => {});
+    throw err;
+  }
+  const gate = new Gate(
+    writer, new BlobStore(home), opts.worldHead, opts.now, maxGroups, home, opts.storage,
+  );
   return {
-    gate: new Gate(
-      writer, new BlobStore(home), opts.worldHead, opts.now, maxGroups, home, opts.storage,
-    ),
-    close: () => writer.close(),
+    gate,
+    attribute: (uid) => attributeFrontier(gate, uid, attribution),
+    // The attribution handle is closed first, but the writer's close always
+    // runs: a failure there is the one the caller must see, and the journal's
+    // lock must never leak because the sidecar failed to close.
+    close: async () => {
+      let failure: unknown;
+      try {
+        await attribution.close();
+      } catch (err) {
+        failure = err;
+      }
+      try {
+        await writer.close();
+      } catch (err) {
+        if (failure === undefined) failure = err;
+      }
+      if (failure !== undefined) throw failure;
+    },
   };
 }
 

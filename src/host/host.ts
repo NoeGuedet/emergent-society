@@ -188,13 +188,18 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
     worldHead: () => world.headHash(), now: Date.now, storage,
   });
   try {
-    const webTools = webToolsFromProviders(providers, frontier.gate);
+    // Every mediator this node owns — the model adapter and the web tools —
+    // crosses the frontier through the node's attribution view, so each begun
+    // exchange carries this cell's uid in the sidecar beside the journal. The
+    // gate itself stays node-blind.
+    const nodeFrontier = frontier.attribute(uid);
+    const webTools = webToolsFromProviders(providers, nodeFrontier);
     const transport = new OpenAITransport({
       endpoint: credential.endpoint,
       key: credential.key,
       credentialId: credential.credentialId,
     });
-    const adapter = new ProviderAdapter(transport, systemProviderPolicy, frontier.gate);
+    const adapter = new ProviderAdapter(transport, systemProviderPolicy, nodeFrontier);
     // The extend port (C1.5): the host composes the store and the supervisor
     // once per runtime over the cell's own roots. The supervisor is built
     // INSIDE the factory: its event port is the loop's router and its service

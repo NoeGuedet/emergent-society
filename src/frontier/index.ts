@@ -29,3 +29,6 @@ export type { Frontier, FrontierJournal } from './journal.js';
 export {
   FrontierCorruptionError, FrontierUnknownCallError, openFrontierJournal,
 } from './journal.js';
+
+export type { AttributionRecord } from './attribution.js';
+export { ATTRIBUTION_FILE, AttributionCorruptionError, readAttribution } from './attribution.js';

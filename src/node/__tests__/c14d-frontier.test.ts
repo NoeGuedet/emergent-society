@@ -18,7 +18,7 @@ import {
 import { openTestDriver } from './helpers.js';
 import {
   FRONTIER_EVENT_TYPES, FRONTIER_MAX_BODY_BYTES, WORLD_HEAD_RE, openFrontierJournal,
-  validateFrontierEvent, FrontierValidationError,
+  readAttribution, validateFrontierEvent, FrontierValidationError,
   type Frontier, type FrontierJournal, type FrontierRequestInput,
   type HttpRequest, type HttpResponse,
 } from '../../frontier/index.js';
@@ -299,10 +299,12 @@ describe('the composition root', () => {
         worldHead: () => world.headHash(), now: Date.now, storage: TEST_STORAGE,
       })).rejects.toBeInstanceOf(SessionAlreadyOwnedError);
 
-      const webTools = webToolsFromProviders(await loadProviders(home), frontier.gate);
-      if (webTools === undefined) throw new Error('tavily registry entry missing');
-
       const openNode = async (uid: string): Promise<NodeDriver> => {
+        // Each node's mediators receive its own attribution view of the one
+        // gate: the frontier stays node-blind, the sidecar names the actor.
+        const gate = frontier.attribute(uid);
+        const webTools = webToolsFromProviders(await loadProviders(home), gate);
+        if (webTools === undefined) throw new Error('tavily registry entry missing');
         const runtime = createAgentRuntime({
           home, uid, world, initialConfig: defaultAgentConfig(),
           terminal: { env: DEFAULT_TERMINAL_ENV },
@@ -311,7 +313,7 @@ describe('the composition root', () => {
               endpoint: `${base}/${uid}/chat/completions`, key: LLM_KEY,
             }),
             providerPolicy,
-            frontier.gate,
+            gate,
           ),
           webTools,
         });
@@ -373,6 +375,14 @@ describe('the composition root', () => {
         `${base}/n1/chat/completions`,   // n1's follow-up plan
         `${base}/n2/chat/completions`,   // n2's plan, same journal
       ]);
+
+      // Every begun exchange is attributed to the node whose mediator began
+      // it, in the same order as the shared chain; the four calls are n1's
+      // three then n2's one.
+      const attribution = await readAttribution(home);
+      expect(attribution.map((record) => record.call))
+        .toEqual(requests.map((request) => request.call));
+      expect(attribution.map((record) => record.uid)).toEqual(['n1', 'n1', 'n1', 'n2']);
 
       // The kernel stamped every call from the world repo's HEAD, best-effort.
       expect(await world.headHash()).toBe(seeded);
