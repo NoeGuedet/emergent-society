@@ -3,6 +3,7 @@ import type { RequestId } from '../../context/contracts.js';
 import type { AgentConfig } from '../../context/contracts.js';
 import { canonicalizeJson } from '../../journal/index.js';
 import { boundToolText } from './text.js';
+import { singleLine } from '../../text.js';
 import { PackageError } from '../packages/errors.js';
 import type { PackageDefinition, PackageStore } from '../packages/store.js';
 import type { RunSupervisor } from '../packages/supervisor.js';
@@ -39,7 +40,43 @@ export type ExtendPort = {
   readonly supervisor: RunSupervisor;
   /** The Run sandbox mode the supervisor spawns under — inspect's honesty. */
   readonly sandbox: boolean;
+  /**
+   * The kernel's spawn capability (A3), when this node was granted it. A node
+   * without the grant sees the honest denial in inspect and in the verb; the
+   * host owns composition, custody and the caps.
+   */
+  readonly spawn?: SpawnPort;
 };
+
+/** One spawn request, already typed: the host validates it against the caps. */
+export type SpawnRequest = {
+  readonly model?: string;
+  readonly heading?: string;
+  readonly charter?: string;
+  readonly spawn?: boolean;
+};
+
+/** What this node may still create; inspect's honesty, never a promise. */
+export type SpawnCaps = {
+  readonly available: boolean;
+  readonly childrenLeft: number;
+  readonly nodesLeft: number;
+  readonly depthLeft: number;
+};
+
+/** The host's spawn seam: compose a node, or refuse with a bounded reason. */
+export type SpawnPort = {
+  spawn(request: SpawnRequest): Promise<{ readonly uid: string; readonly depth: number }>;
+  caps(): SpawnCaps;
+};
+
+/** A bounded, path-free spawn refusal the executor renders as a denied result. */
+export class SpawnRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SpawnRefusedError';
+  }
+}
 
 /**
  * How a verb addresses a Package (the friction pass): by name — the ergonomic standard
@@ -68,7 +105,12 @@ export type ExtendDecision =
     readonly tool: string; readonly args: unknown;
   }
   | { readonly kind: 'extend'; readonly verb: 'stop'; readonly ref: StopRef }
-  | { readonly kind: 'extend'; readonly verb: 'undefine'; readonly ref: PackageRef };
+  | { readonly kind: 'extend'; readonly verb: 'undefine'; readonly ref: PackageRef }
+  | {
+    readonly kind: 'extend'; readonly verb: 'spawn';
+    readonly model?: string; readonly heading?: string;
+    readonly charter?: string; readonly spawn?: boolean;
+  };
 
 /** A schema violation the funnel refuses with, naming the field. */
 function schemaViolation(args: unknown, schema: unknown, where: string): string | null {
@@ -247,7 +289,17 @@ function renderInspect(
     + ` ${usedBytes} / 67108864 bytes.`);
   lines.push('');
   lines.push('== kernel-owned, visible but never mounted ==');
-  lines.push('- spawn: creating new nodes — not available yet; its first use is a dated event.');
+  if (port.spawn !== undefined) {
+    const caps = port.spawn.caps();
+    lines.push(caps.available
+      ? `- spawn: creating new nodes — available: ${caps.childrenLeft} children left`
+        + ` for this node, ${caps.nodesLeft} nodes left in the home, depth ${caps.depthLeft}.`
+        + ' extend {verb:"spawn", model?, heading?, charter?, spawn?}; the child'
+        + ' inherits this node\'s tools and budget, and dies with this node (LIFO).'
+      : '- spawn: creating new nodes — not granted to this node.');
+  } else {
+    lines.push('- spawn: creating new nodes — not granted to this node.');
+  }
   lines.push('- speak: the human channel — agent zero alone, not available yet.');
   lines.push('');
   lines.push('== runtime honesty ==');
@@ -340,6 +392,35 @@ export async function executeExtend(opts: {
       renderInspect(config, port, definitions.map((pkg) => ({
         id: pkg.id, name: pkg.name, purpose: pkg.purpose, sourceBytes: pkg.sourceBytes,
       }))), false, max);
+    return;
+  }
+
+  if (decision.verb === 'spawn') {
+    if (port.spawn === undefined) {
+      await appendResult(gate, id, callId,
+        'denied: this node was not granted the spawn capability', true, max);
+      return;
+    }
+    try {
+      const spawned = await port.spawn.spawn({
+        ...(decision.model !== undefined ? { model: decision.model } : {}),
+        ...(decision.heading !== undefined ? { heading: decision.heading } : {}),
+        ...(decision.charter !== undefined ? { charter: decision.charter } : {}),
+        ...(decision.spawn !== undefined ? { spawn: decision.spawn } : {}),
+      });
+      const caps = port.spawn.caps();
+      await appendResult(gate, id, callId,
+        `spawned ${spawned.uid} (depth ${spawned.depth}) — ${caps.childrenLeft}`
+        + ` children left for this node, ${caps.nodesLeft} nodes left in the home`,
+        false, max);
+    } catch (err) {
+      if (err instanceof SpawnRefusedError) {
+        await appendResult(gate, id, callId,
+          `denied: ${singleLine(err.message, 200)}`, true, max);
+        return;
+      }
+      throw err;
+    }
     return;
   }
 

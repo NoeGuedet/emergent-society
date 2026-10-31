@@ -213,12 +213,12 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
     return { kind: 'execute', cmd };
   }
 
-  // `extend`: the six verbs, each with its exact key set (the funnel's
+  // `extend`: the seven verbs, each with its exact key set (the funnel's
   // argument shapes are validated here — the one-decision-point rule).
-  const verbs = ['inspect', 'define', 'run', 'call', 'stop', 'undefine'];
+  const verbs = ['inspect', 'define', 'run', 'call', 'stop', 'undefine', 'spawn'];
   const verb = parsed['verb'];
   if (typeof verb !== 'string' || !verbs.includes(verb)) {
-    return invalidDetail('verb must be one of inspect, define, run, call, stop, undefine');
+    return invalidDetail('verb must be one of inspect, define, run, call, stop, undefine, spawn');
   }
   const keys = Object.keys(parsed);
   const only = (...allowed: string[]): boolean =>
@@ -227,6 +227,29 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
     return only('verb')
       ? { kind: 'extend', verb: 'inspect' }
       : invalidDetail('inspect takes only verb');
+  }
+  if (verb === 'spawn') {
+    // The kernel capability: the child inherits the parent's tools and budget,
+    // and the host caps the tree. The keys are exactly the optional four; a
+    // wrong key set names the rule, a wrong type is the bare refusal.
+    if (!only('verb', 'model', 'heading', 'charter', 'spawn')) {
+      return invalidDetail('spawn takes verb and optionally model, heading, charter, spawn');
+    }
+    const model = parsed['model'];
+    const heading = parsed['heading'];
+    const charter = parsed['charter'];
+    const grant = parsed['spawn'];
+    if (model !== undefined && (typeof model !== 'string' || model === '')) return INVALID;
+    if (heading !== undefined && (typeof heading !== 'string' || heading === '')) return INVALID;
+    if (charter !== undefined && (typeof charter !== 'string' || charter === '')) return INVALID;
+    if (grant !== undefined && typeof grant !== 'boolean') return INVALID;
+    return {
+      kind: 'extend', verb: 'spawn',
+      ...(typeof model === 'string' ? { model } : {}),
+      ...(typeof heading === 'string' ? { heading } : {}),
+      ...(typeof charter === 'string' ? { charter } : {}),
+      ...(typeof grant === 'boolean' ? { spawn: grant } : {}),
+    };
   }
   if (verb === 'define') {
     if (!only('verb', 'name', 'purpose', 'path')) {

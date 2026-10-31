@@ -33,9 +33,21 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
 });
 
-type Reply = { readonly cmd?: string; readonly content?: string };
+type Reply = {
+  readonly cmd?: string; readonly content?: string;
+  readonly tool?: { readonly name: string; readonly args: unknown };
+};
 
 function message(reply: Reply): unknown {
+  if (reply.tool !== undefined) {
+    return {
+      role: 'assistant', content: null,
+      tool_calls: [{
+        id: 'e0', type: 'function',
+        function: { name: reply.tool.name, arguments: JSON.stringify(reply.tool.args) },
+      }],
+    };
+  }
   if (reply.cmd !== undefined) {
     return {
       role: 'assistant', content: null,
@@ -142,6 +154,128 @@ it('runs two live nodes on one world and one frontier, each with its own log', a
   await reopened.close();
 }, 40_000);
 
+it('spawns a child on the root call, denies the child the capability, and unloads it', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'es-spawn-'));
+  dirs.push(home);
+  await initHome(home);
+  const world = await WorldRepo.open(join(home, 'world'), { gitDir: join(home, 'world.git') });
+  HeadWatcher.for(world, 0);
+  await commitAs(world, 'human', { 'seed.txt': 'seed\n' }, 'seed');
+  const counts = new Map<string, number>();
+  const server = await serveJson((request) => {
+    // The kernel-composed identity sentence is how a scripted reply tells the
+    // root from its child on one provider endpoint.
+    const uid = request.body.toString('utf8').includes('You are node-1.')
+      ? 'node-1' : 'node-0';
+    const count = counts.get(uid) ?? 0;
+    counts.set(uid, count + 1);
+    if (count === 0) {
+      return respond({
+        tool: { name: 'extend', args: { verb: 'spawn', heading: 'Worker.' } },
+      });
+    }
+    return respond({ content: 'idle' });
+  });
+  servers.push(server);
+  await writeFile(join(home, 'providers.json'), JSON.stringify({
+    llm: { key: 'k', endpoint: `${server.url}/v1/chat/completions` },
+  }), { encoding: 'utf8', mode: 0o600 });
+  const lines: string[] = [];
+  const handle = startHost({
+    home, uid: 'node-0', command: 'start', model: 'first-light-test',
+    heading: 'Lead.', sandbox: false,
+    log: createHostLog((line) => lines.push(line)),
+  }, {
+    installSignals: false, keepAlive: false,
+    freeSpace: async () => ({ bytes: 10 ** 12, inodes: 10 ** 9 }),
+  });
+  await vi.waitFor(() => {
+    const spawned = lines
+      .map((line) => JSON.parse(line) as { readonly event: string })
+      .filter((event) => event.event === 'host/spawned');
+    expect(spawned).toHaveLength(1);
+  }, { timeout: 20_000 });
+  // The child boots, tries to spawn itself on its first request (a child gets
+  // no capability implicitly), and is refused; only then is the host stopped.
+  await vi.waitFor(async () => {
+    const events = await localEvents(home, 'node-1');
+    expect(events.some((event) => event.type === 'turn/end')).toBe(true);
+  }, { timeout: 20_000 });
+  handle.stop();
+  expect(await handle.done).toBe(0);
+
+  const child = await localEvents(home, 'node-1');
+  expect(child.filter((event) => event.type === 'node/boot')).toHaveLength(1);
+  expect(child.some((event) => event.type === 'node/shutdown')).toBe(true);
+  const claimed = child.filter((event) => event.type === 'tool/result'
+    && (event.data as { readonly message?: { readonly content?: string } })
+      .message?.content?.includes('spawned'));
+  expect(claimed).toHaveLength(0);
+  const denied = child.some((event) => event.type === 'tool/result'
+    && (event.data as { readonly message?: { readonly content?: string } })
+      .message?.content?.includes('denied: this node was not granted the spawn capability'));
+  expect(denied).toBe(true);
+  const attribution = await readAttribution(home);
+  expect(attribution.some((record) => record.uid === 'node-1')).toBe(true);
+  const spawned = lines
+    .map((line) => JSON.parse(line) as { readonly event: string; readonly parent?: string;
+      readonly uid?: string; readonly depth?: number })
+    .find((event) => event.event === 'host/spawned');
+  expect(spawned).toMatchObject({ parent: 'node-0', uid: 'node-1', depth: 1 });
+}, 60_000);
+
+it('caps a node at eight live children and refuses the ninth with a teaching denial', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'es-spawn-cap-'));
+  dirs.push(home);
+  await initHome(home);
+  const world = await WorldRepo.open(join(home, 'world'), { gitDir: join(home, 'world.git') });
+  HeadWatcher.for(world, 0);
+  await commitAs(world, 'human', { 'seed.txt': 'seed\n' }, 'seed');
+  const counts = new Map<string, number>();
+  const server = await serveJson((request) => {
+    const body = request.body.toString('utf8');
+    const uid = /You are (node-\d+)\./.exec(body)?.[1] ?? 'node-0';
+    const count = counts.get(uid) ?? 0;
+    counts.set(uid, count + 1);
+    if (uid === 'node-0') {
+      // One spawn per root turn (even request), then a plain reply so the turn
+      // closes and the child's commit can wake the root again.
+      return respond(count % 2 === 0
+        ? { tool: { name: 'extend', args: { verb: 'spawn', heading: 'Worker.' } } }
+        : { content: 'idle' });
+    }
+    // Every child writes once (a commit that wakes the root), then parks.
+    return respond(count === 0
+      ? { cmd: `printf 'x\n' > f-${uid}.txt` }
+      : { content: 'idle' });
+  });
+  servers.push(server);
+  await writeFile(join(home, 'providers.json'), JSON.stringify({
+    llm: { key: 'k', endpoint: `${server.url}/v1/chat/completions` },
+  }), { encoding: 'utf8', mode: 0o600 });
+  const lines: string[] = [];
+  const handle = startHost({
+    home, uid: 'node-0', command: 'start', model: 'first-light-test',
+    heading: 'Lead.', sandbox: false,
+    log: createHostLog((line) => lines.push(line)),
+  }, {
+    installSignals: false, keepAlive: false,
+    freeSpace: async () => ({ bytes: 10 ** 12, inodes: 10 ** 9 }),
+  });
+  const denied = async () => (await localEvents(home, 'node-0')).filter((event) =>
+    event.type === 'tool/result'
+    && (event.data as { readonly message?: { readonly content?: string } })
+      .message?.content?.includes('already has 8 live children'));
+  await vi.waitFor(async () => { expect(await denied()).toHaveLength(1); }, { timeout: 40_000 });
+  handle.stop();
+  expect(await handle.done).toBe(0);
+  const root = await localEvents(home, 'node-0');
+  const spawned = root.filter((event) => event.type === 'tool/result'
+    && (event.data as { readonly message?: { readonly content?: string } })
+      .message?.content?.includes('spawned node-'));
+  expect(spawned).toHaveLength(8);
+}, 60_000);
+
 it('refuses a malformed nodes file at the gate, with exit 2 and no owner record', async () => {
   const home = await mkdtemp(join(tmpdir(), 'es-plurality-bad-'));
   dirs.push(home);
@@ -202,23 +336,3 @@ it('boots a declared node set through the host lifetime and stops it cleanly', a
     expect(local.filter((event) => event.type === 'node/boot')).toHaveLength(1);
   }
 }, 40_000);
-
-it('refuses a malformed nodes file at the gate, with exit 2 and no owner record', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'es-plurality-bad-'));
-  dirs.push(home);
-  await initHome(home);
-  const nodesFile = join(home, 'nodes.json');
-  await writeFile(nodesFile, JSON.stringify([
-    { uid: 'node-0', model: 'm', heading: 'h' },
-    { uid: 'node-0', model: 'm', heading: 'h' },
-  ]), 'utf8');
-  const lines: string[] = [];
-  const handle = startHost({
-    home, uid: 'node-0', command: 'start', nodesFile, sandbox: false,
-    log: createHostLog((line) => lines.push(line)),
-  }, { installSignals: false, keepAlive: false });
-  expect(await handle.done).toBe(2);
-  const events = lines.map((line) => JSON.parse(line) as { readonly event: string });
-  expect(events.map((event) => event.event)).toContain('host/error');
-  expect(existsSync(join(home, 'host.json'))).toBe(false);
-}, 20_000);
