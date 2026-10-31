@@ -2,7 +2,7 @@
 
 *Research hypothesis. The perpetual × emergent × co-negotiated-direction triangle names a gap: no surveyed work treats the direction of an LLM agent system as a persistent, versioned artifact continuously revised through human–agent chat co-negotiation (closest works: arXiv:2605.04264, human-ratified agent memory; "Large Language Fields", human-authored versioned mission packages). This is the project goal, not an established result.*
 
-This document states what the project sets out to demonstrate, the design discipline it commits to, and the measurement concept behind the claim. It is the entry point of the design corpus: [seed.md](seed.md) (cold start), [direction.md](direction.md) (chat and direction), [kernel.md](kernel.md) (the runtime), [ROADMAP.md](../ROADMAP.md) (status and checkpoints), and [research/](research/) (the evidence base).
+This document states what the project sets out to demonstrate, the design discipline it commits to, and the measurement concept behind the claim. It is the entry point of the design corpus: [seed.md](seed.md) (cold start), [direction.md](direction.md) (chat and direction), [kernel.md](kernel.md) (the runtime), [substrate.md](substrate.md) (the substrate as a treatment), [ROADMAP.md](../ROADMAP.md) (status and checkpoints), and [research/](research/) (the evidence base).
 
 ## 1. The heart of the experiment
 

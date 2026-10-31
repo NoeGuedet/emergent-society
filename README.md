@@ -15,6 +15,7 @@ Implementation phase; no product. The journal module, node driver, context and p
 | [Seed](docs/seed.md) | Instincts, the Hole, raw tools |
 | [Direction](docs/direction.md) | Pinned heading, versioned letter |
 | [Kernel](docs/kernel.md) | Technical spec |
+| [Substrate](docs/substrate.md) | The substrate as a treatment (design challenge) |
 | [AGENTS.md](AGENTS.md) | Commands and conventions |
 | [Roadmap](ROADMAP.md) | Progress, checkpoints |
 | [SOTA survey](docs/research/sota-autonomous-agents.md) | State of the art |
