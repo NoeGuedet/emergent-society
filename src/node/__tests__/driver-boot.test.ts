@@ -8,11 +8,11 @@ import { appendTear, collectEvents } from '../../journal/__tests__/helpers.js';
 import { NodeDriver, type TurnResult } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
 import { readWorldState } from '../world-state.js';
-import { runWorldDoctor } from '../world-doctor.js';
+import { runWorldDoctor, type DoctorReport } from '../world-doctor.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { ContextFold } from '../../context/fold.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
-import { useWorld } from './helpers.js';
+import { openTestDriver, useWorld } from './helpers.js';
 
 const fixture = useWorld('node-boot-');
 
@@ -35,7 +35,7 @@ async function closeIdle(d: NodeDriver): Promise<void> {
 describe('NodeDriver boot and resume', () => {
   it('journals node/boot with reason start on a fresh node', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const events = await bootlog(home);
     expect(events.map((e) => [e.type, e.data])).toEqual([
       ['node/boot', { reason: 'start' }],
@@ -49,7 +49,7 @@ describe('NodeDriver boot and resume', () => {
     w.append('node/boot', { reason: 'start' });
     w.append('turn/start', { turn: 0, trigger: 'boot', world: { from: null, to: null } });
     await w.close(); // clean fs, logically unclosed turn: the crash shape
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const events = await bootlog(home);
     expect(events.map((e) => e.type)).toEqual([
       'node/boot', 'turn/start', 'turn/end', 'node/boot',
@@ -73,7 +73,7 @@ describe('NodeDriver boot and resume', () => {
     await mkdir(locked);
     await chmod(locked, 0o000);
     try {
-      const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+      const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
       const events = await bootlog(home);
       expect(events.map((e) => e.type)).toEqual([
         'node/boot', 'turn/start', 'turn/end', 'world/commit-refused', 'node/boot',
@@ -98,13 +98,32 @@ describe('NodeDriver boot and resume', () => {
     }
   });
 
+  it('refuses a forged doctor report on the error channel and journals no event', async () => {
+    const { home, world } = fixture();
+    const errors: string[] = [];
+    // An invalid report can only arrive through a cast/injection (the doctor's
+    // own writer now validates); the driver must not make it durable.
+    const forged = { lock: 'free' } as unknown as DoctorReport;
+    const d = await openTestDriver(home, 'n1', wait, world, {
+      worldPollMs: 0, doctor: forged,
+      onError: (err) => { errors.push(err.name); },
+    });
+    expect(errors).toEqual(['InvalidDoctorReportError']);
+    const events = await bootlog(home);
+    expect(events.map((e) => e.type)).toEqual(['node/boot']);
+    // The durable history still folds: the poisoned payload never existed.
+    const fold = new ContextFold();
+    await fold.observe(await loadVerifiedEvents(home, 'n1', C13_EVENT_TYPES));
+    await closeIdle(d);
+  });
+
   it('repairs a torn tail before resuming', async () => {
     const { home, world } = fixture();
     const w = await JournalWriter.open(home, 'n1');
     w.append('node/boot', { reason: 'start' });
     await w.close();
     await appendTear(home);
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const events = await bootlog(home);
     expect(events.map((e) => e.type)).toEqual(['node/boot', 'node/boot']);
     expect(events[1]?.data).toEqual({ reason: 'resume' });
@@ -121,7 +140,7 @@ describe('NodeDriver boot and resume', () => {
     // rather than silently misread.
     w.append('future/thing', { n: 0 });
     await w.close();
-    await expect(NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 }))
+    await expect(openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 }))
       .rejects.toThrow(UnknownEventTypeError);
     // The failed open released its lock: a fresh writer can take the node over
     // instead of hitting SessionAlreadyOwnedError forever.
@@ -138,7 +157,7 @@ describe('NodeDriver boot and resume', () => {
     w.append('future/thing', { n: 0 }, { ignorable: false });
     await w.close();
     const known = new Set([...NODE_EVENT_TYPES, 'future/thing']);
-    const d = await NodeDriver.open(home, 'n1', wait, world, {
+    const d = await openTestDriver(home, 'n1', wait, world, {
       worldPollMs: 0, knownTypes: known,
     });
     expect(d.state).toBe('booting');
@@ -160,7 +179,7 @@ describe('the world/doctor carrier (C3)', () => {
     const report = await runWorldDoctor(world, {
       home, freeSpace: async () => ({ bytes: 100 * 1024 ** 3, inodes: 1_000_000 }),
     });
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0, doctor: report });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0, doctor: report });
     const events = await bootlog(home);
     expect(events.map((event) => event.type)).toEqual(['node/boot', 'world/doctor']);
     expect(events[1]!.ignorable).toBe(true);
@@ -173,7 +192,7 @@ describe('the world/doctor carrier (C3)', () => {
     const report = await runWorldDoctor(world, {
       home, freeSpace: async () => ({ bytes: 100 * 1024 ** 3, inodes: 1_000_000 }),
     });
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0, doctor: report });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0, doctor: report });
     await closeIdle(d);
 
     // An older reader whose known set lacks the type still rebuilds: the

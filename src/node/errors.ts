@@ -28,6 +28,18 @@ export class WorldNotARepoError extends NodeError {
 }
 
 /**
+ * A doctor report handed to `NodeDriver.open` fails the report's own replay
+ * validator. The event is never written: a durable `world/doctor` the fold
+ * rejects would poison the current run and every later boot. The driver reports
+ * this on its error channel and boots on.
+ */
+export class InvalidDoctorReportError extends NodeError {
+  constructor() {
+    super('refusing to journal a world/doctor report its replay validator rejects');
+  }
+}
+
+/**
  * The world's HEAD is not a single local branch the kernel can publish to: it is
  * detached, names something outside `refs/heads/`, or switched branch during a
  * commit. The kernel publishes with a compare-and-swap against one named branch

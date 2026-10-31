@@ -223,6 +223,62 @@ describe('the dirty tree and tracked unreadable paths are reported, never skippe
       }
     },
   );
+  it.skipIf(process.getuid?.() === 0)(
+    'omits a tracked unreadable path with no representable single-line label',
+    async () => {
+      const { world, home } = fixture();
+      // ' ' is a legal git path; `singleLine` collapses it to '', which the
+      // report's own validator rejects. The doctor must omit the label instead
+      // of writing a report its fold can never accept.
+      await commitAs(world, 'n1', { ' ': 'x\n' });
+      const blank = join(world.path, ' ');
+      await chmod(blank, 0o000);
+      try {
+        const report = await runWorldDoctor(world, { home, freeSpace: plenty });
+        expect(report.trackedUnreadable).toEqual([]);
+        // The report the writer emits is exactly the report the fold accepts.
+        expect(parseDoctorReport(report)).toEqual(report);
+      } finally {
+        await chmod(blank, 0o600).catch(() => {});
+      }
+    },
+  );
+  it.skipIf(process.getuid?.() === 0)(
+    'omits every tracked label the validator would reject (/, .., over-long)',
+    async () => {
+      const { world, home } = fixture();
+      // Legal git names whose collapsed labels the replay validator rejects:
+      // ' /x' trims to a leading '/', ' ..' trims to '..', and 101 emoji are
+      // 101 code points but 202 UTF-16 units (the validator's unit). Before the
+      // shared rule the doctor threw and lost the WHOLE report on each boot.
+      const longDir = '😀'.repeat(50);
+      const longFile = '😀'.repeat(51);
+      const rel = {
+        leading: ' /x',
+        traversing: ' ..',
+        long: `${longDir}/${longFile}`,
+      };
+      await commitAs(world, 'n1', { [rel.leading]: 'x\n', [rel.traversing]: 'x\n', [rel.long]: 'x\n' });
+      const paths = [
+        join(world.path, rel.leading),
+        join(world.path, rel.traversing),
+        join(world.path, rel.long),
+      ];
+      for (const path of paths) await chmod(path, 0o000);
+      try {
+        const report = await runWorldDoctor(world, { home, freeSpace: plenty });
+        expect(report.trackedUnreadable).toEqual([]);
+        // The report validates and still carries every other diagnostic.
+        expect(parseDoctorReport(report)).toEqual(report);
+        expect(report.dirty.known).toBe(true);
+        expect(report.index.readable).toBe(true);
+        // The offending labels alone are omitted — the files are untouched.
+        for (const path of paths) expect((await lstat(path)).isFile()).toBe(true);
+      } finally {
+        for (const path of paths) await chmod(path, 0o600).catch(() => {});
+      }
+    },
+  );
 });
 
 describe('untracked unstageable paths are quarantined, bounded and free-space gated', () => {
@@ -292,6 +348,29 @@ describe('untracked unstageable paths are quarantined, bounded and free-space ga
       expect(unknown.freeSpace.state).toBe('unverifiable');
       expect(unknown.quarantine.files).toBe(0);
       expect((await lstat(bad)).isFile()).toBe(true);
+    },
+  );
+
+  it.skipIf(process.getuid?.() === 0)(
+    'omits a quarantine path with no representable label and does not move it',
+    async () => {
+      const { world, home } = fixture();
+      const blank = join(world.path, ' ');
+      await writeFile(blank, '');
+      await chmod(blank, 0o000);
+      try {
+        const report = await runWorldDoctor(world, { home, freeSpace: plenty });
+        // `files === paths.length` stays true because the unrepresentable path
+        // is neither labelled nor moved.
+        expect(report.quarantine).toEqual({
+          files: 0, bytes: 0, paths: [], truncated: false,
+        });
+        expect(parseDoctorReport(report)).toEqual(report);
+        expect((await lstat(blank)).isFile()).toBe(true);
+      } finally {
+        await chmod(blank, 0o600).catch(() => {});
+        await rm(blank, { force: true }).catch(() => {});
+      }
     },
   );
 });

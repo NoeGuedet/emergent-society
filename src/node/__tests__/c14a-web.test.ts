@@ -4,6 +4,7 @@ import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { readFrontier } from '../../frontier/__tests__/helpers.js';
+import { openTestDriver } from './helpers.js';
 import type { HttpRequest, HttpResponse } from '../../frontier/index.js';
 import { BlobStore, canonicalizeJson } from '../../journal/index.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
@@ -172,7 +173,7 @@ describe('C1.4a web tools end to end', () => {
         ),
         webTools,
       });
-      driver = await NodeDriver.open(home, 'n1', runtime.handler, world, {
+      driver = await openTestDriver(home, 'n1', runtime.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
         onCheckpoint: (mark) => runtime.checkpoint(mark),
       });

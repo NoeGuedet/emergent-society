@@ -11,7 +11,7 @@ import { useTempHome, withFailingWrite } from '../../journal/__tests__/helpers.j
 import type { BoundaryGate, DriverHooks, GateCallbacks } from '../../node/gate.js';
 import { createBoundaryGate } from '../../node/gate.js';
 import { NodeDriver } from '../../node/driver.js';
-import { useWorld } from '../../node/__tests__/helpers.js';
+import { openTestDriver, useWorld } from '../../node/__tests__/helpers.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../events.js';
 import { defaultAgentConfig } from '../config.js';
 import { ContextFold } from '../fold.js';
@@ -578,7 +578,7 @@ async function runFirstBoot(
   const injectionActive = new Promise<void>((resolve) => { inject = resolve; });
   const withResult = variant !== 'errorCloser';
   const ref: { d: NodeDriver | null } = { d: null };
-  ref.d = await NodeDriver.open(path, 'n1', async (ctx) => {
+  ref.d = await openTestDriver(path, 'n1', async (ctx) => {
     ctx.gate.append('world/perception', {
       turn: ctx.turn, range: ctx.world,
       value: { kind: 'inline', value: perception('') },
@@ -626,7 +626,7 @@ async function reconcileBoot(
   path: string, world: ReturnType<typeof fixture>['world'], fold: ContextFold,
 ): Promise<void> {
   const hooks = hooksFor(fold, path);
-  const driver = await NodeDriver.open(path, 'n1', () => ({ outcome: 'waiting', toolCalls: false }), world, {
+  const driver = await openTestDriver(path, 'n1', () => ({ outcome: 'waiting', toolCalls: false }), world, {
     knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0,
   });
   driver.stop();
@@ -638,7 +638,7 @@ async function closeOnlyBoot(
   path: string, world: ReturnType<typeof fixture>['world'], fold: ContextFold,
 ): Promise<void> {
   const hooks = hooksFor(fold, path, { onReady: async () => {} });
-  const driver = await NodeDriver.open(path, 'n1', () => ({ outcome: 'waiting', toolCalls: false }), world, {
+  const driver = await openTestDriver(path, 'n1', () => ({ outcome: 'waiting', toolCalls: false }), world, {
     knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0,
   });
   driver.stop();
@@ -877,7 +877,7 @@ describe('fold: acknowledgement is filtered by turn on the live path only', () =
     const fold = new ContextFold();
     const seen: WorldRange[] = [];
     let driver: NodeDriver | null = null;
-    driver = await NodeDriver.open(path, 'n1', (ctx) => {
+    driver = await openTestDriver(path, 'n1', (ctx) => {
       seen.push(ctx.world);
       driver!.stop();
       return { outcome: 'waiting', toolCalls: false };

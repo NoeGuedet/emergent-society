@@ -55,22 +55,37 @@ export function createFencePort(input: {
   let frozen: readonly string[] = [];
   const detail = (text: string): string => singleLine(text, MAX_FENCE_DETAIL);
 
-  /** The node leaf (created if absent) plus every existing Run leaf. */
+  /**
+   * Every existing Run leaf plus the node leaf (created if absent). The
+   * enumeration runs first: a readdir/lstat failure other than ENOENT/ENOTDIR
+   * must refuse before any leaf is frozen, and a missing root still lists as
+   * empty so the node leaf can be created.
+   */
   async function currentLeaves(): Promise<string[]> {
+    const runs = await listLeaves(input.root);
     const node = nodeLeaf(input.root, input.uid);
     await ensureLeaf(node);
-    return [node, ...await listLeaves(input.root)];
+    return [node, ...runs];
   }
 
-  /** The leaves that still exist; a vanished leaf is dropped, never fenced. */
+  /**
+   * The leaves that still exist; a leaf that provably vanished (ENOENT/
+   * ENOTDIR) is dropped, never fenced. Any other lstat failure (EACCES, EIO,
+   * ELOOP, a transient cgroupfs read error) is NOT evidence the leaf is gone:
+   * it is a freeze failure, so the acquire refuses and thaws rather than
+   * reporting `fenced: true` with that Run un-frozen. The first enumeration
+   * applies the same rule inside `listLeaves`.
+   */
   async function existing(leaves: readonly string[]): Promise<string[]> {
     const live: string[] = [];
     for (const leaf of leaves) {
       try {
         await lstat(leaf);
         live.push(leaf);
-      } catch {
-        // Gone between the enumeration and the write: nothing to freeze.
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT' || code === 'ENOTDIR') continue;
+        throw err;
       }
     }
     return live;
@@ -88,15 +103,19 @@ export function createFencePort(input: {
         };
         let verdict = await freezeSet(leaves, polled);
         if (!verdict.ok && isVanish(verdict.reason)) {
-          // One retry on a vanished leaf: re-enumerate the survivors and
-          // freeze them; a leaf that vanished is "gone", never a timeout. The
-          // node's own leaf may not vanish under a live cell — if it did, the
-          // tree was detached and a subset freeze would not fence the shell.
+          // One retry on a vanished leaf: RE-ENUMERATE (not filter the stale
+          // list) so a leaf created in the window is included and one that
+          // vanished is dropped. A leaf that vanished is "gone", never a
+          // timeout; an unstattable one is a freeze failure (existing()).
+          // The node's own leaf may not vanish under a live cell — if it did,
+          // the tree was detached and a subset freeze would not fence the shell.
           const node = nodeLeaf(input.root, input.uid);
-          const live = await existing(leaves);
+          const live = await existing([node, ...await listLeaves(input.root)]);
+          const changed = live.length !== leaves.length
+            || live.some((leaf) => !leaves.includes(leaf));
           if (!live.includes(node)) {
             verdict = { ok: false, reason: 'node-leaf-vanished' };
-          } else if (live.length !== leaves.length) {
+          } else if (changed) {
             leaves = live;
             frozen = leaves;
             verdict = await freezeSet(leaves, polled);

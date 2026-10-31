@@ -9,6 +9,7 @@ import {
 import type { EventEnvelope } from '../../journal/index.js';
 import { sha256HexOf } from '../../journal/index.js';
 import { payloadOfCanonicalBytes, useTempHome } from '../../journal/__tests__/helpers.js';
+import { openTestDriver } from '../../node/__tests__/helpers.js';
 import { createBoundaryGate } from '../../node/gate.js';
 import type { GateCallbacks, GateScope, BoundaryGate } from '../../node/gate.js';
 import { NodeDriver, type TurnContext } from '../../node/driver.js';
@@ -693,7 +694,7 @@ describe('lossless bounded artifacts under the real driver gate', () => {
       acknowledgedWorld: () => null,
     };
     try {
-      driver = await NodeDriver.open(home, 'n1', async (ctx) => {
+      driver = await openTestDriver(home, 'n1', async (ctx) => {
         ref = await ctx.gate.capture(input, 'utf8');
         // `tool/result.raw` is the surviving local artifact reference (execute
         // keeps its raw capture); the claim-check envelope must stay bounded.
@@ -716,7 +717,7 @@ describe('lossless bounded artifacts under the real driver gate', () => {
       for (const event of events) {
         expect(Buffer.byteLength(canonicalizeJson(toJson(event.data)), 'utf8')).toBeLessThan(MAX_BLOB_BYTES);
       }
-      second = await NodeDriver.open(home, 'n1', () => ({ outcome: 'waiting', toolCalls: false }), world,
+      second = await openTestDriver(home, 'n1', () => ({ outcome: 'waiting', toolCalls: false }), world,
         { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
       second.stop();
       await second.run();
@@ -764,7 +765,7 @@ describe('lossless bounded artifacts under the real driver gate', () => {
       acknowledgedWorld: () => null,
     };
     let d: NodeDriver | null = null;
-    d = await NodeDriver.open(home, 'n1', async (ctx: TurnContext) => {
+    d = await openTestDriver(home, 'n1', async (ctx: TurnContext) => {
       for (const n of thresholds) {
         try {
           ctx.gate.append('world/perception', perceptionData(n) as never);

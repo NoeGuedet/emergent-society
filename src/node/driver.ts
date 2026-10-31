@@ -7,13 +7,15 @@ import { StorageError, checkStorage, type StorageConfig } from '../storage.js';
 import { DEFAULT_STORAGE } from './storage-probe.js';
 import { systemClock } from '../util.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
-import { NodeStateError, WorldReconciliationError, GitCommandError } from './errors.js';
+import {
+  GitCommandError, InvalidDoctorReportError, NodeStateError, WorldReconciliationError,
+} from './errors.js';
 import { WakeLatch } from './latch.js';
 import {
   boundedRefusalDetail, commitAllRefused, type CommitRefusal,
 } from './world-commit.js';
 import { clearWorldState, markWorldDegraded } from './world-state.js';
-import type { DoctorReport } from './world-doctor.js';
+import { parseDoctorReport, type DoctorReport } from './world-doctor.js';
 import {
   createBoundaryGate,
   type BoundaryGate, type BoundaryRegistry, type DurableWatermark, type DriverHooks,
@@ -91,11 +93,12 @@ export type TurnHandler = (ctx: TurnContext) => Promise<TurnResult> | TurnResult
 
 /**
  * What one fence attempt proved. `fenced` names how many leaves are frozen (the
- * node leaf plus every Run leaf that existed at acquire time); a non-fenced
- * outcome is either `unavailable` — the host has no usable fence, so the commit
- * may proceed unfenced and the host records why — or `freeze-failed`, a fence
- * that was attempted and could not be established (a runtime cgroup failure),
- * which is a typed commit refusal, never an unfenced commit.
+ * node leaf plus every Run leaf that existed at acquire time). A non-fenced
+ * outcome is a present port's failure — `unavailable` (the runtime says it
+ * cannot fence) or `freeze-failed` (a fence that was attempted and could not be
+ * established); both become the typed `freeze-timeout` commit refusal, never an
+ * unfenced commit. The unfenced case is the ABSENCE of a port: the host records
+ * it on the owner record/`host/boot` and `status`.
  */
 export type FenceOutcome =
   | { readonly fenced: true; readonly leaves: number }
@@ -377,15 +380,23 @@ export class NodeDriver {
     }
     if (opts.doctor !== undefined) {
       // After `node/boot` (and its flush): the report is a boot-time fact of
-      // this open, written by the one writer the driver owns. A failure here
-      // is diagnostic — the node is already booted and the report is not a
-      // load-bearing fact (the fold renders nothing).
-      try {
-        driver.writeEvent('world/doctor', { report: opts.doctor }, { ignorable: true });
-        await driver.flushObservations();
-      } catch (err) {
-        try { opts.onError?.(err instanceof Error ? err : new Error('world/doctor write failed')); }
+      // this open, written by the one writer the driver owns. The writer and the
+      // replay fold must agree, so the payload is validated before it can become
+      // durable: an invalid report is a named error on the diagnostic channel
+      // and NO event at all (a `world/doctor` the fold rejects would poison the
+      // current run and every later boot).
+      const report = parseDoctorReport(opts.doctor);
+      if (report === null) {
+        try { opts.onError?.(new InvalidDoctorReportError()); }
         catch { /* the diagnostic is not the boot */ }
+      } else {
+        try {
+          driver.writeEvent('world/doctor', { report }, { ignorable: true });
+          await driver.flushObservations();
+        } catch (err) {
+          try { opts.onError?.(err instanceof Error ? err : new Error('world/doctor write failed')); }
+          catch { /* the diagnostic is not the boot */ }
+        }
       }
     }
     return driver;
@@ -526,9 +537,37 @@ export class NodeDriver {
           // write-behind window (kernel.md §3): a crash right after it would
           // otherwise orphan the world commit — a hash in the world's history that
           // the node's local log, the only record of which turn produced it, does
-          // not reference.
-          await this.flushObservations();
-          if (refusal !== null) await this.recordCommitRefusal(refusal, this.turn, true);
+          // not reference. A storage refusal here is not a durability fault and
+          // must not end the run or skip the C1 carrier: the writer keeps the
+          // batch pending, the next turn's storage home defers every effect until
+          // a later flush commits it, and the carrier below is still attempted.
+          // On a SUCCESSFUL commit this swallowed refusal is the documented
+          // residual (kernel.md): no self-retry is armed — the retry is the
+          // refused-commit path below — so the pending turn/end waits for the
+          // next turn's barrier or a stop's final flush, and a crash in that
+          // window reconciles the already-committed turn as interrupted at the
+          // next boot (the reconciler names its commit and closes it
+          // synthetically).
+          try {
+            await this.flushObservations();
+          } catch (err) {
+            if (!(err instanceof StorageError)) throw err;
+          }
+          if (refusal !== null) {
+            try {
+              await this.recordCommitRefusal(refusal, this.turn, true);
+            } catch (err) {
+              if (!(err instanceof StorageError)) throw err;
+              // The carrier was appended to the same pending batch and the
+              // degraded sidecar already holds the fact. The bounded self-retry
+              // is still armed: without it a node whose closer AND carrier both
+              // refused would park until a foreign commit or a stop, despite
+              // the documented bounded self-retry. The retry only requests the
+              // latch; the next turn's storage home defers until the probe is
+              // high, and the barrier flush lands the pending batch then.
+              this.scheduleRetry();
+            }
+          }
           await this.checkpoint();
           this.endTurnGate();
           if (result.outcome === 'chained' && refusal === null) {

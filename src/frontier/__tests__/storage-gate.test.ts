@@ -137,6 +137,41 @@ describe('frontier Gate.begin storage home', () => {
     }
   });
 
+  it('refuses `complete` post-effect: the request remains and the next boot marks it incomplete', async () => {
+    const state: State = { free: HIGH };
+    const journal = await openFrontierJournal(home(), {
+      worldHead: async () => null, now: () => 1, storage: guard(state),
+    });
+    try {
+      // Begin under a high probe: the request is durable.
+      const call = await journal.gate.begin(input);
+      state.free = LOW;
+      // `complete` is post-effect and adds no gate check, but its writer's
+      // flush is still guarded: the typed refusal propagates, the response
+      // event stays pending, and the writer is not poisoned.
+      await expect(journal.gate.complete(call, {
+        status: 200, headers: {}, body: Buffer.from('ok'), encoding: 'utf8', complete: true,
+      })).rejects.toBeInstanceOf(StorageError);
+      expect((await readFrontier(home())).map((event) => event.type)).toEqual(['http/request']);
+    } finally {
+      // The process would die here with the terminal still pending; the close's
+      // own flush can only refuse again, so its error is the crash shape.
+      await journal.close().catch(() => {});
+    }
+    // A crash after the refusal: the next boot reconciles the terminal-less
+    // request as `http/incomplete` — the documented carrier.
+    state.free = HIGH;
+    const reopened = await openFrontierJournal(home(), {
+      worldHead: async () => null, now: () => 1, storage: guard(state),
+    });
+    try {
+      expect((await readFrontier(home())).map((event) => event.type))
+        .toEqual(['http/request', 'http/incomplete']);
+    } finally {
+      await reopened.close();
+    }
+  });
+
   it('degrades on a null probe: begin proceeds', async () => {
     const state: State = { free: null };
     const journal = await openFrontierJournal(home(), {

@@ -153,14 +153,17 @@ function identity(author: string): Record<string, string> {
  * `git-spawn` a child that never started, `git-timeout`/`git-abort` a child the
  * process layer ended, `output-cap` the kernel's own output bound, `walk-eacces`
  * and `walk-failure` the world walk's raw filesystem failure (a permission
- * errno, or any other errno — the walk is not a `GitCommandError`),
+ * errno, or any other filesystem errno except `ETIMEDOUT`, which is
+ * `walk-timeout` — the walk is not a `GitCommandError`),
  * `walk-too-deep` a child past the walk's path budget (refused, never silently
- * excluded from the commit), `world-head` a HEAD the kernel cannot publish to
- * (detached, outside `refs/heads/`, or switched during the attempt), and
- * `budget`/`freeze-timeout` the later commit-boundary budgets and fence.
+ * excluded from the commit), `walk-timeout` the walk's wall-clock budget
+ * (`ETIMEDOUT`, refused before `add`), `world-head` a HEAD the kernel cannot
+ * publish to (detached, outside `refs/heads/`, or switched during the attempt),
+ * and `budget`/`freeze-timeout` the later commit-boundary budgets and fence.
  */
 export type CommitRefusal = {
-  readonly reason: 'walk-eacces' | 'walk-failure' | 'walk-too-deep' | 'git-exit' | 'git-spawn'
+  readonly reason: 'walk-eacces' | 'walk-failure' | 'walk-too-deep' | 'walk-timeout'
+    | 'git-exit' | 'git-spawn'
     | 'git-timeout' | 'git-abort' | 'output-cap' | 'world-head' | 'budget' | 'freeze-timeout';
   readonly detail: string;
 };
@@ -171,7 +174,8 @@ export type CommitRefusal = {
  * the fence), which `isCommitRefusal` must pass through.
  */
 const COMMIT_REFUSAL_REASONS: ReadonlySet<string> = new Set([
-  'walk-eacces', 'walk-failure', 'walk-too-deep', 'git-exit', 'git-spawn', 'git-timeout',
+  'walk-eacces', 'walk-failure', 'walk-too-deep', 'walk-timeout',
+  'git-exit', 'git-spawn', 'git-timeout',
   'git-abort', 'output-cap', 'world-head', 'budget', 'freeze-timeout',
 ]);
 
@@ -214,9 +218,10 @@ export function isCommitRefusal(value: unknown): value is CommitRefusal {
  * The sources are recognized by shape and class, not by one shared predicate:
  * a typed refusal passes through by its fields, a `GitCommandError` by its
  * class and process kind, a `WorldHeadError` by its class, and the
- * nested-repository walk's raw filesystem failure (any errno: EACCES, EPERM,
- * ENAMETOOLONG, EIO, EMFILE…) by its class or code, since it fails before any
- * git child exists. A raw errno that escapes the walk is the same class.
+ * nested-repository walk's failure (EACCES/EPERM, ETIMEDOUT, or any other
+ * errno: ENAMETOOLONG, EIO, EMFILE…) by its class or code, since it fails
+ * before any git child exists. ETIMEDOUT is the walk's own `walk-timeout`; a
+ * raw errno that escapes the walk is the same class.
  */
 export function classifyCommitFailure(err: unknown): CommitRefusal | null {
   if (isCommitRefusal(err)) {
@@ -232,7 +237,8 @@ export function classifyCommitFailure(err: unknown): CommitRefusal | null {
     return {
       reason: err.code === 'ETOODEEP'
         ? 'walk-too-deep'
-        : isWalkPermissionCode(err.code) ? 'walk-eacces' : 'walk-failure',
+        : err.code === 'ETIMEDOUT' ? 'walk-timeout'
+          : isWalkPermissionCode(err.code) ? 'walk-eacces' : 'walk-failure',
       detail: boundedRefusalDetail(err.message),
     };
   }
@@ -554,7 +560,15 @@ async function commitOnce(
 async function nestedRepoDirs(io: WorldIo, limits: CommitLimits): Promise<string[]> {
   const nested: string[] = [];
   let entriesSeen = 0;
+  const started = Date.now();
+  /** Refuses with the typed walk-timeout once the wall-clock budget is spent. */
+  const checkDeadline = (rel: string): void => {
+    if (Date.now() - started >= limits.maxWalkMs) {
+      throw new WorldWalkError('walk', 'ETIMEDOUT', rel);
+    }
+  };
   const visit = async (rel: string): Promise<void> => {
+    checkDeadline(rel);
     const dir = rel === '' ? io.path : join(io.path, rel);
     // The root is never refused by the path budget: its readdir is the walk's
     // entry point, and a root past PATH_MAX fails typed from readdir below.
@@ -582,6 +596,11 @@ async function nestedRepoDirs(io: WorldIo, limits: CommitLimits): Promise<string
       return;
     }
     for (const entry of entries) {
+      // The walk runs inside the commit fence, so the deadline is checked
+      // between entries as well as between directories: it bounds the walk's
+      // computation. A single stalled readdir/lstat is the residual — the check
+      // cannot run while that call is pending.
+      checkDeadline(rel);
       // Git's own metadata is not world content, and a symlink is not
       // descended by `add` either.
       if (entry.name === '.git') continue;

@@ -14,6 +14,7 @@ import { systemProviderPolicy } from '../../../provider/policy.js';
 import type { SerializedTransport, TransportFacts, TransportResult } from '../../../provider/transport.js';
 import type { FunctionCall } from '../../../context/contracts.js';
 import { useWorld } from '../../__tests__/helpers.js';
+import { openTestDriver } from '../../__tests__/helpers.js';
 import type { WorldFixture } from '../../__tests__/helpers.js';
 import { createPackageStore } from '../store.js';
 import { createRunSupervisor } from '../supervisor.js';
@@ -130,7 +131,7 @@ async function spineFor(
   const spine: Spine = {
     fx, transport, runtime, driver: null,
     async open(): Promise<NodeDriver> {
-      const driver = await NodeDriver.open(
+      const driver = await openTestDriver(
         fx.home, 'n1', runtime.handler, fx.world,
         { knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0 },
       );
@@ -448,7 +449,7 @@ describe('package lifecycle: the final-swarm corrections', () => {
       terminal: { env: { PATH: '/usr/bin:/bin' } },
       adapter: new ProviderAdapter(transport1, systemProviderPolicy, frontier.gate),
     });
-    let driver = await NodeDriver.open(
+    let driver = await openTestDriver(
       fx.home, 'n1', runtime1.handler, fx.world,
       { knownTypes: C13_EVENT_TYPES, hooks: runtime1.hooks, worldPollMs: 0 },
     );
@@ -472,7 +473,7 @@ describe('package lifecycle: the final-swarm corrections', () => {
       terminal: { env: { PATH: '/usr/bin:/bin' } },
       adapter: new ProviderAdapter(transport2, systemProviderPolicy, frontier.gate),
     });
-    driver = await NodeDriver.open(
+    driver = await openTestDriver(
       fx.home, 'n1', runtime2.handler, fx.world,
       { knownTypes: C13_EVENT_TYPES, hooks: runtime2.hooks, worldPollMs: 0 },
     );

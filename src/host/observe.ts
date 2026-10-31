@@ -5,8 +5,10 @@
  * channel: the plan fixes its shape so an operator can read a cell's progress
  * from stderr without the host ever printing model text, tool output, request
  * or response bodies, headers, or a credential. A caller chooses the fields;
- * this module enforces the bounds — 11 fields, 200 code points per string, the
- * JSONL-safe value types only — so no call site can widen them by accident.
+ * this module enforces the bounds — 12 fields, 200 code points per string, the
+ * JSONL-safe value types only — so no call site can widen them by accident. The
+ * bound is exactly the documented `host/boot` shape (12 facts including
+ * `world`); a narrower cap silently dropped the last one.
  *
  * `emit` owns the line terminator: it serializes once as
  * `JSON.stringify(payload) + '\n'`, so the default sink (stderr) writes a
@@ -16,7 +18,8 @@
  * both serialization and the write sit inside the same guard — so diagnostics
  * are never the failure they describe. An invalid event name is replaced by
  * `host/log-error` rather than thrown, and that substituted event's own `error`
- * field counts against the same absolute 11-field cap.
+ * field counts against the same absolute 12-field cap (the eleven user fields
+ * plus the substituted `error`).
  *
  * Strings are truncated to 200 code points first and then stripped of C0/C1
  * controls and the two line separators, so a host-authored path or message can
@@ -36,8 +39,8 @@ export interface HostLog {
 
 /** The event-name grammar: lowercase, one slash/dash-separated namespace. */
 const EVENT_NAME_RE = /^[a-z][a-z0-9/-]{0,63}$/;
-/** The field cap, excluding `event`. */
-const MAX_FIELDS = 11;
+/** The field cap, excluding `event`; exactly the `host/boot` line's 12 facts. */
+const MAX_FIELDS = 12;
 /** The per-string cap, in code points, not UTF-16 units. */
 const MAX_STRING_CODE_POINTS = 200;
 /** C0 and C1 controls plus the Unicode line/paragraph separators. */
@@ -70,7 +73,8 @@ export function createHostLog(
       const name = valid ? event : LOG_ERROR_EVENT;
       const kept: Record<string, LogValue> = {};
       // The cap is absolute: the substituted event's own `error` field counts
-      // against the same 11, so an invalid name can never widen the line.
+      // against the same MAX_FIELDS (12), so an invalid name can never widen
+      // the line.
       const capacity = valid ? MAX_FIELDS : MAX_FIELDS - 1;
       if (fields !== undefined) {
         for (const key of Object.keys(fields).slice(0, capacity)) {

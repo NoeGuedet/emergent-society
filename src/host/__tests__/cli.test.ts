@@ -1,5 +1,6 @@
-import { access, mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { access, lstat, mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   afterEach, beforeEach, expect, it, vi,
@@ -188,6 +189,66 @@ it('dispatches status: the report prints first, then the exit code it earns', as
   );
 });
 
+it('exits 1 only for an unintended fence=unavailable, not for storage=unquoted or an opt-out', async () => {
+  const base = {
+    home: '/x',
+    host: {
+      state: 'running' as const, pid: 1, uid: 'node-0', command: 'start' as const,
+      sandbox: 'landlock' as const,
+    },
+    frontier: {
+      present: false, count: 0, lastHash: null, counts: {}, openCalls: 0,
+      lastRequest: null, lastResponse: null, error: null,
+    },
+    world: { present: false, head: null, error: null, state: 'healthy' as const },
+  };
+  // A healthy fenced running production host: `storage=unquoted` is the normal
+  // fact (no quota is detected), so it must NOT degrade the exit code.
+  const cleanRunning = {
+    ...base,
+    host: { ...base.host, fence: 'available' as const, storage: 'unquoted' as const },
+  };
+  expect(await runCli(['status', '--home', '/x', '--json'],
+    { ...deps, readStatus: async () => cleanRunning })).toBe(0);
+
+  // A host that requested confinement but could not attach the fence is the
+  // real degradation: exit 1.
+  const unfenced = { ...base, host: { ...base.host, fence: 'unavailable' as const } };
+  expect(await runCli(['status', '--home', '/x', '--json'],
+    { ...deps, readStatus: async () => unfenced })).toBe(1);
+
+  // An explicit `--no-sandbox` opt-out is not a degradation: the report still
+  // carries fence=unavailable (and sandbox=off), but the operator chose it.
+  const optedOut = {
+    ...base,
+    host: {
+      ...base.host, sandbox: 'off' as const, fence: 'unavailable' as const,
+      storage: 'unquoted' as const,
+    },
+  };
+  expect(await runCli(['status', '--home', '/x', '--json'],
+    { ...deps, readStatus: async () => optedOut })).toBe(0);
+
+  // The storage fact alone never degrades the exit.
+  const unquoted = {
+    ...base,
+    host: { ...base.host, fence: 'available' as const, storage: 'unquoted' as const },
+  };
+  expect(await runCli(['status', '--home', '/x'], {
+    ...deps, readStatus: async () => unquoted,
+  })).toBe(0);
+
+  // Only a RUNNING host's fence degrades the exit code; a stale record keeps
+  // the storage fact but no live host, so the report is not a degraded running
+  // one.
+  const stale = {
+    ...base,
+    host: { state: 'stale' as const, storage: 'unquoted' as const },
+  };
+  expect(await runCli(['status', '--home', '/x', '--json'],
+    { ...deps, readStatus: async () => stale })).toBe(0);
+});
+
 it('maps status failures: a missing home to 2, any other throw to 1 with a bounded label', async () => {
   expect(await runCli(['status', '--home', join(home, 'nope')], deps)).toBe(2);
   expect(stderr.join('')).toContain('error:');
@@ -201,4 +262,45 @@ it('maps status failures: a missing home to 2, any other throw to 1 with a bound
   expect(await runCli(['status', '--home', '/x'], failing)).toBe(1);
   expect(stderr.join('')).toContain('error: Error');
   expect(stderr.join('')).not.toContain('raw failure detail');
+});
+
+it('init refuses a legacy in-world world/.git with exit 2 and the migration recipe', async () => {
+  expect(await runCli(['init', '--home', home], deps)).toBe(0);
+  // The documented legacy shape: the git dir lives inside the world and the
+  // external world.git is absent. A real `git init` creates it.
+  await rm(join(home, 'world.git'), { recursive: true, force: true });
+  execFileSync('git', ['-C', join(home, 'world'), 'init', '-q'], { stdio: 'ignore' });
+  stderr.length = 0;
+  expect(await runCli(['init', '--home', home], deps)).toBe(2);
+  const message = stderr.join('');
+  expect(message).toMatch(/migrated/);
+  expect(message).not.toMatch(/remove the stray entry/);
+  // The world (and its recorded history) is kept: init never advises removing it.
+  expect((await lstat(join(home, 'world'))).isDirectory()).toBe(true);
+});
+
+it('init maps a world open/trust refusal to exit 2', async () => {
+  expect(await runCli(['init', '--home', home], deps)).toBe(0);
+  // Both halves present, but world.git is not a repository: the trust layer's
+  // `WorldNotARepoError` is the same configuration refusal start/resume maps to
+  // 2, not a runtime failure.
+  await rm(join(home, 'world.git'), { recursive: true, force: true });
+  await mkdir(join(home, 'world.git'));
+  stderr.length = 0;
+  expect(await runCli(['init', '--home', home], deps)).toBe(2);
+  expect(stderr.join('')).toMatch(/migrated/);
+});
+
+it('init maps a world symlink to $HOME to exit 2', async () => {
+  expect(await runCli(['init', '--home', home], deps)).toBe(0);
+  // The reachable UnsafeWorldPathError shape: both halves exist, but the world
+  // entry is a symlink the trust layer resolves to $HOME. `init` and
+  // start/resume must agree on the world open/trust family's exit code.
+  await rm(join(home, 'world'), { recursive: true, force: true });
+  await symlink(homedir(), join(home, 'world'));
+  stderr.length = 0;
+  expect(await runCli(['init', '--home', home], deps)).toBe(2);
+  const message = stderr.join('');
+  expect(message).toMatch(/refusing .* as the world repo/);
+  expect((await lstat(join(home, 'world'))).isSymbolicLink()).toBe(true);
 });

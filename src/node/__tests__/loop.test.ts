@@ -13,6 +13,7 @@ import { createAgentRuntime, defaultAgentConfig, type AgentRuntime } from '../lo
 import { ContextFold } from '../../context/fold.js';
 import { verifyPerceptions } from '../../context/__tests__/verify-perceptions.js';
 import { readFrontier } from '../../frontier/__tests__/helpers.js';
+import { openTestDriver } from './helpers.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../../context/events.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
 import type { BoundaryGate, DriverHooks } from '../gate.js';
@@ -169,7 +170,7 @@ async function runtimeFor(
 }
 
 function openRuntime(fx: WorldFixture, runtime: AgentRuntime): Promise<NodeDriver> {
-  return NodeDriver.open(fx.home, 'n1', runtime.handler, fx.world, {
+  return openTestDriver(fx.home, 'n1', runtime.handler, fx.world, {
     knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
   });
 }
@@ -309,7 +310,7 @@ describe('turn control', () => {
       await runtime.handler(ctx);
       throw new Error('fatal after effect');
     };
-    const driver = await NodeDriver.open(fx.home, 'n1', failing, fx.world, {
+    const driver = await openTestDriver(fx.home, 'n1', failing, fx.world, {
       knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
     });
     await expect(driver.run()).rejects.toThrow('fatal after effect');
@@ -454,7 +455,7 @@ describe('stop', () => {
         driver!.stop();
       },
     };
-    driver = await NodeDriver.open(fx.home, 'n1', runtime.handler, fx.world, {
+    driver = await openTestDriver(fx.home, 'n1', runtime.handler, fx.world, {
       knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0, batchWindowMs: 10000,
     });
     await driver.run();
@@ -768,7 +769,7 @@ describe('durable world acknowledgement', () => {
     const failing = await runtimeFor(
       fx, configWith({ policy: { retryDelayMs: 1 } }), new ScriptedTransport([]),
     );
-    const d2 = await NodeDriver.open(fx.home, 'n1', failing.handler, fx.world,
+    const d2 = await openTestDriver(fx.home, 'n1', failing.handler, fx.world,
       { knownTypes: C13_EVENT_TYPES, hooks: failing.hooks, worldPollMs: 0 });
     await expect(d2.run()).rejects.toThrow('render boom');
     presenter.override = null;
@@ -784,7 +785,7 @@ describe('durable world acknowledgement', () => {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const seen: WorldRange[] = [];
       const ref: { d: NodeDriver | null } = { d: null };
-      ref.d = await NodeDriver.open(fx.home, 'n1', (ctx) => {
+      ref.d = await openTestDriver(fx.home, 'n1', (ctx) => {
         seen.push(ctx.world);
         ref.d!.stop();
         return waitTurn();
@@ -818,7 +819,7 @@ describe('durable world acknowledgement', () => {
     const h1 = await commitAs(fx.world, 'n3', { 'n3/b.md': 'b' });
     const seen: WorldRange[] = [];
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(fx.home, 'n1', (ctx) => {
+    ref.d = await openTestDriver(fx.home, 'n1', (ctx) => {
       seen.push(ctx.world);
       ref.d!.stop();
       return waitTurn();
@@ -871,7 +872,7 @@ describe('durable world acknowledgement', () => {
     const runtime = await runtimeFor(
       fx, configWith({ policy: { retryDelayMs: 1 } }), new ScriptedTransport([]),
     );
-    const d0 = await NodeDriver.open(fx.home, 'n1', async () => {
+    const d0 = await openTestDriver(fx.home, 'n1', async () => {
       throw new Error('assistant throw');
     }, fx.world, { knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0 });
     await expect(d0.run()).rejects.toThrow('assistant throw');
@@ -884,7 +885,7 @@ describe('durable world acknowledgement', () => {
     const h1 = await commitAs(fx.world, 'n3', { 'n3/b.md': 'b' });
     const seen: WorldRange[] = [];
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(fx.home, 'n1', (ctx) => {
+    ref.d = await openTestDriver(fx.home, 'n1', (ctx) => {
       seen.push(ctx.world);
       ref.d!.stop();
       return waitTurn();

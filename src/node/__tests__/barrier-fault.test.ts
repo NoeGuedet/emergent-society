@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { access } from 'node:fs/promises';
 import { join } from 'node:path';
 import { withFailingWrite } from '../../journal/__tests__/helpers.js';
+import { openTestDriver } from './helpers.js';
 import { readFrontier } from '../../frontier/__tests__/helpers.js';
 import { useWorld, type WorldFixture } from './helpers.js';
 import { NodeDriver } from '../driver.js';
@@ -68,7 +69,7 @@ describe('C1.3 request barrier fault', () => {
     try {
       // open() runs its own resume flush normally; the injected fault lands on the first
       // write inside run(), which is the durable turn/start barrier, before any send.
-      driver = await NodeDriver.open(fx.home, 'n1', runtime.handler, fx.world, {
+      driver = await openTestDriver(fx.home, 'n1', runtime.handler, fx.world, {
         knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
       });
       await withFailingWrite(fx.home, async () => {

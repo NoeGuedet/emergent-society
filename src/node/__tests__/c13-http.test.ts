@@ -11,6 +11,7 @@ import { verifyPerceptions } from '../../context/__tests__/verify-perceptions.js
 import { ProviderAdapter, type ProviderPolicy } from '../../provider/adapter.js';
 import { OpenAITransport } from '../../provider/transport.js';
 import { readFrontier } from '../../frontier/__tests__/helpers.js';
+import { openTestDriver } from './helpers.js';
 import { NodeDriver } from '../driver.js';
 import { createAgentRuntime, defaultAgentConfig } from '../loop.js';
 import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
@@ -177,7 +178,7 @@ describe('C1.3 real boundaries', () => {
     let running: Promise<void> | null = null;
     try {
       const runtime = await makeRuntime();
-      driver = await NodeDriver.open(home, 'n1', runtime.handler, world, {
+      driver = await openTestDriver(home, 'n1', runtime.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
         onCheckpoint: (mark) => runtime.checkpoint(mark),
       });
@@ -231,7 +232,7 @@ describe('C1.3 real boundaries', () => {
       expect((turnStarts[1]!.data as unknown as { world: { to: string } }).world.to).toBe(later);
       expect(beforeRestart.some((event) => event.type === 'turn/end' && event.ignorable === true)).toBe(true);
       const restarted = await makeRuntime();
-      driver = await NodeDriver.open(home, 'n1', restarted.handler, world, {
+      driver = await openTestDriver(home, 'n1', restarted.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: restarted.hooks, worldPollMs: 0,
       });
       // open() rebuilds without a network call; run() deliberately starts a new boot turn.
@@ -339,7 +340,7 @@ describe('C1.3 real boundaries', () => {
     let driver: NodeDriver | null = null;
     let running: Promise<void> | null = null;
     try {
-      driver = await NodeDriver.open(home, 'n1', runtime.handler, world, {
+      driver = await openTestDriver(home, 'n1', runtime.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
         onCheckpoint: (mark) => runtime.checkpoint(mark),
       });

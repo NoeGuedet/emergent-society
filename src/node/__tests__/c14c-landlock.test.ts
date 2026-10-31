@@ -22,6 +22,7 @@ import type { ArtifactRef } from '../../context/contracts.js';
 import {
   commitAs, committedContent, committedPaths, gitIn, gitRaw, useWorld,
 } from './helpers.js';
+import { openTestDriver } from './helpers.js';
 
 /**
  * The C1.4c acceptance harness: the whole credential guarantee end to end and
@@ -156,7 +157,7 @@ type Boot = {
 
 async function bootRuntime(home: string, world: WorldRepo, endpoint: string): Promise<Boot> {
   const runtime = createAgentRuntime(await runtimeOptions(home, world, endpoint));
-  const driver = await NodeDriver.open(home, 'n1', runtime.handler, world, {
+  const driver = await openTestDriver(home, 'n1', runtime.handler, world, {
     knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
     onCheckpoint: (mark) => runtime.checkpoint(mark),
   });

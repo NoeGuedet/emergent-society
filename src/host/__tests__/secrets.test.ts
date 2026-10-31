@@ -10,6 +10,7 @@ import { FRONTIER_EVENT_TYPES } from '../../frontier/index.js';
 import { WorldRepo, gitEnv } from '../../node/world.js';
 import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
 import { serveJson } from '../../node/__tests__/helpers.js';
+import { TEST_STORAGE } from '../../frontier/__tests__/helpers.js';
 import { createHostLog } from '../observe.js';
 import { composeCell, type Cell } from '../host.js';
 
@@ -119,6 +120,7 @@ it('journals no byte of the model key outside the authorization header it wrote'
   try {
     const composed = await composeCell({
       home, uid: 'node-0', config, credential, providers: {}, sandbox: false, pollMs: 0, log,
+      storage: TEST_STORAGE,
     });
     cell = composed;
     const done = composed.driver.run();

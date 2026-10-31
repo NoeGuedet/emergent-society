@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { collectEvents, withFailingWrite } from '../../journal/__tests__/helpers.js';
-import { NodeDriver, type TurnContext, type TurnTrigger } from '../driver.js';
+import type { TurnContext, TurnTrigger } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
 import { WorldRepo } from '../world.js';
-import { useWorld } from './helpers.js';
+import { useWorld, openTestDriver } from './helpers.js';
 
 const fixture = useWorld('node-loop-');
 
@@ -20,7 +20,7 @@ describe('NodeDriver run loop', () => {
   it('chains turns with trigger chain until the handler waits', async () => {
     const { home, world } = fixture();
     const triggers: TurnTrigger[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+    const d = await openTestDriver(home, 'n1', (ctx) => {
       triggers.push(ctx.trigger);
       return { outcome: triggers.length < 3 ? 'chained' : 'waiting', toolCalls: true };
     }, world, { worldPollMs: 0 });
@@ -42,7 +42,7 @@ describe('NodeDriver run loop', () => {
   it('opens every turn on the world range it perceives', async () => {
     const { home, world } = fixture();
     const ranges: unknown[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+    const d = await openTestDriver(home, 'n1', (ctx) => {
       ranges.push(ctx.world);
       return wait();
     }, world, { worldPollMs: 0 });
@@ -59,7 +59,7 @@ describe('NodeDriver run loop', () => {
 
   it('journals an error turn and shuts down when the handler throws', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', () => {
+    const d = await openTestDriver(home, 'n1', () => {
       throw new Error('boom');
     }, world, { worldPollMs: 0 });
     await expect(d.run()).rejects.toThrow('boom');
@@ -71,7 +71,7 @@ describe('NodeDriver run loop', () => {
 
   it('propagates the handler error when the shutdown append also fails', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', () => {
+    const d = await openTestDriver(home, 'n1', () => {
       throw new Error('boom');
     }, world, { worldPollMs: 0 });
     // Fault injection: nothing outside the driver can reach the writer, so the
@@ -90,7 +90,7 @@ describe('NodeDriver run loop', () => {
 
   it('propagates the handler error and still stops when close() fails', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', () => {
+    const d = await openTestDriver(home, 'n1', () => {
       throw new Error('boom');
     }, world, { worldPollMs: 0 });
     // Same fault-injection technique as the shutdown-append test: the writer is
@@ -111,7 +111,7 @@ describe('NodeDriver run loop', () => {
   it('runs maintenance once per park', async () => {
     const { home, world } = fixture();
     let maintenanceCalls = 0;
-    const d = await NodeDriver.open(home, 'n1', wait, world, {
+    const d = await openTestDriver(home, 'n1', wait, world, {
       worldPollMs: 0, onMaintenance: () => { maintenanceCalls += 1; },
     });
     const running = d.run();
@@ -123,7 +123,7 @@ describe('NodeDriver run loop', () => {
 
   it('rejects a run() called out of order', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const running = d.run();
     await vi.waitFor(() => expect(d.state).toBe('waiting'));
     await expect(d.run()).rejects.toThrow('run() out of order');
@@ -133,7 +133,7 @@ describe('NodeDriver run loop', () => {
 
   it('stops cleanly with node/shutdown journaled when stop() precedes run()', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     d.stop();
     await d.run();
     expect(d.state).toBe('stopped');
@@ -144,7 +144,7 @@ describe('NodeDriver run loop', () => {
 
   it('wakes a parked node when stop() is called', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const running = d.run();
     await vi.waitFor(() => expect(d.state).toBe('waiting'));
     d.stop();
@@ -177,7 +177,7 @@ describe('NodeDriver run loop', () => {
       },
     );
     try {
-      const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+      const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
       const running = d.run();
       await reached;
       d.stop();
@@ -193,7 +193,7 @@ describe('NodeDriver run loop', () => {
 
   it('shuts down with reason maintenance-error when the maintenance hook throws', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', wait, world, {
+    const d = await openTestDriver(home, 'n1', wait, world, {
       worldPollMs: 0, onMaintenance: () => { throw new Error('maint boom'); },
     });
     await expect(d.run()).rejects.toThrow('maint boom');
@@ -204,7 +204,7 @@ describe('NodeDriver run loop', () => {
 
   it('labels a loop death outside the handler as driver-error, with its error', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     // Fault injection: the append that opens the turn must fail so the loop
     // dies outside the handler — a handler-error would be a lie in the journal.
     const writer = (d as unknown as { writer: LooseWriter }).writer;
@@ -221,7 +221,7 @@ describe('NodeDriver run loop', () => {
 
   it('journals driver-error when the flush barrier itself rejects', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     // The recorded-write-behind shape: append() accepts, the barrier flush
     // fails. The failure is injected at the fs primitive the writer uses, so
     // nothing in the driver can be blamed for it.
@@ -236,7 +236,7 @@ describe('NodeDriver run loop', () => {
   it('serves the handler a turn context with no writer and no commit', async () => {
     const { home, world } = fixture();
     let keys: string[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx: TurnContext) => {
+    const d = await openTestDriver(home, 'n1', (ctx: TurnContext) => {
       keys = Object.keys(ctx).sort();
       return wait();
     }, world, { worldPollMs: 0 });

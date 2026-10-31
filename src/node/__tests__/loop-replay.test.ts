@@ -10,6 +10,7 @@ import { loadVerifiedEvents, type VerifiedEvent, type VerifiedEvents } from '../
 import { verifyPerceptions } from '../../context/__tests__/verify-perceptions.js';
 import { resolveArtifact } from '../../context/artifacts.js';
 import { readFrontier } from '../../frontier/__tests__/helpers.js';
+import { openTestDriver } from './helpers.js';
 import { ProviderAdapter } from '../../provider/adapter.js';
 import type { SerializedTransport, TransportFacts, TransportResult } from '../../provider/transport.js';
 import type { AgentConfig, ArtifactRef, FunctionCall } from '../../context/contracts.js';
@@ -164,7 +165,7 @@ function runtimeFor(
 }
 
 function openRuntime(fx: WorldFixture, runtime: AgentRuntime): Promise<NodeDriver> {
-  return NodeDriver.open(fx.home, 'n1', runtime.handler, fx.world, {
+  return openTestDriver(fx.home, 'n1', runtime.handler, fx.world, {
     knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
     onCheckpoint: (mark) => runtime.checkpoint(mark),
   });
@@ -309,7 +310,7 @@ describe('C1.3 runtime-seeded replay', () => {
           restartedTransport, providerPolicy, (await fx.frontier()).gate,
         ),
       });
-      driver = await NodeDriver.open(fx.home, 'n1', restarted.handler, fx.world, {
+      driver = await openTestDriver(fx.home, 'n1', restarted.handler, fx.world, {
         knownTypes: C13_EVENT_TYPES, hooks: restarted.hooks, worldPollMs: 0,
       });
       // open() rebuilt offline and reconciled the interrupted call: no send, no terminal.

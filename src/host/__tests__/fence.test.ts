@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it } from 'vitest';
@@ -92,7 +92,7 @@ it('maps a freeze that never lands to freeze-failed after thawing', async () => 
   await port.release();
 });
 
-it('skips a vanished run leaf instead of failing the fence', async () => {
+it('prunes a non-directory run entry before freezing (the vanished-leaf retry is in fence-retry.test.ts)', async () => {
   // A `run-*` entry listed and then gone before the freeze write would be an
   // ENOENT write; listLeaves prunes entries that are not directories, and the
   // freeze wait treats a vanished events file as gone (a frozen run is already
@@ -103,4 +103,27 @@ it('skips a vanished run leaf instead of failing the fence', async () => {
   const port = createFencePort({ root, uid: 'node-0', log: log() });
   expect(await port.acquire()).toEqual({ fenced: true, leaves: 2 });
   await port.release();
+});
+
+it('refuses when the FIRST leaf enumeration fails with a real EACCES', async () => {
+  if (process.getuid?.() === 0) return; // root bypasses mode bits
+  // A real run leaf exists, but the cell root cannot be searched. Before the
+  // fix listLeaves swallowed the EACCES and returned [], so the port froze the
+  // node leaf alone and reported `fenced: true` with the Run un-frozen.
+  const run = join(root, 'run-locked');
+  await mkdir(run);
+  await chmod(root, 0o000);
+  const port = createFencePort({ root, uid: 'node-0', log: log() });
+  try {
+    const outcome = await port.acquire();
+    expect(outcome).toMatchObject({ fenced: false, reason: 'freeze-failed' });
+    if (!outcome.fenced) expect(outcome.detail).toBe('EACCES');
+    // No freeze was attempted: no leaf was touched inside the unreadable cell.
+    expect(fenceLines()).toEqual([
+      { event: 'host/fence', state: 'freeze-failed', leaves: 0, ms: expect.any(Number) },
+    ]);
+  } finally {
+    await chmod(root, 0o700).catch(() => {});
+    await port.release();
+  }
 });

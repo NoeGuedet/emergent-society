@@ -10,6 +10,7 @@ import { WorldRepo } from '../../node/world.js';
 import { readWorldState } from '../../node/world-state.js';
 import { HeadWatcher } from '../../node/watcher.js';
 import { commitAs, serveJson, type LoopServer } from '../../node/__tests__/helpers.js';
+import { TEST_STORAGE } from '../../frontier/__tests__/helpers.js';
 import {
   killLeaves, nodeLeaf, resolveAnchor, thawSet,
 } from '../cgroups.js';
@@ -162,7 +163,7 @@ async function runOneTurn(
         endpoint: `${server.url}/v1/chat/completions`, key: 'sentinel-llm-key',
         credentialId: 'llm',
       },
-      providers: {}, sandbox, pollMs: 0, log, fence,
+      providers: {}, sandbox, pollMs: 0, log, fence, storage: TEST_STORAGE,
     });
     const running = cell.driver.run();
     await vi.waitFor(() => expect(cell.driver.state).toBe('waiting'), { timeout: 10_000 });
@@ -287,7 +288,7 @@ it.skipIf(!realCgroup)(
           credentialId: 'llm',
         },
         providers: {}, sandbox: { cgroupRoot: root }, pollMs: 0,
-        log: createHostLog(() => {}), fence: port,
+        log: createHostLog(() => {}), fence: port, storage: TEST_STORAGE,
       });
       const running = cell.driver.run();
       await vi.waitFor(() => expect(cell.driver.state).toBe('waiting'), { timeout: 10_000 });
@@ -304,8 +305,11 @@ it.skipIf(!realCgroup)(
       expect(head).not.toBeNull();
       // The writer was frozen; on release it finishes the file in the worktree,
       // but HEAD keeps the torn prefix: the residual is declared, not repaired.
-      await sleep(2200);
-      expect(await readFile(target, 'utf8')).toBe('BEGIN\nEND\n');
+      // Poll with a deadline instead of a fixed sleep: the writer's own 2 s
+      // timer fires only after the release, and a loaded machine must not flake.
+      await vi.waitFor(async () => {
+        expect(await readFile(target, 'utf8')).toBe('BEGIN\nEND\n');
+      }, { timeout: 8_000, interval: 50 });
       expect(show()).toBe('BEGIN\n');
     } finally {
       if (writer !== null) writer.kill('SIGKILL');
@@ -361,7 +365,7 @@ it('refuses a freeze failure, thaws, and the shell answers on the next turn', as
         endpoint: `${server.url}/v1/chat/completions`, key: 'sentinel-llm-key',
         credentialId: 'llm',
       },
-      providers: {}, sandbox: false, pollMs: 0, log, fence: port,
+      providers: {}, sandbox: false, pollMs: 0, log, fence: port, storage: TEST_STORAGE,
     });
     const running = cell.driver.run();
     await vi.waitFor(() => expect(cell.driver.state).toBe('waiting'), { timeout: 10_000 });

@@ -18,7 +18,7 @@ import { GateClosedError } from '../gate.js';
 import { NodeDriver, type TurnContext, type TurnResult } from '../driver.js';
 import { HeadWatcher } from '../watcher.js';
 import { WorldRepo, type WorldRange } from '../world.js';
-import { commitAs, useWorld, writeWorldFile } from './helpers.js';
+import { commitAs, openTestDriver, useWorld, writeWorldFile } from './helpers.js';
 
 const fixture = useWorld('node-boundary-');
 
@@ -69,7 +69,7 @@ describe('trusted gate lifetime', () => {
     const ref: { d: NodeDriver | null } = { d: null };
     let sameSignal = false;
     let source: Source | null = null;
-    ref.d = await NodeDriver.open(home, 'n1', (ctx: TurnContext) => {
+    ref.d = await openTestDriver(home, 'n1', (ctx: TurnContext) => {
       sameSignal = ctx.gate.signal === ctx.signal;
       source = ctx.gate.append('compaction/abort', { id: 'c1', reason: 'orphan' });
       ref.d!.stop();
@@ -87,7 +87,7 @@ describe('trusted gate lifetime', () => {
     const hooks = hooksFor(home);
     const ref: { d: NodeDriver | null } = { d: null };
     let retained: BoundaryGate | null = null;
-    ref.d = await NodeDriver.open(home, 'n1', (ctx: TurnContext) => {
+    ref.d = await openTestDriver(home, 'n1', (ctx: TurnContext) => {
       retained = ctx.gate;
       ref.d!.stop();
       return wait();
@@ -105,7 +105,7 @@ describe('trusted gate lifetime', () => {
     const hooks = hooksFor(home);
     const ref: { d: NodeDriver | null } = { d: null };
     let rejected = false;
-    ref.d = await NodeDriver.open(home, 'n1', (ctx: TurnContext) => {
+    ref.d = await openTestDriver(home, 'n1', (ctx: TurnContext) => {
       try {
         (ctx.gate as unknown as { append: (t: string, d: unknown) => unknown })
           .append('turn/end', {});
@@ -124,7 +124,7 @@ describe('trusted gate lifetime', () => {
     const { home, world } = fixture();
     const ref: { d: NodeDriver | null } = { d: null };
     let rejected = false;
-    ref.d = await NodeDriver.open(home, 'n1', (ctx: TurnContext) => {
+    ref.d = await openTestDriver(home, 'n1', (ctx: TurnContext) => {
       expect(ctx.gate.signal).toBe(ctx.signal);
       try { ctx.gate.append('compaction/abort', { id: 'x', reason: 'orphan' }); }
       catch { rejected = true; }
@@ -150,7 +150,7 @@ describe('the ordered durable observation seam', () => {
       },
     });
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', () => {
+    ref.d = await openTestDriver(home, 'n1', () => {
       ref.d!.stop();
       return wait();
     }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
@@ -173,7 +173,7 @@ describe('the ordered durable observation seam', () => {
       },
       onReady: async () => { order.push('ready'); },
     });
-    const d = await NodeDriver.open(home, 'n1', wait, world, {
+    const d = await openTestDriver(home, 'n1', wait, world, {
       knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0,
     });
     d.stop();
@@ -194,7 +194,7 @@ describe('the ordered durable observation seam', () => {
       onDurable: async (events) => { batches.push(events.map((e) => e.type)); },
     });
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', async (ctx) => {
+    ref.d = await openTestDriver(home, 'n1', async (ctx) => {
       ctx.gate.append('compaction/abort', { id: 'z', reason: 'orphan' });
       await ctx.gate.flush();
       ref.d!.stop();
@@ -212,7 +212,7 @@ describe('the ordered durable observation seam', () => {
   it('rejects hooks whose knownTypes omits a boundary type', async () => {
     const { home, world } = fixture();
     const hooks = hooksFor(home);
-    await expect(NodeDriver.open(home, 'n1', wait, world, {
+    await expect(openTestDriver(home, 'n1', wait, world, {
       knownTypes: new Set(['node/boot']), hooks, worldPollMs: 0,
     })).rejects.toThrow(/knownTypes/);
   });
@@ -223,7 +223,7 @@ describe('fatal seams', () => {
     const { home, world } = fixture();
     const hooks = hooksFor(home);
     let handlerCalls = 0;
-    const d = await NodeDriver.open(home, 'n1', () => {
+    const d = await openTestDriver(home, 'n1', () => {
       handlerCalls += 1;
       return wait();
     }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0, batchWindowMs: 10_000 });
@@ -242,7 +242,7 @@ describe('fatal seams', () => {
   it('rethrows the original handler error but journals a safe label under hooks', async () => {
     const { home, world } = fixture();
     const hooks = hooksFor(home);
-    const d = await NodeDriver.open(home, 'n1', () => { throw new Error('boom'); }, world,
+    const d = await openTestDriver(home, 'n1', () => { throw new Error('boom'); }, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
     await expect(d.run()).rejects.toThrow('boom');
     const events = await read(home);
@@ -254,7 +254,7 @@ describe('fatal seams', () => {
 
   it('preserves the legacy error string for a hookless handler throw', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', () => { throw new Error('boom'); }, world,
+    const d = await openTestDriver(home, 'n1', () => { throw new Error('boom'); }, world,
       { worldPollMs: 0 });
     await expect(d.run()).rejects.toThrow('boom');
     const events = await read(home);
@@ -270,12 +270,12 @@ describe('fatal seams', () => {
       // A failing teardown must not displace the resume error either.
       onStop: async () => { stops += 1; throw new Error('stop boom'); },
     });
-    await expect(NodeDriver.open(home, 'n1', wait, world,
+    await expect(openTestDriver(home, 'n1', wait, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 }))
       .rejects.toThrow('resume boom');
     expect(stops).toBe(1);
     // The writer was released: a valid bundle opens the same home afterwards.
-    const d = await NodeDriver.open(home, 'n1', wait, world,
+    const d = await openTestDriver(home, 'n1', wait, world,
       { knownTypes: C13_EVENT_TYPES, hooks: hooksFor(home), worldPollMs: 0 });
     d.stop();
     await d.run();
@@ -298,7 +298,7 @@ describe('recoverable error results', () => {
       acknowledgedWorld: () => ack,
     });
     const seen: number[] = [];
-    const d = await NodeDriver.open(home, 'n1', async (ctx) => {
+    const d = await openTestDriver(home, 'n1', async (ctx) => {
       seen.push(ctx.turn);
       if (ctx.turn === 0) {
         await writeWorldFile(world, 'n1/effect.txt', 'x');
@@ -335,7 +335,7 @@ describe('reused-blob validation on resume', () => {
     if (typeof ref.blob !== 'string') throw new Error('expected a claim-check reference');
     await writeFile(join(home, 'blobs', ref.blob.slice(0, 2), ref.blob),
       JSON.stringify({ substituted: true }));
-    await expect(NodeDriver.open(home, 'n1', wait, world,
+    await expect(openTestDriver(home, 'n1', wait, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 }))
       .rejects.toThrow(/digest|size|blob/i);
   });
@@ -363,7 +363,7 @@ describe('reused-blob validation on resume', () => {
       onDurable: async (events) => { for (const e of events) delivered.push(e.type); },
       readHistory: async () => [forged],
     });
-    await expect(NodeDriver.open(home, 'n1', wait, world,
+    await expect(openTestDriver(home, 'n1', wait, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 }))
       .rejects.toThrow(TruncatedBlobError);
     expect(delivered).toEqual([]);
@@ -382,7 +382,7 @@ describe('reused-blob validation on resume', () => {
       readBlob: () => Promise.reject(eio),
       onDurable: async () => { delivered += 1; },
     });
-    const err = await NodeDriver.open(home, 'n1', wait, world,
+    const err = await openTestDriver(home, 'n1', wait, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 }).catch((e: unknown) => e);
     expect(err).not.toBeInstanceOf(BlobIntegrityError);
     expect(isCorruption(err)).toBe(false);
@@ -424,7 +424,7 @@ async function makeIncompleteGroup(
   let inject!: () => void;
   const injectionActive = new Promise<void>((r) => { inject = r; });
   const ref: { d: NodeDriver | null } = { d: null };
-  ref.d = await NodeDriver.open(home, 'n1', async (ctx) => {
+  ref.d = await openTestDriver(home, 'n1', async (ctx) => {
     ctx.gate.append('tool/call', {
       turn: ctx.turn, request: { turn: ctx.turn, ordinal: 0 },
       call: { id: 'call-1', type: 'function', function: { name: 'execute', arguments: '{}' } },
@@ -478,7 +478,7 @@ describe('error-closer recovery at ready', () => {
     });
     let handlerCalls = 0;
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', () => {
+    ref.d = await openTestDriver(home, 'n1', () => {
       handlerCalls += 1;
       return wait();
     }, world, { knownTypes: C13_EVENT_TYPES, hooks: second, worldPollMs: 0 });
@@ -507,7 +507,7 @@ describe('error-closer recovery at ready', () => {
     let inject!: () => void;
     const injectionActive = new Promise<void>((r) => { inject = r; });
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', async (ctx) => {
+    ref.d = await openTestDriver(home, 'n1', async (ctx) => {
       ctx.gate.append('tool/call', {
         turn: ctx.turn, request: { turn: ctx.turn, ordinal: 0 },
         call: { id: 'solo', type: 'function', function: { name: 'execute', arguments: '{}' } },
@@ -538,7 +538,7 @@ describe('error-closer recovery at ready', () => {
       },
     });
     const ref2: { d: NodeDriver | null } = { d: null };
-    ref2.d = await NodeDriver.open(home, 'n1', wait, world,
+    ref2.d = await openTestDriver(home, 'n1', wait, world,
       { knownTypes: C13_EVENT_TYPES, hooks: second, worldPollMs: 0 });
     ref2.d.stop();
     await ref2.d.run();
@@ -563,7 +563,7 @@ describe('error-closer recovery at ready', () => {
       },
     });
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', wait, world,
+    ref.d = await openTestDriver(home, 'n1', wait, world,
       { knownTypes: C13_EVENT_TYPES, hooks: second, worldPollMs: 0 });
     ref.d.stop();
     await ref.d.run();
@@ -601,7 +601,7 @@ describe('the world acknowledgement proof', () => {
     });
     let handlerCalls = 0;
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', () => {
+    ref.d = await openTestDriver(home, 'n1', () => {
       handlerCalls += 1;
       ref.d!.stop();
       return wait();
@@ -628,7 +628,7 @@ describe('the world acknowledgement proof', () => {
         : { turn: 0, range: { from: null, to: null }, source: cited }),
     });
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
+    ref.d = await openTestDriver(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0, batchWindowMs: 10_000 });
     await expect(ref.d.run()).rejects.toThrow(/delivered observation/);
     expect(handlerCalls).toBe(0);
@@ -649,7 +649,7 @@ describe('the world acknowledgement proof', () => {
         : { turn: 0, range: { from: null, to: null }, source: startSource }),
     });
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
+    ref.d = await openTestDriver(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
     await expect(ref.d.run()).rejects.toThrow(/not world\/perception/);
     expect(handlerCalls).toBe(0);
@@ -661,7 +661,7 @@ describe('the world acknowledgement proof', () => {
     let handlerCalls = 0;
     const hooks = hooksFor(home, { acknowledgedWorld: () => ack });
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
+    ref.d = await openTestDriver(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
     ack = { turn: 7, range: { from: null, to: null }, source: { seq: 0, hash: 'a'.repeat(64) } };
     await expect(ref.d.run()).rejects.toThrow(/current turn/);
@@ -674,7 +674,7 @@ describe('the world acknowledgement proof', () => {
     let handlerCalls = 0;
     const hooks = hooksFor(home, { acknowledgedWorld: () => ack });
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
+    ref.d = await openTestDriver(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
     ack = { turn: 7, range: { from: null, to: null }, source: { seq: 0, hash: 'a'.repeat(64) } };
     await expect(ref.d.run()).rejects.toThrow(/current turn/);
@@ -694,7 +694,7 @@ describe('the world acknowledgement proof', () => {
     let handlerCalls = 0;
     const hooks = hooksFor(home, { acknowledgedWorld: () => ack });
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
+    ref.d = await openTestDriver(home, 'n1', () => { handlerCalls += 1; return wait(); }, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
     ack = { turn: 0, range: { from: null, to: 'b'.repeat(40) }, source: { seq: 0, hash: 'a'.repeat(64) } };
     await expect(ref.d.run()).rejects.toThrow(/range/);
@@ -706,7 +706,7 @@ describe('the world acknowledgement proof', () => {
     const hooks = hooksFor(home, { acknowledgedWorld: () => null });
     let handlerCalls = 0;
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', () => {
+    ref.d = await openTestDriver(home, 'n1', () => {
       handlerCalls += 1;
       ref.d!.stop();
       return wait();
@@ -720,7 +720,7 @@ describe('hook contract refusals', () => {
   it('refuses a hooks bundle that does not expose acknowledgedWorld', async () => {
     const { home, world } = fixture();
     const hooks = withoutPort(hooksFor(home), 'acknowledgedWorld');
-    await expect(NodeDriver.open(home, 'n1', wait, world,
+    await expect(openTestDriver(home, 'n1', wait, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 })).rejects.toThrow(/acknowledgedWorld/);
   });
 
@@ -733,13 +733,13 @@ describe('hook contract refusals', () => {
       const hooks = withoutPort(hooksFor(home), port);
       // The refusal is the up-front contract check, not a later failure that
       // happens to name the port: the message is exact and no journal exists.
-      await expect(NodeDriver.open(home, uid, wait, world,
+      await expect(openTestDriver(home, uid, wait, world,
         { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 }))
         .rejects.toThrow(new Error(`C1.3 hooks require ${port}`));
       expect(existsSync(join(nodeDir(home, uid), LOG_FILE))).toBe(false);
       // The refusal happened before the writer was taken: a valid bundle still
       // opens the same node home afterwards.
-      const d = await NodeDriver.open(home, uid, wait, world,
+      const d = await openTestDriver(home, uid, wait, world,
         { knownTypes: C13_EVENT_TYPES, hooks: hooksFor(home), worldPollMs: 0 });
       d.stop();
       await d.run();
@@ -750,14 +750,14 @@ describe('hook contract refusals', () => {
     const { home, world } = fixture();
     const hooks = hooksFor(home);
     const known = new Set([...C13_EVENT_TYPES].filter((type) => type !== 'node/shutdown'));
-    await expect(NodeDriver.open(home, 'n1', wait, world,
+    await expect(openTestDriver(home, 'n1', wait, world,
       { knownTypes: known, hooks, worldPollMs: 0 })).rejects.toThrow(/node\/shutdown/);
   });
 
   it('journals a fixed maintenance label under hooks, never the raw message', async () => {
     const { home, world } = fixture();
     const hooks = hooksFor(home);
-    const d = await NodeDriver.open(home, 'n1', wait, world, {
+    const d = await openTestDriver(home, 'n1', wait, world, {
       knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0,
       onMaintenance: () => { throw new Error('secret api key sk-live-123'); },
     });
@@ -769,7 +769,7 @@ describe('hook contract refusals', () => {
   it('fails a turn whose toolCalls report disagrees with the accepted gate', async () => {
     const { home, world } = fixture();
     const hooks = hooksFor(home);
-    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+    const d = await openTestDriver(home, 'n1', (ctx) => {
       ctx.gate.append('tool/call', {
         turn: ctx.turn, request: { turn: ctx.turn, ordinal: 0 },
         call: { id: 'c1', type: 'function', function: { name: 'execute', arguments: '{}' } },
@@ -787,7 +787,7 @@ describe('gate revocation on every failure path', () => {
   it('revokes the gate when the turn/start barrier flush fails', async () => {
     const { home, world } = fixture();
     const hooks = hooksFor(home);
-    const d = await NodeDriver.open(home, 'n1', wait, world,
+    const d = await openTestDriver(home, 'n1', wait, world,
       { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0, batchWindowMs: 10_000 });
     let retained: BoundaryGate | null = null;
     const loose = d as unknown as {
@@ -815,7 +815,7 @@ describe('gate revocation on every failure path', () => {
     let retained: BoundaryGate | null = null;
     const spy = vi.spyOn(WorldRepo.prototype, 'commitAll').mockRejectedValue(new Error('commit dead'));
     try {
-      const d = await NodeDriver.open(home, 'n1', (ctx) => {
+      const d = await openTestDriver(home, 'n1', (ctx) => {
         retained = ctx.gate;
         return wait();
       }, world, { knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0 });
@@ -837,7 +837,7 @@ describe('gate revocation on every failure path', () => {
     let inject!: () => void;
     const active = new Promise<void>((r) => { inject = r; });
     const ref: { d: NodeDriver | null } = { d: null };
-    ref.d = await NodeDriver.open(home, 'n1', async (ctx) => {
+    ref.d = await openTestDriver(home, 'n1', async (ctx) => {
       retained = ctx.gate;
       await ctx.gate.flush();
       release();

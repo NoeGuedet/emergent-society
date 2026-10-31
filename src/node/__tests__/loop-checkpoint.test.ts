@@ -14,6 +14,7 @@ import { ProviderAdapter, type ProviderPolicy } from '../../provider/adapter.js'
 import type { SerializedTransport, TransportFacts, TransportResult } from '../../provider/transport.js';
 import type { AgentConfig } from '../../context/contracts.js';
 import { readNode, useWorld, type WorldFixture } from './helpers.js';
+import { openTestDriver } from './helpers.js';
 
 /**
  * T10 checkpoint-hook acceptance. The real `createAgentRuntime` is wired to the
@@ -114,7 +115,7 @@ function openRuntime(
   onCheckpoint: (mark: DurableWatermark) => Promise<void> | void,
   onMaintenance?: () => Promise<void> | void,
 ): Promise<NodeDriver> {
-  return NodeDriver.open(fx.home, 'n1', runtime.handler, fx.world, {
+  return openTestDriver(fx.home, 'n1', runtime.handler, fx.world, {
     knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
     onCheckpoint,
     ...(onMaintenance === undefined ? {} : { onMaintenance }),
@@ -291,7 +292,7 @@ describe('checkpoint wiring', () => {
   it('propagates a driver failure before the signal, instead of awaiting one that never fires', async () => {
     const fx = fixture();
     const boom = new Error('handler exploded');
-    const driver = await NodeDriver.open(fx.home, 'n1', () => {
+    const driver = await openTestDriver(fx.home, 'n1', () => {
       throw boom;
     }, fx.world, { worldPollMs: 0 });
     // Explicit deferred that is never resolved: only the run's own rejection can

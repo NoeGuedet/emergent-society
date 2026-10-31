@@ -15,6 +15,7 @@ import {
 import {
   TEST_STORAGE, failFrontierFlushes, openTestFrontier, readFrontier,
 } from '../../frontier/__tests__/helpers.js';
+import { openTestDriver } from './helpers.js';
 import {
   FRONTIER_EVENT_TYPES, FRONTIER_MAX_BODY_BYTES, WORLD_HEAD_RE, openFrontierJournal,
   validateFrontierEvent, FrontierValidationError,
@@ -154,7 +155,7 @@ async function openRuntime(opts: OpenOptions): Promise<Running> {
     adapter: opts.adapter,
     ...(opts.webTools !== undefined ? { webTools: opts.webTools } : {}),
   });
-  const driver = await NodeDriver.open(opts.home, 'n1', runtime.handler, opts.world, {
+  const driver = await openTestDriver(opts.home, 'n1', runtime.handler, opts.world, {
     knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
   });
   return { runtime, driver, run: driver.run() };
@@ -314,7 +315,7 @@ describe('the composition root', () => {
           ),
           webTools,
         });
-        return NodeDriver.open(home, uid, runtime.handler, world, {
+        return openTestDriver(home, uid, runtime.handler, world, {
           knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks,
           worldPollMs: 0, batchWindowMs: 10000,
         });
@@ -1199,7 +1200,7 @@ describe('proof 11: cold start off the slimmed log', () => {
         terminal: { env: DEFAULT_TERMINAL_ENV },
         adapter: new ProviderAdapter(offline, providerPolicy, (await fixture().frontier()).gate),
       });
-      const driver = await NodeDriver.open(home, 'n1', runtime.handler, world, {
+      const driver = await openTestDriver(home, 'n1', runtime.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0,
       });
       restarted = { driver, runtime };

@@ -71,8 +71,9 @@ export type CellCgroup =
   | { readonly ok: false; readonly reason: string };
 
 /** `<home>`'s stable cgroup name; the hash keeps the unit/dir name valid and unique.
- * The path is normalized first, so `/x/` and `/x` (or a symlinked spelling) name the
- * same cell across boots — a2's unit-name stability depends on it. */
+ * The path is normalized first (trailing separators, `.`, `..` — `resolve` does not
+ * consult the filesystem, so a symlinked spelling hashes differently); a2's
+ * unit-name stability depends on the same spelling being used at both call sites. */
 export function cellHash(home: string): string {
   return createHash('sha256').update(resolve(home)).digest('hex').slice(0, 12);
 }
@@ -303,13 +304,21 @@ export async function ensureLeaf(dir: string): Promise<void> {
  * list is simply not fenced by this attempt — it was not inside the critical
  * section's snapshot. The node's own leaf is named explicitly by the caller
  * (it may not exist yet and is created by the fence).
+ *
+ * Only ENOENT/ENOTDIR means "gone": the root or a listed leaf that provably
+ * vanished is not a failure. Any other readdir/lstat errno (EACCES, EIO,
+ * ELOOP) propagates, because silently returning the survivors would let the
+ * fence report `fenced: true` with an unstattable Run leaf outside the frozen
+ * set.
  */
 export async function listLeaves(root: string): Promise<readonly string[]> {
   let entries: string[];
   try {
     entries = await readdir(root);
-  } catch {
-    return [];
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return [];
+    throw err;
   }
   const names: string[] = [];
   for (const name of entries) {
@@ -317,8 +326,12 @@ export async function listLeaves(root: string): Promise<readonly string[]> {
     try {
       const entry = await lstat(join(root, name));
       if (entry.isDirectory()) names.push(name);
-    } catch {
-      // A leaf removed between readdir and lstat is gone, not a failure.
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // A leaf removed between readdir and lstat is gone, not a failure; any
+      // other errno is not evidence the leaf vanished.
+      if (code === 'ENOENT' || code === 'ENOTDIR') continue;
+      throw err;
     }
   }
   return names.sort().map((name) => join(root, name));
@@ -411,20 +424,50 @@ export async function killLeaves(leaves: readonly string[]): Promise<void> {
   }
 }
 
+/**
+ * Reaps one Run's leaf at teardown: `cgroup.kill` kills every task in the leaf
+ * (the Run's descendants included — a guest can fork children that outlive the
+ * main pid), then the empty leaf is removed so per-Run leaves do not accumulate
+ * for the host's lifetime. A leaf that does not disappear within the freeze
+ * deadline (a survivor, or an unremovable cgroupfs entry) is left in place and
+ * `false` is returned; boot hygiene is the backstop. Missing leaves are already
+ * safe.
+ */
+export async function reapRunLeaf(leaf: string): Promise<boolean> {
+  if (isSvcLeaf(leaf)) return false;
+  await killLeaves([leaf]);
+  const deadline = Date.now() + LIMITS.freezeDeadlineMs;
+  for (;;) {
+    try {
+      await rmdir(leaf);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    }
+    if (Date.now() >= deadline) return false;
+    await sleep(LIMITS.freezePollMs);
+  }
+}
+
 /** The kernel's own leaf is never a fence/reap target. */
 function isSvcLeaf(leaf: string): boolean {
   return leaf === 'svc' || leaf.endsWith('/svc');
 }
 
 /**
- * What boot hygiene proved: the leaves it visited, and the ones it could not
- * remove. A leaf that survives `rmdir` (a process outlived the kill, or the
- * thaw write failed) is named here; the host reports it on `host/degraded`
- * instead of booting silently over a possibly frozen leaf.
+ * What boot hygiene proved: the leaves it visited, the ones it could not
+ * remove, and — when the cell root itself could not be listed — the bounded
+ * errno of that failure. A leaf that survives `rmdir` (a process outlived the
+ * kill, or the thaw write failed) is named here; the host reports it on
+ * `host/degraded` instead of booting silently over a possibly frozen leaf. The
+ * same rule covers an unreadable listing: a non-ENOENT/ENOTDIR readdir or leaf
+ * lstat is a bounded diagnostic (`listError`), never a silent "nothing to do".
  */
 export type BootHygiene = {
   readonly reaped: number;
   readonly failed: readonly string[];
+  /** The cell root's listing errno when it could not be read; never a path. */
+  readonly listError?: string;
 };
 
 /**
@@ -433,14 +476,18 @@ export type BootHygiene = {
  * frozen by a dead kernel would freeze the next node on entry. `svc/` is
  * skipped: it holds the kernel itself. A leaf that cannot be removed after the
  * thaw/kill is not swallowed: it is returned in `failed` so the host can emit a
- * bounded diagnostic (the frozen or busy leaf stays on disk).
+ * bounded diagnostic (the frozen or busy leaf stays on disk). Only
+ * ENOENT/ENOTDIR means the root is gone; any other readdir/lstat failure is
+ * reported through `listError`/`failed` instead of being read as absence.
  */
 export async function bootHygiene(root: string): Promise<BootHygiene> {
   let entries: string[];
   try {
     entries = await readdir(root);
-  } catch {
-    return { reaped: 0, failed: [] };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return { reaped: 0, failed: [] };
+    return { reaped: 0, failed: [], listError: describeFsError(err) };
   }
   let reaped = 0;
   const failed: string[] = [];
@@ -455,8 +502,15 @@ export async function bootHygiene(root: string): Promise<BootHygiene> {
       await rmdir(leaf);
     } catch {
       // Still present after thaw+kill: a surviving process or a failed thaw.
-      // The name (a leaf basename, never a path) is the bounded diagnostic.
-      if (await lstat(leaf).then(() => true, () => false)) failed.push(name);
+      // The name (a leaf basename, never a path) is the bounded diagnostic; an
+      // lstat we cannot trust (EACCES/EIO) is also not proof the leaf is gone.
+      try {
+        await lstat(leaf);
+        failed.push(name);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') failed.push(name);
+      }
     }
     reaped += 1;
   }

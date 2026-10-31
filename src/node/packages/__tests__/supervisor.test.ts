@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+} from 'node:fs';
+import { lstat, mkdir, readFile, rmdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRunSupervisor, type RunSupervisorEvents } from '../supervisor.js';
+import { ensureLeaf, reapRunLeaf, resolveAnchor, runLeaf } from '../../../host/cgroups.js';
 
 /**
  * The confined Run supervisor (kernel.md, the sandbox and local-log
@@ -23,6 +27,32 @@ const fixture = (name: string): string =>
 const READY_MS = 10_000;
 const INVOKE_MS = 5_000;
 const KILL_GRACE_MS = 200;
+const cgroupAnchor = resolveAnchor();
+
+/**
+ * A writable user-owned child under the anchor: a cgroup2 mount proves a tree
+ * exists, not that this user may create a leaf in it. The probe is the same
+ * freeze/kill/events battery `cgroups.test.ts` and `fence-integration.test.ts`
+ * use, so a cgroup2-but-unwritable host SKIPS the real-cgroup case instead of
+ * failing it — a failure must mean a production reap regression.
+ */
+async function writableAnchor(anchor: string): Promise<boolean> {
+  const probe = join(anchor, `.test-runreap-probe-${process.pid}-${Date.now().toString(36)}`);
+  try {
+    await mkdir(probe);
+    await writeFile(join(probe, 'cgroup.freeze'), '0');
+    // Presence only: cgroup.kill accepts only `1`, so writing `0` would EINVAL.
+    await lstat(join(probe, 'cgroup.kill'));
+    await readFile(join(probe, 'cgroup.events'), 'utf8');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await rmdir(probe).catch(() => {});
+  }
+}
+
+const anchorReady = cgroupAnchor === null ? false : await writableAnchor(cgroupAnchor);
 
 /** The injected manual clock: `advance` fires deadlines; nothing sleeps. */
 function manualClock(): {
@@ -70,6 +100,8 @@ interface Harness {
     readonly terminal?: { run: (cmd: string) => Promise<unknown> } | null;
     readonly web?: object | null;
     readonly webAllowance?: { readonly search: boolean; readonly fetch: boolean };
+    readonly prepareCgroupLeaf?: (runId: string) => Promise<string>;
+    readonly reapCgroupLeaf?: (leaf: string) => Promise<unknown>;
   }): ReturnType<typeof createRunSupervisor>;
   dispose(): Promise<void>;
 }
@@ -125,6 +157,10 @@ async function harness(sandbox: boolean): Promise<Harness> {
         ) as never,
         events: eventPort,
         bootstrapPath: bootstrapSource,
+        ...(overrides.prepareCgroupLeaf !== undefined
+          ? { prepareCgroupLeaf: overrides.prepareCgroupLeaf } : {}),
+        ...(overrides.reapCgroupLeaf !== undefined
+          ? { reapCgroupLeaf: overrides.reapCgroupLeaf } : {}),
         ...(sandbox ? {} : {}),
       });
     },
@@ -156,6 +192,38 @@ describe('run supervisor: the sandboxed happy path', () => {
     expect(s.liveRunId()).toBeNull();
     await h.dispose();
   }, 20_000);
+
+  it.skipIf(!existsSync(launcher) || !anchorReady)(
+    'reaps the Run cgroup leaf on stopRun', async () => {
+      const h = await harness(true);
+      const base = join(cgroupAnchor as string,
+        `.test-runreap-${process.pid}-${Date.now().toString(36)}`);
+      mkdirSync(base);
+      const leaves: string[] = [];
+      const s = h.supervisor({
+        prepareCgroupLeaf: async (runId: string) => {
+          const leaf = runLeaf(base, runId);
+          await ensureLeaf(leaf);
+          leaves.push(leaf);
+          return leaf;
+        },
+        reapCgroupLeaf: (leaf: string) => reapRunLeaf(leaf),
+      });
+      try {
+        const start = await s.startRun(PKG, sourceOf('echo.js'));
+        expect(start.ok).toBe(true);
+        if (!start.ok) return;
+        expect(leaves).toHaveLength(1);
+        expect(existsSync(leaves[0]!)).toBe(true);
+        await s.stopRun();
+        // The host port killed the leaf and removed it: no run-* accumulates.
+        expect(existsSync(leaves[0]!)).toBe(false);
+      } finally {
+        for (const leaf of leaves) await reapRunLeaf(leaf).catch(() => {});
+        await rmdir(base).catch(() => {});
+        await h.dispose();
+      }
+    }, 20_000);
 
   it('keeps serving after a throwing handler, with a bounded error result', async () => {
     const h = await harness(true);

@@ -1,7 +1,7 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
-  link, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile,
+  link, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -25,7 +25,7 @@ import {
   type HostHandle, type HostOptions, type ProcessHandlersTarget,
 } from '../host.js';
 import { createHostLog, type HostLog } from '../observe.js';
-import { readOwner } from '../owner.js';
+import { readOwner, requestPause } from '../owner.js';
 import { formatStatus, readStatus } from '../status.js';
 
 /**
@@ -56,6 +56,10 @@ const hostDeps = {
   // The cgroup layer is exercised by cgroups.test.ts with its own harness; the
   // lifecycle cases must never move this worker into a cgroup tree.
   attachToCell: async () => ({ ok: false as const, reason: 'test-stub' }),
+  // Hermetic storage: the controlled HIGH probe, never the real /tmp headroom.
+  // The production default stays the real statfs (HostDeps has no production
+  // switch); the explicit real-probe cases live in storage.test.ts/driver-storage.
+  freeSpace: TEST_STORAGE.probe,
 } as const;
 
 /** The captured stderr lines, keyed by the log that wrote them. */
@@ -473,12 +477,91 @@ it('refuses a second host while the first runs, after the first has parked', asy
   await waitForLog(log, 'host/parked');
   const { model, heading, ...resumeOpts } = opts;
   const second = track(startHost({ ...resumeOpts, command: 'resume' }, hostDeps));
-  expect(await second.done).toBe(1);
-  expect(logged(log)).toContainEqual(
-    expect.objectContaining({ event: 'host/error', error: 'HostAlreadyRunningError' }),
-  );
+  // A live owner record is a configuration refusal (exit 2), and the bounded
+  // message names the blocking pid/uid.
+  expect(await second.done).toBe(2);
+  const refused = logged(log).find((entry) => entry['event'] === 'host/error');
+  expect(refused).toMatchObject({ event: 'host/error', error: 'HostAlreadyRunningError' });
+  expect(String(refused?.['message'])).toMatch(/pid=\d+/);
+  expect(String(refused?.['message'])).toMatch(/uid=node-0/);
   first.stop();
   expect(await first.done).toBe(0);
+}, 20_000);
+
+it('refuses the real legacy shape (world/.git, no world.git) as exit 2 with the migration message', async () => {
+  await serve();
+  // The documented legacy layout: the git dir lives inside the world and the
+  // external world.git is absent. The layout gate runs before WorldRepo.open,
+  // so it must recognize the shape itself and never send the operator to
+  // `init` (which would advise removing the recorded world).
+  await rm(join(home, 'world.git'), { recursive: true, force: true });
+  execFileSync('git', ['-C', join(home, 'world'), 'init', '-q'], { stdio: 'ignore' });
+  expect(await runHostOnce('start', { expectRefusal: true })).toBe(2);
+  const refused = logged(log).find((entry) => entry['event'] === 'host/error');
+  expect(refused).toMatchObject({ event: 'host/error', error: 'WorldNotARepoError' });
+  expect(String(refused?.['message'])).toMatch(/migrated/);
+  // The world is untouched: the refusal is a recipe, not a removal.
+  expect((await lstat(join(home, 'world'))).isDirectory()).toBe(true);
+}, 20_000);
+
+it('refuses a both-present mistrusted world as exit 2 with the migration message', async () => {
+  await serve();
+  // Both world paths exist (so the layout check passes) but the external git
+  // dir is not a repository: `WorldRepo.open` refuses with the typed migration
+  // note. That is a configuration refusal, not a runtime failure.
+  await rm(join(home, 'world.git'), { recursive: true, force: true });
+  await mkdir(join(home, 'world.git'));
+  expect(await runHostOnce('start', { expectRefusal: true })).toBe(2);
+  const refused = logged(log).find((entry) => entry['event'] === 'host/error');
+  expect(refused).toMatchObject({ event: 'host/error', error: 'WorldNotARepoError' });
+  expect(String(refused?.['message'])).toMatch(/migrated/);
+}, 20_000);
+
+it('boots with a bounded world/doctor-failed diagnostic when the doctor throws', async () => {
+  await serve();
+  const h = track(startHost(opts, {
+    ...hostDeps,
+    doctorRunner: async () => { throw new Error('injected doctor failure'); },
+  }));
+  await waitForLog(log, 'host/parked');
+  expect(logged(log)).toContainEqual(
+    expect.objectContaining({ event: 'world/doctor-failed', reason: 'Error' }),
+  );
+  // The failure never refuses the boot: the host reaches its park.
+  expect(logged(log).map((entry) => entry['event'])).toContain('host/boot');
+  h.stop();
+  expect(await h.done).toBe(0);
+}, 20_000);
+
+it('acquires the owner before the config fold, so a pause targets a booting host', async () => {
+  await serve();
+  let entered!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+  let release!: (config: AgentConfig) => void;
+  const held = new Promise<AgentConfig>((resolve) => { release = resolve; });
+  const h = track(startHost(opts, {
+    ...hostDeps,
+    readInitialConfig: async () => {
+      entered();
+      return held;
+    },
+  }));
+  await enteredPromise;
+  // The boot is still inside the fold, but the owner record already exists: a
+  // pause issued now finds a target instead of answering "no host" and letting
+  // the host boot anyway.
+  expect((await readOwner(home)).kind).toBe('live');
+  const signalled: number[] = [];
+  const outcome = await requestPause(home, {
+    timeoutMs: 50, intervalMs: 10,
+    // The host is this test process; never really signal it.
+    deps: { kill: (pid) => { signalled.push(pid); } },
+  });
+  expect(signalled).toHaveLength(1);
+  expect(outcome.kind).toBe('still-stopping');
+  release(existingConfig);
+  h.stop();
+  expect(await h.done).toBe(0);
 }, 20_000);
 
 it('reclaims a stale owner whose pid was reaped', async () => {
@@ -558,6 +641,31 @@ it('reports a boot leaf it could not thaw on host/degraded', async () => {
     expect(logged(log)).toContainEqual(expect.objectContaining({
       event: 'host/degraded',
       reason: expect.stringContaining('boot-thaw-failed: node-stuck'),
+    }));
+    h.stop();
+    expect(await h.done).toBe(0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+it('reports an unreadable cell-root listing as boot-hygiene-failed, not "no leaves"', async () => {
+  await serve();
+  const root = await mkdtemp(join(tmpdir(), 'es-boot-hygiene-'));
+  try {
+    // The seam makes the branch reachable without a real cgroup tree: the
+    // listing fails with EACCES, so booting silently over the unknown leaves
+    // would skip thaw/kill entirely. The diagnostic is bounded and carries the
+    // errno, never a path.
+    const h = track(startHost({ ...opts, sandbox: {} }, {
+      ...hostDeps,
+      attachToCell: async () => ({ ok: true as const, root, limits: false }),
+      bootHygiene: async () => ({ reaped: 0, failed: [], listError: 'EACCES' }),
+    }));
+    await waitForLog(log, 'host/parked');
+    expect(logged(log)).toContainEqual(expect.objectContaining({
+      event: 'host/degraded',
+      reason: expect.stringContaining('boot-hygiene-failed: EACCES'),
     }));
     h.stop();
     expect(await h.done).toBe(0);

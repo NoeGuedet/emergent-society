@@ -12,7 +12,7 @@ import { GitCommandError, WorldReconciliationError } from '../errors.js';
 import { markWorldDegraded, readWorldState } from '../world-state.js';
 import { WorldRepo, type WorldRange } from '../world.js';
 import {
-  commitAs, committedContent, gitIn, readNode, useWorld, worldLog, writeWorldFile,
+  commitAs, committedContent, gitIn, openTestDriver, readNode, useWorld, worldLog, writeWorldFile,
 } from './helpers.js';
 
 const fixture = useWorld('node-world-physics-');
@@ -45,7 +45,7 @@ function first(events: readonly EventEnvelope[], type: string): Record<string, u
 describe('the world as the only channel', () => {
   it('commits the world at the end of a turn, authored by the node, and records the hash', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', async () => {
+    const d = await openTestDriver(home, 'n1', async () => {
       await writeWorldFile(world, 'n1/notes.md', 'hello');
       return acted();
     }, world, { worldPollMs: 0 });
@@ -64,7 +64,7 @@ describe('the world as the only channel', () => {
   it('records the commit of every turn, one per turn', async () => {
     const { home, world } = fixture();
     let turns = 0;
-    const d = await NodeDriver.open(home, 'n1', async () => {
+    const d = await openTestDriver(home, 'n1', async () => {
       turns += 1;
       await writeWorldFile(world, `n1/${turns}.md`, String(turns));
       return { outcome: turns < 2 ? 'chained' : 'waiting', toolCalls: true } as TurnResult;
@@ -94,7 +94,7 @@ describe('the world as the only channel', () => {
       readBlob: (hash) => new BlobStore(home).get(hash),
       acknowledgedWorld: () => null,
     };
-    const d = await NodeDriver.open(home, 'n1', async (ctx) => {
+    const d = await openTestDriver(home, 'n1', async (ctx) => {
       // Under hooks a reported tool call must be backed by an accepted one.
       ctx.gate.append('tool/call', {
         turn: ctx.turn, request: { turn: ctx.turn, ordinal: 0 },
@@ -116,7 +116,7 @@ describe('the world as the only channel', () => {
   it('parks a recoverable error turn and wakes on a foreign commit', async () => {
     const { home, world } = fixture();
     const seen: TurnTrigger[] = [];
-    const d = await NodeDriver.open(home, 'n1', async (ctx) => {
+    const d = await openTestDriver(home, 'n1', async (ctx) => {
       seen.push(ctx.trigger);
       if (ctx.turn === 0) {
         await writeWorldFile(world, 'n1/failed.md', 'x');
@@ -142,7 +142,7 @@ describe('the world as the only channel', () => {
 
   it('journals an empty turn as ignorable, and commits nothing', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const running = d.run();
     await parked(d, world);
     d.stop();
@@ -158,7 +158,7 @@ describe('the world as the only channel', () => {
 
   it('does not mark a turn ignorable when a tool was called', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', acted, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', acted, world, { worldPollMs: 0 });
     const running = d.run();
     await parked(d, world);
     d.stop();
@@ -172,7 +172,7 @@ describe('the world as the only channel', () => {
     // A Run — a process the node left alive (kernel.md §6) — writes to the world
     // with no tool call in the turn: the commit, not the report, settles it.
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', async () => {
+    const d = await openTestDriver(home, 'n1', async () => {
       await writeWorldFile(world, 'n1/by-a-run.md', 'x');
       return wait();
     }, world, { worldPollMs: 0 });
@@ -189,7 +189,7 @@ describe('the world as the only channel', () => {
 describe('the turn closer', () => {
   it('is durable before the turn ends, commit hash and all', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', async () => {
+    const d = await openTestDriver(home, 'n1', async () => {
       await writeWorldFile(world, 'n1/notes.md', 'hello');
       return acted();
     }, world, { worldPollMs: 0, batchWindowMs: 10_000 });
@@ -207,7 +207,7 @@ describe('the turn closer', () => {
 
   it('is flushed before the loop unwinds on a failed turn', async () => {
     const { home, world } = fixture();
-    const d = await NodeDriver.open(home, 'n1', () => {
+    const d = await openTestDriver(home, 'n1', () => {
       throw new Error('boom');
     }, world, { worldPollMs: 0 });
     type LooseWriter = { flush(): Promise<void> };
@@ -228,7 +228,7 @@ describe('the wake predicate', () => {
   it('does not wake on a static world', async () => {
     const { home, world } = fixture();
     const seen: number[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx) => { seen.push(ctx.turn); return wait(); },
+    const d = await openTestDriver(home, 'n1', (ctx) => { seen.push(ctx.turn); return wait(); },
       world, { worldPollMs: 0 });
     const running = d.run();
     await parked(d, world);
@@ -246,7 +246,7 @@ describe('the wake predicate', () => {
   it('never wakes on its own commit', async () => {
     const { home, world } = fixture();
     const seen: number[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx) => { seen.push(ctx.turn); return wait(); },
+    const d = await openTestDriver(home, 'n1', (ctx) => { seen.push(ctx.turn); return wait(); },
       world, { worldPollMs: 0 });
     const running = d.run();
     await parked(d, world);
@@ -265,7 +265,7 @@ describe('the wake predicate', () => {
   it('wakes on a foreign commit, carrying the range from the watermark to HEAD', async () => {
     const { home, world } = fixture();
     const seen: { trigger: TurnTrigger; world: WorldRange }[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+    const d = await openTestDriver(home, 'n1', (ctx) => {
       seen.push({ trigger: ctx.trigger, world: ctx.world });
       return wait();
     }, world, { worldPollMs: 0 });
@@ -293,7 +293,7 @@ describe('the wake predicate', () => {
   it('coalesces several foreign commits into one wake', async () => {
     const { home, world } = fixture();
     const seen: WorldRange[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx) => { seen.push(ctx.world); return wait(); },
+    const d = await openTestDriver(home, 'n1', (ctx) => { seen.push(ctx.world); return wait(); },
       world, { worldPollMs: 0 });
     const running = d.run();
     await parked(d, world);
@@ -313,7 +313,7 @@ describe('the wake predicate', () => {
   it('wakes on a commit made outside this process, on the watcher interval', async () => {
     const { home, world } = timed();
     const seen: TurnTrigger[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx) => { seen.push(ctx.trigger); return wait(); },
+    const d = await openTestDriver(home, 'n1', (ctx) => { seen.push(ctx.trigger); return wait(); },
       world, { worldPollMs: 25 });
     const running = d.run();
     await parked(d, world);
@@ -328,7 +328,7 @@ describe('the wake predicate', () => {
   it('does not let a stale evaluation wake the node on an unmoved world', async () => {
     const { home, world } = fixture();
     const triggers: TurnTrigger[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+    const d = await openTestDriver(home, 'n1', (ctx) => {
       triggers.push(ctx.trigger);
       return wait();
     }, world, { worldPollMs: 0 });
@@ -382,7 +382,7 @@ describe('the wake predicate', () => {
     const { home, world } = fixture();
     const seen: number[] = [];
     const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
-    const d = await NodeDriver.open(home, 'n1', (ctx) => { seen.push(ctx.turn); return wait(); }, world, {
+    const d = await openTestDriver(home, 'n1', (ctx) => { seen.push(ctx.turn); return wait(); }, world, {
       worldPollMs: 0,
       // Runs after the turn closed and before the park: the read that fails is
       // the park's own pre-check.
@@ -405,7 +405,7 @@ describe('the wake predicate', () => {
   it('parks instead of dying when the watcher’s evaluation fails', async () => {
     const { home, world } = fixture();
     const seen: number[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx) => { seen.push(ctx.turn); return wait(); },
+    const d = await openTestDriver(home, 'n1', (ctx) => { seen.push(ctx.turn); return wait(); },
       world, { worldPollMs: 0 });
     const running = d.run();
     await parked(d, world);
@@ -430,7 +430,7 @@ describe('the wake predicate', () => {
     const { home, world } = fixture();
     const head = await commitAs(world, 'n2', { 'n2/earlier.md': 'earlier' });
     const seen: { trigger: TurnTrigger; world: WorldRange }[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+    const d = await openTestDriver(home, 'n1', (ctx) => {
       seen.push({ trigger: ctx.trigger, world: ctx.world });
       return wait();
     }, world, { worldPollMs: 0 });
@@ -448,7 +448,7 @@ describe('the wake predicate', () => {
     const root = await commitAs(world, 'n2', { 'n2/root.md': 'root' });
     await commitAs(world, 'n2', { 'n2/tip.md': 'tip' });
     const triggers: TurnTrigger[] = [];
-    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+    const d = await openTestDriver(home, 'n1', (ctx) => {
       triggers.push(ctx.trigger);
       return wait();
     }, world, { worldPollMs: 0 });
@@ -472,7 +472,7 @@ describe('the wake predicate', () => {
     const range = vi.spyOn(WorldRepo.prototype, 'commitsSince');
     const bounded = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
     try {
-      const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+      const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
       const running = d.run();
       await vi.waitFor(() => expect(d.state).toBe('waiting'));
       // The predicate holds its answer to existence: it streams authors and stops
@@ -491,7 +491,7 @@ describe('the wake predicate', () => {
     const { home, world } = fixture();
     const diagnostics: Error[] = [];
     const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
-    const d = await NodeDriver.open(home, 'n1', wait, world, {
+    const d = await openTestDriver(home, 'n1', wait, world, {
       worldPollMs: 0,
       onError: (err) => { diagnostics.push(err); },
       // Runs after the turn closed and before the park: the read that fails is
@@ -513,7 +513,7 @@ describe('the wake predicate', () => {
     const { home, world } = fixture();
     const diagnostics: Error[] = [];
     const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
-    const d = await NodeDriver.open(home, 'n1', wait, world, {
+    const d = await openTestDriver(home, 'n1', wait, world, {
       worldPollMs: 0,
       onError: (err) => { diagnostics.push(err); },
       onMaintenance: () => {
@@ -535,7 +535,7 @@ describe('the wake predicate', () => {
     const { home, world } = fixture();
     const diagnostics: Error[] = [];
     const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
-    const d = await NodeDriver.open(home, 'n1', wait, world, {
+    const d = await openTestDriver(home, 'n1', wait, world, {
       worldPollMs: 0,
       onError: (err) => { diagnostics.push(err); },
       onMaintenance: () => {
@@ -555,7 +555,7 @@ describe('the wake predicate', () => {
     const { home, world } = fixture();
     const seen: number[] = [];
     const spy = vi.spyOn(WorldRepo.prototype, 'hasForeignCommit');
-    const d = await NodeDriver.open(home, 'n1', (ctx) => {
+    const d = await openTestDriver(home, 'n1', (ctx) => {
       seen.push(ctx.turn);
       return wait();
     }, world, {
@@ -595,8 +595,8 @@ describe('two nodes on one world', () => {
       await gate;
       return acted();
     };
-    const first = await NodeDriver.open(home, 'n1', handler('n1'), world, { worldPollMs: 0 });
-    const second = await NodeDriver.open(home, 'n2', handler('n2'), world, { worldPollMs: 0 });
+    const first = await openTestDriver(home, 'n1', handler('n1'), world, { worldPollMs: 0 });
+    const second = await openTestDriver(home, 'n2', handler('n2'), world, { worldPollMs: 0 });
     const runs = [first.run(), second.run()];
     await vi.waitFor(() => expect(first.state).toBe('waiting'));
     await vi.waitFor(() => expect(second.state).toBe('waiting'));
@@ -631,11 +631,11 @@ describe('two nodes on one world', () => {
   it('wakes the peer when one node commits', async () => {
     const { home, world } = fixture();
     const triggers: TurnTrigger[] = [];
-    const writer = await NodeDriver.open(home, 'n1', async () => {
+    const writer = await openTestDriver(home, 'n1', async () => {
       await writeWorldFile(world, 'n1/said.md', 'hello');
       return acted();
     }, world, { worldPollMs: 0 });
-    const reader = await NodeDriver.open(home, 'n2', (ctx) => {
+    const reader = await openTestDriver(home, 'n2', (ctx) => {
       triggers.push(ctx.trigger);
       return wait();
     }, world, { worldPollMs: 0 });
@@ -669,7 +669,7 @@ describe('resume and the world', () => {
     await w.close();
     await writeWorldFile(world, 'n1/half.md', 'unfinished');
 
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const events = await readNode(home);
     const closer = events.find((e) => e.type === 'turn/end');
     expect(closer?.data).toMatchObject({ turn: 0, outcome: 'interrupted', synthetic: true });
@@ -698,7 +698,7 @@ describe('resume and the world', () => {
     // attribution, not a lost effect.
     await writeWorldFile(world, 'peer/inflight.md', 'not mine');
 
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const closer = (await readNode(home)).find((e) => e.type === 'turn/end');
     const commit = (closer?.data as { commit?: string } | undefined)?.commit;
     expect(commit).toBe(await world.headHash());
@@ -719,7 +719,7 @@ describe('resume and the world', () => {
     w.append('turn/end', { turn: 0, outcome: 'waiting' });
     await w.close();
     await writeWorldFile(world, 'peer/inflight.md', 'not mine');
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     expect(await world.headHash()).toBeNull();
     d.stop();
     await d.run();
@@ -729,7 +729,7 @@ describe('resume and the world', () => {
     const { home, world } = fixture();
     // A first life: one turn that writes and commits, then a second turn that
     // opens on that commit and parks. Its watermark is a real hash, not null.
-    const first = await NodeDriver.open(home, 'n1', async (ctx) => {
+    const first = await openTestDriver(home, 'n1', async (ctx) => {
       if (ctx.turn === 0) {
         await writeWorldFile(world, 'n1/first.md', 'first');
         return { outcome: 'chained', toolCalls: true };
@@ -747,7 +747,7 @@ describe('resume and the world', () => {
     const head = await commitAs(world, 'n3', { 'n3/b.md': 'b' });
 
     const seen: { trigger: TurnTrigger; world: WorldRange }[] = [];
-    const second = await NodeDriver.open(home, 'n1', (ctx) => {
+    const second = await openTestDriver(home, 'n1', (ctx) => {
       seen.push({ trigger: ctx.trigger, world: ctx.world });
       return wait();
     }, world, { worldPollMs: 0 });
@@ -789,7 +789,7 @@ describe('orphan commit reconciliation at resume', () => {
     // must not sweep it in.
     await writeWorldFile(world, 'peer/inflight.md', 'not mine');
 
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const closer = await closerOf(home);
     expect(closer).toMatchObject({
       turn: 0, outcome: 'interrupted', synthetic: true, commit: landed?.hash,
@@ -811,7 +811,7 @@ describe('orphan commit reconciliation at resume', () => {
     const peer = await commitAs(world, 'n3', { 'n3/after.md': 'after' });
     expect(await world.headHash()).toBe(peer);
 
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     expect(await closerOf(home)).toMatchObject({ outcome: 'interrupted', commit: landed?.hash });
     // The peer's commit stays HEAD; nothing new was committed.
     expect(await world.headHash()).toBe(peer);
@@ -831,7 +831,7 @@ describe('orphan commit reconciliation at resume', () => {
     const head = await world.headHash();
     const before = (await readNode(home)).map((e) => e.type);
 
-    await expect(NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 }))
+    await expect(openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 }))
       .rejects.toBeInstanceOf(WorldReconciliationError);
     // No closer was written and the world was not touched: a safe refusal.
     expect((await readNode(home)).map((e) => e.type)).toEqual(before);
@@ -845,7 +845,7 @@ describe('orphan commit reconciliation at resume', () => {
     // refuses rather than falling back to all history.
     await openTurnOn(home, 'a'.repeat(40));
     const head = await world.headHash();
-    await expect(NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 }))
+    await expect(openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 }))
       .rejects.toBeInstanceOf(WorldReconciliationError);
     expect(await world.headHash()).toBe(head);
   });
@@ -862,7 +862,7 @@ describe('orphan commit reconciliation at resume', () => {
     await commitAs(world, 'n2', { 'n2/foreign.md': 'f' }, 'turn 0');
     await writeWorldFile(world, 'n1/recovered.md', 'r');
 
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const commit = (await closerOf(home))?.commit;
     expect(commit).toBe(await world.headHash());
     expect(await committedContent(world, 'n1/recovered.md')).toBe('r');
@@ -877,13 +877,13 @@ describe('orphan commit reconciliation at resume', () => {
     await writeWorldFile(world, 'n1/kept.md', 'kept');
     await world.commitAll('n1', 'turn 0');
 
-    const first = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const first = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     first.stop();
     await first.run();
     const head = await world.headHash();
     expect((await readNode(home)).filter((e) => e.type === 'turn/end')).toHaveLength(1);
 
-    const second = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const second = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     second.stop();
     await second.run();
     expect(await world.headHash()).toBe(head);
@@ -902,7 +902,7 @@ describe('orphan commit reconciliation at resume', () => {
     await markWorldDegraded(home, 'world-head', 1);
     expect((await readWorldState(home)).degraded).toBe(true);
 
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const closer = (await readNode(home)).find((e) => e.type === 'turn/end');
     expect(closer?.data).toMatchObject({
       turn: 0, outcome: 'interrupted', synthetic: true, commit: landed?.hash,
@@ -921,7 +921,7 @@ describe('orphan commit reconciliation at resume', () => {
     await writeWorldFile(world, 'n1/unfinished.md', 'unfinished');
     await gitIn(world, ['checkout', '--detach', '--quiet', 'HEAD']);
 
-    const d = await NodeDriver.open(home, 'n1', wait, world, { worldPollMs: 0 });
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
     const events = await readNode(home);
     const synthetic = events.find((e) => e.type === 'turn/end');
     // The recovery commit is refused, so the synthetic closer names no commit
@@ -961,7 +961,7 @@ describe('the commit boundary is a refusal, not a death', () => {
     const blocked = await blockGitAdd(world);
     // The production 1 s default would fire mid-assertion; the no-op schedule
     // keeps this case about the refusal path, not the retry clock.
-    const d = await NodeDriver.open(home, 'n1', wait, world, {
+    const d = await openTestDriver(home, 'n1', wait, world, {
       worldPollMs: 0, schedule: () => () => {},
     });
     const running = d.run();
@@ -999,12 +999,117 @@ describe('the commit boundary is a refusal, not a death', () => {
       && (event.data as { turn?: number }).turn === 1)).toBe(false);
   });
 
+  it('keeps the commit-refused carrier when the closer flush is storage-refused', async () => {
+    const { home, world } = fixture();
+    const blocked = await blockGitAdd(world);
+    const policy = {
+      minFreeBytes: 100, minFreeInodes: 10, reserveBytes: 0, reserveInodes: 0,
+    };
+    const HIGH = { bytes: 1_000, inodes: 1_000 };
+    const LOW = { bytes: 99, inodes: 1_000 };
+    let free = LOW;
+    let probes = 0;
+    // Calls 1-3 are the boot flush, the turn-start probe and the turn-start
+    // barrier; the fourth is the closer's flush, which must refuse.
+    const probe = async () => {
+      probes += 1;
+      return probes < 4 ? HIGH : free;
+    };
+    const d = await openTestDriver(home, 'n1', wait, world, {
+      worldPollMs: 0, schedule: () => () => {},
+      storage: { policy, probe },
+    });
+    const running = d.run();
+    try {
+      await parked(d, world);
+      // The closer and the carrier are pending in the writer, not durable yet.
+      free = HIGH;
+    } finally {
+      d.stop();
+      await running;
+      await unblock(blocked);
+    }
+    expect(d.state).toBe('stopped');
+    const events = await readNode(home);
+    const endIndex = events.findIndex((event) => event.type === 'turn/end');
+    const refusalIndex = events.findIndex((event) => event.type === 'world/commit-refused');
+    // The refused closer flush does not skip the C1 carrier or end the run: the
+    // next (recovering) flush lands both, and a clean stop follows.
+    expect(endIndex).toBeGreaterThanOrEqual(0);
+    expect(refusalIndex).toBe(endIndex + 1);
+    expect(events.find((event) => event.type === 'node/shutdown')?.data)
+      .toEqual({ reason: 'stop-requested' });
+    expect((await readWorldState(home)).reason).toBe('git-exit');
+  });
+
+  it('arms the bounded self-retry when the closer and carrier both refuse, then re-commits', async () => {
+    const { home, world } = fixture();
+    const blocked = await blockGitAdd(world);
+    const policy = {
+      minFreeBytes: 100, minFreeInodes: 10, reserveBytes: 0, reserveInodes: 0,
+    };
+    const HIGH = { bytes: 1_000, inodes: 1_000 };
+    const LOW = { bytes: 99, inodes: 1_000 };
+    let free = LOW;
+    let probes = 0;
+    // Calls 1-3 are the boot flush, the turn-start probe and the turn-start
+    // barrier; 4 and 5 are the closer and the carrier, both refusing.
+    const probe = async () => {
+      probes += 1;
+      return probes < 4 ? HIGH : free;
+    };
+    const delays: number[] = [];
+    const retryRef: { call: (() => void) | null } = { call: null };
+    const schedule = (ms: number, callback: () => void): (() => void) => {
+      delays.push(ms);
+      retryRef.call = callback;
+      return () => {};
+    };
+    const d = await openTestDriver(home, 'n1', async (ctx) => {
+      // The retry wake is an ordinary turn; a real write makes its commit move
+      // HEAD so the successful commit clears the degraded sidecar.
+      if (ctx.trigger === 'wakeup') await writeWorldFile(world, 'n1/recovered.md', 'ok\n');
+      return wait();
+    }, world, { worldPollMs: 0, schedule, storage: { policy, probe } });
+    const running = d.run();
+    try {
+      await parked(d, world);
+      // Both flush refusals were swallowed and the retry is still armed (1 s is
+      // the first step of the 1/4/16 s ladder): the node is not waiting for a
+      // foreign commit. Nothing from the closer/carrier is durable yet.
+      expect(delays).toEqual([1000]);
+      expect(retryRef.call).not.toBeNull();
+      expect((await readNode(home)).some((event) => event.type === 'turn/end')).toBe(false);
+
+      free = HIGH;
+      await unblock(blocked);
+      retryRef.call!();
+      // The retry wakeup's barrier flushes the pending closer/carrier, then its
+      // handler write is committed: wait for the real commit to clear the
+      // sidecar (the pending closer alone lands earlier, at the barrier).
+      await vi.waitFor(async () => {
+        expect((await readWorldState(home)).degraded).toBe(false);
+      }, { timeout: 10_000 });
+      // The recovering turn flushed the pending closer and carrier and its own
+      // real commit cleared the sidecar.
+      const events = await readNode(home);
+      const endIndex = events.findIndex((event) => event.type === 'turn/end');
+      const refusalIndex = events.findIndex((event) => event.type === 'world/commit-refused');
+      expect(refusalIndex).toBe(endIndex + 1);
+      expect(d.state).toBe('waiting');
+    } finally {
+      d.stop();
+      await running;
+      await unblock(blocked);
+    }
+  });
+
   it('classifies the walk\'s raw EACCES as its own reason', async () => {
     const { home, world } = fixture();
     const locked = join(world.path, 'locked');
     await mkdir(locked);
     await chmod(locked, 0o000);
-    const d = await NodeDriver.open(home, 'n1', wait, world, {
+    const d = await openTestDriver(home, 'n1', wait, world, {
       worldPollMs: 0, schedule: () => () => {},
     });
     const running = d.run();
@@ -1030,7 +1135,7 @@ describe('the commit boundary is a refusal, not a death', () => {
       return () => {};
     };
     try {
-      const d = await NodeDriver.open(home, 'n1', async () => {
+      const d = await openTestDriver(home, 'n1', async () => {
         throw new Error('handler exploded');
       }, world, { worldPollMs: 0, schedule });
       await expect(d.run()).rejects.toThrow('handler exploded');
@@ -1079,7 +1184,7 @@ describe('the commit boundary is a refusal, not a death', () => {
       readBlob: (hash) => new BlobStore(home).get(hash),
       acknowledgedWorld: () => null,
     };
-    const d = await NodeDriver.open(home, 'n1', wait, world, {
+    const d = await openTestDriver(home, 'n1', wait, world, {
       knownTypes: C13_EVENT_TYPES, hooks, worldPollMs: 0, schedule: () => () => {},
     });
     const running = d.run();
@@ -1105,7 +1210,7 @@ describe('the commit boundary is a refusal, not a death', () => {
       delays.push(ms);
       return () => {};
     };
-    const d = await NodeDriver.open(home, 'n1', async () => {
+    const d = await openTestDriver(home, 'n1', async () => {
       await writeWorldFile(world, 'n1/detached.md', 'x');
       return acted();
     }, world, { worldPollMs: 0, schedule });
@@ -1139,7 +1244,7 @@ describe('the commit boundary is a refusal, not a death', () => {
     };
     try {
       const turns: number[] = [];
-      const d = await NodeDriver.open(home, 'n1', async (ctx) => {
+      const d = await openTestDriver(home, 'n1', async (ctx) => {
         turns.push(ctx.turn);
         return wait();
       }, world, { worldPollMs: 0, schedule });
@@ -1183,7 +1288,7 @@ describe('the commit boundary is a refusal, not a death', () => {
     };
     try {
       const turns: number[] = [];
-      const d = await NodeDriver.open(home, 'n1', async (ctx) => {
+      const d = await openTestDriver(home, 'n1', async (ctx) => {
         turns.push(ctx.turn);
         // The second turn repairs the world AND writes, so its commit is a real
         // one: that is the only event that clears the sidecar and resets the
@@ -1243,7 +1348,7 @@ describe('the commit boundary is a refusal, not a death', () => {
     };
     try {
       const turns: number[] = [];
-      const d = await NodeDriver.open(home, 'n1', async (ctx) => {
+      const d = await openTestDriver(home, 'n1', async (ctx) => {
         turns.push(ctx.turn);
         if (ctx.turn === 1) await unblock(blocked); // repaired, but nothing to commit
         if (ctx.turn === 2) await writeFile(join(world.path, 'n1-recovered.md'), 'x');

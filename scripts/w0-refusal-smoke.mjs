@@ -2,7 +2,9 @@
 // journals, a loopback fake provider. It proves the refusal path end to end:
 // a chmod-000 file planted in the world makes a turn's commit refuse; the turn
 // ends `waiting`, the kernel is alive with no fault event, `status` is degraded
-// (exit 1 from the sidecar alone), the next turn's model-visible context carries
+// (exit 1 from the world sidecar alone: the host's explicit `--no-sandbox`
+// opt-out is not a degradation, and storage=unquoted is normal), the next
+// turn's model-visible context carries
 // the bounded refusal line exactly once, and the node's OWN shell removes the
 // blocker and writes, so the next turn's real commit — not a no-op attempt —
 // clears the sidecar. It then plants an interrupted turn plus the same damage,
@@ -273,9 +275,21 @@ function statusReport(home, acceptable) {
   return JSON.parse(result.stdout);
 }
 
-/** One plant: an untracked unreadable file makes `git add --all` exit 128. */
-async function plantUnreadable(path) {
+/**
+ * One plant: a TRACKED unreadable file makes `git add --all` exit 128. It must
+ * be tracked: an untracked unreadable file is the doctor's quarantine case
+ * (moved aside at boot, which would let the commit succeed), while a tracked
+ * one is only REPORTED — the doctor never moves it — so the refusal path is
+ * exercised deterministically.
+ */
+async function plantUnreadableTracked(home, rel) {
+  const path = join(home, 'world', rel);
   await writeFile(path, 'unreadable');
+  git(home, ['add', '--', rel]);
+  git(home, [
+    '-c', 'user.name=harness', '-c', 'user.email=harness@world.local',
+    'commit', '--quiet', '--message', `plant ${rel}`,
+  ]);
   await chmod(path, 0o000);
 }
 
@@ -296,7 +310,7 @@ async function main() {
     //    is unreadable, and the world starts healthy (no sidecar). The harness
     //    never repairs the world: the node's own shell does, in the retry turn.
     const blocked = join(home, 'world', 'blocked.txt');
-    await plantUnreadable(blocked);
+    await plantUnreadableTracked(home, 'blocked.txt');
     assert.equal((await lstat(blocked)).mode & 0o777, 0o000, 'the planted file is unreadable');
     assert.equal((await readWorldState(home)).degraded, false, 'the home starts healthy');
     const headBefore = tryHead(home);
@@ -322,8 +336,9 @@ async function main() {
     //    commit, deterministically (no sleep, no race with a timer).
     await waitFor(() => server.pending, { child, label: 'the retry turn is in flight' });
 
-    // 3. The kernel is alive, no fault event was logged, and status says
-    //    degraded, exiting 1 for the sidecar (not for a folded error).
+    // 3. The kernel is alive, no fault event was logged, and status is
+    //    degraded, exiting 1 for the sidecar alone (the host's explicit
+    //    --no-sandbox opt-out never degrades the exit).
     assert.equal(child.smoke.exitCode, undefined, 'the kernel must not exit on a refusal');
     assert.ok(child.pid !== undefined, 'the kernel has a pid');
     assert.doesNotThrow(() => process.kill(child.pid, 0), 'the kernel process is alive');
@@ -381,6 +396,8 @@ async function main() {
     assert.equal(recoveryEnd.data.commit, headAfter, 'the closer joins the commit hash');
     await waitFor(async () => (await readWorldState(home)).degraded === false,
       { child, label: 'the sidecar clears on a successful commit' });
+    // The world sidecar is what must read healthy here; a clean fenced cell
+    // would exit 0 on the same storage=unquoted fact.
     // Absent, not merely healthy: a malformed file would also read healthy.
     await assert.rejects(lstat(join(home, 'world-state.json')), /ENOENT/,
       'the sidecar file is removed');
@@ -397,6 +414,8 @@ async function main() {
     assert.equal(pauseCode, 0, 'the paused host exits 0');
     await waitDone(child);
 
+    // The tracked blocker must be in place before the opening range is captured.
+    await plantUnreadableTracked(home, 'blocked2.txt');
     const head = git(home, ['rev-parse', 'HEAD']).trim();
     const writer = await JournalWriter.open(home, UID);
     writer.append('turn/start', {
@@ -406,7 +425,6 @@ async function main() {
     await writer.close();
 
     const blocked2 = join(home, 'world', 'blocked2.txt');
-    await plantUnreadable(blocked2);
     assert.equal((await lstat(blocked2)).mode & 0o777, 0o000,
       'the boot-phase file is unreadable');
     server.armRecovery();

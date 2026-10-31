@@ -110,7 +110,9 @@ async function setup(): Promise<{ home: string; world: WorldRepo; seed: string }
 
 /** Composes through the real root and registers the cell for teardown. */
 async function compose(options: CellOptions): Promise<Cell> {
-  const cell = await composeCell(options);
+  // Hermetic storage by default: the controlled HIGH probe, unless a case
+  // injects its own. The production default remains the real statfs.
+  const cell = await composeCell({ storage: TEST_STORAGE, ...options });
   cells.push(cell);
   return cell;
 }

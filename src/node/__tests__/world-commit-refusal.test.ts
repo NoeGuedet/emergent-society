@@ -80,6 +80,12 @@ describe('classifyCommitFailure: the commit boundary names every refusal', () =>
       reason: 'walk-too-deep',
       detail: 'world walk walk failed (ETOODEEP): deep/rel',
     });
+    // The walk's wall-clock budget (it runs inside the commit fence) is its own
+    // typed reason, never `walk-failure` and never a kernel death.
+    expect(classifyCommitFailure(new WorldWalkError('walk', 'ETIMEDOUT', 'slow/rel'))).toEqual({
+      reason: 'walk-timeout',
+      detail: 'world walk walk failed (ETIMEDOUT): slow/rel',
+    });
   });
 
   it('passes through a later stage\'s typed refusal', () => {

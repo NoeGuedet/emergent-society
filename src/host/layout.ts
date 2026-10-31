@@ -5,7 +5,9 @@ import {
 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { frontierLayout, nodeDir, nodeLayout } from '../journal/index.js';
+import { WorldNotARepoError } from '../node/errors.js';
 import { WorldRepo } from '../node/world.js';
+import { migrationNote } from '../node/world-trust.js';
 import { HostConfigError } from './errors.js';
 
 /**
@@ -34,7 +36,10 @@ import { HostConfigError } from './errors.js';
  * `providers.json` (the operator writes the key, so no secret is ever generated
  * onto argv or a terminal) and it never creates `host.json` (only a running
  * host does). A home with exactly one of `world/` and `world.git/` is a partial
- * layout and is refused instead of guessed at.
+ * layout and is refused instead of guessed at — except the documented legacy
+ * shape (`world/.git` present, `world.git` absent), which is refused with the
+ * sanitizing migration recipe so neither `start` nor `init` tells the operator
+ * to remove the recorded world.
  */
 
 /** The cell home's absolute paths, derived from the journal's own literals. */
@@ -186,8 +191,27 @@ export async function assertCellLayout(home: string): Promise<void> {
     statOrNull(world), statOrNull(gitDir),
   ]);
   if (worldEntry?.isDirectory() !== true || gitEntry?.isDirectory() !== true) {
+    const legacy = await legacyWorldError(world, gitDir, gitEntry === null);
+    if (legacy !== null) throw legacy;
     throw new HostConfigError('cell layout is not initialized; run init');
   }
+}
+
+/**
+ * The documented legacy shape: the world directory exists with its git dir
+ * inside it (`world/.git`) and the external `world.git` is absent. The layout
+ * gate runs before `WorldRepo.open`, so it must recognize this shape itself
+ * and surface the sanitizing recipe instead of sending the operator to `init`,
+ * which would then advise removing the world (and its recorded history).
+ * `WorldNotARepoError` is the same refusal class `open` uses, so start/resume
+ * map it to exit 2 and `init` does too.
+ */
+async function legacyWorldError(
+  world: string, gitDir: string, externalAbsent: boolean,
+): Promise<WorldNotARepoError | null> {
+  if (!externalAbsent) return null;
+  if ((await lstatOrNull(join(world, '.git'))) === null) return null;
+  return new WorldNotARepoError(world, migrationNote(world, gitDir));
 }
 
 /**
@@ -196,8 +220,9 @@ export async function assertCellLayout(home: string): Promise<void> {
  * A missing home is created 0700 (the umask is overridden by the explicit
  * `chmod`); an existing one must already pass `assertHomePermissions`. Both
  * world paths present opens the repository (and lets its trust checks run);
- * neither initializes it; exactly one is a partial layout and is refused. The
- * credential file and the owner record are never created here.
+ * neither initializes it; a legacy in-world `.git` is refused with the
+ * migration recipe (exit 2, the world kept); any other partial layout is
+ * refused. The credential file and the owner record are never created here.
  *
  * @returns `created: true` when the world pair was initialized by this call.
  */
@@ -221,6 +246,8 @@ export async function initHome(home: string): Promise<{ readonly created: boolea
     await WorldRepo.init(world, { gitDir });
     return { created: true };
   }
+  const legacy = await legacyWorldError(world, gitDir, gitEntry === null);
+  if (legacy !== null) throw legacy;
   throw new HostConfigError(
     'partial cell layout: expected both <home>/world and <home>/world.git; '
     + 'remove the stray entry and run init again',

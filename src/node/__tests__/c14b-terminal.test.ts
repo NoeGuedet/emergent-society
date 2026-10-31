@@ -13,6 +13,7 @@ import { HeadWatcher } from '../watcher.js';
 import { createAgentRuntime, defaultAgentConfig } from '../loop.js';
 import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import { commitAs, useWorld } from './helpers.js';
+import { openTestDriver } from './helpers.js';
 import type { WorldRepo } from '../world.js';
 import type { ArtifactRef } from '../../context/contracts.js';
 
@@ -107,7 +108,7 @@ describe('C1.4b persistent terminal end to end', () => {
     let running: Promise<void> | null = null;
     try {
       const runtime = createAgentRuntime(await runtimeOptions(home, world, model.url));
-      driver = await NodeDriver.open(home, 'n1', runtime.handler, world, {
+      driver = await openTestDriver(home, 'n1', runtime.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
         onCheckpoint: (mark) => runtime.checkpoint(mark),
       });
@@ -172,7 +173,7 @@ describe('C1.4b persistent terminal end to end', () => {
     try {
       // First boot: cd into subdir, park, stop (the stop disposes the session).
       const first = createAgentRuntime(await runtimeOptions(home, world, model.url));
-      let driver = await NodeDriver.open(home, 'n1', first.handler, world, {
+      let driver = await openTestDriver(home, 'n1', first.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: first.hooks, worldPollMs: 0, batchWindowMs: 10000,
         onCheckpoint: (mark) => first.checkpoint(mark),
       });
@@ -183,7 +184,7 @@ describe('C1.4b persistent terminal end to end', () => {
 
       // Second boot on the same home: the session is gone with the process.
       const second = createAgentRuntime(await runtimeOptions(home, world, model.url));
-      driver = await NodeDriver.open(home, 'n1', second.handler, world, {
+      driver = await openTestDriver(home, 'n1', second.handler, world, {
         knownTypes: C13_EVENT_TYPES, hooks: second.hooks, worldPollMs: 0, batchWindowMs: 10000,
         onCheckpoint: (mark) => second.checkpoint(mark),
       });

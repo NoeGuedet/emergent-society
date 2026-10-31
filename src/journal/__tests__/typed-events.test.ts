@@ -28,7 +28,11 @@ describe('EventDataMap declaration merging', () => {
     makeEvent({ type: 'test/typed', data: { n: 'wrong' }, seq: 0, time: 1, prevHash: GENESIS_HASH });
     // @ts-expect-error `text` is required for `test/text`
     makeEvent({ type: 'test/text', data: {}, seq: 0, time: 1, prevHash: GENESIS_HASH });
-    expect(true).toBe(true);
+    // The runtime half still runs (the type errors are the compile-time proof).
+    const ok = makeEvent({
+      type: 'test/typed', data: { n: 1 }, seq: 0, time: 1, prevHash: GENESIS_HASH,
+    });
+    expect(ok.data).toEqual({ n: 1 });
   });
 
   it('narrows the appended payload type at the writer', async () => {
@@ -48,7 +52,7 @@ describe('EventDataMap declaration merging', () => {
       expectTypeOf(union.data).toEqualTypeOf<{ n: number }>();
       expect(union.data.n).toBe(1);
     }
-    expect(true).toBe(true);
+    expect(union).toMatchObject({ type: 'test/typed', data: { n: 1 } });
   });
 
   it('still allows an unregistered type at the runtime boundary', async () => {

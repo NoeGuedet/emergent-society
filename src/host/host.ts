@@ -30,17 +30,19 @@ import {
 import { DEFAULT_STORAGE, statfsProbe } from '../node/storage-probe.js';
 import type { LlmCredential } from './credentials.js';
 import { llmCredentialFrom, loadProviderStore } from './credentials.js';
-import { HostConfigError } from './errors.js';
 import {
   assertCellLayout, assertHomeOutsideCheckout, assertHomePermissions, cellPaths,
 } from './layout.js';
 import type { HostLog } from './observe.js';
 import {
-  attachCell, bootHygiene, detectLaunchMode, ensureLeaf, LIMITS, limitLeaf, nodeLeaf, runLeaf,
+  attachCell, bootHygiene, detectLaunchMode, ensureLeaf, LIMITS, limitLeaf, nodeLeaf, reapRunLeaf,
+  runLeaf,
 } from './cgroups.js';
-import type { CellCgroup } from './cgroups.js';
+import type { BootHygiene, CellCgroup } from './cgroups.js';
 import { createFencePort } from './fence.js';
 import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
+import { HostAlreadyRunningError, HostConfigError } from './errors.js';
+import { UnsafeWorldPathError, WorldNotARepoError } from '../node/errors.js';
 
 /**
  * The composition root: one cell, composed in one place and in one order.
@@ -113,6 +115,12 @@ export type CellOptions = {
    * No env switch, no CLI flag.
    */
   readonly storage?: StorageConfig;
+  /**
+   * TEST-ONLY doctor runner (F-6): production is `runWorldDoctor`. A throw is
+   * caught into the bounded `world/doctor-failed` diagnostic, exactly as the
+   * production runner's programming-error path is.
+   */
+  readonly doctorRunner?: (world: WorldRepo, opts: { home: string }) => Promise<DoctorReport>;
   readonly pollMs?: number; readonly log: HostLog;
 };
 
@@ -170,7 +178,7 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
   // A doctor failure is a bounded host diagnostic, never a refused boot.
   let doctor: DoctorReport | undefined;
   try {
-    doctor = await runWorldDoctor(world, { home });
+    doctor = await (options.doctorRunner ?? runWorldDoctor)(world, { home });
   } catch (err) {
     log.emit('world/doctor-failed', {
       reason: err instanceof Error ? err.name : 'Error',
@@ -251,6 +259,7 @@ export async function composeCell(options: CellOptions): Promise<Cell> {
                 }
                 return leaf;
               },
+              reapCgroupLeaf: (leaf: string) => reapRunLeaf(leaf),
             }
             : {}),
         }),
@@ -368,7 +377,7 @@ async function attachSandbox(
       log.emit('host/degraded', { home, uid, reason: attach.reason });
       return sandbox;
     }
-    const hygiene = await bootHygiene(attach.root);
+    const hygiene = await (deps.bootHygiene ?? bootHygiene)(attach.root);
     if (hygiene.failed.length > 0) {
       // A leaf that survived the thaw/kill keeps a possibly frozen process on
       // disk: never boot silently over it. The names are leaf basenames, never
@@ -376,6 +385,13 @@ async function attachSandbox(
       const names = hygiene.failed.slice(0, 8).join(',');
       log.emit('host/degraded', {
         home, uid, reason: singleLine(`boot-thaw-failed: ${names}`, 200),
+      });
+    }
+    if (hygiene.listError !== undefined) {
+      // An unreadable cell root is not "no leaves": booting over it would skip
+      // the thaw/kill entirely. The errno is bounded and carries no path.
+      log.emit('host/degraded', {
+        home, uid, reason: singleLine(`boot-hygiene-failed: ${hygiene.listError}`, 200),
       });
     }
     return {
@@ -432,6 +448,24 @@ export type HostDeps = {
   readonly compose?: (options: CellOptions) => Promise<Cell>;
   readonly now?: () => number;
   readonly proc?: ProcessHandlersTarget;
+  /**
+   * TEST-ONLY doctor runner (F-6): injected into `composeCell`, so the
+   * `world/doctor-failed` branch is reachable without a production switch.
+   */
+  readonly doctorRunner?: (world: WorldRepo, opts: { home: string }) => Promise<DoctorReport>;
+  /**
+   * TEST-ONLY boot-hygiene seam: reachable without a real cgroup tree, so both
+   * bounded diagnostics (`boot-thaw-failed`, `boot-hygiene-failed`) are tested
+   * without a production switch. Production is `bootHygiene` from cgroups.ts.
+   */
+  readonly bootHygiene?: (root: string) => Promise<BootHygiene>;
+  /**
+   * TEST-ONLY config-fold seam (E-5): a test can hold the boot's POST-owner
+   * config-fold window open — the owner record is already acquired when it
+   * runs, so a pause issued meanwhile targets this host. Production is
+   * `resolveInitialConfig`.
+   */
+  readonly readInitialConfig?: (options: HostOptions) => Promise<AgentConfig>;
 };
 
 /** A running host: one idempotent stop and one promise that never rejects. */
@@ -677,10 +711,11 @@ function errorName(err: unknown): string {
  * Signal handling and the keepalive are installed **synchronously**, before the
  * first await, because a SIGINT that arrives while the first home check is in
  * flight must still stop the host that is about to exist. Everything after that
- * runs in the plan's order: the home checks, the config gate (a pure fold with
- * no lock, so a refused start never creates and removes an owner record), the
- * owner, the credential read, then the composition. The owner precedes the
- * credential read and compose so `pause` can target a booting host.
+ * runs in the plan's order: the home checks, the owner record (acquired BEFORE
+ * the potentially long config fold, so a pause issued during boot targets this
+ * host; a config refusal releases the record in the one `finally`), the config
+ * gate, the attach, the fence/storage annotate, the credential read, then the
+ * composition.
  *
  * A stop that arrives before the cell exists is remembered, not lost: after
  * composition the driver is stopped before `run()`, which replays the
@@ -696,10 +731,13 @@ function errorName(err: unknown): string {
  * rejection — outranks a clean run: the host still takes the graceful path, but
  * it exits `1`.
  *
- * `HostConfigError` maps to `2` (a refused configuration), everything else to
- * `1`; `UsageError` is a CLI-only error and never reaches here. The lifetime
- * never calls `process.exit` and never rejects `done`: the caller owns the
- * process exit, and a host that cannot start is a resolved code, not a throw.
+ * A configuration refusal maps to `2` — `HostConfigError`, a live
+ * `HostAlreadyRunningError`, and the world open/trust family
+ * (`WorldNotARepoError`, `UnsafeWorldPathError`) — with its bounded typed
+ * message; everything else maps to `1`. `UsageError` is a CLI-only error and
+ * never reaches here. The lifetime never calls `process.exit` and never rejects
+ * `done`: the caller owns the process exit, and a host that cannot start is a
+ * resolved code, not a throw.
  */
 export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle {
   const { home, uid, command, sandbox, pollMs, log } = options;
@@ -739,13 +777,18 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       await assertHomeOutsideCheckout(home);
       await assertHomePermissions(home);
       await assertCellLayout(home);
-      const config = await resolveInitialConfig(options);
-      const storage = resolveStorage(deps);
-      const storageState = storageFact(storage.policy);
+      // The owner record comes BEFORE the long config fold: a `pause` issued
+      // while the boot is still reading the journal then targets a live host
+      // instead of answering "no host" and letting the start proceed. The
+      // fence/storage facts are annotated after the attach (below), so a boot
+      // that fails in the fold releases the record in the one `finally`.
       owner = await acquireOwner(home, {
         uid, command, ...(deps.now !== undefined ? { now: deps.now } : {}),
         sandbox: sandbox === false ? 'off' : 'landlock',
       });
+      const config = await (deps.readInitialConfig ?? resolveInitialConfig)(options);
+      const storage = resolveStorage(deps);
+      const storageState = storageFact(storage.policy);
       // Read the launch mode before the attach moves this process into svc/.
       const launchMode = detectLaunchMode();
       const cellSandbox = await attachSandbox(home, uid, sandbox, log, deps);
@@ -786,6 +829,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       cell = await (deps.compose ?? composeCell)({
         home, uid, config, credential, providers, sandbox: cellSandbox, log, storage,
         ...(deps.fence !== undefined ? { fence: deps.fence } : {}),
+        ...(deps.doctorRunner !== undefined ? { doctorRunner: deps.doctorRunner } : {}),
         ...(pollMs !== undefined ? { pollMs } : {}),
       });
       log.emit('host/boot', {
@@ -809,10 +853,19 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       if (stopRequested) cell.driver.stop('stop-requested');
       await cell.driver.run();
     } catch (err) {
-      code = err instanceof HostConfigError ? 2 : 1;
+      // A usage/config refusal is exit 2, matching AGENTS: the host's own
+      // configuration classes plus the world open/trust family (a legacy or
+      // tampered world is a configuration refusal, not a runtime failure).
+      // Those typed messages are bounded by the log (200 code points) and carry
+      // the migration recipe's opening or the blocking pid/uid.
+      const configRefusal = err instanceof HostConfigError
+        || err instanceof HostAlreadyRunningError
+        || err instanceof WorldNotARepoError
+        || err instanceof UnsafeWorldPathError;
+      code = configRefusal ? 2 : 1;
       log.emit('host/error', {
         error: errorName(err),
-        ...(err instanceof HostConfigError ? { message: err.message } : {}),
+        ...(configRefusal && err instanceof Error ? { message: err.message } : {}),
       });
     } finally {
       // Both cleanup steps can reject, and neither may replace the code the

@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { BlobStore, JournalWriter } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
 import { useTempHome } from '../../journal/__tests__/helpers.js';
+import { openTestDriver } from '../../node/__tests__/helpers.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../events.js';
 import { createBoundaryGate } from '../../node/gate.js';
 import { ContextFold } from '../fold.js';
@@ -354,7 +355,7 @@ describe('C1.4d T8.10: the local → frontier join', () => {
         adapter: new ProviderAdapter(transport, providerPolicy, journal.gate),
         webTools,
       });
-      driver = await NodeDriver.open(fx.home, 'n1', runtime.handler, fx.world, {
+      driver = await openTestDriver(fx.home, 'n1', runtime.handler, fx.world, {
         knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
       });
       running = driver.run();

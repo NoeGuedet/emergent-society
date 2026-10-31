@@ -7,9 +7,10 @@ import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, vi } from 'vitest';
 import { collectEvents } from '../../journal/__tests__/helpers.js';
 import type { EventEnvelope } from '../../journal/index.js';
-import { openTestFrontier } from '../../frontier/__tests__/helpers.js';
+import { openTestFrontier, TEST_STORAGE } from '../../frontier/__tests__/helpers.js';
 import type { FrontierJournal } from '../../frontier/index.js';
 import type { ProviderPolicy } from '../../provider/adapter.js';
+import { NodeDriver, type NodeDriverOptions, type TurnHandler } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
 import { HeadWatcher } from '../watcher.js';
 import { WorldRepo, gitEnv } from '../world.js';
@@ -112,6 +113,19 @@ export async function gitIn(
   world: WorldRepo, args: readonly string[], env: NodeJS.ProcessEnv = gitEnv(),
 ): Promise<string> {
   return gitRaw(world.path, [...world.gitBaseArgs(), ...args], env);
+}
+
+/**
+ * Opens a driver with the shared HIGH storage seam unless the case injects its
+ * own (the explicit real-probe cases keep `DEFAULT_STORAGE` and their skip
+ * guard). The production default stays the real `statfs` probe; no
+ * non-storage suite may pass or fail on the host's `/tmp` headroom.
+ */
+export function openTestDriver(
+  home: string, uid: string, handler: TurnHandler, world: WorldRepo,
+  opts: NodeDriverOptions = {},
+): Promise<NodeDriver> {
+  return NodeDriver.open(home, uid, handler, world, { storage: TEST_STORAGE, ...opts });
 }
 
 /**

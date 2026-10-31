@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { GitCommandError } from '../errors.js';
 import {
-  MUTATING_GIT_SUBCOMMANDS, isMutatingGit, probeWorldLock, runGit, runGitWithStdin,
+  failureOf, MUTATING_GIT_SUBCOMMANDS, isMutatingGit, probeWorldLock, runGit, runGitWithStdin,
   worldIndexLockPath, worldLockPath, type WorldLockState,
 } from '../world-git.js';
 import { classifyCommitFailure, commitAllRefused } from '../world-commit.js';
@@ -264,6 +264,50 @@ describe('deadlines: the child is killed, its close awaited, the failure typed',
     );
     expect(tree.trim()).toMatch(/^[0-9a-f]{40}$/);
   });
+
+  it('survives an early-exiting git child while 2 MiB of stdin is still buffered', async () => {
+    const f = fixture();
+    // A git child that never drains its stdin and is deadline-killed: the
+    // pending pipe write fails with EPIPE. Without a `child.stdin` error
+    // listener Node 24 turns that into an uncaught stream error that kills the
+    // kernel process; the typed timeout must win and this test must survive.
+    await fakeBins({ git: '#!/bin/sh\nsleep 30\n' });
+    const input = Buffer.alloc(2 * 1024 * 1024, 0x61);
+    await expect(runGitWithStdin(
+      f.world.path, [...baseArgs(f), 'cat-file', '--batch-check'], input, 250,
+    )).rejects.toMatchObject({ kind: 'timeout' });
+  });
+
+  it('pins the output-cap ordering deterministically (code 0, signal null, capped)', () => {
+    // The live cap below always kills a still-writing child, so its outcome is
+    // a signal and the old code-0-first order would pass it too. The actual
+    // edge — a child that exits 0 at the very moment the cap is crossed — is
+    // pinned here with a synthetic outcome, the pure classifier's input.
+    const error = failureOf(['log'], {
+      code: 0, signal: null, stdout: '', stderr: '',
+      outputCapped: true, timedOut: false, spawnError: null,
+    }, false);
+    expect(error).toBeInstanceOf(GitCommandError);
+    expect(error?.outputCapped).toBe(true);
+    expect(classifyCommitFailure(error)).toMatchObject({ reason: 'output-cap' });
+  });
+
+  it('refuses truncated stdout when a child crosses the output cap', async () => {
+    const f = fixture();
+    // Behavioral check only: more than the 64 MiB bound, then the handler kills
+    // the still-writing child and the capped prefix is a refusal, never a
+    // complete fact. The code-0-at-the-cap ordering is pinned above.
+    await fakeBins({ git: '#!/bin/sh\n/usr/bin/head -c 80000000 /dev/zero\n' });
+    let caught: unknown;
+    try {
+      await runGit(f.world.path, [...baseArgs(f), 'log'], undefined, 30_000);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(GitCommandError);
+    expect((caught as GitCommandError).outputCapped).toBe(true);
+    expect(classifyCommitFailure(caught)).toMatchObject({ reason: 'output-cap' });
+  }, 60_000);
 
   it('removes the index.lock its own timed-out child created, under the flock', async () => {
     const f = fixture();

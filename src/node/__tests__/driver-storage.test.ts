@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { NodeDriver } from '../driver.js';
 import { NODE_EVENT_TYPES } from '../events.js';
-import { type StorageConfig, type StorageFree, type StoragePolicy } from '../../storage.js';
+import { type StorageConfig, type StorageFree, type StoragePolicy,
+  StorageError, checkStorage } from '../../storage.js';
+import { DEFAULT_STORAGE } from '../storage-probe.js';
 import { collectEvents } from '../../journal/__tests__/helpers.js';
 import { useWorld } from './helpers.js';
 
@@ -205,8 +207,16 @@ describe('NodeDriver storage home', () => {
     expect(events.map((event) => event.type)).toEqual(['node/boot', 'node/shutdown']);
   }, 20_000);
 
-  it('opens a turn under the default real probe on a test home', async () => {
+  it('opens a turn under the default real probe when the host is above the floors', async ({ skip }) => {
     const { home, world } = fixture();
+    // A legitimate low-space host must skip, not fail: the default real probe is
+    // a production-parity case, not a host-capability requirement.
+    try {
+      await checkStorage(DEFAULT_STORAGE, home);
+    } catch (err) {
+      if (err instanceof StorageError) skip();
+      throw err;
+    }
     let handlerTurn: number | null = null;
     const d = await NodeDriver.open(home, 'n1', (ctx) => {
       handlerTurn = ctx.turn;

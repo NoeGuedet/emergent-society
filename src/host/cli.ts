@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import { KernelError } from '../errors.js';
+import { WorldNotARepoError, UnsafeWorldPathError } from '../node/errors.js';
 import { HostConfigError, UsageError } from './errors.js';
 import { startHost, type HostHandle, type HostOptions } from './host.js';
 import { initHome } from './layout.js';
@@ -28,9 +29,10 @@ import { formatStatus, readStatus, type StatusReport } from './status.js';
  *
  * A refused `start`/`resume` is not caught here: `startHost` never rejects
  * `done`, it resolves the code the host already journaled, so the lifetime's
- * own mapping (`HostConfigError` → 2, everything else → 1) is the one the
- * shell sees. `init`, `pause` and `status` are one-shot calls with no
- * lifetime, so their failures are mapped here.
+ * own mapping (`HostConfigError`, `HostAlreadyRunningError`,
+ * `WorldNotARepoError`, `UnsafeWorldPathError` → 2, everything else → 1) is
+ * the one the shell sees. `init`, `pause` and `status` are one-shot calls with
+ * no lifetime, so their failures are mapped here.
  */
 
 /** The two operator sinks; production defaults write to `process`. */
@@ -64,8 +66,10 @@ function failureOf(error: unknown): string {
  * The providers path is printed rather than created — the key is written by the
  * operator, so no secret is ever generated onto a terminal or into a journal —
  * and the hint names the real path, not a `<home>` placeholder, so it can be
- * pasted as-is. A `HostConfigError` (a permissive home, a partial layout) is a
- * configuration refusal (`2`); anything else is a runtime failure (`1`).
+ * pasted as-is. A `HostConfigError` (a permissive home, a partial layout) and
+ * the world open/trust family (`WorldNotARepoError`, `UnsafeWorldPathError`)
+ * are configuration refusals (`2`), exactly the family start/resume maps to
+ * `2`; anything else is a runtime failure (`1`).
  */
 async function runInit(home: string, out: Sink, err: Sink): Promise<number> {
   try {
@@ -78,7 +82,13 @@ async function runInit(home: string, out: Sink, err: Sink): Promise<number> {
     return 0;
   } catch (error) {
     err(`error: ${failureOf(error)}\n`);
-    return error instanceof HostConfigError ? 2 : 1;
+    // A world open/trust refusal is a configuration refusal here too: the world
+    // pair is the same operator input as a permissive home, and `init` is the
+    // command that repairs one.
+    return error instanceof HostConfigError
+      || error instanceof WorldNotARepoError
+      || error instanceof UnsafeWorldPathError
+      ? 2 : 1;
   }
 }
 
@@ -177,9 +187,18 @@ async function runStatus(
     const report = await (deps.readStatus ?? readStatus)(command.home);
     out(command.json ? `${JSON.stringify(report)}\n` : `${formatStatus(report)}\n`);
     // The documented rule: a produced but degraded report exits 1. A refused
-    // world commit is a third degradation source beside the two folded errors.
+    // world commit is a third degradation source beside the two folded errors;
+    // the one host-level degradation is a running host that requested
+    // confinement but carries `fence=unavailable` (a failed attach, no cgroup
+    // v2). An explicit `--no-sandbox` opt-out (`sandbox=off`) is not a
+    // degradation: the operator chose it, and the report still prints both
+    // facts. `storage=unquoted` is the normal production fact (no quota is
+    // detected), not a detected degradation, so it never moves the exit code.
+    const degradedHost = report.host.state === 'running'
+      && report.host.fence === 'unavailable'
+      && report.host.sandbox !== 'off';
     return report.frontier.error !== null || report.world.error !== null
-      || report.world.state === 'degraded' ? 1 : 0;
+      || report.world.state === 'degraded' || degradedHost ? 1 : 0;
   } catch (error) {
     err(`error: ${failureOf(error)}\n`);
     return error instanceof HostConfigError ? 2 : 1;

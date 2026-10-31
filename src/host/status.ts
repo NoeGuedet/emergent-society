@@ -58,7 +58,8 @@ export type StatusReport = {
     /**
      * The host-lifetime storage fact from the owner record: `quoted` only when
      * a quota record was injected, `unquoted` for every production cell. The
-     * human line prints `storage=unquoted` only (the degraded fact). Unlike the
+     * human line prints `storage=unquoted` only; it is the normal production
+     * state, not a degradation (only the fence moves the exit code). Unlike the
      * fence (surfaced only while a host holds the record), the storage fact
      * survives the host: a stale record still carries it.
      */
@@ -395,7 +396,9 @@ function bounded(text: string, limit = 120): string {
  * The host line, one shape per owner state; `stale` carries no pid. The fence
  * field appears only for `unavailable`, and the storage field only for
  * `unquoted`: a fenced/quoted host's line stays byte-identical to the report
- * before the fact existed, and those are the degradations an operator must see.
+ * before the fact existed. The fence is the degradation the exit code follows;
+ * `storage=unquoted` is the normal production state, printed for the operator
+ * but never a degradation.
  */
 function hostLine(host: StatusReport['host']): string {
   const storage = host.storage === 'unquoted' ? ' storage=unquoted' : '';

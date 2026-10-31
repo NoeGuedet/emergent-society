@@ -5,8 +5,9 @@
 // imports the compiled host from dist). It is manual and never runs in a gate;
 // no npm script is added for it.
 //
-// Skips (exit 0, prints "skipped") when cgroup v2 or freeze/kill is unavailable
-// — a skip is never reported as a pass.
+// Skips (exit 0, prints "skipped") when cgroup v2 with a writable freeze leaf
+// (`cgroup.freeze` write, `cgroup.kill` present, `cgroup.events` read) is
+// unavailable — a skip is never reported as a pass.
 //
 // Scenarios:
 //  1. TURNS: a real host, a real cell tree, and a writer injected into the
@@ -35,7 +36,7 @@ import { once } from 'node:events';
 import {
   chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -240,6 +241,10 @@ async function freezeAvailable() {
   try {
     await mkdir(probe);
     await writeFile(join(probe, 'cgroup.freeze'), '0');
+    // Presence only, not a write: cgroup.kill accepts only `1`, so writing `0`
+    // would EINVAL. The release path calls killLeaves; a host without the file
+    // must skip, not fail inside the reap.
+    await lstat(join(probe, 'cgroup.kill'));
     await readFile(join(probe, 'cgroup.events'), 'utf8');
     return true;
   } catch {
@@ -308,6 +313,19 @@ async function scenarioTurns(shimDir) {
       'every fence froze at least the node leaf');
     assert.equal((await readWorldState(home)).degraded, false, 'the world stayed healthy');
     assert.ok(headHas(home, 'ticks.txt'), 'the shell turns committed their world files');
+    // A fenced healthy running host is NOT degraded: status exits 0 even with
+    // the normal storage=unquoted fact. The scenario-4 control is an explicit
+    // `--no-sandbox` opt-out, so it also asserts 0 (fence=unavailable and
+    // sandbox=off are in the report, not a degradation); the pair distinguishes
+    // the facts, not the exit. The exit-code discrimination for an UNINTENDED
+    // fence degradation (a running host that requested confinement but carries
+    // fence=unavailable -> 1) is pinned in src/host/__tests__/cli.test.ts.
+    const fencedStatus = spawnSync(process.execPath, [MAIN, 'status', '--home', home, '--json'], {
+      encoding: 'utf8',
+    });
+    assert.equal(fencedStatus.status, 0, `fenced status exited ${fencedStatus.status}`);
+    assert.equal(JSON.parse(fencedStatus.stdout).host.fence, 'available',
+      'the fenced status carries host.fence=available');
     host.stop();
     assert.equal(await host.exited, 0, 'the host stops cleanly');
   } finally {
@@ -483,6 +501,10 @@ async function scenarioUnfenced() {
     const statusJson = spawnSync(process.execPath, [MAIN, 'status', '--home', home, '--json'], {
       encoding: 'utf8',
     });
+    // An explicit `--no-sandbox` opt-out is not a degradation: the report still
+    // carries fence=unavailable (and sandbox=off), but the operator chose it,
+    // so the exit is 0. A host that requested confinement and failed the
+    // attach is the degradation (pinned in cli.test).
     assert.equal(statusJson.status, 0, `status --json exited ${statusJson.status}`);
     const report = JSON.parse(statusJson.stdout);
     assert.equal(report.host.state, 'running');
@@ -493,6 +515,8 @@ async function scenarioUnfenced() {
     assert.equal(statusHuman.status, 0);
     assert.ok(statusHuman.stdout.includes('fence=unavailable'),
       'the human host line carries fence=unavailable');
+    assert.ok(statusHuman.stdout.includes('sandbox=off'),
+      'the human host line names the explicit opt-out');
     host.stop();
     assert.equal(await host.exited, 0, 'the unfenced host stops cleanly');
   } finally {

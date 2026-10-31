@@ -176,7 +176,9 @@ it('formats the exact lines and omits null last records', () => {
   expect(formatStatus({ ...base, host: { state: 'stale' as const, storage: 'unquoted' } }))
     .toContain('host: stale storage=unquoted');
   expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9 } })).toContain('unverified pid=9');
-  // The degraded storage fact is printed on every host line that has a pid.
+  // The normal production storage=unquoted fact (not a degradation: no quota
+  // is ever detected) is printed on every host line that carries it; a quoted
+  // fact changes no byte.
   expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9, storage: 'unquoted' } }))
     .toContain('unverified pid=9 storage=unquoted');
   expect(formatStatus({ ...base, host: { state: 'unverified' as const, pid: 9, storage: 'quoted' } }))

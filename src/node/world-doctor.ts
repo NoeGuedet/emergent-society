@@ -128,9 +128,34 @@ export function quarantineDir(home: string): string {
   return join(home, '.es', 'quarantine');
 }
 
-/** One bounded, single-line relative path: never a payload, never an absolute path. */
-function reportPath(rel: string): string {
-  return singleLine(rel, MAX_DOCTOR_PATH_CHARS);
+/**
+ * The validator's one path rule, shared by the writer (`reportPath`) and the
+ * replay validator (`boundedPath`) so a label the writer emits can never be
+ * rejected by the fold. `value` is already the single-line label: non-empty,
+ * at most `MAX_DOCTOR_PATH_CHARS` UTF-16 units (the validator's unit — the
+ * `singleLine` cap counts code points, so a 101-emoji label is 202 units and
+ * is not representable), no leading `/`, no `..` segment.
+ */
+function representableReportPath(value: string): boolean {
+  if (value === '' || value.length > MAX_DOCTOR_PATH_CHARS) return false;
+  if (singleLine(value, MAX_DOCTOR_PATH_CHARS) !== value) return false;
+  if (value.startsWith('/') || value.split('/').some((part) => part === '..')) return false;
+  return true;
+}
+
+/**
+ * One bounded, single-line relative path: never a payload, never an absolute
+ * path. `null` means the name has no form the reporter can carry — a
+ * whitespace- or control-only name collapses to `''`, a collapsed name can
+ * start with `/` (a raw `' /x'` trims to it) or become `..`, and a
+ * 101-emoji name is 202 UTF-16 units although only 101 code points — so the
+ * caller OMITS the entry. Writing a label the report's own validator rejects
+ * would poison the fold and every later boot, so `reportPath` applies exactly
+ * the validator's rule above.
+ */
+function reportPath(rel: string): string | null {
+  const label = singleLine(rel, MAX_DOCTOR_PATH_CHARS);
+  return representableReportPath(label) ? label : null;
 }
 
 /** A git path is safe to address under the world root when it has no traversal. */
@@ -197,11 +222,19 @@ function unstageable(entry: Stats, uid: number | undefined): boolean {
   return true;
 }
 
+/** A statfs product clamped to a safe integer, exactly as `statfsProbe` does. */
+function clampSafe(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(Math.trunc(value), Number.MAX_SAFE_INTEGER);
+}
+
 /** Reads free bytes/inodes for the quarantine gate; null is unverifiable. */
 async function defaultFreeSpace(home: string): Promise<{ bytes: number; inodes: number } | null> {
   try {
     const fs = await statfs(home);
-    return { bytes: fs.bavail * fs.bsize, inodes: fs.ffree };
+    // The report validator requires safe integers; `bavail * bsize` is not
+    // guaranteed to be one, so the reader clamps exactly like the real probe.
+    return { bytes: clampSafe(fs.bavail * fs.bsize), inodes: clampSafe(fs.ffree) };
   } catch {
     return null;
   }
@@ -347,14 +380,16 @@ export async function runWorldDoctor(
     }
     scanned += 1;
     if (!safeRelative(rel)) continue;
+    const label = reportPath(rel);
+    if (label === null) continue;
     try {
       const entry = await lstat(join(world.path, rel));
       if (!entry.isFile() && !entry.isDirectory()) continue;
-      if (unstageable(entry, uid)) unreadable.push(reportPath(rel));
+      if (unstageable(entry, uid)) unreadable.push(label);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       // A deleted tracked path is not unreadable; any other errno is.
-      if (code !== 'ENOENT' && code !== 'ENOTDIR') unreadable.push(reportPath(rel));
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') unreadable.push(label);
     }
   }
   if (scanTruncated) dirty = { ...dirty, truncated: true };
@@ -391,6 +426,12 @@ export async function runWorldDoctor(
         break;
       }
       if (!safeRelative(rel)) continue;
+      // A name with no representable single-line label is left in place: the
+      // report must stay valid (a moved file absent from `paths` would break
+      // `files === paths.length`), and a diagnostic omission never justifies a
+      // mutation we cannot describe.
+      const label = reportPath(rel);
+      if (label === null) continue;
       const abs = join(world.path, rel);
       let entry;
       try {
@@ -419,7 +460,7 @@ export async function runWorldDoctor(
         // leaves the entry where it is; the commit will refuse typed.
         continue;
       }
-      moved.push(reportPath(rel));
+      moved.push(label);
       bytes += size;
     }
     quarantine = { files: moved.length, bytes, paths: moved, truncated };
@@ -428,7 +469,7 @@ export async function runWorldDoctor(
     quarantine = { files: 0, bytes: 0, paths: [], truncated: true };
   }
 
-  return {
+  const report: DoctorReport = {
     lock,
     indexLock,
     index: { readable, unmerged, missingBlobs, blobsChecked },
@@ -437,6 +478,13 @@ export async function runWorldDoctor(
     quarantine,
     freeSpace,
   };
+  // The writer and the replay validator must agree: a report the fold would
+  // reject is a programming error here (the host reports `world/doctor-failed`
+  // and boots on), never a durable event that poisons every later boot.
+  if (parseDoctorReport(report) === null) {
+    throw new Error('the world doctor produced a report its own validator rejects');
+  }
+  return report;
 }
 
 // --- the report's replay validator ------------------------------------------
@@ -464,14 +512,12 @@ function enumOf<T extends string>(value: unknown, allowed: readonly T[]): T | nu
 }
 
 function boundedPath(value: unknown): string | null {
-  if (typeof value !== 'string' || value === '') return null;
-  if (value.length > MAX_DOCTOR_PATH_CHARS) return null;
-  if (singleLine(value, MAX_DOCTOR_PATH_CHARS) !== value) return null;
+  if (typeof value !== 'string') return null;
   // The writer emits world-relative names; the validator enforces the same
-  // shape so a forged event cannot smuggle an absolute or traversing path into
-  // the replay report.
-  if (value.startsWith('/') || value.split('/').some((part) => part === '..')) return null;
-  return value;
+  // shape (one shared rule) so a forged event cannot smuggle an absolute or
+  // traversing path into the replay report, and the writer cannot emit a label
+  // this validator would reject.
+  return representableReportPath(value) ? value : null;
 }
 
 function boundedPaths(value: unknown, max: number): string[] | null {

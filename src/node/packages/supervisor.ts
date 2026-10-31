@@ -109,6 +109,13 @@ export type RunSupervisorDeps = {
    * supervisor only joins it via the launcher's `--cgroup`.
    */
   readonly prepareCgroupLeaf?: (runId: string) => Promise<string>;
+  /**
+   * Reaps a Run's cgroup leaf at teardown: the host layer kills every task in
+   * the leaf (guest descendants included) and removes it. Best-effort by
+   * contract; boot hygiene is the backstop, and an absent port means the cell
+   * has no cgroup tree.
+   */
+  readonly reapCgroupLeaf?: (leaf: string) => Promise<unknown>;
 };
 
 /** The compiled bootstrap beside this module; tests inject the .ts source. */
@@ -155,6 +162,8 @@ interface LiveRun {
   readonly runId: string;
   readonly packageId: string;
   readonly leaf: string;
+  /** The cgroup leaf the launcher joined, when the cell has a tree. */
+  readonly cgroupLeaf: string | null;
   readonly child: ChildProcessWithoutNullStreams;
   readonly decoder: FrameDecoder;
   readonly invokeGuard: Guard;
@@ -279,6 +288,19 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
     await syncPath(dirname(leaf)).catch(() => {});
   }
 
+  /** Best-effort Run leaf reap, including the cgroup leaf when one was joined. */
+  async function reapCgroup(leaf: string | null): Promise<void> {
+    const reap = deps.reapCgroupLeaf;
+    if (leaf === null || reap === undefined) return;
+    await reap(leaf).catch(() => {});
+  }
+
+  /** The home leaf and (when present) the cgroup leaf: teardown is complete. */
+  async function reapRun(run: LiveRun): Promise<void> {
+    await reapLeaf(run.leaf);
+    await reapCgroup(run.cgroupLeaf);
+  }
+
   /** Frees the slot if this run still owns it. */
   function releaseSlot(run: LiveRun): void {
     if (live === run) live = null;
@@ -310,7 +332,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
       } else {
         startResolve({ ok: false, code: 'crashed', detail: boundDetail(stderr) });
       }
-      void reapLeaf(run.leaf);
+      void reapRun(run);
       releaseSlot(run);
       return;
     }
@@ -332,7 +354,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
       });
     }
     invoke?.settle({ status: 'crashed' });
-    void reapLeaf(run.leaf);
+    void reapRun(run);
     releaseSlot(run);
   }
 
@@ -352,6 +374,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
       try {
         const runId = randomBytes(16).toString('hex');
         const leaf = join(runsDir, runId);
+        let cgroupLeaf: string | null = null;
         const bootstrapBytes = await readFileOrNull(bootstrapSource);
         if (bootstrapBytes === null) {
           return {
@@ -381,6 +404,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
             // cell has a tree; the launcher joins it before restricting.
             const cgroupPath = deps.prepareCgroupLeaf !== undefined
               ? await deps.prepareCgroupLeaf(runId) : undefined;
+            cgroupLeaf = cgroupPath ?? null;
             const spec = await buildRunSandboxSpec({
               home: deps.home, uid: deps.uid, runLeaf: leaf, interpreterPath: interpreter,
               ...(deps.launcherPath !== undefined ? { launcherPath: deps.launcherPath } : {}),
@@ -397,6 +421,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
           }
         } catch (err) {
           await reapLeaf(leaf);
+          await reapCgroup(cgroupLeaf);
           const detail = err instanceof SandboxUnavailableError
             ? err.message
             : err instanceof Error ? err.message : String(err);
@@ -413,7 +438,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
         }) as ChildProcessWithoutNullStreams;
 
         const run: LiveRun = {
-          runId, packageId, leaf, child,
+          runId, packageId, leaf, cgroupLeaf, child,
           decoder: new FrameDecoder(),
           invokeGuard: makeGuard(), svcGuard: makeGuard(),
           startedAt: deps.now(),
@@ -458,7 +483,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
           });
           run.invoke?.settle({ status: 'crashed' });
           run.invoke = null;
-          void reapLeaf(run.leaf);
+          void reapRun(run);
           releaseSlot(run);
         });
         child.on('exit', (code) => {
@@ -479,7 +504,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
             detail: 'the child sent no run/ready within the ready deadline',
           });
           resolve?.({ ok: false, code: 'timeout' });
-          void reapLeaf(run.leaf);
+          void reapRun(run);
         });
 
         return new Promise<StartRunVerdict>((resolve) => {
@@ -572,7 +597,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
         run.kernelStopped = true;
         try { run.child.kill('SIGKILL'); } catch { /* already dead */ }
       }
-      await reapLeaf(run.leaf);
+      await reapRun(run);
     },
   };
 
@@ -604,7 +629,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
       });
       run.invoke?.settle({ status: 'crashed' });
       run.invoke = null;
-      void reapLeaf(run.leaf);
+      void reapRun(run);
       return;
     }
     const frame = outcome.frame;
@@ -628,7 +653,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
         } else {
           resolve?.({ ok: false, code: 'busy' });
         }
-        void reapLeaf(run.leaf);
+        void reapRun(run);
         return;
       }
       case 'tool/result': {
@@ -642,7 +667,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
               detail: `tool/result without its invoke: ${frame.callId}`,
             });
           }
-          void reapLeaf(run.leaf);
+          void reapRun(run);
           return;
         }
         invoke.settle(frame.ok
@@ -667,7 +692,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
         }
         run.invoke?.settle({ status: 'crashed' });
         run.invoke = null;
-        void reapLeaf(run.leaf);
+        void reapRun(run);
         return;
       }
     }
@@ -687,7 +712,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
         id: run.packageId, runId: run.runId, code: 'protocol',
         detail: `service request before an accepted registration: ${frame.callId}`,
       });
-      void reapLeaf(run.leaf);
+      void reapRun(run);
       return;
     }
     if (!run.svcGuard.begin(frame.callId)) {
@@ -697,7 +722,7 @@ export function createRunSupervisor(deps: RunSupervisorDeps): {
         id: run.packageId, runId: run.runId, code: 'protocol',
         detail: `overlapping service request: ${frame.callId}`,
       });
-      void reapLeaf(run.leaf);
+      void reapRun(run);
       return;
     }
     const service = frame.type === 'svc/execute' ? 'execute' as const

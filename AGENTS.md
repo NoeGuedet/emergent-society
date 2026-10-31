@@ -23,7 +23,10 @@ machine default shell may be older, always select 24 via nvm first.
 - `pause --home <abs-dir>` — deliver a stop to the host owning the home; no `--uid` (one host
   owns a home).
 - `status --home <abs-dir> [--json]` — read-only report; a produced but degraded report
-  exits `1`.
+  exits `1` (a folded frontier/world error, the degraded-world sidecar, or a running host
+  that requested confinement but carries `fence=unavailable`). An explicit `--no-sandbox`
+  opt-out (`sandbox=off`) and the normal production fact `storage=unquoted` (no quota is
+  detected) do not degrade the exit.
 - `help` — `--help`, `-h`, or empty argv; prints usage, exit `0`.
 
 Parsing is strict (no positionals, no unknown flags; relative `--home` and bad `--uid` are
@@ -89,6 +92,29 @@ is still stopping.
 6. `npm run test:first-light-packages`
 
 No push until every gate passes; there is no CI to catch a failure later.
+
+### Manual survival-core acceptance (per wave; not an npm script)
+
+After the gates, `npm run build` leaves `dist/`, and these three compiled smokes are the
+real-system acceptance for the refusal, fence and delegated-reap mechanisms:
+
+1. `node scripts/w0-refusal-smoke.mjs` — C1: a refusal carrier and a surviving run.
+2. `node scripts/w0-fence-smoke.mjs` — C2: the commit fence against a real cgroup tree.
+3. `node scripts/w0-reap-smoke.mjs` — W0-a2: the delegated launch reaps the cell cgroup,
+   and a pause through the wrapper stops the host.
+
+Prerequisites and skip semantics: the refusal smoke runs every host with `--no-sandbox`
+(no cgroup tree, no systemd) and needs node, git and util-linux `flock` (the journal
+sidecar); it has no skip path — a missing `flock` is a failure, and it exits `0`/`1` only.
+The fence smoke skips (exit 0, prints "skipped") when Linux cgroup v2 with an unprivileged
+writable freeze leaf (`cgroup.freeze` write, `cgroup.kill` present, `cgroup.events` read)
+is unavailable; the reap smoke skips likewise when cgroup v2, `systemd-run`, or a reachable
+systemd `--user` manager is unavailable. util-linux `flock` is a
+declared prerequisite of all three, and a skip is never a pass. They are invoked by path;
+there is deliberately no npm script. Known environment sensitivity: the reap smoke's unit
+Main process may exit 2 while the unit is still settling; the smoke itself then reports
+exit 1. Retry it once and report the observed result rather than treating the first exit as
+a kernel failure.
 
 ## What does NOT exist (do not assume it does)
 

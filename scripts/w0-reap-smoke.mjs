@@ -2,8 +2,9 @@
 // W0-a2 acceptance: the delegated launch reaps its whole cell cgroup when the
 // kernel dies, and `pause` stops the host through the same shape.
 //
-// Skips (exit 0, prints "skipped") when the user manager / systemd-run is
-// unavailable or cgroup v2 is absent — a skip is never reported as a pass.
+// Skips (exit 0, prints "skipped") when cgroup v2 is absent, `systemd-run` is
+// missing, or the systemd `--user` manager does not answer — a skip is never
+// reported as a pass.
 //
 // Flow: temp home -> loopback fake provider -> launch via start-service.mjs ->
 // wait for host/parked -> inject a setsid'd sleeper into the cell cgroup ->
@@ -20,6 +21,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveAnchor } from '../dist/host/cgroups.js';
+import { C13_EVENT_TYPES } from '../dist/context/events.js';
+import { loadVerifiedEvents } from '../dist/context/loader.js';
 
 const MAIN = fileURLToPath(new URL('../dist/host/main.js', import.meta.url));
 const REPO = fileURLToPath(new URL('..', import.meta.url));
@@ -31,13 +34,29 @@ let currentUnit = '';
 
 const sleep = (ms) => new Promise((done) => { setTimeout(done, ms); });
 
+/**
+ * The systemd `--user` manager answers, not merely that the binary exists:
+ * `systemd-run --version` reads the executable and contacts nothing, so it
+ * cannot tell a host with the binary and no user manager (where the smoke must
+ * skip, not fail) from a usable one. `show-environment` is a manager round trip
+ * with no unit or property semantics.
+ */
+function userManagerAvailable() {
+  try {
+    execFileSync('systemctl', ['--user', 'show-environment'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function available() {
   try {
     execFileSync('systemd-run', ['--version'], { stdio: 'ignore' });
   } catch {
     return false;
   }
-  return resolveAnchor() !== null;
+  return userManagerAvailable() && resolveAnchor() !== null;
 }
 
 async function waitForValue(probe, deadlineMs, label) {
@@ -88,7 +107,7 @@ async function procsIn(cgroupPath) {
 
 async function main() {
   if (!available()) {
-    console.log('w0 reap smoke: skipped (no systemd user manager)');
+    console.log('w0 reap smoke: skipped (cgroup v2, systemd-run or the systemd --user manager unavailable)');
     return;
   }
   const home = mkdtempSync(join(tmpdir(), 'es-w0-reap-'));
@@ -160,6 +179,20 @@ async function main() {
       }
     }, 15_000, 'cell controllers enabled');
 
+    // Wait until the first host's configuration is durably journaled (the ready
+    // phase precedes the boot turn): the second launch is then deterministically
+    // a `resume` (a SIGKILL during the ready phase would leave the home in
+    // either state). The wrapper's stderr does not carry the kernel's lines —
+    // systemd keeps them in the user journal — so read the local log.
+    await waitFor(async () => {
+      try {
+        const events = await loadVerifiedEvents(home, 'node-0', C13_EVENT_TYPES);
+        return events.some((event) => event.type === 'system/message');
+      } catch {
+        return false;
+      }
+    }, 20_000, 'first host configuration journaled');
+
     // A setsid'd sleeper joins a fresh node leaf — the class that outlived the
     // kernel in the incident. Node's detached option calls setsid on the child
     // itself, so the recorded pid IS the sleeper (an inner `setsid` would fork).
@@ -203,10 +236,12 @@ async function main() {
     }, REAP_DEADLINE_MS, 'unit stopping');
     await launchExit;
 
-    // Pause proof: a second boot, then the operator verb stops it.
+    // Pause proof: a second boot, then the operator verb stops it. The first
+    // run journaled the cell's configuration, so the second launch is `resume`
+    // (a `start` is refused by the config gate by design).
     const second = spawn(
       process.execPath,
-      [WRAPPER, 'start', '--home', home, '--model', 'w0-reap-probe', '--heading', 'Reap smoke 2.'],
+      [WRAPPER, 'resume', '--home', home],
       { stdio: ['ignore', 'pipe', 'pipe'] },
     );
     secondRef.value = second;
@@ -238,9 +273,14 @@ async function main() {
     console.log(`w0 reap smoke: ok (reaped in ${reapedInMs} ms; pause exit ${pause.status})`);
     void stderr;
   } finally {
-    // Never leave a live transient service, wrapper or sleeper behind.
+    // Never leave a live transient service, wrapper or sleeper behind. The
+    // wrapper creates BOTH the unit and its implicit `--slice=<unit>` slice:
+    // stopping only the service leaves the slice active forever, so the slice
+    // is stopped and reset-failed as well.
     spawnSync('systemctl', ['--user', 'stop', unit], { stdio: 'ignore' });
     spawnSync('systemctl', ['--user', 'reset-failed', unit], { stdio: 'ignore' });
+    spawnSync('systemctl', ['--user', 'stop', `${unit}.slice`], { stdio: 'ignore' });
+    spawnSync('systemctl', ['--user', 'reset-failed', `${unit}.slice`], { stdio: 'ignore' });
     for (const child of [launchRef.value, secondRef.value, sleeperRef.value]) {
       if (child !== null && child !== undefined && child.exitCode === null) {
         try { child.kill('SIGKILL'); } catch { /* already gone */ }
@@ -248,6 +288,27 @@ async function main() {
     }
     await new Promise((done) => server.close(done));
     rmSync(home, { recursive: true, force: true });
+  }
+  // The cleanup contract is a fact, not a hope: no unit or slice of this run
+  // (named by the home hash) may survive the smoke. A short poll absorbs the
+  // user manager's asynchronous unloading.
+  await waitFor(() => {
+    const left = esUnits().filter((name) => name.includes(hash));
+    return left.length === 0;
+  }, REAP_DEADLINE_MS, 'no es-* leftover unit or slice');
+}
+
+/** The user manager's loaded es-* unit/slice names (never a path). */
+function esUnits() {
+  try {
+    return execFileSync('systemctl', [
+      '--user', 'list-units', 'es-*', '--all', '--no-legend', '--plain',
+    ], { encoding: 'utf8' })
+      .split('\n')
+      .map((line) => line.trim().split(/\s+/u)[0] ?? '')
+      .filter((name) => name !== '');
+  } catch {
+    return [];
   }
 }
 

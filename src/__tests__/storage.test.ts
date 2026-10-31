@@ -150,13 +150,21 @@ describe('the statfs probe', () => {
     await expect(statfsProbe(join(home, 'nope'))).resolves.toBeNull();
   });
 
-  it('passes the real enforcement floors on this host (D8: 7.3 GiB / 854k inodes)', async () => {
-    const reading = await statfsProbe(home);
-    expect(reading).not.toBeNull();
-    expect(() => assertStorage(DEFAULT_STORAGE_POLICY, reading!)).not.toThrow();
-    // The composed default carries the real probe and the production policy.
+  it('passes the real enforcement floors on this host when the host is above them', async ({ skip }) => {
+    // The composed default carries the real probe and the production policy —
+    // a fact independent of this host's free space.
     expect(DEFAULT_STORAGE.policy).toBe(DEFAULT_STORAGE_POLICY);
     expect(DEFAULT_STORAGE.probe).toBe(statfsProbe);
+    const reading = await statfsProbe(home);
+    expect(reading).not.toBeNull();
+    const bytesFloor = STORAGE_MIN_FREE_BYTES + KERNEL_RESERVE_BYTES;
+    const inodesFloor = STORAGE_MIN_FREE_INODES + KERNEL_RESERVE_INODES;
+    if (reading!.bytes < bytesFloor || reading!.inodes < inodesFloor) {
+      // A legitimate low-space/low-inode host must not fail the suite: the
+      // production floors are the invariant, this host's reading is not.
+      skip();
+    }
+    expect(() => assertStorage(DEFAULT_STORAGE_POLICY, reading!)).not.toThrow();
   });
 });
 

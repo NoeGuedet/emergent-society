@@ -395,7 +395,7 @@ export function classifyGitFailure(err: unknown): GitFailure {
 }
 
 /** One bounded child outcome: the raw process facts, never a decision. */
-type CommandOutcome = {
+export type CommandOutcome = {
   readonly code: number | null;
   readonly signal: NodeJS.Signals | null;
   readonly stdout: string;
@@ -517,6 +517,15 @@ function runCommand(
     });
     child.on('error', (err) => { spawnError = err; });
     child.on('close', (code, signal) => settle(code, signal));
+    // A child that exits or is deadline-killed before draining a large stdin
+    // makes the pending pipe write fail with EPIPE. Without a listener Node
+    // raises an uncaught 'error' on the stream and kills the kernel process;
+    // the outcome is still the close's to classify (typically the typed
+    // `timeout`), so the stream error is recorded and ignored.
+    child.stdin.on('error', () => {
+      // EPIPE after an early exit or a deadline kill: the close classifies the
+      // outcome, and an unhandled stream 'error' would kill the kernel process.
+    });
     child.stdin.end(opts.stdin);
   });
 }
@@ -529,8 +538,12 @@ function runCommand(
  * retried rather than reported as a git policy failure. flock's own startup
  * exits (64 usage, 66 no input, 69 unavailable — the wrapped command could not
  * execute) are the spawn class, exactly as a missing git binary is.
+ *
+ * Exported so the output-cap ordering is pinned deterministically: a synthetic
+ * `{code: 0, signal: null, outputCapped: true}` cannot be produced reliably
+ * through a live child (the cap kills the writer before it can exit 0).
  */
-function failureOf(
+export function failureOf(
   args: readonly string[], outcome: CommandOutcome, flockWrapped: boolean,
 ): GitCommandError | null {
   if (outcome.spawnError !== null) {
@@ -538,12 +551,16 @@ function failureOf(
       args, null, String(outcome.spawnError), classifyGitFailure(outcome.spawnError),
     );
   }
-  if (outcome.code === 0 && outcome.signal === null) return null;
   if (outcome.outputCapped) {
+    // The bound is checked BEFORE the success return: a child that exits 0 at
+    // the very moment the cap is crossed must still be a refusal, never a
+    // truncated-but-successful shorter fact (the group kill is a no-op once it
+    // has exited, so the close cannot be relied on to carry a signal).
     return new GitCommandError(
       args, outcome.code, outcome.stderr, { kind: 'exit', outputCapped: true },
     );
   }
+  if (outcome.code === 0 && outcome.signal === null) return null;
   if (outcome.timedOut || outcome.signal !== null) {
     // The one process-layer classification: a kill is a `timeout` there too,
     // so a direct kill and Node's own timeout cannot drift apart.
@@ -730,9 +747,12 @@ export async function probeWorldLock(
  * writer. A held lock means a live writer, so the file is left. Human git does
  * not take this flock — the declared residual — so the mtime proof is what
  * keeps a human's live lock; a fresh lock is never removed. Ref locks
- * (`refs/heads/<branch>.lock`, `packed-refs.lock`) are not removed in C3: an
- * `update-ref` timeout leaves them, they are retried as contention and finally
- * refused typed, and an operator or the agent repairs them (documented).
+ * (`refs/heads/<branch>.lock`, `packed-refs.lock`) are NOT this function's
+ * case: the commit path's `maybeRemoveAttemptLocks` removes a ref lock its own
+ * timed-out `update-ref` created (compared by inode against the pre-spawn
+ * snapshot, under the same flock), and an `update-ref` timeout is then retried
+ * as contention and finally refused typed; a ref lock that predates the
+ * attempt is left, like the index lock here.
  *
  * `opts.flock` is the test seam for an absent binary; production resolves the
  * declared prerequisite from PATH.

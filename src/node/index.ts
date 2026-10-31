@@ -27,8 +27,8 @@ export {
   type WorldRange,
 } from './world.js';
 export {
-  GitCommandError, NodeError, NodeStateError, UnsafeWorldPathError, WorldHeadError,
-  WorldNotARepoError, WorldReconciliationError,
+  GitCommandError, InvalidDoctorReportError, NodeError, NodeStateError, UnsafeWorldPathError,
+  WorldHeadError, WorldNotARepoError, WorldReconciliationError,
 } from './errors.js';
 export {
   NODE_EVENT_TYPES, type ShutdownReason, type TurnEndOutcome, type TurnTrigger,

@@ -24,6 +24,17 @@ export const GIT_READ_TIMEOUT_MS = 10_000;
 /** Entries the nested-repository walk may see before it refuses (measured 130 MB RSS at 300k). */
 export const MAX_WALK_ENTRIES = 100_000;
 
+/**
+ * The nested-repository walk's wall-clock budget. It runs inside the commit
+ * fence, so it bounds the walk's computation between completed filesystem
+ * calls: 30 s covers the measured incident sizes with headroom and, together
+ * with the git deadlines, bounds a slow-but-progressing walk. It does not bound
+ * a single stalled `readdir`/`lstat`: the deadline is checked only when the
+ * previous call returns, so a hung syscall is the infrastructure residual that
+ * can still hold the fence until it completes.
+ */
+export const MAX_WALK_MS = 30_000;
+
 /** The apparent-size cap for one regular file in the walk (sparse files count apparent bytes). */
 export const MAX_FILE_APPARENT_BYTES = 64 * 1024 * 1024;
 
@@ -41,10 +52,17 @@ export const QUARANTINE_MAX_BYTES = 256 * 1024 * 1024;
 
 /**
  * How old an `index.lock` must be before the doctor may remove it. It sits
- * above the whole commit worst case (~75 s: a 2 s freeze attempt per commit
- * retry, the 30 s `add` and five 10 s plumbing children), so a live commit can
- * never be inside the window. A kernel writer holds the world flock, so the
- * age rule is the doctor's proof for the case the flock cannot see: human git.
+ * above the fixed part of one `commitOnce` attempt — ~180 s: the 30 s walk,
+ * the 30 s `add` and up to twelve 10 s plumbing children (the first commit's
+ * object-format read; on an unborn branch a second `ls-files` replaces the
+ * `diff --cached --raw` child rather than adding one), plus
+ * one additional 10 s `update-index` per surviving nested-repo gitlink, which
+ * is why the total is not a fixed constant — and above every single child's
+ * deadline. The age rule needs the per-child bound: a live kernel writer holds
+ * `index.lock` only while one child runs (30 s at most), and the bounded commit
+ * retry repeats an attempt only after the previous one's children closed. The
+ * flock, not the age, is the cross-kernel proof; the age rule is the doctor's
+ * proof for the case the flock cannot see: human git.
  */
 export const INDEX_STALE_MS = 5 * 60 * 1000;
 
@@ -63,12 +81,14 @@ export const MAX_TRACKED_UNREADABLE_PATHS = 100;
 export const MAX_DOCTOR_SCAN_ENTRIES = 100_000;
 
 
-/** The code-point cap of one reported relative path (a path is never a payload). */
+/** The validator's cap of one reported relative path, in UTF-16 units. */
 export const MAX_DOCTOR_PATH_CHARS = 200;
 
 /** The commit budgets a caller may lower for a test; production uses the defaults. */
 export type CommitLimits = {
   readonly maxWalkEntries: number;
+  /** The nested-repository walk's wall-clock budget (it runs inside the fence). */
+  readonly maxWalkMs: number;
   readonly maxFileApparentBytes: number;
   readonly maxStagedPaths: number;
   readonly maxStagedBytes: number;
@@ -77,6 +97,7 @@ export type CommitLimits = {
 /** The production budgets (what `WorldRepo.commitAll` uses, with no switch). */
 export const DEFAULT_COMMIT_LIMITS: CommitLimits = Object.freeze({
   maxWalkEntries: MAX_WALK_ENTRIES,
+  maxWalkMs: MAX_WALK_MS,
   maxFileApparentBytes: MAX_FILE_APPARENT_BYTES,
   maxStagedPaths: MAX_STAGED_PATHS,
   maxStagedBytes: MAX_STAGED_BYTES,

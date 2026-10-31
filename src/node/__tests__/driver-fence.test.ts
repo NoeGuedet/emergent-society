@@ -12,6 +12,7 @@ import { readWorldState } from '../world-state.js';
 import {
   readNode, useWorld, writeWorldFile,
 } from './helpers.js';
+import { openTestDriver } from './helpers.js';
 
 /**
  * The C2 commit fence at the driver seam: one acquire/release wraps the whole
@@ -71,7 +72,7 @@ it('acquires once around the commit and releases before the closer is durable', 
       calls.push('release');
     },
   };
-  const d = await NodeDriver.open(home, 'n1', async () => {
+  const d = await openTestDriver(home, 'n1', async () => {
     await writeWorldFile(world, 'n1/fenced.md', 'fenced');
     return wait();
   }, world, {
@@ -119,7 +120,7 @@ it('refuses a freeze failure as freeze-timeout, never as an unfenced commit', as
       calls.push('release');
     },
   };
-  const d = await NodeDriver.open(home, 'n1', async () => {
+  const d = await openTestDriver(home, 'n1', async () => {
     await writeWorldFile(world, 'n1/held.md', 'held');
     return wait();
   }, world, { worldPollMs: 0, fence: port, schedule: () => () => {} });
@@ -156,7 +157,7 @@ it('refuses a freeze failure as freeze-timeout, never as an unfenced commit', as
 
 it('commits unfenced when the host has no port', async () => {
   const { home, world } = fixture();
-  const d = await NodeDriver.open(home, 'n1', async () => {
+  const d = await openTestDriver(home, 'n1', async () => {
     await writeWorldFile(world, 'n1/open.md', 'open');
     return wait();
   }, world, { worldPollMs: 0, schedule: () => () => {} });
@@ -187,7 +188,7 @@ it('refuses a present port that reports unavailable, never committing unfenced',
       calls.push('release');
     },
   };
-  const d = await NodeDriver.open(home, 'n1', async () => {
+  const d = await openTestDriver(home, 'n1', async () => {
     await writeWorldFile(world, 'n1/unavailable.md', 'unavailable');
     return wait();
   }, world, { worldPollMs: 0, fence: port, schedule: () => () => {} });
@@ -221,7 +222,7 @@ it('turns a throwing acquire into a freeze-timeout refusal, never a driver error
       released = true;
     },
   };
-  const d = await NodeDriver.open(home, 'n1', async () => {
+  const d = await openTestDriver(home, 'n1', async () => {
     await writeWorldFile(world, 'n1/acquire.md', 'acquire');
     return wait();
   }, world, { worldPollMs: 0, fence: port, schedule: () => () => {} });
@@ -260,7 +261,7 @@ it('defers a stop across the critical section: the commit lands and release prec
       calls.push('release');
     },
   };
-  const d = await NodeDriver.open(home, 'n1', async () => {
+  const d = await openTestDriver(home, 'n1', async () => {
     await writeWorldFile(world, 'n1/deferred.md', 'deferred');
     return wait();
   }, world, { worldPollMs: 0, fence: port, schedule: () => () => {} });
@@ -301,7 +302,7 @@ it('takes one acquire per attempt across the commit\'s internal lock retries', a
       calls.push('release');
     },
   };
-  const d = await NodeDriver.open(home, 'n1', async () => {
+  const d = await openTestDriver(home, 'n1', async () => {
     await writeWorldFile(world, 'n1/retried.md', 'retried');
     return wait();
   }, world, { worldPollMs: 0, fence: port, schedule: () => () => {} });
@@ -339,7 +340,7 @@ it('acquires only after the handler returned, with no driver timer across the co
     },
     async release(): Promise<void> {},
   };
-  const d = await NodeDriver.open(home, 'n1', async () => {
+  const d = await openTestDriver(home, 'n1', async () => {
     await writeWorldFile(world, 'n1/ordered.md', 'ordered');
     handlerReturned = true;
     return wait();
@@ -374,7 +375,7 @@ it('a throwing release never displaces the commit', async () => {
       throw new Error('release exploded');
     },
   };
-  const d = await NodeDriver.open(home, 'n1', async () => {
+  const d = await openTestDriver(home, 'n1', async () => {
     await writeWorldFile(world, 'n1/safe.md', 'safe');
     return wait();
   }, world, {

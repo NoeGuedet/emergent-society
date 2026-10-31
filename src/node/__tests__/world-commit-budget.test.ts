@@ -152,6 +152,16 @@ describe('the pre-add walk budget', () => {
     expect(refusal?.reason).toBe('budget');
     expect(refusal?.detail).not.toContain(world.path);
   });
+  it('refuses a walk past its wall-clock budget as a typed walk-timeout', async () => {
+    const { world } = fixture();
+    await write(world, 'a.txt', 'x');
+    const attempt = await commitAllRefused(
+      () => commitAll(ioOf(world), 'n1', 'turn 0', budget({ maxWalkMs: 0 })),
+    );
+    expect(attempt.refusal).toMatchObject({ reason: 'walk-timeout' });
+    // The deadline precedes `add`: nothing was staged.
+    expect(await stagedPaths(world)).toEqual([]);
+  });
 });
 
 describe('the post-add staged budget', () => {

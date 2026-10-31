@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFileSync, realpathSync } from 'node:fs';
 import {
-  lstat, mkdir, mkdtemp, readFile, rm, rmdir, writeFile,
+  chmod, lstat, mkdir, mkdtemp, readFile, rm, rmdir, writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
 import {
   attachCell, bootHygiene, cellHash, cellRootUnder, cellUnitName,
   cgroupCapabilities, detectLaunchMode, enableControllers, ensureLeaf, freezeSet,
-  killLeaves, launchModeFromCgroup, limitLeaf, listLeaves, nodeLeaf, resolveAnchor,
+  killLeaves, launchModeFromCgroup, limitLeaf, listLeaves, nodeLeaf, reapRunLeaf, resolveAnchor,
   runLeaf, svcDir,
 } from '../cgroups.js';
 
@@ -238,6 +238,48 @@ describe.skipIf(freezeLeaf === null)('cgroup attach, freeze and kill', () => {
     }
   }, 15_000);
 
+  it('reaps a run leaf together with a guest descendant, then removes it', async () => {
+    const root = await freshRoot();
+    const leaf = join(root, 'run-reap');
+    await ensureLeaf(leaf);
+    // A shell moved into the leaf BEFORE it spawns a grandchild: the child
+    // inherits the leaf but not the shell's lifetime, exactly the class that
+    // survived stopRun's direct-child SIGKILL in the audit.
+    const shell = spawn('/bin/sh', ['-c', 'read x; sleep 30 & echo $!; wait'], {
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    const shellPid = shell.pid as number;
+    let grandPid = 0;
+    try {
+      await writeFile(join(leaf, 'cgroup.procs'), String(shellPid));
+      shell.stdin.write('\n');
+      const line = await new Promise<string>((resolve, reject) => {
+        shell.stdout.once('data', (chunk: Buffer) => resolve(chunk.toString('utf8')));
+        shell.once('error', reject);
+      });
+      grandPid = Number(line.trim());
+      expect(Number.isInteger(grandPid) && grandPid > 0).toBe(true);
+      const inLeaf = async (): Promise<boolean> => {
+        const procs = (await readFile(join(leaf, 'cgroup.procs'), 'utf8')).split('\n');
+        return procs.includes(String(shellPid)) && procs.includes(String(grandPid));
+      };
+      const deadline = Date.now() + 2000;
+      while (!(await inLeaf()) && Date.now() < deadline) {
+        await new Promise((resolve) => { setTimeout(resolve, 20); });
+      }
+      expect(await inLeaf()).toBe(true);
+
+      expect(await reapRunLeaf(leaf)).toBe(true);
+      expect(await lstat(leaf).catch(() => null)).toBeNull();
+      expect(await waitForDead(shellPid)).toBe(true);
+      expect(await waitForDead(grandPid)).toBe(true);
+    } finally {
+      shell.kill('SIGKILL');
+      if (grandPid > 0) { try { process.kill(grandPid, 'SIGKILL'); } catch { /* gone */ } }
+      await removeTree(root);
+    }
+  }, 15_000);
+
   it('refuses to freeze the kernel\'s own svc leaf', async () => {
     const root = await freshRoot();
     try {
@@ -333,6 +375,24 @@ describe('leaf enumeration and vanished leaves', () => {
       }
       expect(await listLeaves(join(root, 'missing'))).toEqual([]);
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('propagates a non-ENOENT readdir error instead of reporting no leaves', async () => {
+    if (process.getuid?.() === 0) return; // root bypasses mode bits
+    const root = await mkdtemp(join(tmpdir(), 'es-listleaves-eacces-'));
+    try {
+      await mkdir(join(root, 'run-locked'));
+      await chmod(root, 0o000);
+      // A readdir that cannot see the cell is NOT "no run leaves": swallowing
+      // it would let the fence report `fenced: true` with the Run unfrozen.
+      await expect(listLeaves(root)).rejects.toMatchObject({ code: 'EACCES' });
+      await expect(bootHygiene(root)).resolves.toMatchObject({
+        reaped: 0, failed: [], listError: 'EACCES',
+      });
+    } finally {
+      await chmod(root, 0o700).catch(() => {});
       await rm(root, { recursive: true, force: true });
     }
   });

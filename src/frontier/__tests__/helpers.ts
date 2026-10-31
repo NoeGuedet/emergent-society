@@ -11,7 +11,6 @@ import { frontierLayout, type JournalLayout } from '../../journal/layout.js';
 import { JournalReader } from '../../journal/reader.js';
 import { JournalWriter } from '../../journal/writer.js';
 import { DEFAULT_STORAGE_POLICY, type StorageConfig } from '../../storage.js';
-import { statfsProbe } from '../../node/storage-probe.js';
 import { FRONTIER_EVENT_TYPES } from '../events.js';
 import { openFrontierJournal, type FrontierJournal } from '../journal.js';
 
@@ -45,13 +44,16 @@ export function useFrontierHome(prefix: string): () => string {
 }
 
 /**
- * The real storage seam for suites that do not exercise a refusal: the
- * production enforcement policy over the real `statfs` probe, so every
- * frontier/node test runs the same circuit breaker production does (a test
- * home under `/tmp` passes the 2 GiB + 512 MiB / 100k + 10k floors).
+ * The controlled HIGH storage seam for suites that do not exercise a refusal:
+ * the production policy over a reading far above every floor (1 TiB / 1e9
+ * inodes). It is hermetic — the non-storage suites must not pass or fail on the
+ * host's `/tmp` headroom. A test that wants the real probe injects
+ * `DEFAULT_STORAGE` (production policy + `statfsProbe`) and keeps its skip
+ * guard; the explicit real-parity cases do exactly that.
  */
 export const TEST_STORAGE: StorageConfig = {
-  policy: DEFAULT_STORAGE_POLICY, probe: statfsProbe,
+  policy: DEFAULT_STORAGE_POLICY,
+  probe: async () => ({ bytes: 10 ** 12, inodes: 10 ** 9 }),
 };
 
 /** The knobs `openTestFrontier` exposes on top of the journal's own options. */
@@ -66,8 +68,8 @@ export type TestFrontierOptions = {
  * Opens a frontier journal for a test. The world-head callback defaults to
  * `null` (no world repo is needed by the gate suite); the write-behind window
  * defaults high because the gate flushes explicitly and a test must never race
- * a timer. The storage seam defaults to the real probe; a refusal case injects
- * a low one.
+ * a timer. The storage seam defaults to the controlled HIGH probe above; a
+ * refusal case injects a low one.
  */
 export function openTestFrontier(
   home: string,

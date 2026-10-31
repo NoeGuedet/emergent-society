@@ -428,7 +428,10 @@ async function scenarioA() {
     assert.ok(server.requests.some((r) => r.authorization === `Bearer ${FAKE_KEY}`),
       'A: the server never saw Bearer <fake>');
 
-    // A.6 — status while the host runs.
+    // A.6 — status while the host runs. A running host is not degraded by the
+    // normal `storage=unquoted` fact or by its explicit `--no-sandbox` opt-out
+    // (`sandbox=off`), so the exit is 0; an unintended fence=unavailable would
+    // be the degradation.
     const running = statusReport(home, [0]);
     assert.equal(running.host.state, 'running', 'A: status host state');
     assert.equal(running.frontier.counts['http/request'], 2, 'A: status request count');
