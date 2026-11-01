@@ -74,14 +74,21 @@ export function canonicalMessagesBytes(messages: readonly ChatMessage[]): Uint8A
   return Buffer.from(canonicalizeJson(toJson(messages.map(encodeMessage))), 'utf8');
 }
 
-/** The canonical UTF-8 wire bytes of a plan. Pure: it never mutates the plan. */
+/**
+ * The canonical UTF-8 wire bytes of a plan. Pure: it never mutates the plan.
+ * The kernel-owned prefix is byte-stable: the charter, then the heading, then
+ * — only when the operator declared a served-model catalog — the substrate
+ * block, all before the history.
+ */
 export function serializeWire(plan: RequestPlan): Uint8Array {
   const messages: JsonValue[] = [
     { role: 'system', content: plan.charter },
     { role: 'system', content: plan.heading },
-    ...plan.history.map(encodeMessage),
-    ...plan.queue.map(encodeMessage),
   ];
+  if (plan.substrate !== undefined) {
+    messages.push({ role: 'system', content: plan.substrate });
+  }
+  messages.push(...plan.history.map(encodeMessage), ...plan.queue.map(encodeMessage));
   const wire: Record<string, JsonValue> = {
     model: plan.model,
     ...encodeParameters(plan.parameters),

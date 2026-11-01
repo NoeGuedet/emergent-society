@@ -40,6 +40,24 @@ it('accepts a same-uid 0600 regular file with an llm entry', async () => {
     endpoint: 'http://127.0.0.1:9/v1/chat/completions',
     key: 'sentinel-llm-key', credentialId: 'llm',
   });
+  // No declared catalog: the credential carries no models key at all.
+  expect('models' in cred).toBe(false);
+});
+
+it('carries the declared model catalog through the credential, ids only', async () => {
+  const home = await freshHome();
+  const path = join(home, 'providers.json');
+  await writeFile(path, JSON.stringify({
+    llm: {
+      key: 'sentinel-llm-key', endpoint: 'http://127.0.0.1:9/v1/chat/completions',
+      models: ['vendor/model-a', 'model-b:free'],
+    },
+  }), { mode: 0o600 });
+  await chmod(path, 0o600);
+  const cred = llmCredentialFrom(await loadProviderStore(home));
+  expect(cred.models).toEqual(['vendor/model-a', 'model-b:free']);
+  // The catalog is non-secret by declaration; the key never rides it.
+  expect(cred.models).not.toContain('sentinel-llm-key');
 });
 
 it('accepts 0400 and 0600; refuses 0640, 0660 and 0644', async () => {

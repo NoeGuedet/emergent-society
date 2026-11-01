@@ -3,7 +3,10 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { loadProviders } from '../tools/providers.js';
+import {
+  MAX_MODEL_ID_CHARS, MAX_MODEL_IDS, MODEL_REFUSAL_CODE_POINTS, loadProviders, modelRefusal,
+} from '../tools/providers.js';
+import { singleLine } from '../../text.js';
 
 let home: string;
 beforeEach(async () => { home = await mkdtemp(join(tmpdir(), 'c14a-providers-')); });
@@ -173,5 +176,108 @@ describe('loadProviders', () => {
       expect(String(err)).not.toContain('example.test');
       expect(String(err)).not.toContain('not a url');
     }
+  });
+});
+
+describe('the declared model catalog (llm.models)', () => {
+  const ENDPOINT = 'https://api.example.test/v1/chat/completions';
+
+  it('carries the ids through in declaration order, deep-frozen', async () => {
+    await write({ llm: { key: 'k', endpoint: ENDPOINT, models: ['vendor/model-a', 'model-b:free'] } });
+    const registry = await loadProviders(home);
+    expect(registry.llm?.models).toEqual(['vendor/model-a', 'model-b:free']);
+    expect(Object.isFrozen(registry.llm?.models)).toBe(true);
+    // The endpoint and key still load exactly as before the manifest existed.
+    expect(registry.llm?.key).toBe('k');
+  });
+
+  it('accepts an empty catalog as a declaration of no served models', async () => {
+    await write({ llm: { key: 'k', endpoint: ENDPOINT, models: [] } });
+    await expect(loadProviders(home)).resolves.toMatchObject({ llm: { models: [] } });
+  });
+
+  it('accepts the exact caps: 64 ids of 256 printable characters', async () => {
+    expect(MAX_MODEL_ID_CHARS).toBe(256);
+    const ids = Array.from({ length: MAX_MODEL_IDS }, (_, index) =>
+      `${index}-${'m'.repeat(MAX_MODEL_ID_CHARS - String(index).length - 1)}`);
+    expect(ids.every((id) => [...id].length === MAX_MODEL_ID_CHARS)).toBe(true);
+    await write({ llm: { key: 'k', endpoint: ENDPOINT, models: ids } });
+    const registry = await loadProviders(home);
+    expect(registry.llm?.models).toHaveLength(MAX_MODEL_IDS);
+    for (const id of ids) expect(registry.llm?.models).toContain(id);
+  });
+
+  it('accepts printable ASCII and refuses every other class, by position and value-free', async () => {
+    for (const value of ['a b', 'A-Z0-9._:/@-', 'x!y']) {
+      await write({ llm: { key: 'k', endpoint: ENDPOINT, models: [value] } });
+      await expect(loadProviders(home)).resolves.toMatchObject({ llm: { models: [value] } });
+    }
+    const refused = ['a\nb', 'a\tb', 'a\u0000b', 'a\u001fb', 'a\u007fb', 'a€b', 'a\u0085b'];
+    for (const value of refused) {
+      await write({ llm: { key: 'k', endpoint: ENDPOINT, models: ['ok-id', value] } });
+      const err = await loadProviders(home).catch((e: unknown) => e);
+      expect(String(err)).toMatch(/llm\.models\[1\]: expected a one-line printable ASCII model id/);
+      expect(String(err)).not.toContain('a\tb');
+      expect(String(err)).not.toContain('\u0000');
+    }
+    for (const bad of [null, 'models', {}, [7], [''], ['a'.repeat(MAX_MODEL_ID_CHARS + 1)]]) {
+      await write({ llm: { key: 'k', endpoint: ENDPOINT, models: bad } });
+      const err = await loadProviders(home).catch((e: unknown) => e);
+      expect(String(err)).toMatch(/invalid providers\.json: llm\.models/);
+    }
+    await write({ llm: { key: 'k', endpoint: ENDPOINT, models: Array.from({ length: 65 }, (_, index) => `m${index}`) } });
+    const tooMany = await loadProviders(home).catch((e: unknown) => e);
+    expect(String(tooMany)).toMatch(/llm\.models: expected at most 64 entries/);
+  });
+
+  it('refuses a duplicate by position without echoing the repeated id', async () => {
+    await write({ llm: { key: 'k', endpoint: ENDPOINT, models: ['dup-SECRET-id', 'other', 'dup-SECRET-id'] } });
+    const err = await loadProviders(home).catch((e: unknown) => e);
+    expect(String(err)).toMatch(/llm\.models\[2\]: repeats an earlier model id/);
+    expect(String(err)).not.toContain('dup-SECRET-id');
+  });
+});
+
+describe('modelRefusal: the teaching enumeration, budgeted whole', () => {
+  it('enumerates a short catalog whole, with the count pointer', () => {
+    const served = ['first-light-test', 'vendor/model-a', 'vendor/model-b'];
+    expect(modelRefusal('unknown-model', served)).toBe(
+      'model "unknown-model" is not served; this kernel serves:'
+      + ' first-light-test, vendor/model-a, vendor/model-b'
+      + ' (3 models total — inspect lists them)');
+    expect(modelRefusal('unknown-model', ['only-one'])).toContain(
+      ' (1 model total — inspect lists them)');
+  });
+
+  it('fits a 64-model catalog with a long requested id inside the 200-code-point clamp', () => {
+    const catalog = Array.from({ length: MAX_MODEL_IDS }, (_, index) =>
+      `served-vendor/model-${String(index + 1).padStart(2, '0')}-long-suffix`);
+    const message = modelRefusal(`not-served-${'x'.repeat(300)}`, catalog);
+    // The renderer's clamp (`singleLine(err.message, 200)`) is a no-op: the
+    // whole message — the tail pointer included — survives by construction.
+    expect(MODEL_REFUSAL_CODE_POINTS).toBe(200);
+    expect([...message].length).toBeLessThanOrEqual(MODEL_REFUSAL_CODE_POINTS);
+    expect(singleLine(message, 200)).toBe(message);
+    expect(message.endsWith(' (64 models total — inspect lists them)')).toBe(true);
+    expect(message).toContain('served-vendor/model-01');
+    expect(message).toContain(', …');
+    // The echoed id is clamped to a bounded token, never the 300 characters.
+    expect(message).not.toContain('x'.repeat(300));
+  });
+
+  it('keeps the pointer when not even one served id fits', () => {
+    const message = modelRefusal('unknown', ['z'.repeat(256)]);
+    expect([...message].length).toBeLessThanOrEqual(200);
+    expect(singleLine(message, 200)).toBe(message);
+    expect(message.endsWith(' (1 model total — inspect lists them)')).toBe(true);
+    expect(message).toContain('serves: … (1 model total');
+  });
+
+  it('says the declaration is empty rather than rendering a dangling list', () => {
+    const message = modelRefusal('unknown', []);
+    expect(message).toBe('model "unknown" is not served; this kernel serves:'
+      + ' no models (providers.json declares llm.models empty)');
+    expect([...message].length).toBeLessThanOrEqual(200);
+    expect(singleLine(message, 200)).toBe(message);
   });
 });

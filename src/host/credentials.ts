@@ -25,12 +25,22 @@ import { HostConfigError } from './errors.js';
  * the same path the layout module and `init` address. `loadProviderStore`
  * delegates a malformed store to the loader's message unchanged (it is already
  * value-free and already starts `invalid providers.json`), and `llmCredentialFrom`
- * yields the one credential literal the frontier journals: `'llm'`.
+ * yields the one credential literal the frontier journals: `'llm'`. The
+ * optional `llm.models` catalog rides through that credential unchanged: it is
+ * the operator's declaration, not a secret, and the host hands it to the
+ * runtime (the substrate block), the extend port (inspect) and the pool (spawn
+ * validation) from this one value.
  */
 
 /** The model endpoint and key, under the credential id the frontier journals. */
 export type LlmCredential = {
   readonly endpoint: string; readonly key: string; readonly credentialId: 'llm';
+  /**
+   * The operator-declared served-model catalog, carried through from the
+   * store's `llm.models` (ids only — never a secret). Absent means the store
+   * declares none: no substrate block, no validation, today's behavior.
+   */
+  readonly models?: readonly string[];
 };
 
 const PROVIDERS_BASENAME = 'providers.json';
@@ -109,5 +119,8 @@ export function llmCredentialFrom(registry: ProviderRegistry): LlmCredential {
   if (entry === undefined) {
     throw new HostConfigError(`providers.json has no "${LLM_CREDENTIAL_ID}" entry`);
   }
-  return { endpoint: entry.endpoint, key: entry.key, credentialId: LLM_CREDENTIAL_ID };
+  return {
+    endpoint: entry.endpoint, key: entry.key, credentialId: LLM_CREDENTIAL_ID,
+    ...(entry.models !== undefined ? { models: entry.models } : {}),
+  };
 }

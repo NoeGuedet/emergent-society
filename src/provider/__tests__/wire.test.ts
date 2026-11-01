@@ -88,6 +88,22 @@ describe('serializeWire: top-level shape', () => {
   });
 });
 
+describe('serializeWire: the substrate block', () => {
+  it('emits the substrate as the third system message, before history, only when present', () => {
+    const history: ChatMessage[] = [{ role: 'user', content: 'hist' }];
+    const without = messages(serializeWire(plan({ history })));
+    expect(without.filter((m) => m['role'] === 'system')).toHaveLength(2);
+    expect(without[2]).toEqual({ role: 'user', content: 'hist' });
+
+    const substrate = 'The substrate this kernel serves — models: served-a, served-b';
+    const withSubstrate = messages(serializeWire(plan({ history, substrate })));
+    expect(withSubstrate[0]).toEqual({ role: 'system', content: 'charter text' });
+    expect(withSubstrate[1]).toEqual({ role: 'system', content: 'heading text' });
+    expect(withSubstrate[2]).toEqual({ role: 'system', content: substrate });
+    expect(withSubstrate[3]).toEqual({ role: 'user', content: 'hist' });
+  });
+});
+
 describe('serializeWire: exact assistant message shape', () => {
   it('omits tool_calls for a no-call assistant while preserving content null', () => {
     const history: ChatMessage[] = [{ role: 'assistant', content: null, tool_calls: [] }];

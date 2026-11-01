@@ -31,7 +31,23 @@ export type AssembleInput = {
    * block's citation; absent means the journaled heading (the boot seed).
    */
   readonly direction?: { readonly text: string; readonly source: Source };
+  /**
+   * The operator-declared served-model catalog, handed in by the runtime from
+   * its own host fact. Presentation only: it rides the plan's substrate block
+   * as the third kernel-owned system message, never inside the charter or
+   * heading text, and it never enters `stateHash` (which covers the journaled
+   * state alone). Absent means no catalog: no block, today's plan.
+   */
+  readonly models?: readonly string[];
 };
+
+/**
+ * The pinned substrate sentence: the kernel-owned block naming the served
+ * models, immediately after the heading block and before the history. Its
+ * prefix is fixed; the ids follow in declaration order, joined by `, `, and an
+ * empty declaration says so rather than rendering a dangling list.
+ */
+const SUBSTRATE_PREFIX = 'The substrate this kernel serves — models: ';
 
 function refuse(message: string): never {
   throw new Error(`cannot assemble: ${message}`);
@@ -97,10 +113,21 @@ export function assemble(input: AssembleInput): RequestPlan {
 
   const headingText = input.direction?.text ?? surface.heading.text;
   const headingSource = input.direction?.source ?? surface.heading.source;
+  // The substrate block is a host fact with no receipt: it enters the plan
+  // only when the operator declared a catalog, its section cites no source,
+  // and it is the one prefix block whose bytes an operator edit can move — the
+  // documented cache invalidator beside a heading change.
+  const substrate = input.models === undefined
+    ? undefined
+    : `${SUBSTRATE_PREFIX}${input.models.length === 0
+      ? '(none declared)' : input.models.join(', ')}`;
   const sections: PlanSection[] = [
     { name: 'tools', cache: 'stable', sources: [source] },
     { name: 'charter', cache: 'stable', sources: [source] },
     { name: 'heading', cache: 'stable', sources: [headingSource] },
+    ...(substrate !== undefined
+      ? [{ name: 'substrate' as const, cache: 'stable' as const, sources: [] }]
+      : []),
     { name: 'history', cache: 'advance', sources: sortUnique(historySources) },
     { name: 'queue', cache: 'volatile', sources: sortUnique(queueSources) },
   ];
@@ -119,6 +146,7 @@ export function assemble(input: AssembleInput): RequestPlan {
     queue,
     charter: config.value.charter,
     heading: headingText,
+    ...(substrate !== undefined ? { substrate } : {}),
   };
   return toJson(plan) as unknown as RequestPlan;
 }

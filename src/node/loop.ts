@@ -96,6 +96,13 @@ export type RuntimeOptions = {
   /** Kernel-mediated web tools; when absent, offered web calls resolve as `denied`. */
   readonly webTools?: WebTools;
   /**
+   * The operator-declared served-model catalog (providers.json `llm.models`),
+   * handed to the assembler as the plan's substrate block. A host fact, not a
+   * journaled one: absent means the store declares no catalog, so no block is
+   * rendered and a node's model stays the free string it was.
+   */
+  readonly models?: readonly string[];
+  /**
    * The extend port factory (C1.5): the loop owns the event router (it alone
    * knows which gate the current dispatch holds), the caller owns the
    * construction — the host composes the store and the supervisor (L5), tests
@@ -529,6 +536,7 @@ class Runtime implements AgentRuntime {
       const plan = assemble({
         id, state: this.fold.snapshot(),
         ...(ctx.direction !== undefined ? { direction: ctx.direction } : {}),
+        ...(this.options.models !== undefined ? { models: this.options.models } : {}),
       });
       const bytes = canonicalBytes(plan).length;
       if (bytes >= MAX_CAPTURE_BYTES) {

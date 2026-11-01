@@ -161,7 +161,7 @@ export type ProjectionState = {
 };
 
 export type PlanSection = {
-  readonly name: 'tools' | 'charter' | 'heading' | 'history' | 'queue';
+  readonly name: 'tools' | 'charter' | 'heading' | 'substrate' | 'history' | 'queue';
   readonly cache: 'stable' | 'advance' | 'volatile';
   readonly sources: Source[];
 };
@@ -174,6 +174,15 @@ export type RequestPlan = {
   readonly sections: PlanSection[];
   readonly history: ChatMessage[]; readonly queue: ChatMessage[];
   readonly charter: string; readonly heading: string;
+  /**
+   * The kernel-owned substrate block: the operator-declared served models,
+   * rendered as its own system message immediately after the heading block.
+   * Present only when the store declares a catalog — absent means no block and
+   * today's plan. It is a host fact, not a projection of the journal: its
+   * section carries `sources: []` and no receipt, and it never rides inside
+   * the charter or heading text.
+   */
+  readonly substrate?: string;
 };
 
 export type AssistantProjection = {

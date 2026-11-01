@@ -15,7 +15,7 @@ import { singleLine } from '../text.js';
 import { readWorldState, type WorldState } from '../node/world-state.js';
 import { runWorldDoctor, type DoctorReport } from '../node/world-doctor.js';
 import { fileURLToPath } from 'node:url';
-import type { ProviderRegistry } from '../node/tools/providers.js';
+import { modelRefusal, type ProviderRegistry } from '../node/tools/providers.js';
 import { DEFAULT_TERMINAL_ENV } from '../node/tools/terminal.js';
 import { webToolsFromProviders } from '../node/tools/web.js';
 import {
@@ -294,6 +294,10 @@ async function openCellShared(options: CellOptions): Promise<SharedCell> {
  */
 async function composeNode(options: CellOptions, shared: SharedCell): Promise<NodeCell> {
   const { home, uid, config, credential, providers, sandbox, pollMs, log } = options;
+  // The operator's served-model declaration rides the credential: the runtime
+  // renders it as the plan's substrate block and the extend port lists it.
+  // Absent stays absent — no block, no line, no validation.
+  const models = credential.models;
   const { world, doctor, storage, storageState } = shared;
   const paths = cellPaths(home, uid);
   // Every mediator this node owns — the model adapter and the web tools —
@@ -335,6 +339,7 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
     home, uid, world, initialConfig: config, adapter,
     terminal: { env: DEFAULT_TERMINAL_ENV, sandbox: shellSandbox },
     ...(webTools !== undefined ? { webTools } : {}),
+    ...(models !== undefined ? { models } : {}),
     extend: (events, ports) => ({
       store,
       supervisor: createRunSupervisor({
@@ -379,6 +384,7 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
       sandbox: sandbox !== false,
       ...(options.spawn !== undefined ? { spawn: options.spawn } : {}),
       ...(options.speak !== undefined ? { speak: options.speak } : {}),
+      ...(models !== undefined ? { models } : {}),
     }),
   });
   const driver = await NodeDriver.open(home, uid, wrapHandler(runtime.handler, log), world, {
@@ -1061,6 +1067,13 @@ class NodePool {
    * (the one path that stops and settles a composed-but-unrun cell) and throws
    * the bounded refusal, never registering a child; (5) register, start and
    * observe.
+   *
+   * Before the reservation, a requested model is validated against the
+   * operator's declared catalog: an out-of-catalog id is a bounded teaching
+   * refusal whose enumeration is budgeted whole for the renderer's clamp, and
+   * a refusal never reserves a uid or a roster place. A request that names no
+   * model inherits the requester's own — attenuation wins over validation —
+   * even when that model is not in the catalog (the documented residual).
    */
   async spawn(
     requesterUid: string, request: SpawnRequest,
@@ -1072,6 +1085,11 @@ class NodePool {
     }
     if (!requester.canSpawn) {
       throw new SpawnRefusedError('this node was not granted the spawn capability');
+    }
+    const catalog = this.deps.credential.models;
+    if (catalog !== undefined && request.model !== undefined
+      && !catalog.includes(request.model)) {
+      throw new SpawnRefusedError(modelRefusal(request.model, catalog));
     }
     const uid = this.reserveUid(requesterUid);
     try {
@@ -1455,6 +1473,24 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       }
       const providers = await loadProviderStore(home);
       const credential = llmCredentialFrom(providers);
+      // Every START is validated against the operator's declared manifest
+      // here — immediately after the provider store loads, where it loads
+      // today (the resolved configs are already known; no boot reorder). A
+      // start on a fresh or recovered cell composes its model from the flags
+      // or the nodes file, so an id the store does not serve is a
+      // configuration refusal (exit 2), not a wedged first request. `resume`
+      // never re-validates: its journaled config won and may predate the
+      // declaration (the journaled-configs-win invariant).
+      if (command === 'start') {
+        const catalog = credential.models;
+        if (catalog !== undefined) {
+          for (const config of configs) {
+            if (!catalog.includes(config.model)) {
+              throw new HostConfigError(modelRefusal(config.model, catalog));
+            }
+          }
+        }
+      }
       // The declared spawn grant: one port per node whose nodes-file entry
       // says `spawn: true` (a solo flag boot grants nobody). The port closes
       // over the pool, which exists only after the shared parts are composed;

@@ -52,6 +52,13 @@ export type ExtendPort = {
    * Delivery is outside the world; the frontier already holds the call.
    */
   readonly speak?: SpeakPort;
+  /**
+   * The operator-declared served-model catalog (providers.json `llm.models`),
+   * when the store declares one. inspect lists it honestly; it is the one
+   * source for validating a model a verb requests (the host's pool validates
+   * `spawn` against it).
+   */
+  readonly models?: readonly string[];
 };
 
 /** One spawn request, already typed: the host validates it against the caps. */
@@ -260,7 +267,8 @@ function storeFailureText(err: PackageError): { content: string; isError: boolea
 /**
  * Renders the honest inspect catalogue (kernel.md, the sandbox and
  * local-log sections): base tools, package tools with their schemas, the
- * stored packages with the caps and their meaning, the kernel-owned
+ * stored packages with the caps and their meaning, the operator-declared
+ * served models when the store declares a catalog, the kernel-owned
  * `spawn`/`speak`, and the runtime honesty — the sandbox mode with its
  * spelled-out meaning, the fail-closed contract, the withheld capabilities,
  * the caps, the no-rlimit residual, the egress-open residual, the
@@ -309,6 +317,21 @@ function renderInspect(
   lines.push(`caps: one Run at a time (a tool swap is stop then run — two`
     + ' deliberate acts); 32 tools per Run; definition sources total'
     + ` ${usedBytes} / 67108864 bytes.`);
+  // The substrate: the operator's served-model declaration, listed honestly.
+  // Absent means the store declares no catalog at all, and the section is not
+  // rendered — no line, today's inspect.
+  if (port.models !== undefined) {
+    lines.push('');
+    lines.push('== the substrate this kernel serves (operator-declared, unverified) ==');
+    if (port.models.length === 0) {
+      lines.push('(none declared — every start is refused; providers.json declares'
+        + ' llm.models empty)');
+    } else {
+      lines.push('not a routing table: the kernel does not probe these ids. A start,'
+        + ' and a spawn that names a model, must be one of them:');
+      for (const model of port.models) lines.push(`- ${model}`);
+    }
+  }
   lines.push('');
   lines.push('== kernel-owned, visible but never mounted ==');
   if (port.spawn !== undefined) {

@@ -107,9 +107,14 @@ async function initFixture(): Promise<{ home: string; world: WorldRepo }> {
   return { home, world };
 }
 
-async function providers(home: string, url: string): Promise<void> {
+async function providers(
+  home: string, url: string, models?: readonly string[],
+): Promise<void> {
   await writeFile(join(home, 'providers.json'), JSON.stringify({
-    llm: { key: 'k', endpoint: `${url}/v1/chat/completions` },
+    llm: {
+      key: 'k', endpoint: `${url}/v1/chat/completions`,
+      ...(models !== undefined ? { models } : {}),
+    },
   }), { encoding: 'utf8', mode: 0o600 });
 }
 
@@ -294,6 +299,104 @@ it('spawns through a declared grant, names the requester, and denies the ungrant
     (event) => event.event === 'host/ended' && event.uid === 'node-1')).toBe(true);
   const attribution = await readAttribution(home);
   expect(attribution.some((record) => record.uid === 'node-1')).toBe(true);
+}, 60_000);
+
+it('refuses an out-of-catalog spawned model with the whole clamp-budgeted enumeration', async () => {
+  const { home } = await initFixture();
+  // Sixty-four declared models and one long, unserved requested id: the
+  // refusal enumerates the catalog and must still render whole inside the
+  // executor's `denied:` clamp — the tail pointer survives by construction.
+  const catalog = [
+    'first-light-test',
+    ...Array.from({ length: 63 }, (_, index) =>
+      `served-vendor/model-${String(index + 1).padStart(2, '0')}`),
+  ];
+  expect(catalog).toHaveLength(64);
+  const requested = `not-served-${'x'.repeat(300)}`;
+  const counts = new Map<string, number>();
+  const server = await serveJson((request) => {
+    const body = request.body.toString('utf8');
+    const count = counts.get('node-0') ?? 0;
+    counts.set('node-0', count + 1);
+    return respond(count === 0 && body.includes('You are node-0')
+      ? { tool: { name: 'extend', args: { verb: 'spawn', model: requested, heading: 'Worker.' } } }
+      : { content: 'idle' });
+  });
+  servers.push(server);
+  await providers(home, server.url, catalog);
+  const nodesFile = await writeNodes(home, [
+    { uid: 'node-0', model: 'first-light-test', heading: 'Lead.', spawn: true },
+  ]);
+  const lines: string[] = [];
+  const handle = boot(home, { nodesFile, lines });
+  const denials = async () => (await resultTexts(home, 'node-0'))
+    .filter((text) => text.includes('is not served'));
+  await vi.waitFor(async () => { expect(await denials()).toHaveLength(1); }, { timeout: 30_000 });
+  handle.stop();
+  expect(await handle.done).toBe(0);
+
+  const denial = (await denials())[0]!;
+  expect(denial.startsWith('denied: model "')).toBe(true);
+  // `denied: ` plus one whole 200-code-point message: nothing was cut.
+  expect([...denial].length).toBeLessThanOrEqual('denied: '.length + 200);
+  expect(denial.endsWith(' (64 models total — inspect lists them)')).toBe(true);
+  expect(denial).toContain('served-vendor/model-01');
+  expect(denial).toContain(', …');
+  // The refusal precedes every composition side effect: no child was composed,
+  // no spawn was announced, and no child cell directory exists.
+  expect(hostEvents(lines).some((event) => event.event === 'host/spawned')).toBe(false);
+  expect(existsSync(join(home, 'nodes', 'node-1'))).toBe(false);
+}, 60_000);
+
+it('spawns an in-catalog model and the live child runs on it', async () => {
+  const { home } = await initFixture();
+  const catalog = ['first-light-test', 'served-child-model'];
+  const counts = new Map<string, number>();
+  const server = await serveJson((request) => {
+    const body = request.body.toString('utf8');
+    const uid = body.includes('You are node-1') ? 'node-1' : 'node-0';
+    const count = counts.get(uid) ?? 0;
+    counts.set(uid, count + 1);
+    // The root names a declared model; every later reply parks.
+    return respond(uid === 'node-0' && count === 0
+      ? { tool: { name: 'extend', args: { verb: 'spawn', model: 'served-child-model', heading: 'Worker.' } } }
+      : { content: 'idle' });
+  });
+  servers.push(server);
+  await providers(home, server.url, catalog);
+  const nodesFile = await writeNodes(home, [
+    { uid: 'node-0', model: 'first-light-test', heading: 'Lead.', spawn: true },
+  ]);
+  const lines: string[] = [];
+  const handle = boot(home, { nodesFile, lines });
+  await vi.waitFor(() => {
+    expect(hostEvents(lines).filter((event) => event.event === 'host/spawned')).toHaveLength(1);
+  }, { timeout: 30_000 });
+  // The child is live: it boots and sends its own request, which names the
+  // declared model and carries the same declared substrate block.
+  const childRequest = async () => server.requests.find((request) =>
+    request.body.toString('utf8').includes('You are node-1'));
+  await vi.waitFor(async () => { expect(await childRequest()).toBeDefined(); }, { timeout: 30_000 });
+  handle.stop();
+  expect(await handle.done).toBe(0);
+
+  expect(hostEvents(lines).find((event) => event.event === 'host/spawned'))
+    .toMatchObject({ requester: 'node-0', uid: 'node-1' });
+  const child = await foldedConfig(home, 'node-1');
+  expect(child?.model).toBe('served-child-model');
+  expect(child?.charter.endsWith(' You are node-1, composed by node-0.')).toBe(true);
+  const events = await localEvents(home, 'node-1');
+  expect(events.filter((event) => event.type === 'node/boot')).toHaveLength(1);
+  expect(hostEvents(lines).some(
+    (event) => event.event === 'host/ended' && event.uid === 'node-1')).toBe(true);
+  const wire = JSON.parse((await childRequest())!.body.toString('utf8')) as {
+    model: string; messages: Array<{ role: string; content: string }>;
+  };
+  expect(wire.model).toBe('served-child-model');
+  expect(wire.messages[2]).toEqual({
+    role: 'system',
+    content: 'The substrate this kernel serves — models: first-light-test, served-child-model',
+  });
 }, 60_000);
 
 it('refuses the seventeenth node at the home ceiling, the one roster cap', async () => {

@@ -146,7 +146,7 @@ interface Dispatched {
 
 async function extendCall(
   s: Session, args: JsonValue, over: Partial<AgentConfig> = {},
-  portSandbox = false,
+  portSandbox = false, models?: readonly string[],
 ): Promise<Dispatched> {
   const gate = s.gate('turn', 0);
   s.packageGate(gate);
@@ -155,7 +155,10 @@ async function extendCall(
       projection([call('c1', 'extend', args)]), ID, gate, config(over),
       { run: async () => { throw new Error('not used'); } },
       undefined,
-      { store: s.store, supervisor: s.supervisor, sandbox: portSandbox },
+      {
+        store: s.store, supervisor: s.supervisor, sandbox: portSandbox,
+        ...(models !== undefined ? { models } : {}),
+      },
     );
   } finally {
     s.packageGate(null);
@@ -220,6 +223,33 @@ describe('extend: the six verbs', () => {
       expect(onContent).toMatch(/(^|\n)a Run's file reach: its own leaf/);
       expect(onContent).toContain('EACCES');
       expect(onContent).not.toContain('none — unconfined');
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('lists the operator-declared served models honestly, and no line without a catalog', async () => {
+    const s = await openSession();
+    try {
+      // No catalog: no substrate section at all — today's inspect.
+      const bare = await extendCall(s, { verb: 'inspect' });
+      expect(bare.results[0]!.isError).toBe(false);
+      expect(bare.results[0]!.content).not.toContain('the substrate this kernel serves');
+      expect(bare.results[0]!.content).not.toContain('not a routing table');
+
+      const declared = await extendCall(
+        s, { verb: 'inspect' }, {}, false, ['served-a', 'vendor/model-b']);
+      const content = declared.results[0]!.content;
+      expect(content).toContain(
+        '== the substrate this kernel serves (operator-declared, unverified) ==');
+      expect(content).toContain('not a routing table: the kernel does not probe these ids.');
+      expect(content).toMatch(/(^|\n)- served-a(\n|$)/);
+      expect(content).toMatch(/(^|\n)- vendor\/model-b(\n|$)/);
+
+      // A declared-but-empty catalog says so instead of rendering a list.
+      const empty = await extendCall(s, { verb: 'inspect' }, {}, false, []);
+      expect(empty.results[0]!.content)
+        .toContain('(none declared — every start is refused;');
     } finally {
       await s.shutdown();
     }

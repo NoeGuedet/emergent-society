@@ -19,6 +19,7 @@ import { processStartTime } from '../../journal/lock.js';
 import {
   serveJson, type LoopServer, type RecordedRequest,
 } from '../../node/__tests__/helpers.js';
+import { modelRefusal } from '../../node/tools/providers.js';
 import { WorldRepo } from '../../node/world.js';
 import {
   attachProcessHandlers, composeCell, startHost,
@@ -70,6 +71,8 @@ let home = '';
 let log: HostLog;
 let opts: HostOptions;
 let server: LoopServer | null = null;
+/** The catalog the current case's store declares (undefined = none). */
+let servedModels: readonly string[] | undefined;
 
 /**
  * A fresh cell per case. The world pair is initialized here because `start`
@@ -86,6 +89,7 @@ beforeEach(async () => {
     home, uid: 'node-0', command: 'start', model: 'first-light-test',
     heading: 'First light.', sandbox: false, pollMs: 0, log,
   };
+  servedModels = undefined;
 });
 
 afterEach(async () => {
@@ -107,9 +111,12 @@ function track(handle: HostHandle): HostHandle {
 }
 
 /** Starts this case's loopback provider and writes the 0600 credential store. */
-async function serve(respond: Responder = () => idleReply): Promise<LoopServer> {
+async function serve(
+  respond: Responder = () => idleReply, models?: readonly string[],
+): Promise<LoopServer> {
   const started = await serveJson(respond);
   server = started;
+  servedModels = models;
   await writeProviders(started);
   return started;
 }
@@ -118,7 +125,10 @@ async function writeProviders(target: LoopServer): Promise<void> {
   await writeFile(
     join(home, 'providers.json'),
     JSON.stringify({
-      llm: { key: 'sentinel-llm-key', endpoint: `${target.url}/v1/chat/completions` },
+      llm: {
+        key: 'sentinel-llm-key', endpoint: `${target.url}/v1/chat/completions`,
+        ...(servedModels !== undefined ? { models: servedModels } : {}),
+      },
     }),
     { mode: 0o600 },
   );
@@ -387,6 +397,153 @@ it('refuses mock-model, a missing heading and a corrupt log with exit 2', async 
   expect(logged(log)).toContainEqual(
     expect.objectContaining({ event: 'host/error', error: 'HostConfigError' }),
   );
+}, 20_000);
+
+it('validates a solo start against the declared manifest, after the store loads', async () => {
+  await serve(undefined, ['served-a', 'served-b']);
+  expect(await runHostOnce('start', { expectRefusal: true })).toBe(2);
+  const error = logged(log).find((entry) => entry['event'] === 'host/error');
+  expect(error).toMatchObject({ error: 'HostConfigError' });
+  // The enumeration is the shared teaching refusal, whole: the pointer is the
+  // tail, so its presence proves the log's 200-code-point bound did not cut it.
+  const message = String(error?.['message']);
+  expect(message).toBe(modelRefusal('first-light-test', ['served-a', 'served-b']));
+  expect(message).toContain('(2 models total — inspect lists them)');
+  // A configuration refusal: no cell composed, no boot, no turn.
+  expect(logged(log).some((entry) => entry['event'] === 'host/boot')).toBe(false);
+  expect(logged(log).some((entry) => entry['event'] === 'host/parked')).toBe(false);
+}, 20_000);
+
+it('validates every nodes-file start entry against the declared manifest', async () => {
+  await serve(undefined, ['served-a']);
+  const nodesFile = join(home, 'nodes.json');
+  await writeFile(nodesFile, JSON.stringify([
+    { uid: 'node-0', model: 'served-a', heading: 'Lead.' },
+    { uid: 'node-1', model: 'not-served', heading: 'Worker.' },
+  ]));
+  const handle = track(startHost({ ...opts, nodesFile }, hostDeps));
+  expect(await handle.done).toBe(2);
+  const error = logged(log).find((entry) => entry['event'] === 'host/error');
+  expect(error).toMatchObject({ error: 'HostConfigError' });
+  expect(String(error?.['message'])).toBe(
+    modelRefusal('not-served', ['served-a']));
+}, 20_000);
+
+it('treats an empty declaration as a catalog: starts, spawn models and the block say none', async () => {
+  // One scripted server for both phases. The refused start sends nothing, so
+  // the resume's first request is the server's first: it asks for a spawn
+  // naming a model, and every later request parks.
+  const spawnReply: ReplyBody = {
+    body: JSON.stringify({ choices: [{ message: {
+      role: 'assistant', content: null,
+      tool_calls: [{
+        id: 'e0', type: 'function',
+        function: {
+          name: 'extend',
+          arguments: JSON.stringify({ verb: 'spawn', model: 'any-model', heading: 'Child.' }),
+        },
+      }],
+    } }] }),
+  };
+  const srv = await serve((_request, index) => (index === 0 ? spawnReply : idleReply), []);
+
+  // A start is refused: the declaration exists and serves nothing.
+  expect(await runHostOnce('start', { expectRefusal: true })).toBe(2);
+  const error = logged(log).find((entry) => entry['event'] === 'host/error');
+  expect(error).toMatchObject({ error: 'HostConfigError' });
+  expect(String(error?.['message'])).toBe(modelRefusal('first-light-test', []));
+  expect(String(error?.['message']))
+    .toContain('no models (providers.json declares llm.models empty)');
+  expect(logged(log).some((entry) => entry['event'] === 'host/boot')).toBe(false);
+
+  // A journaled config still resumes (resume never re-validates): its request
+  // renders the empty block, and a spawn naming any model is refused.
+  await seedConfig(existingConfig);
+  const nodesFile = join(home, 'nodes.json');
+  await writeFile(nodesFile, JSON.stringify([{ uid: 'node-0', spawn: true }]));
+  const { model, heading, ...resumeOpts } = opts;
+  const resumed = track(startHost({ ...resumeOpts, command: 'resume', nodesFile }, hostDeps));
+  const denials = async (): Promise<string[]> => (await readC13(home, 'node-0'))
+    .filter((event) => event.type === 'tool/result')
+    .map((event) => ((event.data as { message?: { content?: string } }).message?.content) ?? '')
+    .filter((content) => content.startsWith('denied:'));
+  await vi.waitFor(async () => { expect(await denials()).toHaveLength(1); }, { timeout: 10_000 });
+  resumed.stop();
+  expect(await resumed.done).toBe(0);
+
+  expect((await denials())[0]).toBe(`denied: ${modelRefusal('any-model', [])}`);
+  expect(logged(log).some((entry) => entry['event'] === 'host/spawned')).toBe(false);
+  await expect(lstat(join(home, 'nodes', 'node-1')))
+    .rejects.toMatchObject({ code: 'ENOENT' });
+  const first = srv.requests[0];
+  expect(first).toBeDefined();
+  const body = JSON.parse(first!.body.toString('utf8')) as {
+    messages: Array<{ role: string; content: string }>;
+  };
+  expect(body.messages[2]).toEqual({
+    role: 'system', content: 'The substrate this kernel serves — models: (none declared)',
+  });
+}, 30_000);
+
+it('never re-validates a resume: the journaled config wins over a newer manifest', async () => {
+  // Boot with no catalog: the model is journaled as a free string.
+  const srv = await serve();
+  expect(await runHostOnce('start', {})).toBe(0);
+  const sent = srv.requests.length;
+  // The operator then declares a catalog that does not serve the journaled
+  // model. A start would be refused; the resume is admitted, and its request
+  // still carries the newly declared substrate block.
+  servedModels = ['served-a'];
+  await writeProviders(srv);
+  const { model, heading, ...resumeOpts } = opts;
+  const resumed = track(startHost({ ...resumeOpts, command: 'resume' }, hostDeps));
+  await vi.waitFor(
+    () => expect(srv.requests.length).toBeGreaterThan(sent), { timeout: 10_000 });
+  resumed.stop();
+  expect(await resumed.done).toBe(0);
+  const last = srv.requests.at(-1);
+  expect(last).toBeDefined();
+  const body = JSON.parse(last!.body.toString('utf8')) as {
+    messages: Array<{ role: string; content: string }>;
+  };
+  expect(body.messages[2]).toEqual({
+    role: 'system', content: 'The substrate this kernel serves — models: served-a',
+  });
+}, 30_000);
+
+it('projects the declared models as the third kernel system block on the wire', async () => {
+  const srv = await serve(undefined, ['first-light-test', 'served-b']);
+  const h = track(startHost(opts, hostDeps));
+  await waitForLog(log, 'host/parked');
+  h.stop();
+  expect(await h.done).toBe(0);
+  const first = srv.requests[0];
+  expect(first).toBeDefined();
+  const body = JSON.parse(first!.body.toString('utf8')) as {
+    messages: Array<{ role: string; content: string }>;
+  };
+  expect(body.messages[0]!.role).toBe('system');
+  expect(body.messages[0]!.content).toContain('You are node-0.');
+  expect(body.messages[1]).toEqual({ role: 'system', content: 'First light.' });
+  expect(body.messages[2]).toEqual({
+    role: 'system',
+    content: 'The substrate this kernel serves — models: first-light-test, served-b',
+  });
+}, 20_000);
+
+it('renders no substrate block when the store declares no catalog', async () => {
+  const srv = await serve();
+  const h = track(startHost(opts, hostDeps));
+  await waitForLog(log, 'host/parked');
+  h.stop();
+  expect(await h.done).toBe(0);
+  const first = srv.requests[0];
+  expect(first).toBeDefined();
+  const body = JSON.parse(first!.body.toString('utf8')) as {
+    messages: Array<{ role: string; content: string }>;
+  };
+  expect(body.messages.filter((message) => message.role === 'system')).toHaveLength(2);
+  expect(JSON.stringify(body)).not.toContain('The substrate this kernel serves');
 }, 20_000);
 
 it('start composes the operator charter; resume refuses the flag-carried file', async () => {

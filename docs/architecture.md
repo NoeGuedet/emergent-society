@@ -265,8 +265,13 @@ the need.
 ## 7. The credential store and the hostile-provider disclosure
 
 The `providers.json` schema is enforced in `src/node/tools/providers.ts`: exactly two
-named entries — `llm` (`{key, endpoint}`, no defaults, the model endpoint) and the
-optional `tavily` (the web tools: `key` required nonempty, sent only in the
+named entries — `llm` (`{key, endpoint, models?}`, no defaults, the model endpoint;
+`models`, when present, is the operator-declared served-model catalog — at most 64
+unique one-line printable ASCII ids of at most 256 characters each (0x20–0x7E; no
+control characters, newlines, DEL or non-ASCII), operator-declared, unverified,
+not a routing table; the kernel lists it in `inspect`, projects it as the
+third kernel-owned system block, and validates every start and every spawn that names
+a model against it) and the optional `tavily` (the web tools: `key` required nonempty, sent only in the
 `Authorization` header; `baseUrl` optional, `https`-only unless the host is loopback, no
 embedded credentials, query or fragment; `timeoutMs` 1–120000, default 20000;
 `maxResults` 1–20, default 8; `maxResponseBytes` 1024–8388608, default 1 MiB). Unknown

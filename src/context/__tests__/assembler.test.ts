@@ -110,19 +110,31 @@ describe('assemble: canonical offering', () => {
 });
 
 describe('assemble: prefix and stable sections', () => {
-  it('emits exactly two system messages: charter then heading, with no duplicate heading', () => {
-    const state = makeState();
-    const plan = assemble({ id: ID, state });
-    const wire = parse(serializeWire(plan));
-    const messages = wire['messages'] as Array<Record<string, unknown>>;
-    const systems = messages.filter((m) => m['role'] === 'system');
-    expect(systems).toHaveLength(2);
-    expect(messages[0]).toEqual({ role: 'system', content: plan.charter });
-    expect(messages[1]).toEqual({ role: 'system', content: plan.heading });
-    expect(messages.filter((m) => m['content'] === plan.heading)).toHaveLength(1);
+  it('emits two system messages without a catalog and the substrate block third with one', () => {
+    const absent = assemble({ id: ID, state: makeState() });
+    const absentWire = parse(serializeWire(absent));
+    const absentMessages = absentWire['messages'] as Array<Record<string, unknown>>;
+    const absentSystems = absentMessages.filter((m) => m['role'] === 'system');
+    expect(absentSystems).toHaveLength(2);
+    expect(absentMessages[0]).toEqual({ role: 'system', content: absent.charter });
+    expect(absentMessages[1]).toEqual({ role: 'system', content: absent.heading });
+    expect(absentMessages.filter((m) => m['content'] === absent.heading)).toHaveLength(1);
+    // No catalog, no block: today's plan, byte for byte.
+    expect(absent.substrate).toBeUndefined();
+
+    const models = ['served-a', 'served-b'];
+    const present = assemble({ id: ID, state: makeState(), models });
+    expect(present.substrate)
+      .toBe('The substrate this kernel serves — models: served-a, served-b');
+    const presentWire = parse(serializeWire(present));
+    const presentMessages = presentWire['messages'] as Array<Record<string, unknown>>;
+    expect(presentMessages.filter((m) => m['role'] === 'system')).toHaveLength(3);
+    expect(presentMessages[0]).toEqual({ role: 'system', content: present.charter });
+    expect(presentMessages[1]).toEqual({ role: 'system', content: present.heading });
+    expect(presentMessages[2]).toEqual({ role: 'system', content: present.substrate });
   });
 
-  it('orders and classifies the sections exactly', () => {
+  it('orders and classifies the sections exactly, with the substrate only when declared', () => {
     const plan = assemble({ id: ID, state: makeState() });
     expect(plan.sections.map((s) => ({ name: s.name, cache: s.cache }))).toEqual([
       { name: 'tools', cache: 'stable' },
@@ -131,6 +143,36 @@ describe('assemble: prefix and stable sections', () => {
       { name: 'history', cache: 'advance' },
       { name: 'queue', cache: 'volatile' },
     ]);
+    const declared = assemble({ id: ID, state: makeState(), models: ['served-a'] });
+    expect(declared.sections.map((s) => ({ name: s.name, cache: s.cache }))).toEqual([
+      { name: 'tools', cache: 'stable' },
+      { name: 'charter', cache: 'stable' },
+      { name: 'heading', cache: 'stable' },
+      { name: 'substrate', cache: 'stable' },
+      { name: 'history', cache: 'advance' },
+      { name: 'queue', cache: 'volatile' },
+    ]);
+    // A receipt-free host fact: the substrate section cites no journal source.
+    expect(declared.sections[3]?.sources).toEqual([]);
+  });
+});
+
+describe('assemble: the substrate block is a host fact, never journaled state', () => {
+  it('leaves the state hash untouched and never rides the charter or heading', () => {
+    const absent = assemble({ id: ID, state: makeState() });
+    const present = assemble({ id: ID, state: makeState(), models: ['catalog-id'] });
+    expect(present.stateHash).toBe(absent.stateHash);
+    expect(present.config).toEqual(absent.config);
+    expect(present.charter).not.toContain('catalog-id');
+    expect(present.heading).not.toContain('catalog-id');
+    const messages = (parse(serializeWire(present))['messages'] as Array<{ content: string }>);
+    expect(messages.filter((message) => message.content.includes('catalog-id'))).toHaveLength(1);
+    expect(Object.isFrozen(present)).toBe(true);
+  });
+
+  it('renders an empty declaration honestly instead of a dangling list', () => {
+    const plan = assemble({ id: ID, state: makeState(), models: [] });
+    expect(plan.substrate).toBe('The substrate this kernel serves — models: (none declared)');
   });
 });
 

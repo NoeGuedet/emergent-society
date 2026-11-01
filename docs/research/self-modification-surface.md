@@ -280,12 +280,15 @@ See G1/G2 — this is the single most consequential finding in this audit.
 
 ### 4.1 What reaches the model
 
-Exactly: the charter (first system message), the heading (second system message), the committed history and the
-open-turn queue, and the tool schemas/descriptions — **`src/provider/wire.ts:79-89`** and
-**`src/context/assembler.ts:90-112`** (`sections` at `assembler.ts:90-96`; `charter`/`heading` at `110-111`).
-`model` and `parameters` are wire fields (**`wire.ts:86-87`**), not text; `policy` is in the plan
-(`assembler.ts:104`) but is never rendered into the messages. So a node does **not** learn its step budget, its
-timeouts, its model id, or its caps from the prompt — only from tool descriptions and from `extend inspect`.
+Exactly: the charter (first system message), the heading (second system message), the substrate block (third
+system message, only when the operator declares `llm.models` — a host fact listing the served ids), the committed
+history and the open-turn queue, and the tool schemas/descriptions — **`src/provider/wire.ts:84-91`** and
+**`src/context/assembler.ts:124-133`** (`sections` at `assembler.ts:124-133`; the substrate block at
+`assembler.ts:120-123,149`; `charter`/`heading` at `147-148`). `model` and `parameters` are wire fields
+(**`wire.ts:93-94`**), not text; `policy` is in the plan (`assembler.ts:141`) but is never rendered into the
+messages. So a node does **not** learn its step budget, its timeouts, its own model id (the substrate block lists
+the served ids, never which of them this node sends), or its caps from the prompt — only from tool descriptions
+and from `extend inspect`.
 
 World perception is the kernel's diff of *foreign* commits; its own commits are omitted and merely named
 (**`src/context/diff.ts:14,47-48,149-158`**; range/watermark logic at `src/node/driver.ts:687-704`).
