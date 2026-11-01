@@ -78,6 +78,7 @@ const BASE_TOOLS: ReadonlySet<string> = new Set([
 
 const VERB_VOCABULARY: ReadonlySet<string> = new Set([
   'inspect', 'define', 'run', 'call', 'stop', 'undefine', 'verb', 'update_self',
+  'request_death',
 ]);
 
 const KERNEL_OWNED: ReadonlySet<string> = new Set(['spawn', 'speak']);

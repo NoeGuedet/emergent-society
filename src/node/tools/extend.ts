@@ -13,7 +13,7 @@ import type { RunSupervisor } from '../packages/supervisor.js';
 
 /**
  * The extend executor (kernel.md, the sandbox and local-log sections): the
- * peer of terminal and web — the nine verbs, the append home of the four
+ * peer of terminal and web — the ten verbs, the append home of the four
  * verb facts (define, run, stop, undefine; the registry's effect facts and
  * the supervisor's error/service facts ride the injected event port), the
  * funnel's kernel-side schema validation, and the honest inspect catalogue.
@@ -68,6 +68,12 @@ export type ExtendPort = {
    * does not hold the fold. Absent resolves `update_self` as a bounded denial.
    */
   readonly self?: SelfPort;
+  /**
+   * The node's own clean end (§0.9), host-composed over the pool — the check-
+   * and-mark is synchronous so the executor's decision, its one result and the
+   * stop share one turn. Absent resolves `request_death` as a bounded denial.
+   */
+  readonly depart?: DepartPort;
 };
 
 /** One spawn request, already typed: the host validates it against the caps. */
@@ -98,6 +104,25 @@ export class SpawnRefusedError extends Error {
     this.name = 'SpawnRefusedError';
   }
 }
+
+/**
+ * The host's departure seam (plan §0.9): a node's own clean end.
+ *
+ * `beginDepart` is the pool's synchronous **check-and-mark**: it refuses the
+ * last live node (counting in-flight departures as leaving, so two concurrent
+ * departures can never empty the pool) and otherwise marks this node's
+ * departure. The mark lives until the node's run settles — cleared by the
+ * node's own end, never by an error path — so the last-node rule cannot flip
+ * mid-flight. `depart` stops the node through `stop('self-requested')`.
+ *
+ * Both methods are deliberately synchronous: the executor appends its one
+ * honest result between them with no await, so no other node's decision can
+ * interleave between the mark and the stop.
+ */
+export type DepartPort = {
+  beginDepart(): boolean;
+  depart(): void;
+};
 
 /** The human-channel message ceiling: a message, not a document. */
 export const MAX_SPEAK_BYTES = 8192;
@@ -152,7 +177,8 @@ export type ExtendDecision =
     readonly kind: 'extend'; readonly verb: 'update_self';
     readonly heading?: string; readonly path?: string; readonly model?: string;
   }
-  | { readonly kind: 'extend'; readonly verb: 'speak'; readonly text: string };
+  | { readonly kind: 'extend'; readonly verb: 'speak'; readonly text: string }
+  | { readonly kind: 'extend'; readonly verb: 'request_death' };
 
 /** A schema violation the funnel refuses with, naming the field. */
 function schemaViolation(args: unknown, schema: unknown, where: string): string | null {
@@ -261,6 +287,26 @@ function failure(text: string): { content: string; isError: true } {
   return { content: text, isError: true };
 }
 
+/**
+ * The request_death branch's ONE result, appended without a capture.
+ *
+ * `appendResult` awaits `gate.capture` and `executeExtend` is async, but this
+ * branch must not await between the departure decision and the stop: the
+ * check-and-mark, the result and the stop share one synchronous turn, so no
+ * other node's departure can interleave and the last-node rule cannot change
+ * under the decision. `gate.append` is synchronous and the short grant or
+ * denial needs no raw artifact — `raw: null` is the honest shape.
+ */
+function appendDepartureResult(
+  gate: BoundaryGate, id: RequestId, callId: string, content: string, isError: boolean,
+): void {
+  gate.append('tool/result', {
+    turn: id.turn, request: id, callId,
+    message: { role: 'tool', content, tool_call_id: callId },
+    isError, raw: null, failure: null, synthetic: false, frontierCall: null,
+  });
+}
+
 function storeFailureText(err: PackageError): { content: string; isError: boolean } {
   switch (err.code) {
     case 'invalid-argument':
@@ -301,7 +347,8 @@ const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true });
  * local-log sections): base tools, package tools with their schemas, the
  * stored packages with the caps and their meaning, the operator-declared
  * served models when the store declares a catalog, the kernel-owned
- * `spawn`/`speak`, and the runtime honesty — the sandbox mode with its
+ * `spawn`/`speak` and the `request_death` rule, and the runtime honesty — the
+ * sandbox mode with its
  * spelled-out meaning, the fail-closed contract, the withheld capabilities,
  * the caps, the no-rlimit residual, the egress-open residual, the
  * 256 KiB funneled-args input cap with the svc.execute workaround, the svc
@@ -380,6 +427,13 @@ function renderInspect(
     lines.push('- spawn: creating new nodes — not granted to this node.');
   }
   lines.push('- speak: the human channel — agent zero alone, not available yet.');
+  // Static rule text, never a live query: the departure decision is a
+  // check-and-MARK, so a read must not call `beginDepart` (it would leave a
+  // departure mark as a read side effect). The line states the rule, not a
+  // promise about this node's place in the roster.
+  lines.push('- request_death: this node\'s own clean end — extend {verb:"request_death"};'
+    + ' granted unless this is the last live node (the operator pauses the host); the'
+    + ' stop cancels the turn\'s remaining calls.');
   lines.push('');
   lines.push('== runtime honesty ==');
   const status = port.supervisor.sandboxStatus();
@@ -471,6 +525,32 @@ export async function executeExtend(opts: {
       renderInspect(config, port, definitions.map((pkg) => ({
         id: pkg.id, name: pkg.name, purpose: pkg.purpose, sourceBytes: pkg.sourceBytes,
       }))), false, max);
+    return;
+  }
+
+  if (decision.verb === 'request_death') {
+    // The node's own clean end (§0.9). FULLY SYNCHRONOUS by construction: no
+    // await anywhere in this branch, so nothing can interleave between the
+    // pool's check-and-mark, this one result and the stop that fulfils the
+    // mark. The append and the stop are wrapped so a granted mark always
+    // receives its stop — an append that throws still calls `depart()`, since
+    // the mark's fulfilment is the node's end and the mark dies with it.
+    const depart = port.depart;
+    if (depart === undefined) {
+      appendDepartureResult(gate, id, callId,
+        'denied: this cell was composed without a depart port', true);
+      return;
+    }
+    const granted = depart.beginDepart();
+    try {
+      appendDepartureResult(gate, id, callId,
+        granted
+          ? 'departure granted: this node stops when this turn ends'
+          : 'denied: the last live node cannot die; the operator pauses the host',
+        !granted);
+    } finally {
+      if (granted) depart.depart();
+    }
     return;
   }
 

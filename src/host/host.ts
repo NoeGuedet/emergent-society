@@ -47,7 +47,7 @@ import type { BootHygiene, CellCgroup } from './cgroups.js';
 import { createFencePort } from './fence.js';
 import {
   SpeakRefusedError, SpawnRefusedError,
-  type SpeakPort, type SpawnCaps, type SpawnPort, type SpawnRequest,
+  type DepartPort, type SpeakPort, type SpawnCaps, type SpawnPort, type SpawnRequest,
 } from '../node/tools/extend.js';
 import { ChatLog } from './chat.js';
 import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
@@ -139,6 +139,11 @@ export type CellOptions = {
    * receives one only when the requester asked for it.
    */
   readonly spawn?: SpawnPort;
+  /**
+   * The node's own clean end (plan §0.9): the host composes it for every node
+   * over the pool, whose check-and-mark refuses the last live node.
+   */
+  readonly depart?: DepartPort;
   /** The human channel, granted to agent zero (the first booted node) only. */
   readonly speak?: SpeakPort;
   readonly pollMs?: number; readonly log: HostLog;
@@ -196,6 +201,8 @@ export type CellSetOptions = {
     readonly uid: string; readonly config: AgentConfig;
     /** The spawn port for a node whose nodes-file entry declared the grant. */
     readonly spawn?: SpawnPort;
+    /** The departure port every node holds: its own clean end. */
+    readonly depart?: DepartPort;
   }[];
   readonly credential: LlmCredential; readonly providers: ProviderRegistry;
   readonly sandbox: CellOptions['sandbox'];
@@ -370,6 +377,7 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
       }),
       sandbox: sandbox !== false,
       ...(options.spawn !== undefined ? { spawn: options.spawn } : {}),
+      ...(options.depart !== undefined ? { depart: options.depart } : {}),
       ...(options.speak !== undefined ? { speak: options.speak } : {}),
       ...(models !== undefined ? { models } : {}),
     }),
@@ -503,7 +511,10 @@ export async function composeCellSet(options: CellSetOptions): Promise<CellSet> 
 /** One node's composition options from the set's shared fields. */
 function nodeOptionsOf(
   options: CellSetOptions,
-  spec: { readonly uid: string; readonly config: AgentConfig; readonly spawn?: SpawnPort },
+  spec: {
+    readonly uid: string; readonly config: AgentConfig;
+    readonly spawn?: SpawnPort; readonly depart?: DepartPort;
+  },
   spawn?: SpawnPort, speak?: SpeakPort,
 ): CellOptions {
   return {
@@ -511,6 +522,7 @@ function nodeOptionsOf(
     credential: options.credential, providers: options.providers,
     sandbox: options.sandbox, log: options.log,
     ...(spawn !== undefined ? { spawn } : {}),
+    ...(spec.depart !== undefined ? { depart: spec.depart } : {}),
     ...(speak !== undefined ? { speak } : {}),
     ...(options.fence !== undefined ? { fence: options.fence } : {}),
     ...(options.storage !== undefined ? { storage: options.storage } : {}),
@@ -953,7 +965,10 @@ function createDrainWaiter(): DrainWaiter {
  *
  * `host/spawned {requester, uid}` and `host/ended {uid, reason}` are the host
  * log's lines for birth and death; the frontier journal is untouched (it
- * records kernel-mediated HTTP exchanges only, and is node-blind).
+ * records kernel-mediated HTTP exchanges only, and is node-blind). A node may
+ * ask for its own clean end (`extend {verb:"request_death"}`): the
+ * synchronous `beginDepart` check-and-mark refuses the last live node, and
+ * `depart` stops the marked node under the `self-requested` reason.
  *
  * Spawned nodes are in-memory, like a Run: their local logs survive, the pool
  * does not. A restart reaps them; the next boot's roster is the nodes file.
@@ -968,6 +983,13 @@ class NodePool {
    * against the one ceiling before either composes anything.
    */
   private readonly reservations = new Set<string>();
+  /**
+   * Uids whose own departure is marked (plan §0.9). A mark counts as LEAVING
+   * for the last-node rule and lives until the node's run settles — `onEnd`
+   * clears it, never an error path — so a granted departure cannot be
+   * re-decided against a stale roster.
+   */
+  private readonly departures = new Set<string>();
   /** Every run the pool ever started: `close` awaits them all, settled or not. */
   private readonly runs = new Set<Promise<void>>();
   private closing = false;
@@ -1035,6 +1057,41 @@ class NodePool {
       return { available: false, nodesLeft: 0 };
     }
     return { available: true, nodesLeft: this.placesLeft() };
+  }
+
+  /** The departure port handed to a node's cell: the pool's own check-and-mark. */
+  departPortFor(uid: string): DepartPort {
+    return {
+      beginDepart: () => this.beginDepart(uid),
+      depart: () => { this.depart(uid); },
+    };
+  }
+
+  /**
+   * The departure check-and-mark (plan §0.9), SYNCHRONOUS by design: the
+   * executor's branch calls it, appends its one result and stops the node with
+   * no await in between, so two turns cannot interleave between the check and
+   * the mark.
+   *
+   * The last live node is refused — in-flight departures count as LEAVING, so
+   * a node is granted only when at least one other node stays — and the pool
+   * therefore never empties through `request_death`. The mark lives until the
+   * node's run settles (`onEnd` clears it), never an error path: a marked node
+   * that is still finishing its turn keeps counting as leaving, so a second
+   * departure cannot slip through the window between the grant and the end.
+   */
+  beginDepart(uid: string): boolean {
+    if (!this.nodes.has(uid)) return false;
+    // Already marked: this node is leaving; its stop is in flight.
+    if (this.departures.has(uid)) return true;
+    if (this.nodes.size - this.departures.size <= 1) return false;
+    this.departures.add(uid);
+    return true;
+  }
+
+  /** Fulfils a marked departure: the node stops under its own reason. */
+  depart(uid: string): void {
+    this.nodes.get(uid)?.cell.driver.stop('self-requested');
   }
 
   /**
@@ -1108,6 +1165,9 @@ class NodePool {
         sandbox: this.deps.sandbox, log: this.deps.log,
         storage: this.deps.storage,
         ...(canSpawn ? { spawn: this.portFor(uid) } : {}),
+        // Every node holds its own clean end — the grant is the pool's rule,
+        // not a declared capability, so a composed child mirrors a booted one.
+        depart: this.departPortFor(uid),
       };
       let cell: NodeCell;
       try {
@@ -1187,6 +1247,9 @@ class NodePool {
    */
   private onEnd(uid: string, err: unknown, node: PoolNode): void {
     this.nodes.delete(uid);
+    // The departure mark lives exactly as long as the node's run: the node's
+    // own end clears it, never an error path.
+    this.departures.delete(uid);
     const at = this.order.indexOf(uid);
     if (at !== -1) this.order.splice(at, 1);
     this.deps.log.emit('host/ended', {
@@ -1508,6 +1571,14 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
           ? { available: false, nodesLeft: 0 }
           : pool.caps(uid)),
       });
+      // The node's own clean end: every node holds it (the grant is the pool's
+      // last-node rule, not a declared capability). The pool exists only after
+      // the shared parts are composed, and a call can only come from a running
+      // turn, so it is bound by then — an unbound pool is an honest refusal.
+      const departPortFor = (uid: string): DepartPort => ({
+        beginDepart: () => (pool === null ? false : pool.beginDepart(uid)),
+        depart: () => { pool?.depart(uid); },
+      });
       // The human channel, granted to the root only (agent zero). Delivery is
       // the chat log; the frontier already holds the exact call bytes.
       const rootSpeak: SpeakPort = {
@@ -1532,6 +1603,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         const spec = specs[0]!;
         const cell = await (deps.compose ?? composeCell)({
           ...sharedOptions, uid: spec.uid, config: configs[0]!,
+          depart: departPortFor(spec.uid),
           ...(spec.spawn === true ? { spawn: spawnPortFor(spec.uid) } : {}),
           speak: rootSpeak,
         });
@@ -1544,6 +1616,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
           ...sharedOptions, speak: rootSpeak,
           nodes: specs.map((spec, index) => ({
             uid: spec.uid, config: configs[index]!,
+            depart: departPortFor(spec.uid),
             ...(spec.spawn === true ? { spawn: spawnPortFor(spec.uid) } : {}),
           })),
         });

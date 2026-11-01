@@ -15,6 +15,7 @@ import { ContextFold } from '../../context/fold.js';
 import { MAX_CAPTURE_BYTES, createBoundaryGate } from '../gate.js';
 import type { BoundaryGate, GateCallbacks, GateScope } from '../gate.js';
 import { dispatchCalls } from '../tools/dispatch.js';
+import { executeExtend, type DepartPort } from '../tools/extend.js';
 import { createPackageStore } from '../packages/store.js';
 import type { PackageStore } from '../packages/store.js';
 import { createRunSupervisor } from '../packages/supervisor.js';
@@ -151,6 +152,7 @@ interface Dispatched {
 async function extendCall(
   s: Session, args: JsonValue, over: Partial<AgentConfig> = {},
   portSandbox = false, models?: readonly string[], self?: SelfPort,
+  depart?: DepartPort,
 ): Promise<Dispatched> {
   const gate = s.gate('turn', 0);
   s.packageGate(gate);
@@ -163,6 +165,7 @@ async function extendCall(
         store: s.store, supervisor: s.supervisor, sandbox: portSandbox,
         ...(models !== undefined ? { models } : {}),
         ...(self !== undefined ? { self } : {}),
+        ...(depart !== undefined ? { depart } : {}),
       },
     );
   } finally {
@@ -1643,6 +1646,168 @@ describe('extend: update_self (the identity rewrite)', () => {
       expect(results[0]!.isError).toBe(true);
       expect(results[0]!.content).toBe('denied: this cell was composed without a self port');
       expect(rawEvents.filter((event) => event.type === 'system/message')).toHaveLength(0);
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+});
+
+describe('extend: request_death, the node\'s own clean end', () => {
+  /** Wraps a real gate, recording every call in order (and any capture). */
+  function recordingGate(inner: BoundaryGate, record: string[]): BoundaryGate {
+    return {
+      signal: inner.signal,
+      append: (type, data) => {
+        record.push(`append:${type}`);
+        return inner.append(type, data);
+      },
+      flush: () => inner.flush(),
+      capture: (bytes, encoding, complete) => {
+        record.push('capture');
+        return inner.capture(bytes, encoding, complete);
+      },
+      store: <T>(value: T) => inner.store(value),
+    };
+  }
+
+  /** The branch's departure seam: records its calls, decides `granted`. */
+  function departPort(record: string[], granted: boolean): DepartPort {
+    return {
+      beginDepart: () => {
+        record.push('beginDepart');
+        return granted;
+      },
+      depart: () => { record.push('depart'); },
+    };
+  }
+
+  it('marks, appends the one capture-free result and stops, in that order', async () => {
+    const s = await openSession();
+    try {
+      const record: string[] = [];
+      const gate = recordingGate(s.gate('turn', 0), record);
+      await executeExtend({
+        gate, id: ID, callId: 'd1',
+        decision: { kind: 'extend', verb: 'request_death' },
+        config: config(),
+        port: {
+          store: s.store, supervisor: s.supervisor, sandbox: false,
+          depart: departPort(record, true),
+        },
+      });
+      // No await separates the decision, the result and the stop: the recorded
+      // order is the whole branch, and no capture ever ran. The dispatcher's
+      // flush after the executor is what makes the result durable.
+      expect(record).toEqual(['beginDepart', 'append:tool/result', 'depart']);
+      await gate.flush();
+      const results = (await events(s.home)).filter((event) => event.type === 'tool/result');
+      expect(results).toHaveLength(1);
+      const data = results[0]!.data as Record<string, unknown>;
+      expect(data['callId']).toBe('d1');
+      expect(data['isError']).toBe(false);
+      expect(data['synthetic']).toBe(false);
+      // The short grant needs no raw artifact: the direct append is the shape.
+      expect(data['raw']).toBeNull();
+      expect(data['failure']).toBeNull();
+      expect((data['message'] as { readonly content: string }).content)
+        .toBe('departure granted: this node stops when this turn ends');
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('denies the last live node without a stop', async () => {
+    const s = await openSession();
+    try {
+      const record: string[] = [];
+      const gate = recordingGate(s.gate('turn', 0), record);
+      await executeExtend({
+        gate, id: ID, callId: 'd1',
+        decision: { kind: 'extend', verb: 'request_death' },
+        config: config(),
+        port: {
+          store: s.store, supervisor: s.supervisor, sandbox: false,
+          depart: departPort(record, false),
+        },
+      });
+      expect(record).toEqual(['beginDepart', 'append:tool/result']);
+      await gate.flush();
+      const data = (await events(s.home))
+        .filter((event) => event.type === 'tool/result')[0]!.data as Record<string, unknown>;
+      expect(data['isError']).toBe(true);
+      expect(data['raw']).toBeNull();
+      expect((data['message'] as { readonly content: string }).content)
+        .toBe('denied: the last live node cannot die; the operator pauses the host');
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('denies honestly when the cell was composed without a depart port', async () => {
+    const s = await openSession();
+    try {
+      const { results } = await extendCall(s, { verb: 'request_death' });
+      expect(results).toHaveLength(1);
+      expect(results[0]!.isError).toBe(true);
+      expect(results[0]!.content).toBe('denied: this cell was composed without a depart port');
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('still stops a granted node when the result append throws', async () => {
+    const s = await openSession();
+    try {
+      let departed = false;
+      const inner = s.gate('turn', 0);
+      const throwing: BoundaryGate = {
+        signal: inner.signal,
+        append: () => { throw new Error('append failed'); },
+        flush: () => inner.flush(),
+        capture: (bytes, encoding, complete) => inner.capture(bytes, encoding, complete),
+        store: <T>(value: T) => inner.store(value),
+      };
+      await expect(executeExtend({
+        gate: throwing, id: ID, callId: 'd1',
+        decision: { kind: 'extend', verb: 'request_death' },
+        config: config(),
+        port: {
+          store: s.store, supervisor: s.supervisor, sandbox: false,
+          depart: {
+            beginDepart: () => true,
+            depart: () => { departed = true; },
+          },
+        },
+      })).rejects.toThrow('append failed');
+      // A granted mark always receives its stop: the mark's fulfilment is the
+      // node's end, so a failed append cannot strand it.
+      expect(departed).toBe(true);
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('renders the depart rule in inspect without taking a departure mark', async () => {
+    const s = await openSession();
+    try {
+      let marks = 0;
+      const depart: DepartPort = {
+        beginDepart: () => {
+          marks += 1;
+          return true;
+        },
+        depart: () => { throw new Error('inspect must never depart'); },
+      };
+      const { results } = await extendCall(
+        s, { verb: 'inspect' }, {}, false, undefined, undefined, depart);
+      expect(results[0]!.isError).toBe(false);
+      expect(results[0]!.content)
+        .toMatch(/(^|\n)- request_death: this node's own clean end/);
+      expect(results[0]!.content).toContain(
+        'granted unless this is the last live node (the operator pauses the host)');
+      // The line is static rule text: a read never calls the check-and-mark,
+      // which would leave a departure mark as a read side effect.
+      expect(marks).toBe(0);
     } finally {
       await s.shutdown();
     }

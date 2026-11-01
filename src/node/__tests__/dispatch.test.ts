@@ -1140,3 +1140,53 @@ describe('dispatchCalls: update_self recognition', () => {
     }
   }, 15000);
 });
+
+describe('dispatchCalls: request_death recognition', () => {
+  // The verb is recognized with its exact key set: {verb} and nothing else. An
+  // accepted call reaches the executor, which (with no extend port threaded)
+  // answers the honest denial — never unknown-tool, never a shell command.
+  it('accepts {verb} and reaches the executor', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(
+        projection([call('d1', 'extend', JSON.stringify({ verb: 'request_death' }))]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'denied', status: null });
+      expect(data.message.content).toBe('error: denied\nthis cell was composed without an extend port');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('refuses any extra key with the rule named', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(
+        projection([call('d1', 'extend', '{"verb":"request_death","reason":"tired"}')]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'invalid-tool', status: null });
+      expect(data.message.content).toContain('request_death takes only verb');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('the unknown-verb teaching refusal names the whole vocabulary', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([call('d1', 'extend', '{"verb":"make"}')]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.message.content).toContain('request_death');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+});

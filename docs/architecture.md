@@ -74,7 +74,7 @@ not individually logged.
 | `direction.ts` | `readRatifiedDirection`: `DIRECTION.md` at the latest human-authored commit (two bounded git reads; ≤ 8 KiB pinned, truncation notice, empty/unborn → null); `HUMAN_AUTHOR` is reserved and can never be a node uid |
 | `web.ts` | `web_search`/`web_fetch`: the Tavily client, renderers, `webToolsFromProviders`; every invocation crosses the frontier |
 | `providers.ts` | `loadProviders`: the kernel-side `providers.json` store (see §7) |
-| `dispatch.ts` | `dispatchCalls`: completes tool dialogues through the gate; `wait` takes `{}` or an ISO-8601 `{until}` (1 s–7 days ahead, carried back as `wakeAt`); owns the extend verbs' recognition (seven verbs; `run`/`undefine` take name or id; `stop` takes name, id or nothing — the bare stop names THE live Run; `spawn` takes optional model/heading/charter/spawn) and the native-call bridge — a live-registered package tool called by its bare name runs through the funnel |
+| `dispatch.ts` | `dispatchCalls`: completes tool dialogues through the gate; `wait` takes `{}` or an ISO-8601 `{until}` (1 s–7 days ahead, carried back as `wakeAt`); owns the extend verbs' recognition (ten verbs; `run`/`undefine` take name or id; `stop` takes name, id or nothing — the bare stop names THE live Run; `spawn` takes optional model/heading/charter/spawn; `request_death` takes only `verb` and runs the capture-free synchronous departure branch) and the native-call bridge — a live-registered package tool called by its bare name runs through the funnel |
 | `extend.ts` | The extend executor: the verbs, the verb facts, the funnel's kernel-side schema validation, the honest inspect catalogue |
 | `text.ts` | `boundToolText`: the model-visible tool-text bound |
 

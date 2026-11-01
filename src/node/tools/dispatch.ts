@@ -21,7 +21,7 @@ import { MAX_SPEAK_BYTES, executeExtend, type ExtendDecision, type ExtendPort } 
  * `web_fetch` run through the injected `WebTools` port (its client is the only
  * place the credential is written, and only into an `Authorization` header; its
  * raw body is a frontier fact, so the local result carries only `frontierCall`
- * and no artifact), `extend` runs the six package verbs through the injected
+ * and no artifact), `extend` runs the extend verbs through the injected
  * `ExtendPort`, and a **live-registered package tool attempted natively — the
  * bare-name idiom the models are trained for — is bridged to the funnel**
  * (the friction pass): the same executor, the same kernel-side schema validation, the same
@@ -214,20 +214,30 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
     return { kind: 'execute', cmd };
   }
 
-  // `extend`: the nine verbs, each with its exact key set (the funnel's
+  // `extend`: the ten verbs, each with its exact key set (the funnel's
   // argument shapes are validated here — the one-decision-point rule).
   const verbs = [
     'inspect', 'define', 'run', 'call', 'stop', 'undefine', 'spawn', 'speak', 'update_self',
+    'request_death',
   ];
   const verb = parsed['verb'];
   if (typeof verb !== 'string' || !verbs.includes(verb)) {
     return invalidDetail(
-      'verb must be one of inspect, define, run, call, stop, undefine, spawn, speak, update_self',
+      'verb must be one of inspect, define, run, call, stop, undefine, spawn, speak,'
+      + ' update_self, request_death',
     );
   }
   const keys = Object.keys(parsed);
   const only = (...allowed: string[]): boolean =>
     keys.every((key) => allowed.includes(key));
+  if (verb === 'request_death') {
+    // The node's own clean end: a verb and nothing else. The executor's branch
+    // is the one synchronous decision in the funnel (check-and-mark, the one
+    // result, the stop), so there is no argument to shape here.
+    return only('verb')
+      ? { kind: 'extend', verb: 'request_death' }
+      : invalidDetail('request_death takes only verb');
+  }
   if (verb === 'inspect') {
     return only('verb')
       ? { kind: 'extend', verb: 'inspect' }

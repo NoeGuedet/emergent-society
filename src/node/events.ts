@@ -14,7 +14,10 @@ import type { WorldRange } from './world.js';
 
 export type TurnTrigger = 'boot' | 'chain' | 'wakeup' | 'timer';
 export type TurnEndOutcome = 'chained' | 'waiting' | 'error' | 'interrupted';
-export type ShutdownReason = 'stop-requested' | 'handler-error' | 'maintenance-error' | 'driver-error';
+export type ShutdownReason =
+  | 'stop-requested' | 'handler-error' | 'maintenance-error' | 'driver-error'
+  /** The node's own clean end (`extend {verb:"request_death"}`). */
+  | 'self-requested';
 
 /** The node's durable vocabulary, declared once; merged into the journal's map below. */
 export interface NodeEventDataMap {
