@@ -15,7 +15,7 @@ import { ContextFold } from '../../context/fold.js';
 import { MAX_CAPTURE_BYTES, createBoundaryGate } from '../gate.js';
 import type { BoundaryGate, GateCallbacks, GateScope } from '../gate.js';
 import { dispatchCalls } from '../tools/dispatch.js';
-import { executeExtend, type DepartPort } from '../tools/extend.js';
+import { executeExtend, type DepartPort, type SpeakPort } from '../tools/extend.js';
 import { createPackageStore } from '../packages/store.js';
 import type { PackageStore } from '../packages/store.js';
 import { createRunSupervisor } from '../packages/supervisor.js';
@@ -152,7 +152,7 @@ interface Dispatched {
 async function extendCall(
   s: Session, args: JsonValue, over: Partial<AgentConfig> = {},
   portSandbox = false, models?: readonly string[], self?: SelfPort,
-  depart?: DepartPort,
+  depart?: DepartPort, speak?: SpeakPort,
 ): Promise<Dispatched> {
   const gate = s.gate('turn', 0);
   s.packageGate(gate);
@@ -166,6 +166,7 @@ async function extendCall(
         ...(models !== undefined ? { models } : {}),
         ...(self !== undefined ? { self } : {}),
         ...(depart !== undefined ? { depart } : {}),
+        ...(speak !== undefined ? { speak } : {}),
       },
     );
   } finally {
@@ -208,9 +209,14 @@ describe('extend: the six verbs', () => {
       for (const tool of ['execute', 'wait', 'web_search', 'web_fetch', 'extend']) {
         expect(content).toContain(tool);
       }
-      // The kernel-owned section: visible, never mounted.
-      expect(content).toContain('spawn');
-      expect(content).toContain('speak');
+      // The kernel-owned section: visible, never mounted. This harness passes
+      // no speak port, so the human channel renders the honest denial; the
+      // port's presence below renders the granted line instead.
+      expect(content).toMatch(
+        /(^|\n)- spawn: creating new nodes — not granted to this node\./);
+      expect(content).toMatch(
+        /(^|\n)- speak: the human channel — not granted to this node \(agent zero alone\)\./);
+      expect(content).not.toContain('not available yet');
       // Runtime honesty: the sandbox mode and the input cap.
       expect(content).toMatch(/sandbox/i);
       expect(content).toContain('256 KiB');
@@ -231,6 +237,17 @@ describe('extend: the six verbs', () => {
       expect(onContent).toMatch(/(^|\n)a Run's file reach: its own leaf/);
       expect(onContent).toContain('EACCES');
       expect(onContent).not.toContain('none — unconfined');
+      // The speak line is port-conditional exactly like spawn's: the port's
+      // presence renders the honest granted line, its absence the denial.
+      const spoken = await extendCall(s, { verb: 'inspect' }, {}, false,
+        undefined, undefined, undefined, { speak: async () => {} });
+      const speakContent = spoken.results[0]!.content;
+      expect(spoken.results[0]!.isError).toBe(false);
+      expect(speakContent).toMatch(
+        /(^|\n)- speak: the human channel — available to this node:/);
+      expect(speakContent).toContain('extend {verb:"speak", text}');
+      expect(speakContent).toContain('8192 bytes');
+      expect(speakContent).not.toContain('not granted to this node (agent zero alone)');
     } finally {
       await s.shutdown();
     }

@@ -13,8 +13,9 @@ import { TEST_STORAGE } from '../../frontier/__tests__/helpers.js';
 import { commitAs, gitIn, serveJson } from '../../node/__tests__/helpers.js';
 import { HeadWatcher } from '../../node/watcher.js';
 import { WorldRepo } from '../../node/world.js';
+import { AUTHORED_IDENTITY_RE } from '../../node/identity.js';
 import {
-  AUTHORED_IDENTITY_RE, composeCellSet, startHost,
+  composeCellSet, startHost,
   type CellSet, type HostDeps, type HostHandle, type HostOptions, type NodeCell,
 } from '../host.js';
 import { initHome } from '../layout.js';

@@ -226,18 +226,6 @@ export type ChildComposeSeam = (
   options: CellOptions, compose: () => Promise<NodeCell>,
 ) => Promise<NodeCell>;
 
-/**
- * The authored-strip pattern, re-exported for the host's own callers: a
- * trailing kernel identity sentence (` You are <uid>.` or
- * ` You are <uid>, composed by <uid>.`) over the uid grammar, never a
- * hardcoded `node-\d+`. The kernel owns the final sentence of every charter, so
- * any authored one is stripped before the kernel stamps its own: a world
- * charter written by another node cannot smuggle a second identity past it.
- * The one definition lives in `../node/identity.ts` (boot, spawn and
- * `update_self` share it).
- */
-export { AUTHORED_IDENTITY_RE } from '../node/identity.js';
-
 /** The parts one home shares across every node it runs. */
 type SharedCell = {
   readonly world: WorldRepo;
@@ -961,9 +949,12 @@ function createDrainWaiter(): DrainWaiter {
  * composed — and the pool starts, owns and observes every run, booted and
  * composed alike.
  *
- * The pool is the host's sole lifetime anchor. Its drain promise resolves only
- * when no live node remains (a later spawn re-arms it) and rejects at the first
- * BOOTED run's rejection: the body's await propagates that rejection into the
+ * The pool is the host's sole lifetime anchor. The drain waiter is per call: a
+ * fresh promise is created by each `drain()` call and resolves once no live
+ * node remains, rejecting at the first BOOTED run's rejection; it is never
+ * re-armed because the pool cannot empty while a spawn is in flight (the
+ * requester awaits the call), so a settled wait is never resumed by a spawn.
+ * The body's await propagates that rejection into the
  * host's existing catch (exit 1, `host/error`), and the exit `finally` then
  * stops and settles everything. A composed node's rejection ends only that node
  * (`host/ended` carries the reason) and the host keeps running while any other
@@ -1039,8 +1030,10 @@ class NodePool {
   }
 
   /**
-   * The host lifetime's one anchor: resolves when no live node remains (a later
-   * spawn re-arms it), rejects with the first booted run's rejection.
+   * The host lifetime's one anchor: a fresh waiter per call, resolving when no
+   * live node remains and rejecting with the first booted run's rejection. It
+   * is never re-armed: the pool cannot empty while a spawn is in flight (the
+   * requester awaits the call), so a settled wait is never resumed by a spawn.
    */
   drain(): Promise<void> {
     if (this.fault !== null) return Promise.reject(this.fault);

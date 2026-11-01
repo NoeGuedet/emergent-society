@@ -42,10 +42,10 @@ next assembled request (`src/node/self.ts`, `src/node/tools/extend.ts`, `src/nod
 The statements below describe the composed charter's origin, the journal as the one carrier
 of a configuration, and the impossibility of a re-compose.
 
-The composed charter is produced once, at the `start` gate, as `base + " You are <uid>."`:
+The composed charter is produced once, at the `start` gate, as `stripAuthoredIdentity(base) + " You are <uid>."` (the base is stripped of any trailing authored identity sentence before the kernel's own is stamped):
 
-- `src/host/host.ts:448-456` — `const base = charterFile !== undefined ? await readCharterFile(...) : defaultAgentConfig().charter;` then `charter: \`${base} You are ${uid}.\``. The exact composition is at **host.ts:455**.
-- The base default is **`src/context/config.ts:18-21`**; the operator file is validated at **host.ts:351-415** (regular file, fatal UTF-8, non-empty). The boot read is bounded only by the capture-ceiling DoS guard (refuse, never truncate); the one identity bound is the derived identity budget (`src/node/identity-budget.ts`), checked at the START composition (start only, after the provider load), the spawn-side composition and `update_self`'s renew — never in the validator, and separate from the canonical-config ceiling.
+- `src/host/host.ts:905-912` — `const base = charterFile !== undefined ? await readCharterFile(...) : defaultAgentConfig().charter;` then `charter: \`${stripAuthoredIdentity(base)}${identitySentence(uid)}\``. The exact composition is at **host.ts:912**.
+- The base default is **`src/context/config.ts:18-21`**; the operator file is validated at **host.ts:351-415** (regular file, fatal UTF-8, non-empty). The boot read is bounded only by the capture-ceiling DoS guard (refuse, never truncate); the one identity bound is the derived identity budget (`src/node/identity-budget.ts`), checked at the START composition (start only, after the provider load), the spawn-side composition and `update_self`'s renew — never in the validator, and separate from the canonical-config ceiling. A charter file at exactly the capture ceiling passes the read guard, composes a config past the canonical-config ceiling, and the validator's own `Error` is classified exit 1 with a bare `host/error {"error":"Error"}` (the validator stays untouched so journaled configs replay); the two named bounds are the file guard and the derived budget.
 - The value is validated by **`src/context/config.ts:181-215`** and journaled as a `system/message` fact.
 
 The journaled value is the charter in force at that point; a rewrite appends a new version and the fold replays the chain:
@@ -351,17 +351,19 @@ From **`src/context/config.ts:18-21`** (one string, concatenated):
 You act by writing in the shared world. Preserve durable knowledge in files. Your context is finite: it is compacted periodically and whatever you have not put outside it is lost. The heading is the boot seed; the living direction is the world's files.
 ```
 
-plus, from **`src/host/host.ts:455`** (`` `${base} You are ${uid}.` ``):
+plus, from **`src/host/host.ts:912`** (`` `${stripAuthoredIdentity(base)}${identitySentence(uid)}` ``):
 
 ```
 You act by writing in the shared world. Preserve durable knowledge in files. Your context is finite: it is compacted periodically and whatever you have not put outside it is lost. The heading is the boot seed; the living direction is the world's files. You are node-0.
 ```
 
-With `--charter-file`, `base` is the raw file text (**`host.ts:448-450`**) and the same sentence is appended with
-exactly one ASCII space before `You`, and no other separator normalization (`host.ts:455`). Pinned by tests:
+With `--charter-file`, `base` is the file text (**`host.ts:905-907`**), stripped of any trailing authored
+identity sentence before the kernel's own is stamped (`host.ts:912`); the same sentence is appended with
+exactly one ASCII space before `You`, and no other separator normalization (`host.ts:912`). Pinned by tests:
 `src/host/__tests__/lifecycle.test.ts` (the default `defaultAgentConfig().charter + ' You are node-0.'`
 composition, the operator base, and the exact-8192 and 100 KiB acceptances — both below the pinned identity
-floor — beside the two distinct over-bound refusals: the capture-ceiling DoS guard and the derived budget).
+floor — beside the two distinct over-bound refusals: the capture-ceiling DoS guard and the derived budget;
+the exact capture-ceiling boundary itself is the validator's own `Error`, exit 1).
 
 ### 5.2 What it says about self-modification: nothing
 
@@ -386,9 +388,9 @@ Packages, `svc` and the Run's file reach), and the `extend inspect` honesty bloc
 (**`src/node/tools/extend.ts:249-293`**). The only *runtime* reminder of the Hole is the compaction replacement
 notice, **`src/context/compaction.ts:39`**: `Older committed context was removed; externalize what must survive.`
 
-Cross-check: the Hole wording comes from the friction pass 2 record
-(`docs/plans/2026-10-29-fp2-friction-pass-2.md:12-20`, "The default charter gains the two seed facts … and the
-heading-authority fact … NO memory strategy is taught") and `docs/seed.md:30`. `docs/kernel.md:9` claims
+Cross-check: the Hole wording comes from the friction pass 2 record (the default charter gains the two seed
+facts … and the heading-authority fact … NO memory strategy is taught), whose tracked statement is
+`docs/seed.md:30`. `docs/kernel.md:9` claims
 "flow-down travels through charters and delegation", and `docs/kernel.md:73` states "A shared tool offering across
 working nodes is a host/seed obligation, not a kernel-enforced invariant" — no charter flow-down mechanism exists in
 `src/` (see G12).

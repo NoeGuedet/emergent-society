@@ -854,6 +854,27 @@ it('start refuses a missing, empty, invalid or over-bound charter file with exit
 }, 240_000);
 
 /**
+ * The exact capture-ceiling boundary: a charter of exactly MAX_CAPTURE_BYTES
+ * passes the boot read's DoS guard (which refuses strictly above it), composes
+ * a config past the canonical-config ceiling, and is refused by
+ * `validateAgentConfig` — the validator's own plain `Error`, classified exit 1
+ * with a bare `host/error {"error":"Error"}` and no message (the validator is
+ * untouched so journaled configs replay). Only the captured-file guard and the
+ * derived identity budget are config refusals (exit 2); this one is not.
+ */
+it('classifies the exact capture-ceiling charter as exit 1 with a bare error', async () => {
+  await serve();
+  const exactCeilingPath = join(home, 'exact-ceiling.txt');
+  await writeFile(exactCeilingPath, 'x'.repeat(MAX_CAPTURE_BYTES));
+  expect(await runHostOnce('start', {
+    charterFile: exactCeilingPath, expectRefusal: true,
+  })).toBe(1);
+  const error = logged(log).filter((entry) => entry['event'] === 'host/error').at(-1);
+  expect(error).toMatchObject({ event: 'host/error', error: 'Error' });
+  expect(error).not.toHaveProperty('message');
+}, 120_000);
+
+/**
  * The nominal anti-wedge proof (plan §0.5 / §7 S5): under a shrunk policy in
  * the uncapped band — the two constraints solved together, `W ≤ C −
  * IDENTITY_FLOOR` and `budget > IDENTITY_FLOOR + overhead` — an identity above

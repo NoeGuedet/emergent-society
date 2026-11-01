@@ -426,7 +426,14 @@ function renderInspect(
   } else {
     lines.push('- spawn: creating new nodes — not granted to this node.');
   }
-  lines.push('- speak: the human channel — agent zero alone, not available yet.');
+  if (port.speak !== undefined) {
+    lines.push('- speak: the human channel — available to this node:'
+      + ' extend {verb:"speak", text}; one non-blank message of at most'
+      + ` ${MAX_SPEAK_BYTES} bytes, delivered to the human outside the world (the frontier`
+      + ' already holds the exact call bytes).');
+  } else {
+    lines.push('- speak: the human channel — not granted to this node (agent zero alone).');
+  }
   // Static rule text, never a live query: the departure decision is a
   // check-and-MARK, so a read must not call `beginDepart` (it would leave a
   // departure mark as a read side effect). The line states the rule, not a
