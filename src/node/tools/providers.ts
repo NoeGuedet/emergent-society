@@ -87,8 +87,8 @@ export type ProviderEntry = {
  * Absent means no catalog: no substrate block, no validation, and a node's
  * model stays the free string it was. When present, the kernel projects the
  * ids into every request as a kernel-owned substrate block, lists them in
- * `inspect`, and validates every start and every spawn that names a model
- * against them.
+ * `inspect`, and validates every start, every spawn that names a model and
+ * every `update_self` that names a model against them.
  */
 export type LlmEntry = {
   readonly key: string; readonly endpoint: string; readonly models?: readonly string[];

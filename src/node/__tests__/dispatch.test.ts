@@ -1065,3 +1065,78 @@ describe('dispatchCalls: web tools', () => {
     }
   }, 15000);
 });
+
+describe('dispatchCalls: update_self recognition', () => {
+  // The verb is recognized with its exact key set: {verb, heading?, path?,
+  // model?} and at least one identity field. An accepted call reaches the
+  // executor, which (with no extend port threaded) answers the honest denial —
+  // never unknown-tool, never a shell command.
+  const ACCEPTED: JsonValue[] = [
+    { verb: 'update_self', heading: 'a new heading' },
+    { verb: 'update_self', path: 'charter.md' },
+    { verb: 'update_self', model: 'model-b' },
+    { verb: 'update_self', heading: 'h', path: 'p.md', model: 'm' },
+  ];
+
+  it.each(ACCEPTED)('accepts %j and reaches the executor', async (args) => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([call('u1', 'extend', JSON.stringify(args))]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'denied', status: null });
+      expect(data.message.content).toBe('error: denied\nthis cell was composed without an extend port');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  const REFUSED: ReadonlyArray<readonly [string, string, string]> = [
+    ['an unknown key', '{"verb":"update_self","charter":"x"}',
+      'update_self takes verb and at least one of heading, path, model'],
+    ['no identity field', '{"verb":"update_self"}',
+      'update_self takes at least one of heading, path, model'],
+  ];
+
+  it.each(REFUSED)('refuses %s with the rule named', async (_name, args, want) => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([call('u1', 'extend', args)]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'invalid-tool', status: null });
+      expect(data.message.content).toContain(want);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  const BARE: JsonValue[] = [
+    { verb: 'update_self', heading: 3 },
+    { verb: 'update_self', heading: '' },
+    { verb: 'update_self', path: 3 },
+    { verb: 'update_self', path: '' },
+    { verb: 'update_self', model: 3 },
+    { verb: 'update_self', model: '' },
+    { verb: 'update_self', model: null },
+  ];
+
+  it.each(BARE)('a wrong-typed or empty value stays the bare refusal (%j)', async (args) => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([call('u1', 'extend', JSON.stringify(args))]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'invalid-tool', status: null });
+      expect(data.message.content).toBe('error: invalid-tool');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+});

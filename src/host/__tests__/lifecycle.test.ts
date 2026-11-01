@@ -20,6 +20,7 @@ import {
   serveJson, type LoopServer, type RecordedRequest,
 } from '../../node/__tests__/helpers.js';
 import { modelRefusal } from '../../node/tools/providers.js';
+import { identityBudget, identityBytes } from '../../node/identity-budget.js';
 import { WorldRepo } from '../../node/world.js';
 import {
   attachProcessHandlers, composeCell, startHost,
@@ -626,6 +627,31 @@ it('resume uses the journaled model and writes no second system/message', async 
   expect(events.filter((e) => e.type === 'system/message')[0]!.data).toMatchObject({
     value: expect.objectContaining({ value: expect.objectContaining({ model: 'first-light-test' }) }),
   });
+}, 20_000);
+
+it('replays an old-rules configuration whose identity exceeds the derived budget', async () => {
+  const server = await serve();
+  // Legal when it was written: the model was a free string and no identity
+  // budget existed (a start composed it from the flags). The budget is
+  // admission-only — `validateAgentConfig` is untouched — so the old log still
+  // folds and boots, and resume never resurrects or refuses the identity.
+  const legacy = validateAgentConfig({
+    ...defaultAgentConfig(),
+    model: 'first-light-test'.padEnd(300_000, '-'),
+    heading: 'Legacy heading.',
+    charter: 'the old charter You are node-0.',
+  });
+  expect(identityBytes(legacy)).toBeGreaterThan(identityBudget(legacy));
+  await seedConfig(legacy);
+  expect(await runHostOnce('resume', {})).toBe(0);
+  const events = await readC13(home, 'node-0');
+  // No second configuration was journaled: the fold replay stands.
+  expect(events.filter((e) => e.type === 'system/message')).toHaveLength(1);
+  // The resumed node's first request carries the journaled model verbatim (the
+  // host log's own line is bounded, so the wire is the honest witness).
+  const wire = JSON.parse(server.requests[0]!.body.toString('utf8')) as { model: string };
+  expect(wire.model).toBe(legacy.model);
+  expect(logged(log).some((entry) => entry['event'] === 'host/boot')).toBe(true);
 }, 20_000);
 
 it('refuses a second host while the first runs, after the first has parked', async () => {

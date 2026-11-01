@@ -115,6 +115,15 @@ export type PackageStore = {
   /** One verified definition by exact id, or null (derived, read-only). */
   definitionById(id: string): Promise<PackageDefinition | null>;
   undefinePackage(id: string): Promise<void>;
+  /**
+   * The fd-first contained read of one source file under the injected roots,
+   * bounded by the caller's own `maxBytes` — refuse, never truncate. This is
+   * the self-rewrite's charter channel (`update_self`'s `path`, mirroring
+   * define's vocabulary); the read keeps every define invariant (open before
+   * anything is known, containment proven on the pinned fd, regular file, no
+   * outside hardlink) and only parameterizes the bound.
+   */
+  readWorldSource(path: string, maxBytes: number): Promise<Buffer>;
 };
 
 const ID_RE = /^[0-9a-f]{64}$/;
@@ -204,10 +213,11 @@ export async function createPackageStore(deps: PackageStoreDeps): Promise<Packag
   /**
    * The fd-first read: open (non-blocking, so a FIFO cannot hang the kernel),
    * prove containment on the pinned fd, refuse non-regular files and
-   * hardlinks, then read the bytes from the fd only — bounded by the
-   * per-source cap.
+   * hardlinks, then read the bytes from the fd only — bounded by the caller's
+   * `maxBytes` (define's per-source cap, or the self channel's capture
+   * ceiling). Over the bound is a refusal, never a truncated result.
    */
-  async function readContainedSource(path: string): Promise<Buffer> {
+  async function readContainedSource(path: string, maxBytes: number): Promise<Buffer> {
     const candidate = isAbsolute(path) ? path : join(worldRoot, path);
     let handle: FileHandle;
     try {
@@ -245,10 +255,10 @@ export async function createPackageStore(deps: PackageStoreDeps): Promise<Packag
         const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
         if (bytesRead === 0) break;
         total += bytesRead;
-        if (total > MAX_PACKAGE_SOURCE_BYTES) {
+        if (total > maxBytes) {
           throw new PackageError(
             'cap-exceeded',
-            `the source exceeds the ${MAX_PACKAGE_SOURCE_BYTES}-byte per-definition cap`,
+            `the source exceeds the ${maxBytes}-byte read cap`,
           );
         }
         chunks.push(Buffer.from(chunk.subarray(0, bytesRead)));
@@ -319,7 +329,7 @@ export async function createPackageStore(deps: PackageStoreDeps): Promise<Packag
     readonly path: string;
   }): Promise<{ readonly id: string; readonly sourceBytes: number }> {
     validateInput(input.name, input.purpose, input.path);
-    const source = await readContainedSource(input.path);
+    const source = await readContainedSource(input.path, MAX_PACKAGE_SOURCE_BYTES);
     parsePrecheck(source.toString('utf8'));
     const manifest = { name: input.name, purpose: input.purpose };
     const id = identity(manifest, source);
@@ -566,8 +576,20 @@ export async function createPackageStore(deps: PackageStoreDeps): Promise<Packag
     return verdict.ok ? verdict.definition : null;
   }
 
+  /** The public bounded contained read (the self channel's charter source). */
+  async function readWorldSource(path: string, maxBytes: number): Promise<Buffer> {
+    if (typeof path !== 'string' || path.length === 0) {
+      throw new PackageError('invalid-argument', 'the source path must be a nonempty string');
+    }
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+      throw new PackageError('invalid-argument', 'the read bound must be a positive safe integer');
+    }
+    return readContainedSource(path, maxBytes);
+  }
+
   return {
     definePackage, readMountedPackages, readPackageSource, listPackages,
     resolveLatestByName, newestIdByName, definitionById, undefinePackage,
+    readWorldSource,
   };
 }

@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { JournalWriter } from '../../journal/index.js';
+import { BlobStore, JournalWriter } from '../../journal/index.js';
 import type { EventEnvelope, JsonValue } from '../../journal/index.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../../context/events.js';
 import { canonicalizeJson } from '../../journal/index.js';
@@ -12,12 +12,13 @@ import { loadVerifiedEvents } from '../../context/loader.js';
 import type { VerifiedEvents } from '../../context/loader.js';
 import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
 import { ContextFold } from '../../context/fold.js';
-import { createBoundaryGate } from '../gate.js';
+import { MAX_CAPTURE_BYTES, createBoundaryGate } from '../gate.js';
 import type { BoundaryGate, GateCallbacks, GateScope } from '../gate.js';
 import { dispatchCalls } from '../tools/dispatch.js';
 import { createPackageStore } from '../packages/store.js';
 import type { PackageStore } from '../packages/store.js';
 import { createRunSupervisor } from '../packages/supervisor.js';
+import { createSelfPort, type SelfPort } from '../self.js';
 import type { RunSupervisor, RunSupervisorEvents } from '../packages/supervisor.js';
 import type {
   AgentConfig, AssistantProjection, FunctionCall, RequestId, Source,
@@ -43,6 +44,8 @@ type Session = {
   readonly packageGate: (gate: BoundaryGate | null) => void;
   /** A raw journal append, outside the boundary gate (the turn envelopes). */
   readonly rawAppend: (type: string, data: JsonValue) => void;
+  /** Makes the raw appends durable (the seeded initial configuration). */
+  readonly flush: () => Promise<void>;
   readonly shutdown: () => Promise<void>;
 };
 
@@ -66,7 +69,7 @@ async function openSession(): Promise<Session> {
       record(writer.append(type, data as never, opts)),
     flush: () => writer.flush(),
     lookup,
-    readBlob: async () => new Uint8Array(),
+    readBlob: (hash: string) => new BlobStore(home).get(hash),
     now: () => 100,
   };
   const closes: Array<() => void> = [];
@@ -115,6 +118,7 @@ async function openSession(): Promise<Session> {
     home, world, store, supervisor, gate,
     packageGate: (next) => { packageGate = next; },
     rawAppend: (type, data) => { record(writer.append(type, data as never)); },
+    flush: () => writer.flush(),
     shutdown,
   };
 }
@@ -146,7 +150,7 @@ interface Dispatched {
 
 async function extendCall(
   s: Session, args: JsonValue, over: Partial<AgentConfig> = {},
-  portSandbox = false, models?: readonly string[],
+  portSandbox = false, models?: readonly string[], self?: SelfPort,
 ): Promise<Dispatched> {
   const gate = s.gate('turn', 0);
   s.packageGate(gate);
@@ -158,6 +162,7 @@ async function extendCall(
       {
         store: s.store, supervisor: s.supervisor, sandbox: portSandbox,
         ...(models !== undefined ? { models } : {}),
+        ...(self !== undefined ? { self } : {}),
       },
     );
   } finally {
@@ -243,6 +248,8 @@ describe('extend: the six verbs', () => {
       expect(content).toContain(
         '== the substrate this kernel serves (operator-declared, unverified) ==');
       expect(content).toContain('not a routing table: the kernel does not probe these ids.');
+      expect(content).toContain('A start, a spawn or an update_self that names a model'
+        + ' outside the declared catalog is refused');
       expect(content).toMatch(/(^|\n)- served-a(\n|$)/);
       expect(content).toMatch(/(^|\n)- vendor\/model-b(\n|$)/);
 
@@ -1391,6 +1398,251 @@ describe('extend: packages addressable by name (the friction pass, L1)', () => {
         expect(typed.results[0]!.isError, JSON.stringify(args)).toBe(true);
         expect(typed.results[0]!.content, JSON.stringify(args)).toBe('error: invalid-tool');
       }
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+});
+
+describe('extend: update_self (the identity rewrite)', () => {
+  /** Makes the seeded config durable under the exact `system/message` shape. */
+  async function seedConfig(s: Session, cfg: AgentConfig): Promise<void> {
+    s.rawAppend('system/message', {
+      version: cfg.version, value: { kind: 'inline', value: cfg },
+    } as unknown as JsonValue);
+    await s.flush();
+  }
+
+  /** The latest journaled config (the live identity this harness's seam reads). */
+  async function liveConfigOf(s: Session): Promise<AgentConfig> {
+    const stored = await configEvents(s);
+    const last = stored[stored.length - 1]!;
+    const data = last.data as { value: { value: AgentConfig } };
+    return data.value.value;
+  }
+
+  async function configEvents(s: Session) {
+    return (await events(s.home)).filter((event) => event.type === 'system/message');
+  }
+
+  it('rewrites the heading and journals the next config version like the ready phase', async () => {
+    const s = await openSession();
+    try {
+      const before = config();
+      await seedConfig(s, before);
+      const self = createSelfPort(() => before, 'n1');
+      const { results } = await extendCall(
+        s, { verb: 'update_self', heading: 'rewritten heading' }, {}, false, undefined, self,
+      );
+      expect(results[0]!.isError).toBe(false);
+      expect(results[0]!.content).toBe('self updated (version 2): heading');
+      const stored = await configEvents(s);
+      expect(stored).toHaveLength(2);
+      const data = stored[1]!.data as {
+        version: number; value: { kind: string; value: AgentConfig };
+      };
+      expect(data.version).toBe(2);
+      expect(data.value.kind).toBe('inline');
+      expect(data.value.value.heading).toBe('rewritten heading');
+      expect(data.value.value.version).toBe(2);
+      // The fold applies it: the live identity is the rewritten one.
+      expect((await liveConfigOf(s)).heading).toBe('rewritten heading');
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('reads the charter from a world file and stamps its own sentence', async () => {
+    const s = await openSession();
+    try {
+      const before = config();
+      await seedConfig(s, before);
+      writeFileSync(join(s.world, 'charter.md'), 'a world charter You are node-9.');
+      const self = createSelfPort(() => before, 'n1');
+      const { results, rawEvents } = await extendCall(
+        s, { verb: 'update_self', path: 'charter.md' }, {}, false, undefined, self,
+      );
+      expect(results[0]!.isError).toBe(false);
+      expect(results[0]!.content).toBe('self updated (version 2): charter');
+      const stored = rawEvents.filter((event) => event.type === 'system/message');
+      const data = stored[1]!.data as { value: { value: AgentConfig } };
+      expect(data.value.value.charter).toBe('a world charter You are n1.');
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('refuses a charter path outside the world (nothing journaled)', async () => {
+    const s = await openSession();
+    try {
+      const before = config();
+      await seedConfig(s, before);
+      const outside = join(s.home, 'outside.md');
+      writeFileSync(outside, 'outside');
+      const self = createSelfPort(() => before, 'n1');
+      for (const path of [outside, 'never-existed.md']) {
+        const { results } = await extendCall(
+          s, { verb: 'update_self', path }, {}, false, undefined, self,
+        );
+        expect(results[0]!.isError).toBe(true);
+        expect(results[0]!.content).toMatch(/^error: update_self\/path-refused\n/);
+      }
+      // The fixed refusal never leaks an errno or an existence fact.
+      expect(await configEvents(s)).toHaveLength(1);
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('refuses a charter over the read bound — refuse, never truncate', async () => {
+    const s = await openSession();
+    try {
+      const before = config();
+      await seedConfig(s, before);
+      writeFileSync(join(s.world, 'huge.md'), Buffer.alloc(MAX_CAPTURE_BYTES + 1, 0x63));
+      const self = createSelfPort(() => before, 'n1');
+      const { results } = await extendCall(
+        s, { verb: 'update_self', path: 'huge.md' }, {}, false, undefined, self,
+      );
+      expect(results[0]!.isError).toBe(true);
+      expect(results[0]!.content).toMatch(/^error: update_self\/cap-exceeded\n/);
+      expect(await configEvents(s)).toHaveLength(1);
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('refuses a charter the config validator cannot carry, as a bounded denial', async () => {
+    const s = await openSession();
+    try {
+      const before = config();
+      await seedConfig(s, before);
+      // Under the read bound, over the config ceiling once canonicalized
+      // (6 MiB of C0 control characters escape to ~36 MiB): the renewal's
+      // validation fails, and the seam must render a bounded denial — never a
+      // handler fault from a model-triggered call.
+      writeFileSync(join(s.world, 'verbs.md'), Buffer.alloc(6 * 1024 * 1024, 0x01));
+      const self = createSelfPort(() => before, 'n1');
+      const { results } = await extendCall(
+        s, { verb: 'update_self', path: 'verbs.md' }, {}, false, undefined, self,
+      );
+      expect(results[0]!.isError).toBe(true);
+      expect(results[0]!.content).toMatch(/^denied: /);
+      expect(results[0]!.content).toContain('invalid agent configuration');
+      expect(results[0]!.content.length).toBeLessThanOrEqual(200 + 'denied: '.length);
+      expect(await configEvents(s)).toHaveLength(1);
+    } finally {
+      await s.shutdown();
+    }
+  }, 30_000);
+
+  it('validates a requested model against the declared catalog when one exists', async () => {
+    const s = await openSession();
+    try {
+      const before = config();
+      await seedConfig(s, before);
+      const self = createSelfPort(() => before, 'n1');
+      const denied = await extendCall(
+        s, { verb: 'update_self', model: 'model-b' }, {}, false, ['model-a'], self,
+      );
+      expect(denied.results[0]!.isError).toBe(true);
+      expect(denied.results[0]!.content).toMatch(/^denied: model "model-b" is not served/);
+      expect(await configEvents(s)).toHaveLength(1);
+      const accepted = await extendCall(
+        s, { verb: 'update_self', model: 'model-b' }, {}, false,
+        ['model-a', 'model-b'], self,
+      );
+      expect(accepted.results[0]!.isError).toBe(false);
+      expect(accepted.results[0]!.content).toBe('self updated (version 2): model');
+      // No catalog: the model stays the free string it was — the budget is the
+      // bound that still holds (the next case).
+      const free = await extendCall(
+        s, { verb: 'update_self', model: 'model-c' }, {}, false, undefined, self,
+      );
+      expect(free.results[0]!.isError).toBe(false);
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('refuses a model past the derived budget (the catalog-less hole stays closed)', async () => {
+    const s = await openSession();
+    try {
+      const before = config();
+      await seedConfig(s, before);
+      const self = createSelfPort(() => before, 'n1');
+      const { results } = await extendCall(
+        s, { verb: 'update_self', model: 'm'.repeat(300_000) }, {}, false, undefined, self,
+      );
+      expect(results[0]!.isError).toBe(true);
+      expect(results[0]!.content).toMatch(/^denied: the identity is \d+ canonical bytes; the/);
+      expect(results[0]!.content).toContain('sendability budget');
+      expect(await configEvents(s)).toHaveLength(1);
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('preserves the composer suffix across a rewrite, and never stacks a sentence', async () => {
+    const s = await openSession();
+    try {
+      const before = config({ charter: 'base You are n1, composed by n0.' });
+      await seedConfig(s, before);
+      // A world file normally ends with a newline: the trailing whitespace must
+      // not defeat the authored-strip pattern and let a second sentence stack.
+      writeFileSync(join(s.world, 'kid.md'), 'fresh start You are node-9, composed by node-8.\n');
+      const self = createSelfPort(() => before, 'n1');
+      const { rawEvents } = await extendCall(
+        s, { verb: 'update_self', path: 'kid.md' }, {}, false, undefined, self,
+      );
+      const stored = rawEvents.filter((event) => event.type === 'system/message');
+      const data = stored[1]!.data as { value: { value: AgentConfig } };
+      expect(data.value.value.charter).toBe('fresh start You are n1, composed by n0.');
+      expect(data.value.value.charter.match(/You are /g)).toHaveLength(1);
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('increases versions strictly across rewrites and keeps capabilities byte-identical', async () => {
+    const s = await openSession();
+    try {
+      const before = config();
+      await seedConfig(s, before);
+      const capability = (cfg: AgentConfig) => canonicalizeJson({
+        tools: cfg.tools, allowedTools: cfg.allowedTools, policy: cfg.policy,
+      });
+      let live = before;
+      const self = createSelfPort(() => live, 'n1');
+      writeFileSync(join(s.world, 'next.md'), 'next charter');
+      for (const args of [
+        { verb: 'update_self', heading: 'one' },
+        { verb: 'update_self', path: 'next.md' },
+        { verb: 'update_self', model: 'model-z' },
+      ]) {
+        const { results } = await extendCall(s, args, {}, false, undefined, self);
+        expect(results[0]!.isError).toBe(false);
+        live = await liveConfigOf(s);
+        expect(capability(live)).toBe(capability(before));
+      }
+      const stored = await configEvents(s);
+      expect(stored.map((event) => (event.data as { version: number }).version)).toEqual([1, 2, 3, 4]);
+      expect(live.version).toBe(4);
+      expect(live.heading).toBe('one');
+      expect(live.charter).toBe('next charter You are n1.');
+      expect(live.model).toBe('model-z');
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('denies update_self when the cell has no self port', async () => {
+    const s = await openSession();
+    try {
+      const { results, rawEvents } = await extendCall(s, { verb: 'update_self', heading: 'x' });
+      expect(results[0]!.isError).toBe(true);
+      expect(results[0]!.content).toBe('denied: this cell was composed without a self port');
+      expect(rawEvents.filter((event) => event.type === 'system/message')).toHaveLength(0);
     } finally {
       await s.shutdown();
     }

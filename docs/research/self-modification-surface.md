@@ -32,25 +32,33 @@ claim derived from documented Linux semantics rather than execution is daemon su
 
 ## 1. SELF — what a node can change about itself
 
-### 1.1 Charter: rewrite, append, re-compose — all impossible
+### 1.1 Charter, heading and model: rewritable; re-compose impossible
+
+A node's identity — heading, charter and model — is rewritable from inside the running
+node: `extend {verb:"update_self", heading?, path?, model?}` (at least one field; `path`
+names a world source file, mirroring `define`'s vocabulary) renews the configuration from
+the live fold, journals it as the next versioned `system/message`, and applies from the
+next assembled request (`src/node/self.ts`, `src/node/tools/extend.ts`, `src/node/loop.ts`).
+The statements below describe the composed charter's origin, the journal as the one carrier
+of a configuration, and the impossibility of a re-compose.
 
 The composed charter is produced once, at the `start` gate, as `base + " You are <uid>."`:
 
 - `src/host/host.ts:448-456` — `const base = charterFile !== undefined ? await readCharterFile(...) : defaultAgentConfig().charter;` then `charter: \`${base} You are ${uid}.\``. The exact composition is at **host.ts:455**.
-- The base default is **`src/context/config.ts:18-21`**; the operator file is validated at **host.ts:351-415** (regular file, ≤ 8192 bytes at **host.ts:335**, fatal UTF-8, non-empty).
+- The base default is **`src/context/config.ts:18-21`**; the operator file is validated at **host.ts:351-415** (regular file, fatal UTF-8, non-empty). The boot read is capped at 8192 bytes; the admission bound a rewrite is checked against is the derived identity budget (`src/node/identity-budget.ts`), not that boot-file cap.
 - The value is validated by **`src/context/config.ts:181-215`** and journaled as a `system/message` fact.
 
-That journaled value is the only charter that can ever be in force:
+The journaled value is the charter in force at that point; a rewrite appends a new version and the fold replays the chain:
 
 - **`src/node/loop.ts:346-349`** — the initial config is written **only when the fold has none** (`if (this.fold.snapshot().config === null)`).
 - **`src/context/assembler.ts:110`** — each request's `charter` is read from the folded config (`charter: config.value.charter`), and sent as the first system message (`src/provider/wire.ts:80`).
 - The driver replays the journal into the fold on every boot (`src/node/driver.ts:838-861`), so a restart reproduces the same charter.
 
-There is exactly one in-process API that can schedule a new config, and nothing in production calls it:
+A second in-process API can schedule a new config, and it is tests-only (the production path is `update_self`):
 
 - **`src/node/loop.ts:305-310`** — `scheduleConfig(config)`; grep shows only the interface declaration (`loop.ts:106`) and this implementation. The host composition (`src/host/host.ts:99-199`) never calls it.
 - Even that path is version-gated: **`src/node/loop.ts:475-479`** applies a scheduled config only when `scheduled.version > config.version`, and the fold enforces the same rule at replay (**`src/context/fold.ts:317-319`**, `'config version must strictly increase'`).
-- The only event type that carries a config is `system/message` (`src/context/events.ts:31`); its validator is **`src/context/events.ts:392-406`** and it is **scope-agnostic** (no `turnScope` call, unlike `world/perception` at `events.ts:409`) and **non-ignorable** (`events.ts:90`). No tool receives the gate except `executeExtend`, and it appends only the four package verb facts plus `tool/result` (**`src/node/tools/extend.ts:322-329,348-351,399-402,501-503,534,571`**); the terminal and web ports receive only `gate.signal` (**`src/node/tools/dispatch.ts:528-531,538-542`**).
+- The only event type that carries a config is `system/message` (`src/context/events.ts:31`); its validator is **`src/context/events.ts:392-406`** and it is **scope-agnostic** (no `turnScope` call, unlike `world/perception` at `events.ts:409`) and **non-ignorable** (`events.ts:90`). The only tool holding the gate is `executeExtend`: it appends the four package verb facts, `tool/result`, and — since `update_self` — the next versioned `system/message` configuration event, which the ready phase and the rewrite journal in the same shape (**`src/node/tools/extend.ts`**, **`src/node/loop.ts`**); the terminal and web ports receive only `gate.signal` (**`src/node/tools/dispatch.ts`**). The node-local journal is the identity history, and the fold replays it.
 
 **Re-compose** is impossible from either side:
 
@@ -58,15 +66,18 @@ There is exactly one in-process API that can schedule a new config, and nothing 
 - **`src/host/host.ts:458-463`** — `resume` refuses `--model`, `--heading` and `--charter-file`.
 - **`src/host/layout.ts:204-228`** — `init` is idempotent and never touches `nodes/`; no CLI verb deletes a journal (`src/host/options.ts:211-223`).
 
-Consequence: the only way to give an *existing* uid a new charter is an out-of-band deletion of `<home>/nodes/<uid>/log.v0.*` by the operator. A *new* uid in the same home gets a freshly composed charter (**host.ts:433-456** runs for a uid with no log).
+Consequence: a *re-compose* still requires an out-of-band deletion of `<home>/nodes/<uid>/log.v0.*` by the operator; the charter, heading and model themselves are rewritten in place by `update_self`, within the identity budget and the ratified direction. A *new* uid in the same home gets a freshly composed charter (**host.ts:433-456** runs for a uid with no log).
 
-### 1.2 Model / provider: impossible
+### 1.2 Model: rewritable; provider, parameters and key: fixed
 
-`model` is part of the journaled config (`src/context/contracts.ts:113`), fixed at `start`
-(**`src/host/host.ts:435-436,453`** — required, and `mock-model` refused). The provider endpoint and key come
-from the host credential store, read before the runtime exists (**`src/host/host.ts:547-552`**) and handed to
-`OpenAITransport` (**`host.ts:108-113`**). `resume` refuses `--model` (**`host.ts:458-459`**). The model id is
-emitted as a JSON field (**`src/provider/wire.ts:86`**), not as text the model reads.
+`model` is part of the journaled config (`src/context/contracts.ts`), set at `start` (required;
+`mock-model` refused) or inherited by a spawn, and rewritable from inside the node with
+`extend {verb:"update_self", model}` — validated against the operator-declared catalog when one
+exists (`src/node/tools/extend.ts`) and measured by the identity budget (`src/node/identity-budget.ts`).
+The provider endpoint and key come from the host credential store, read before the runtime exists
+(**`src/host/host.ts`**) and handed to `OpenAITransport`; `parameters` and the key are not
+rewritable. `resume` still refuses `--model` (the journaled config wins). The model id is emitted
+as a JSON field (**`src/provider/wire.ts`**), not as text the model reads.
 
 ### 1.3 uid: impossible
 
@@ -497,9 +508,9 @@ than data.
 
 ## Synthesis — what a node can and cannot recode about itself (10 lines)
 
-1. It cannot touch its charter: the string is fixed at `start`, journaled once, replayed from the fold, and no tool holds an append path to `system/message` (`host.ts:448-456`; `loop.ts:346-349`; `assembler.ts:110`).
-2. It cannot trigger a re-compose: `start` refuses a journaled cell and `resume` refuses the composing flags (`host.ts:440-442,458-463`); only an out-of-band journal deletion does it.
-3. It cannot change model, provider, parameters or uid; all are journaled, and the uid is load-bearing in the journal path, git author, perception check and scratch path (`contracts.ts:110-115`; `driver.ts:716`; `loop.ts:174,484-488`).
+1. It can rewrite its own heading, charter and model (`extend {verb:"update_self"}`): the runtime renews the config from the live fold (version +1), the executor journals it as the next `system/message`, and the change applies from the next assembled request — the node-local journal is the identity history (`src/node/self.ts`; `src/node/tools/extend.ts`). The heading is the seed fallback: a rewrite never moves the human-ratified `DIRECTION.md` block, and the identity budget admits it (`src/node/identity-budget.ts`).
+2. It cannot trigger a re-compose: `start` refuses a journaled cell and `resume` refuses the composing flags (`host.ts`); only an out-of-band journal deletion does it.
+3. It cannot change provider, parameters, uid or its capabilities (`tools`, `allowedTools`, `policy`), which are carried over untouched by every rewrite; the uid is load-bearing in the journal path, git author, perception check and scratch path (`contracts.ts`; `driver.ts`; `loop.ts`).
 4. It cannot change its step budget, shell timeout, capture or result caps; every number is read from the journaled policy at use (`loop.ts:507`; `dispatch.ts:538-542`).
 5. It cannot change the advertised five-tool offering; the registry is read at dispatch and never spliced into the request (`registry.ts:11-16`; `extend.ts:30-33`; test `extend.test.ts:931`).
 6. It can grow its *callable* capability: define/run/stop/undefine Packages, whose tools are invocable by bare name through the bridge without moving the offering (`extend.ts:384`; `dispatch.ts:473-484`).

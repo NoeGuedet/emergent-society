@@ -557,3 +557,58 @@ describe('package store: the name channel (the friction pass)', () => {
     }
   });
 });
+
+describe('package store: the public bounded contained read', () => {
+  it('reads a world file relative to the world root and an absolute one', async () => {
+    const f = fixture();
+    const s = await store(f);
+    worldFile(f, 'charter.md', 'a world charter\n');
+    const relative = await s.readWorldSource('charter.md', 1024);
+    expect(relative.toString('utf8')).toBe('a world charter\n');
+    const absolute = await s.readWorldSource(join(f.world, 'charter.md'), 1024);
+    expect(absolute.equals(relative)).toBe(true);
+    rmSync(f.home, { recursive: true, force: true });
+  });
+
+  it('accepts a file exactly at the caller\'s bound and refuses one byte past it', async () => {
+    const f = fixture();
+    const s = await store(f);
+    worldFile(f, 'exact.md', 'x'.repeat(64));
+    expect((await s.readWorldSource('exact.md', 64)).length).toBe(64);
+    worldFile(f, 'over.md', 'x'.repeat(65));
+    await expect(s.readWorldSource('over.md', 64))
+      .rejects.toMatchObject({ code: 'cap-exceeded' });
+    // Refuse, never truncate: the refusal names the caller's bound.
+    try {
+      await s.readWorldSource('over.md', 64);
+    } catch (err) {
+      expect((err as Error).message).toContain('64-byte read cap');
+    }
+    rmSync(f.home, { recursive: true, force: true });
+  });
+
+  it('keeps the fd-first containment: an outside path is the one fixed refusal', async () => {
+    const f = fixture();
+    const s = await store(f);
+    const outside = join(f.home, 'outside.md');
+    writeFileSync(outside, 'outside');
+    symlinkSync(outside, join(f.world, 'escape.md'));
+    for (const path of [outside, 'never-existed.md', join(f.world, 'escape.md')]) {
+      await expect(s.readWorldSource(path, 1024))
+        .rejects.toMatchObject({ code: 'path-refused' });
+    }
+    rmSync(f.home, { recursive: true, force: true });
+  });
+
+  it('refuses a malformed bound and an empty path before touching the filesystem', async () => {
+    const f = fixture();
+    const s = await store(f);
+    for (const maxBytes of [0, -1, 1.5, Number.NaN]) {
+      await expect(s.readWorldSource('charter.md', maxBytes))
+        .rejects.toMatchObject({ code: 'invalid-argument' });
+    }
+    await expect(s.readWorldSource('', 1024))
+      .rejects.toMatchObject({ code: 'invalid-argument' });
+    rmSync(f.home, { recursive: true, force: true });
+  });
+});

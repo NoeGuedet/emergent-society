@@ -12,6 +12,7 @@ import { ContextFold } from '../context/fold.js';
 import { loadVerifiedEvents } from '../context/loader.js';
 import { writeSnapshot } from '../context/snapshots.js';
 import { dispatchCalls } from './tools/dispatch.js';
+import { createSelfPort } from './self.js';
 import type { ExtendPort } from './tools/extend.js';
 import type { RunSupervisorEvents } from './packages/supervisor.js';
 import type { ProviderAdapter } from '../provider/adapter.js';
@@ -106,7 +107,10 @@ export type RuntimeOptions = {
    * The extend port factory (C1.5): the loop owns the event router (it alone
    * knows which gate the current dispatch holds), the caller owns the
    * construction — the host composes the store and the supervisor (L5), tests
-   * inject them. When absent, offered `extend` calls resolve as `denied`.
+   * inject them. When absent, offered `extend` calls resolve as `denied`. The
+   * runtime always replaces the returned port's `self` field with its own seam
+   * over the live fold, so a rewrite is derived from the identity in force,
+   * never from a caller's snapshot.
    */
   readonly extend?: (
     events: RunSupervisorEvents,
@@ -263,13 +267,24 @@ class Runtime implements AgentRuntime {
     };
     // The extend port is composed last: the factory receives the event
     // router AND the node's own ports (svc inherits their rights — an
-    // absent tool is a null port, the allowedTools inheritance).
-    this.extendPort = options.extend === undefined
+    // absent tool is a null port, the allowedTools inheritance). The runtime
+    // then supplies the self seam over its own live fold: only this module
+    // holds the folded configuration a rewrite is derived from, and the
+    // renew reads it at call time — never the config captured at turn start.
+    const port = options.extend === undefined
       ? null
       : options.extend(packageEvents, {
         terminal: this.terminalPort,
         web: options.webTools ?? null,
       });
+    this.extendPort = port === null
+      ? null
+      : {
+        ...port,
+        self: createSelfPort(
+          () => this.fold.snapshot().config?.value ?? null, options.uid, options.models,
+        ),
+      };
   }
 
   /**

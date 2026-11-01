@@ -49,6 +49,17 @@ export type AssembleInput = {
  */
 const SUBSTRATE_PREFIX = 'The substrate this kernel serves — models: ';
 
+/**
+ * The pinned substrate block's text: the fixed prefix, then the ids in
+ * declaration order joined by `, `, and `(none declared)` for an empty
+ * declaration rather than a dangling list. Exported so the identity budget
+ * measures the exact block the plan carries instead of a restated sentence.
+ */
+export function substrateText(models: readonly string[]): string {
+  return `${SUBSTRATE_PREFIX}${models.length === 0
+    ? '(none declared)' : models.join(', ')}`;
+}
+
 function refuse(message: string): never {
   throw new Error(`cannot assemble: ${message}`);
 }
@@ -119,8 +130,7 @@ export function assemble(input: AssembleInput): RequestPlan {
   // documented cache invalidator beside a heading change.
   const substrate = input.models === undefined
     ? undefined
-    : `${SUBSTRATE_PREFIX}${input.models.length === 0
-      ? '(none declared)' : input.models.join(', ')}`;
+    : substrateText(input.models);
   const sections: PlanSection[] = [
     { name: 'tools', cache: 'stable', sources: [source] },
     { name: 'charter', cache: 'stable', sources: [source] },

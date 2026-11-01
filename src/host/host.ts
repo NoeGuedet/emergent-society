@@ -9,8 +9,10 @@ import { C13_EVENT_TYPES } from '../context/events.js';
 import { ContextFold } from '../context/fold.js';
 import { loadVerifiedEvents } from '../context/loader.js';
 import { openFrontierJournal, type FrontierJournal } from '../frontier/index.js';
-import { NODE_UID_RE, nodeLayout } from '../journal/index.js';
+import { nodeLayout } from '../journal/index.js';
 import { createPackageStore, createRunSupervisor } from '../node/packages/index.js';
+import { identitySentence, stripAuthoredIdentity } from '../node/identity.js';
+import { IdentityBudgetError, assertSendableIdentity } from '../node/identity-budget.js';
 import { singleLine } from '../text.js';
 import { readWorldState, type WorldState } from '../node/world-state.js';
 import { runWorldDoctor, type DoctorReport } from '../node/world-doctor.js';
@@ -217,31 +219,16 @@ export type ChildComposeSeam = (
 ) => Promise<NodeCell>;
 
 /**
- * The uid grammar as an inner-pattern fragment. `NODE_UID_RE.source` is the
- * one grammar (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`); only its anchors are
- * removed, so the sentence patterns below can never drift from it.
+ * The authored-strip pattern, re-exported for the host's own callers: a
+ * trailing kernel identity sentence (` You are <uid>.` or
+ * ` You are <uid>, composed by <uid>.`) over the uid grammar, never a
+ * hardcoded `node-\d+`. The kernel owns the final sentence of every charter, so
+ * any authored one is stripped before the kernel stamps its own: a world
+ * charter written by another node cannot smuggle a second identity past it.
+ * The one definition lives in `../node/identity.ts` (boot, spawn and
+ * `update_self` share it).
  */
-const UID_FRAGMENT = NODE_UID_RE.source.replace(/^\^/, '').replace(/\$$/, '');
-
-/**
- * The authored-strip pattern: a trailing kernel identity sentence —
- * ` You are <uid>.` or ` You are <uid>, composed by <uid>.` — over the uid
- * grammar, never a hardcoded `node-\d+`. The kernel owns the final sentence of
- * every charter, so any authored one is stripped before the kernel stamps its
- * own: a world charter written by another node cannot smuggle a second
- * identity past it.
- */
-export const AUTHORED_IDENTITY_RE =
-  new RegExp(` You are ${UID_FRAGMENT}(?:, composed by ${UID_FRAGMENT})?\\.$`);
-
-/**
- * The kernel's composer sentence for a spawned node: the child's uid and the
- * requester that composed it. The requester is information, not structure —
- * the world records no parentage.
- */
-function composerSentence(uid: string, requesterUid: string): string {
-  return ` You are ${uid}, composed by ${requesterUid}.`;
-}
+export { AUTHORED_IDENTITY_RE } from '../node/identity.js';
 
 /** The parts one home shares across every node it runs. */
 type SharedCell = {
@@ -904,7 +891,7 @@ async function resolveNodeConfig(
       ...defaultAgentConfig(),
       model,
       heading,
-      charter: `${base.replace(AUTHORED_IDENTITY_RE, '')} You are ${uid}.`,
+      charter: `${stripAuthoredIdentity(base)}${identitySentence(uid)}`,
     });
   }
   if (model !== undefined || heading !== undefined) {
@@ -1074,6 +1061,14 @@ class NodePool {
    * a refusal never reserves a uid or a roster place. A request that names no
    * model inherits the requester's own — attenuation wins over validation —
    * even when that model is not in the catalog (the documented residual).
+   *
+   * The composed config is checked against the derived identity budget (the
+   * plan's spawn-side admission seam) after it is composed and BEFORE any
+   * composition side effect: an over-budget child is a bounded
+   * `SpawnRefusedError`, so no cell directory is created, no child local log
+   * exists and no `host/spawned` is emitted. The composer suffix is part of the
+   * measured block, which is why a requester sitting just under the budget can
+   * be refused a child that would cross it.
    */
   async spawn(
     requesterUid: string, request: SpawnRequest,
@@ -1099,6 +1094,14 @@ class NodePool {
         ?? requester.cell.config;
       const canSpawn = request.spawn === true && requester.canSpawn;
       const config = composedChildConfig(base, uid, requesterUid, request);
+      try {
+        assertSendableIdentity(config, catalog);
+      } catch (err) {
+        if (err instanceof IdentityBudgetError) {
+          throw new SpawnRefusedError(singleLine(err.message, 200));
+        }
+        throw err;
+      }
       const options: CellOptions = {
         home: this.deps.home, uid, config,
         credential: this.deps.credential, providers: this.deps.providers,
@@ -1286,12 +1289,12 @@ class NodePool {
 function composedChildConfig(
   base: AgentConfig, uid: string, requesterUid: string, request: SpawnRequest,
 ): AgentConfig {
-  const authored = (request.charter ?? base.charter).replace(AUTHORED_IDENTITY_RE, '');
+  const authored = stripAuthoredIdentity(request.charter ?? base.charter);
   return validateAgentConfig({
     ...base,
     model: request.model ?? base.model,
     heading: request.heading ?? base.heading,
-    charter: `${authored}${composerSentence(uid, requesterUid)}`,
+    charter: `${authored}${identitySentence(uid, requesterUid)}`,
     // Attenuation: a child can hold only what the requester holds.
     allowedTools: [...base.allowedTools],
     policy: {

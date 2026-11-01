@@ -214,13 +214,15 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
     return { kind: 'execute', cmd };
   }
 
-  // `extend`: the seven verbs, each with its exact key set (the funnel's
+  // `extend`: the nine verbs, each with its exact key set (the funnel's
   // argument shapes are validated here — the one-decision-point rule).
-  const verbs = ['inspect', 'define', 'run', 'call', 'stop', 'undefine', 'spawn', 'speak'];
+  const verbs = [
+    'inspect', 'define', 'run', 'call', 'stop', 'undefine', 'spawn', 'speak', 'update_self',
+  ];
   const verb = parsed['verb'];
   if (typeof verb !== 'string' || !verbs.includes(verb)) {
     return invalidDetail(
-      'verb must be one of inspect, define, run, call, stop, undefine, spawn, speak',
+      'verb must be one of inspect, define, run, call, stop, undefine, spawn, speak, update_self',
     );
   }
   const keys = Object.keys(parsed);
@@ -266,6 +268,32 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
       ...(typeof heading === 'string' ? { heading } : {}),
       ...(typeof charter === 'string' ? { charter } : {}),
       ...(typeof grant === 'boolean' ? { spawn: grant } : {}),
+    };
+  }
+  if (verb === 'update_self') {
+    // The self rewrite (plan §0.7): the identity fields are optional, but at
+    // least one must be present — a rewrite that changes nothing is a wrong
+    // call, not a no-op version. `path` mirrors define's vocabulary (a world
+    // source file), never a second meaning for spawn's inline `charter`. A
+    // wrong key SET names the rule; a wrong-typed or empty value is the bare
+    // refusal (the model sent the right shape with a bad value).
+    if (!only('verb', 'heading', 'path', 'model')) {
+      return invalidDetail('update_self takes verb and at least one of heading, path, model');
+    }
+    const heading = parsed['heading'];
+    const path = parsed['path'];
+    const model = parsed['model'];
+    if (heading === undefined && path === undefined && model === undefined) {
+      return invalidDetail('update_self takes at least one of heading, path, model');
+    }
+    if (heading !== undefined && (typeof heading !== 'string' || heading === '')) return INVALID;
+    if (path !== undefined && (typeof path !== 'string' || path === '')) return INVALID;
+    if (model !== undefined && (typeof model !== 'string' || model === '')) return INVALID;
+    return {
+      kind: 'extend', verb: 'update_self',
+      ...(typeof heading === 'string' ? { heading } : {}),
+      ...(typeof path === 'string' ? { path } : {}),
+      ...(typeof model === 'string' ? { model } : {}),
     };
   }
   if (verb === 'define') {

@@ -1,16 +1,19 @@
 import type { BoundaryGate } from '../gate.js';
+import { MAX_CAPTURE_BYTES } from '../gate.js';
 import type { RequestId } from '../../context/contracts.js';
 import type { AgentConfig } from '../../context/contracts.js';
 import { canonicalizeJson } from '../../journal/index.js';
 import { boundToolText } from './text.js';
+import { modelRefusal } from './providers.js';
 import { singleLine } from '../../text.js';
 import { PackageError } from '../packages/errors.js';
+import { SelfRefusedError, type SelfPort } from '../self.js';
 import type { PackageDefinition, PackageStore } from '../packages/store.js';
 import type { RunSupervisor } from '../packages/supervisor.js';
 
 /**
  * The extend executor (kernel.md, the sandbox and local-log sections): the
- * peer of terminal and web — the six verbs, the append home of the four
+ * peer of terminal and web — the nine verbs, the append home of the four
  * verb facts (define, run, stop, undefine; the registry's effect facts and
  * the supervisor's error/service facts ride the injected event port), the
  * funnel's kernel-side schema validation, and the honest inspect catalogue.
@@ -56,9 +59,15 @@ export type ExtendPort = {
    * The operator-declared served-model catalog (providers.json `llm.models`),
    * when the store declares one. inspect lists it honestly; it is the one
    * source for validating a model a verb requests (the host's pool validates
-   * `spawn` against it).
+   * `spawn` against it, the executor validates `update_self`).
    */
   readonly models?: readonly string[];
+  /**
+   * The node's own identity rewrite (§0.7), supplied by the runtime — it reads
+   * the live folded config, so the seam cannot be constructed by a caller that
+   * does not hold the fold. Absent resolves `update_self` as a bounded denial.
+   */
+  readonly self?: SelfPort;
 };
 
 /** One spawn request, already typed: the host validates it against the caps. */
@@ -138,6 +147,10 @@ export type ExtendDecision =
     readonly kind: 'extend'; readonly verb: 'spawn';
     readonly model?: string; readonly heading?: string;
     readonly charter?: string; readonly spawn?: boolean;
+  }
+  | {
+    readonly kind: 'extend'; readonly verb: 'update_self';
+    readonly heading?: string; readonly path?: string; readonly model?: string;
   }
   | { readonly kind: 'extend'; readonly verb: 'speak'; readonly text: string };
 
@@ -265,6 +278,25 @@ function storeFailureText(err: PackageError): { content: string; isError: boolea
 }
 
 /**
+ * The self channel's store refusal: the same bounded codes, spelled for
+ * `update_self` (a charter read, not a definition). A store method never
+ * truncates — an over-bound file is refused whole.
+ */
+function selfStoreFailureText(err: PackageError): { content: string; isError: boolean } {
+  switch (err.code) {
+    case 'path-refused':
+      return failure(`error: update_self/path-refused\n${err.message}`);
+    case 'cap-exceeded':
+      return failure(`error: update_self/cap-exceeded\n${err.message}`);
+    default:
+      return failure(`error: update_self/refused\n${err.message}`);
+  }
+}
+
+/** The strict UTF-8 decode of a charter read; invalid bytes are a refusal, never U+FFFD. */
+const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true });
+
+/**
  * Renders the honest inspect catalogue (kernel.md, the sandbox and
  * local-log sections): base tools, package tools with their schemas, the
  * stored packages with the caps and their meaning, the operator-declared
@@ -327,8 +359,9 @@ function renderInspect(
       lines.push('(none declared — every start is refused; providers.json declares'
         + ' llm.models empty)');
     } else {
-      lines.push('not a routing table: the kernel does not probe these ids. A start,'
-        + ' and a spawn that names a model, must be one of them:');
+      lines.push('not a routing table: the kernel does not probe these ids. A start, a'
+        + ' spawn or an update_self that names a model outside the declared catalog is'
+        + ' refused:');
       for (const model of port.models) lines.push(`- ${model}`);
     }
   }
@@ -490,6 +523,86 @@ export async function executeExtend(opts: {
       }
       throw err;
     }
+    return;
+  }
+
+  if (decision.verb === 'update_self') {
+    // The self channel (plan §0.7): the new charter is authored in the world
+    // (a `path`, mirroring define's vocabulary), the identity fields are
+    // applied by the runtime's renew over the LIVE folded config, and the
+    // change is journaled exactly like the ready phase — `gate.store` plus a
+    // versioned `system/message`. The new identity therefore applies from the
+    // next assembled request (possibly this turn); the turn's dispatch and
+    // policy stay on the config captured at turn start, which is the `config`
+    // this executor was handed.
+    if (port.self === undefined) {
+      await appendResult(gate, id, callId,
+        'denied: this cell was composed without a self port', true, max);
+      return;
+    }
+    let charter: string | undefined;
+    if (decision.path !== undefined) {
+      // Bounded by the capture ceiling the config validator and the plan check
+      // share — refuse, never truncate. A larger file could never become a
+      // sendable identity anyway; the bound only stops the read from being a
+      // DoS channel.
+      let bytes: Buffer;
+      try {
+        bytes = await port.store.readWorldSource(decision.path, MAX_CAPTURE_BYTES);
+      } catch (err) {
+        if (err instanceof PackageError) {
+          const text = selfStoreFailureText(err);
+          await appendResult(gate, id, callId, text.content, true, max);
+          return;
+        }
+        throw err;
+      }
+      try {
+        charter = STRICT_UTF8.decode(bytes);
+      } catch {
+        await appendResult(gate, id, callId,
+          'error: update_self/invalid-source\nthe charter is not valid UTF-8', true, max);
+        return;
+      }
+    }
+    // The model is validated against the operator's declared catalog when one
+    // exists — the same source and the same bounded refusal as spawn's. With no
+    // catalog the model stays the free string it was; the identity budget below
+    // is what keeps the catalog-less model hole closed.
+    if (decision.model !== undefined && port.models !== undefined
+      && !port.models.includes(decision.model)) {
+      await appendResult(gate, id, callId,
+        `denied: ${modelRefusal(decision.model, port.models)}`, true, max);
+      return;
+    }
+    let next: AgentConfig;
+    try {
+      next = port.self.renew({
+        ...(decision.heading !== undefined ? { heading: decision.heading } : {}),
+        ...(charter !== undefined ? { charter } : {}),
+        ...(decision.model !== undefined ? { model: decision.model } : {}),
+      });
+    } catch (err) {
+      if (err instanceof SelfRefusedError) {
+        await appendResult(gate, id, callId,
+          `denied: ${singleLine(err.message, 200)}`, true, max);
+        return;
+      }
+      throw err;
+    }
+    // The ready phase's exact shape: the config is stored (claim-checked like
+    // any other value) and appended as its own versioned event. The fold
+    // enforces the strictly-increasing version at replay; the executor's flush
+    // (dispatchCalls) makes the event durable before the next request.
+    const stored = await gate.store(next);
+    gate.append('system/message', { version: next.version, value: stored });
+    const changed = [
+      ...(decision.heading !== undefined ? ['heading'] : []),
+      ...(charter !== undefined ? ['charter'] : []),
+      ...(decision.model !== undefined ? ['model'] : []),
+    ];
+    await appendResult(gate, id, callId,
+      `self updated (version ${next.version}): ${changed.join(', ')}`, false, max);
     return;
   }
 
