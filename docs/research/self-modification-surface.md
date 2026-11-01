@@ -45,7 +45,7 @@ of a configuration, and the impossibility of a re-compose.
 The composed charter is produced once, at the `start` gate, as `base + " You are <uid>."`:
 
 - `src/host/host.ts:448-456` — `const base = charterFile !== undefined ? await readCharterFile(...) : defaultAgentConfig().charter;` then `charter: \`${base} You are ${uid}.\``. The exact composition is at **host.ts:455**.
-- The base default is **`src/context/config.ts:18-21`**; the operator file is validated at **host.ts:351-415** (regular file, fatal UTF-8, non-empty). The boot read is capped at 8192 bytes; the admission bound a rewrite is checked against is the derived identity budget (`src/node/identity-budget.ts`), not that boot-file cap.
+- The base default is **`src/context/config.ts:18-21`**; the operator file is validated at **host.ts:351-415** (regular file, fatal UTF-8, non-empty). The boot read is bounded only by the capture-ceiling DoS guard (refuse, never truncate); the one identity bound is the derived identity budget (`src/node/identity-budget.ts`), checked at the START composition (start only, after the provider load), the spawn-side composition and `update_self`'s renew — never in the validator, and separate from the canonical-config ceiling.
 - The value is validated by **`src/context/config.ts:181-215`** and journaled as a `system/message` fact.
 
 The journaled value is the charter in force at that point; a rewrite appends a new version and the fold replays the chain:
@@ -359,8 +359,9 @@ You act by writing in the shared world. Preserve durable knowledge in files. You
 
 With `--charter-file`, `base` is the raw file text (**`host.ts:448-450`**) and the same sentence is appended with
 exactly one ASCII space before `You`, and no other separator normalization (`host.ts:455`). Pinned by tests:
-`src/host/__tests__/lifecycle.test.ts:365` (`defaultAgentConfig().charter + ' You are node-0.'`), `:388`
-(operator base), `:434` (8192-byte acceptance).
+`src/host/__tests__/lifecycle.test.ts` (the default `defaultAgentConfig().charter + ' You are node-0.'`
+composition, the operator base, and the exact-8192 and 100 KiB acceptances — both below the pinned identity
+floor — beside the two distinct over-bound refusals: the capture-ceiling DoS guard and the derived budget).
 
 ### 5.2 What it says about self-modification: nothing
 

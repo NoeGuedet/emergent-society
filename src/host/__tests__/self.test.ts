@@ -22,10 +22,12 @@ import { createHostLog } from '../observe.js';
  * through the node-local journal.
  *
  * One home, one world, one frontier; the only network is the loopback fake
- * provider. The spawn-side budget case injects the requester's oversized (but
- * under-budget-by-ten-bytes) identity through the test-only config seam — the
- * boot charter file cap is still live in this brick, so a real boot cannot
- * compose it.
+ * provider. The spawn-side budget case injects the requester's near-boundary
+ * identity (exactly ten canonical bytes below the derived budget) through the
+ * test-only config seam. That identity is UNDER the START budget, so the START
+ * seam admits it; the seam pins the exact canonical size so the spawn-side
+ * refusal — the longer composer sentence crossing the budget — is exercised at
+ * the boundary without composing a real boot.
  */
 
 const dirs: string[] = [];

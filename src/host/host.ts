@@ -12,6 +12,7 @@ import { openFrontierJournal, type FrontierJournal } from '../frontier/index.js'
 import { nodeLayout } from '../journal/index.js';
 import { createPackageStore, createRunSupervisor } from '../node/packages/index.js';
 import { identitySentence, stripAuthoredIdentity } from '../node/identity.js';
+import { MAX_CAPTURE_BYTES } from '../node/gate.js';
 import { IdentityBudgetError, assertSendableIdentity } from '../node/identity-budget.js';
 import { singleLine } from '../text.js';
 import { readWorldState, type WorldState } from '../node/world-state.js';
@@ -777,14 +778,11 @@ async function readCellConfig(home: string, uid: string): Promise<CellConfigStat
   }
 }
 
-/** The operator charter ceiling: a file this large would own every request. */
-const MAX_CHARTER_BYTES = 8192;
-
 /**
  * Reads the operator's charter file once, at the start gate. The path is the
  * operator's own (validated absolute by argv parsing) and must resolve to a
  * regular file — a FIFO, a device or a directory is refused rather than read;
- * symlinks are followed. At most `MAX_CHARTER_BYTES + 1` raw bytes are ever
+ * symlinks are followed. At most `MAX_CAPTURE_BYTES + 1` raw bytes are ever
  * loaded, so an oversize file is refused by its byte count, never buffered
  * whole; the bytes must be valid UTF-8 — an invalid encoding is refused, not
  * silently rewritten into replacement characters — and nothing about the file
@@ -793,6 +791,14 @@ const MAX_CHARTER_BYTES = 8192;
  * the same inode, so the opened file's `(dev, ino)` is compared to the
  * store's before a single byte is read — the credential store must never
  * enter the journal.
+ *
+ * The bound is the capture ceiling — the boot charter read's DoS guard, not an
+ * arbitrary charter size: a file this large could never become a sendable
+ * request anyway, and reading more of it would only spend the host's memory on
+ * a value no bound admits, so an oversize file is REFUSED (never truncated).
+ * The identity budget at the START-composition seam is the one identity bound;
+ * this guard and `validateAgentConfig`'s canonical-config ceiling are separate,
+ * file/DOS bounds and are named as such in the docs.
  */
 async function readCharterFile(home: string, uid: string, path: string): Promise<string> {
   const resolved = resolve(path);
@@ -835,7 +841,7 @@ async function readCharterFile(home: string, uid: string, path: string): Promise
       throw new HostConfigError(
         'refusing the providers store as a charter file; its content would be journaled');
     }
-    const buffer = Buffer.alloc(MAX_CHARTER_BYTES + 1);
+    const buffer = Buffer.alloc(MAX_CAPTURE_BYTES + 1);
     let bytesRead = 0;
     while (bytesRead < buffer.length) {
       const { bytesRead: chunk } = await handle.read(
@@ -843,9 +849,9 @@ async function readCharterFile(home: string, uid: string, path: string): Promise
       if (chunk === 0) break;
       bytesRead += chunk;
     }
-    if (bytesRead > MAX_CHARTER_BYTES) {
+    if (bytesRead > MAX_CAPTURE_BYTES) {
       throw new HostConfigError(
-        `the charter file is over ${MAX_CHARTER_BYTES} bytes; the limit is ${MAX_CHARTER_BYTES}`);
+        `the charter file is over ${MAX_CAPTURE_BYTES} bytes; the limit is ${MAX_CAPTURE_BYTES}`);
     }
     let text: string;
     try {
@@ -1554,6 +1560,25 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
             if (!catalog.includes(config.model)) {
               throw new HostConfigError(modelRefusal(config.model, catalog));
             }
+          }
+        }
+        // The START-composition seam of the derived identity budget (plan
+        // §0.5): the composed identity — heading + charter + the kernel's
+        // sentence (inside the charter) + model, in canonical bytes — must be
+        // strictly below `budget = min(max(C − W, IDENTITY_FLOOR), C)`, where
+        // the reserve W needs the declared catalog for its substrate term.
+        // This is why the check sits AFTER the provider load, and it is
+        // START-ONLY: a resume's journaled config won and may legally predate
+        // the budget (replay compatibility), and `validateAgentConfig` is
+        // never touched (the fold re-runs it on every replay). The refusal
+        // keeps the helper's bounded message, naming the measurement and the
+        // bound.
+        for (const config of configs) {
+          try {
+            assertSendableIdentity(config, catalog);
+          } catch (err) {
+            if (err instanceof IdentityBudgetError) throw new HostConfigError(err.message);
+            throw err;
           }
         }
       }

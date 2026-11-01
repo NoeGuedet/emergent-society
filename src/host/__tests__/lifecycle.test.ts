@@ -6,9 +6,13 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { canonicalBytes } from '../../context/artifacts.js';
+import { assemble } from '../../context/assembler.js';
 import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
-import type { AgentConfig } from '../../context/contracts.js';
+import type { AgentConfig, ChatMessage, RequestPlan } from '../../context/contracts.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
+import { ContextFold } from '../../context/fold.js';
+import { loadVerifiedEvents } from '../../context/loader.js';
 import { FRONTIER_EVENT_TYPES, openFrontierJournal } from '../../frontier/index.js';
 import { TEST_STORAGE } from '../../frontier/__tests__/helpers.js';
 import { encodeBatch, scanBatches } from '../../journal/framing.js';
@@ -19,8 +23,13 @@ import { processStartTime } from '../../journal/lock.js';
 import {
   serveJson, type LoopServer, type RecordedRequest,
 } from '../../node/__tests__/helpers.js';
+import { MAX_CAPTURE_BYTES } from '../../node/gate.js';
 import { modelRefusal } from '../../node/tools/providers.js';
-import { identityBudget, identityBytes } from '../../node/identity-budget.js';
+import {
+  ESCAPE_FACTOR, IDENTITY_FLOOR, PLAN_MARGIN, assertSendableIdentity, effectiveCeiling,
+  identityBudget, identityBytes, reserve,
+} from '../../node/identity-budget.js';
+import { canonicalMessagesBytes } from '../../provider/wire.js';
 import { WorldRepo } from '../../node/world.js';
 import {
   attachProcessHandlers, composeCell, startHost,
@@ -240,6 +249,199 @@ async function seedBootOnly(target: string): Promise<void> {
   writer.append('node/boot', { reason: 'start' });
   await writer.flush();
   await writer.close();
+}
+
+// --- the identity-budget boundary fixture (S5, plan §0.5) -------------------
+
+/** The model the boundary fixture's store declares and its config names. */
+const BOUNDARY_MODEL = 'boundary-model';
+/** The declared catalog, so the reserve's substrate term is real. */
+const BOUNDARY_CATALOG = [BOUNDARY_MODEL] as const;
+/** Headroom between the fixture identity and the derived budget (over the actual O). */
+const BOUNDARY_HEADROOM = 128 * 1024;
+/** A C0 control character: JSON-escaped as a six-byte \u00XX — the true 6× case. */
+const C0_CHAR = '\u0001';
+/** The identity fill of the two fixture identities (well above the 256 KiB floor). */
+const CAPS_IDENTITY_FILL = 1_500_000;
+const K_IDENTITY_FILL = 500_000;
+
+/** The reserve's history component: the K branch or the caps branch, whichever is larger. */
+function historyComponent(policy: AgentConfig['policy']): number {
+  return Math.max(
+    policy.compactAfterBytes,
+    (policy.keepRecentGroups * policy.maxCallsPerResponse * policy.maxToolResultBytes
+      + policy.keepRecentGroups * policy.maxAssistantBytes) * ESCAPE_FACTOR,
+  );
+}
+
+/**
+ * A config whose policy is shrunk into the uncapped band, with the ceiling
+ * solved together with the identity: `C = reserve + identity + headroom`, so
+ * `budget = C − reserve = identity + headroom` — strictly above the floor and
+ * leaving more than the plan's actual metadata overhead beside the identity.
+ * Under the factory policy the same identity is refused (the budget collapses
+ * to the floor).
+ */
+function shrunkBoundaryConfig(
+  patch: Partial<AgentConfig['policy']>, identityFill: number,
+): { readonly config: AgentConfig; readonly ceiling: number } {
+  const base = defaultAgentConfig();
+  const compose = (maxRequestBytes: number): AgentConfig => validateAgentConfig({
+    ...base,
+    model: BOUNDARY_MODEL,
+    heading: 'Boundary seed.',
+    charter: 'c'.repeat(identityFill) + ' You are node-0.',
+    policy: { ...base.policy, ...patch, maxRequestBytes },
+  });
+  const probe = compose(1 * 1024 * 1024);
+  const ceiling = reserve(probe, BOUNDARY_CATALOG) + identityBytes(probe) + BOUNDARY_HEADROOM;
+  return { config: compose(ceiling), ceiling };
+}
+
+/** One balanced dialogue group: an assistant call and its one result, at the given sizes. */
+function dialogueGroup(
+  ordinal: number, assistantChars: number, resultChars: number,
+): ChatMessage[] {
+  const call = {
+    id: `call-${ordinal}`, type: 'function' as const,
+    function: { name: 'execute', arguments: '{"cmd":"true"}' },
+  };
+  return [
+    { role: 'assistant', content: C0_CHAR.repeat(assistantChars), tool_calls: [call] },
+    { role: 'tool', content: C0_CHAR.repeat(resultChars), tool_call_id: call.id },
+  ];
+}
+
+/**
+ * `keepRecentGroups` control-laden groups whose canonical total is the target
+ * (the K-dominant variant): the envelope is the per-message JSON around the
+ * six-byte escapes, measured once with one-character contents.
+ */
+function sizedControlGroups(targetCanonical: number, groups: number): ChatMessage[][] {
+  const probe = Array.from({ length: groups }, (_, ordinal) => dialogueGroup(ordinal, 1, 1));
+  const envelope = canonicalMessagesBytes(probe.flat()).length
+    - groups * 2 * ESCAPE_FACTOR;
+  const raw = Math.max(groups * 2, Math.floor((targetCanonical - envelope) / ESCAPE_FACTOR));
+  const perMessage = Math.max(1, Math.floor(raw / (groups * 2)));
+  return Array.from({ length: groups }, (_, ordinal) =>
+    dialogueGroup(ordinal, perMessage, perMessage));
+}
+
+/**
+ * Seeds the control-laden dialogue groups DIRECTLY into the node-local journal:
+ * `execute` sanitizes PTY output and strips C0, so a driven result can never
+ * carry the true six-byte escapes (plan S5). One closed turn promotes exactly
+ * `keepRecentGroups` balanced dialogue groups, so the compaction span is
+ * eligible-empty. Returns the canonical history size H.
+ */
+async function seedControlHistory(
+  turn: number, groups: readonly ChatMessage[][],
+): Promise<number> {
+  const writer = await JournalWriter.open(home, 'node-0', {});
+  writer.append('turn/start', { turn, trigger: 'boot', world: { from: null, to: null } });
+  groups.forEach((messages, ordinal) => {
+    const assistant = messages[0];
+    const result = messages[1];
+    if (assistant === undefined || assistant.role !== 'assistant'
+      || result === undefined || result.role !== 'tool') {
+      throw new Error('a seeded group is not one assistant and one result');
+    }
+    const call = assistant.tool_calls[0];
+    if (call === undefined) throw new Error('a seeded assistant advertises no call');
+    const request = { turn, ordinal };
+    writer.append('assistant/message', {
+      id: request,
+      value: {
+        kind: 'inline',
+        value: { message: assistant, contentTruncated: false, frontierCall: 'f'.repeat(32) },
+      },
+    });
+    writer.append('tool/call', { turn, request, call });
+    writer.append('tool/result', {
+      turn, request, callId: call.id, message: result,
+      isError: false, raw: null, failure: null, synthetic: false, frontierCall: null,
+    });
+  });
+  writer.append('turn/end', { turn, outcome: 'waiting' });
+  await writer.flush();
+  await writer.close();
+  return canonicalMessagesBytes(groups.flat()).length;
+}
+
+/**
+ * Folds the local journal through the measured request's turn opening — the
+ * exact state the runtime assembles the boundary plan from: `turn/start`, then
+ * the turn's (empty) perception and its artifact events, no direction pin —
+ * and reconstructs that plan. The plan is never journaled; this is the
+ * assembler's own pure function over the folded journal.
+ */
+async function boundaryPlan(expectedTurn: number): Promise<{
+  readonly fold: ContextFold; readonly plan: RequestPlan; readonly planBytes: number;
+}> {
+  const events = await loadVerifiedEvents(home, 'node-0', C13_EVENT_TYPES);
+  const start = events.findIndex((event) => event.type === 'turn/start'
+    && (event.data as { turn?: number }).turn === expectedTurn);
+  if (start < 0) throw new Error(`the local log has no turn/start for turn ${expectedTurn}`);
+  const trailing = new Set([
+    'world/perception', 'direction/pinned', 'artifact/chunk', 'artifact/end',
+  ]);
+  let end = start;
+  while (end + 1 < events.length && trailing.has(events[end + 1]!.type)) end += 1;
+  const fold = new ContextFold();
+  await fold.observe(events.slice(0, end + 1));
+  const plan = assemble({
+    id: { turn: expectedTurn, ordinal: 0 }, state: fold.snapshot(), models: BOUNDARY_CATALOG,
+  });
+  return { fold, plan, planBytes: canonicalBytes(plan).length };
+}
+
+/** The last turn number the local log opened. */
+async function lastTurnNumber(): Promise<number> {
+  const events = await readC13(home, 'node-0');
+  return Math.max(...events
+    .filter((event) => event.type === 'turn/start')
+    .map((event) => Number((event.data as { turn?: number }).turn)));
+}
+
+/** What one measured boundary run hands the test: the request the premise names. */
+type BoundaryRun = {
+  readonly fold: ContextFold; readonly plan: RequestPlan;
+  readonly planBytes: number; readonly wireBytes: number; readonly wireBody: string;
+  readonly seededH: number;
+};
+
+/**
+ * Runs one boundary fixture: starts the shrunk config through the test-only
+ * config seam (one hanging provider request, so the start journals its config
+ * and parks without a committed idle dialogue), seeds the control-laden
+ * history, resumes and measures the first request the resumed node sends —
+ * the boundary plan. Every wait is generous (the plan is megabytes): 120 s.
+ */
+async function measureBoundary(
+  srv: LoopServer, config: AgentConfig, groups: ChatMessage[][],
+): Promise<BoundaryRun> {
+  const started = track(startHost(opts, {
+    ...hostDeps, readInitialConfig: async () => config,
+  }));
+  await vi.waitFor(() => expect(srv.requests.length).toBe(1), { timeout: 120_000 });
+  started.stop();
+  expect(await started.done).toBe(0);
+
+  const seededTurn = await lastTurnNumber() + 1;
+  const seededH = await seedControlHistory(seededTurn, groups);
+  const { model, heading, ...resumeOpts } = opts;
+  const resumed = track(startHost({ ...resumeOpts, command: 'resume' }, hostDeps));
+  const boundary = srv.requests.length;
+  await vi.waitFor(() => expect(srv.requests.length).toBe(boundary + 1), { timeout: 120_000 });
+  const wire = srv.requests[boundary]!;
+  resumed.stop();
+  expect(await resumed.done).toBe(0);
+
+  const { fold, plan, planBytes } = await boundaryPlan(seededTurn + 1);
+  return {
+    fold, plan, planBytes, wireBytes: wire.body.byteLength,
+    wireBody: wire.body.toString('utf8'), seededH,
+  };
 }
 
 /**
@@ -560,7 +762,7 @@ it('start composes the operator charter; resume refuses the flag-carried file', 
   expect(await runHostOnce('resume', { charterFile: charterPath, expectRefusal: true })).toBe(2);
 }, 20_000);
 
-it('start refuses a missing, empty, invalid or oversize charter file with exit 2', async () => {
+it('start refuses a missing, empty, invalid or over-bound charter file with exit 2', async () => {
   await serve();
   expect(await runHostOnce('start', { charterFile: join(home, 'absent.txt'), expectRefusal: true }))
     .toBe(2);
@@ -585,25 +787,283 @@ it('start refuses a missing, empty, invalid or oversize charter file with exit 2
   await link(join(home, 'providers.json'), join(home, 'hard-charter.txt'));
   expect(await runHostOnce('start', { charterFile: join(home, 'hard-charter.txt'), expectRefusal: true }))
     .toBe(2);
-  await writeFile(join(home, 'huge.txt'), 'x'.repeat(8193));
-  expect(await runHostOnce('start', { charterFile: join(home, 'huge.txt'), expectRefusal: true }))
-    .toBe(2);
-  expect(logged(log)).toContainEqual(
-    expect.objectContaining({ event: 'host/error', error: 'HostConfigError' }),
-  );
+
+  // "Oversize" now has two distinct bounds, not an arbitrary 8 KiB charter cap.
+  // First the boot read's DoS guard: the capture ceiling, refused by byte
+  // count, never buffered whole and never truncated.
+  const fileBoundPath = join(home, 'over-file-bound.txt');
+  await writeFile(fileBoundPath, 'x'.repeat(MAX_CAPTURE_BYTES + 1));
+  expect(await runHostOnce('start', {
+    charterFile: fileBoundPath, expectRefusal: true,
+  })).toBe(2);
+  let error = logged(log).filter((entry) => entry['event'] === 'host/error').at(-1);
+  expect(error).toMatchObject({ event: 'host/error', error: 'HostConfigError' });
+  expect(String(error?.['message'])).toBe(
+    `the charter file is over ${MAX_CAPTURE_BYTES} bytes; the limit is ${MAX_CAPTURE_BYTES}`);
+
+  // Second the derived identity budget at the START-composition seam: a file
+  // under the DoS guard whose composed identity is past the bound is the same
+  // intent (an oversized charter is refused) with the new bound. Under the
+  // factory policy the budget collapses to the pinned floor.
+  const overBudgetPath = join(home, 'over-budget.txt');
+  const overBudgetText = 'x'.repeat(300 * 1024);
+  await writeFile(overBudgetPath, overBudgetText);
+  expect(await runHostOnce('start', {
+    charterFile: overBudgetPath, expectRefusal: true,
+  })).toBe(2);
+  error = logged(log).filter((entry) => entry['event'] === 'host/error').at(-1);
+  expect(error).toMatchObject({ event: 'host/error', error: 'HostConfigError' });
+  const refusal = String(error?.['message']);
+  expect(refusal).toContain('the sendability budget is');
+  // The tail survives the operator log's 200-code-point bound: the bounded
+  // sendability message renders un-truncated by construction.
+  expect(refusal).toContain(`floored at ${IDENTITY_FLOOR})`);
+  expect(refusal).not.toContain('the charter file is over');
+  const overBudget = validateAgentConfig({
+    ...defaultAgentConfig(), model: 'first-light-test', heading: 'First light.',
+    charter: `${overBudgetText} You are node-0.`,
+  });
+  expect(identityBytes(overBudget)).toBeGreaterThanOrEqual(identityBudget(overBudget));
+  expect(refusal).toContain(`the sendability budget is ${identityBudget(overBudget)} bytes`);
+
   // The boot-recovery start (node/boot journaled, no config) still composes a
-  // charter — and the exact 8192-byte FILE boundary is accepted, not refused
-  // (the composed charter grows by the identity sentence past the file cap,
-  // which bounds the operator's file, not the composed value).
+  // charter — and both the exact 8192-byte FILE boundary and a 100 KiB file
+  // are accepted: each sits below the pinned IDENTITY_FLOOR, the factory
+  // budget, so the only remaining identity bound is the derived budget.
   await seedBootOnly(home);
   const exactPath = join(home, 'exact.txt');
   await writeFile(exactPath, 'x'.repeat(8192));
   expect(await runHostOnce('start', { charterFile: exactPath })).toBe(0);
-  const events = await readC13(home, 'node-0');
-  const seeded = events.filter((e) => e.type === 'system/message')[0]!.data as
-    { value: { value: { charter: string } } };
+  let events = await readC13(home, 'node-0');
+  let seeded = events.filter((e) => e.type === 'system/message')[0]!.data as
+    { value: { value: AgentConfig } };
   expect(seeded.value.value.charter).toBe('x'.repeat(8192) + ' You are node-0.');
-}, 20_000);
+  expect(identityBytes(seeded.value.value)).toBeLessThan(IDENTITY_FLOOR);
+
+  await resetHome();
+  await seedBootOnly(home);
+  const midPath = join(home, 'mid.txt');
+  const midText = 'x'.repeat(100 * 1024);
+  await writeFile(midPath, midText);
+  expect(await runHostOnce('start', { charterFile: midPath })).toBe(0);
+  events = await readC13(home, 'node-0');
+  seeded = events.filter((e) => e.type === 'system/message')[0]!.data as
+    { value: { value: AgentConfig } };
+  expect(seeded.value.value.charter).toBe(`${midText} You are node-0.`);
+  expect(identityBytes(seeded.value.value)).toBeLessThan(IDENTITY_FLOOR);
+}, 240_000);
+
+/**
+ * The nominal anti-wedge proof (plan §0.5 / §7 S5): under a shrunk policy in
+ * the uncapped band — the two constraints solved together, `W ≤ C −
+ * IDENTITY_FLOOR` and `budget > IDENTITY_FLOOR + overhead` — an identity above
+ * the floor and strictly below the budget, with a sealed control-laden history
+ * at the reserve's history component, still composes and sends plans. The
+ * fixture pins `I + H + O < C` (the binding ceiling min(MAX_CAPTURE_BYTES,
+ * maxRequestBytes)) and the premise `planBytes ≥ wireBytes`; the plan-ceiling
+ * check against MAX_CAPTURE_BYTES stays a separate assertion. The history is
+ * seeded as exactly `keepRecentGroups` dialogue groups at the policy caps, so
+ * the compaction span is eligible-empty and no compaction fires before the
+ * measured request — while the caps branch (not `compactAfterBytes`) sizes the
+ * reserve's history term.
+ */
+it('sends the boundary plan under a shrunk policy and a sealed control-laden history', async () => {
+  const patch: Partial<AgentConfig['policy']> = {
+    compactAfterBytes: 64 * 1024,
+    keepRecentGroups: 8,
+    maxCallsPerResponse: 1,
+    maxToolResultBytes: 32768,
+    maxAssistantBytes: 32768,
+  };
+  const { config, ceiling } = shrunkBoundaryConfig(patch, CAPS_IDENTITY_FILL);
+  const identity = identityBytes(config);
+  const budget = identityBudget(config, BOUNDARY_CATALOG);
+  const reserved = reserve(config, BOUNDARY_CATALOG);
+  expect(ceiling).toBe(Math.min(MAX_CAPTURE_BYTES, config.policy.maxRequestBytes));
+  expect(effectiveCeiling(config)).toBe(ceiling);
+  // The uncapped band, with both constraints solved together: the reserve
+  // leaves the floor's room (W ≤ C − IDENTITY_FLOOR), so the budget follows
+  // C − W and is the identity plus the headroom — above the floor and above
+  // the identity by more than the plan's actual metadata overhead.
+  expect(reserved).toBeLessThanOrEqual(ceiling - IDENTITY_FLOOR);
+  expect(budget).toBe(ceiling - reserved);
+  expect(budget).toBe(identity + BOUNDARY_HEADROOM);
+  expect(budget).toBeGreaterThan(IDENTITY_FLOOR);
+  expect(identity).toBeGreaterThan(IDENTITY_FLOOR);
+  // The same identity under the factory policy collapses to the floor and is
+  // refused — the concern the shrunk policy exists to solve.
+  const factory = validateAgentConfig({ ...config, policy: defaultAgentConfig().policy });
+  expect(identityBudget(factory)).toBe(IDENTITY_FLOOR);
+  expect(() => assertSendableIdentity(factory)).toThrow(/sendability budget/);
+  // The boundary refusal is adjacent: an identity exactly AT the budget is
+  // refused by the helper, and the START seam refuses it with that same
+  // bounded message.
+  const adjacent = validateAgentConfig({
+    ...config,
+    charter: 'c'.repeat(CAPS_IDENTITY_FILL + (budget - identity)) + ' You are node-0.',
+  });
+  expect(identityBytes(adjacent)).toBe(budget);
+  let adjacentMessage = '';
+  try {
+    assertSendableIdentity(adjacent, BOUNDARY_CATALOG);
+  } catch (err) {
+    adjacentMessage = (err as Error).message;
+  }
+  expect(adjacentMessage).toContain('the sendability budget is');
+  expect(adjacentMessage).toContain(`floored at ${IDENTITY_FLOOR})`);
+
+  // The one hanging request is the start's (it journals the config and parks
+  // without a committed idle dialogue); the resume's first request is the
+  // measured boundary.
+  const srv = await serve(
+    (_request, index) => (index === 0 ? new Promise<ReplyBody>(() => {}) : idleReply),
+    BOUNDARY_CATALOG,
+  );
+  // The seam runs AFTER the provider load: the declared catalog feeds the
+  // reserve's substrate term, so a seam that ran before it would compute a
+  // larger budget and admit this identity. A refusal is a config refusal
+  // (exit 2) before any composition.
+  const refused = track(startHost(opts, {
+    ...hostDeps, readInitialConfig: async () => adjacent,
+  }));
+  expect(await refused.done).toBe(2);
+  const refusal = logged(log).filter((entry) => entry['event'] === 'host/error').at(-1);
+  expect(refusal).toMatchObject({ event: 'host/error', error: 'HostConfigError' });
+  expect(String(refusal?.['message'])).toBe(adjacentMessage);
+  expect(logged(log).some((entry) => entry['event'] === 'host/boot')).toBe(false);
+
+  await resetHome();
+  const groups = Array.from({ length: config.policy.keepRecentGroups }, (_, ordinal) =>
+    dialogueGroup(ordinal, config.policy.maxAssistantBytes, config.policy.maxToolResultBytes));
+  const run = await measureBoundary(srv, config, groups);
+  const { fold, plan, planBytes, wireBytes, wireBody, seededH } = run;
+  const component = historyComponent(config.policy);
+  expect(component).toBe(config.policy.keepRecentGroups
+    * (config.policy.maxCallsPerResponse * config.policy.maxToolResultBytes
+      + config.policy.maxAssistantBytes) * ESCAPE_FACTOR);
+  // The caps branch sizes the history term; the per-message envelope is slack
+  // on top (the reserve's caps term is raw-content-based).
+  expect(seededH).toBeGreaterThanOrEqual(component);
+  expect(seededH - component).toBeLessThan(8 * 1024);
+
+  const state = fold.snapshot();
+  const liveConfig = state.config?.value;
+  expect(liveConfig).toBeDefined();
+  const committed = state.surface?.nodes.filter((node) => node.group.kind !== 'heading') ?? [];
+  expect(committed.map((node) => node.group.kind)).toEqual(
+    Array.from({ length: config.policy.keepRecentGroups }, () => 'dialogue'));
+  // No compaction fired before the measured request: the history is above
+  // compactAfterBytes (the trigger is real), but exactly keepRecentGroups
+  // groups make the eligible span empty, and the assembled history is H.
+  const all = await readC13(home, 'node-0');
+  expect(all.some((event) => event.type === 'compaction/start'
+    || event.type === 'compaction/summary')).toBe(false);
+  const history = canonicalMessagesBytes(plan.history).length;
+  expect(history).toBe(seededH);
+  // O = planBytes − identity − actual history − offering − substrate −
+  // direction (no direction is pinned): the plan's actual metadata overhead.
+  const offering = canonicalBytes(plan.tools).length;
+  const substrate = plan.substrate === undefined ? 0 : canonicalBytes(plan.substrate).length;
+  const overhead = planBytes - identity - history - offering - substrate;
+  const liveIdentity = identityBytes(liveConfig!);
+  expect(liveIdentity).toBe(identity);
+  const liveBudget = identityBudget(liveConfig!, BOUNDARY_CATALOG);
+  expect(liveBudget).toBe(budget);
+  expect(overhead).toBeLessThanOrEqual(PLAN_MARGIN);
+  // The binding-ceiling inequality the fixture pins; the plan ceiling is the
+  // separate assertion right after.
+  expect(liveIdentity + history + overhead).toBeLessThan(ceiling);
+  expect(liveIdentity).toBeLessThan(liveBudget - overhead);
+  expect(planBytes).toBeLessThan(MAX_CAPTURE_BYTES);
+  // The premise: the plan's canonical bytes dominate the wire's.
+  expect(planBytes).toBeGreaterThanOrEqual(wireBytes);
+  expect(wireBytes).toBeLessThanOrEqual(ceiling);
+  // ...and the wire provably carries the seeded history: its body is at least
+  // H bytes (a regression that dropped the seeded groups would leave only the
+  // identity plus the fixed blocks), and the control-laden dialogue is present
+  // in its exact escaped form.
+  expect(wireBytes).toBeGreaterThanOrEqual(seededH);
+  expect(wireBody).toContain('\\u0001');
+}, 240_000);
+
+/**
+ * The compactAfterBytes-dominant variant (plan S5): a policy whose K sits under
+ * `C − IDENTITY_FLOOR − PLAN_MARGIN − the other fixed terms` and exceeds the
+ * caps term. The seeded history is just below K in canonical bytes and is
+ * assembled verbatim — H < K already prevents compaction (the trigger check
+ * precedes eligibility) — so the K branch of the history term is exercised,
+ * not just the caps branch, and the plan still sends.
+ */
+it('sizes the reserve by compactAfterBytes and assembles a just-below-K history verbatim', async () => {
+  const patch: Partial<AgentConfig['policy']> = {
+    compactAfterBytes: 1 * 1024 * 1024,
+    keepRecentGroups: 8,
+    maxCallsPerResponse: 1,
+    maxToolResultBytes: 256,
+    maxAssistantBytes: 256,
+  };
+  const { config, ceiling } = shrunkBoundaryConfig(patch, K_IDENTITY_FILL);
+  const identity = identityBytes(config);
+  const budget = identityBudget(config, BOUNDARY_CATALOG);
+  const reserved = reserve(config, BOUNDARY_CATALOG);
+  const component = historyComponent(config.policy);
+  const fixed = reserved - component - PLAN_MARGIN;
+  // The K branch is exercised: K exceeds the caps term and the reserve's
+  // history term is K. The plan's stated K bound holds: K sits under
+  // C − IDENTITY_FLOOR − PLAN_MARGIN − the other fixed terms.
+  expect(component).toBe(config.policy.compactAfterBytes);
+  expect(config.policy.compactAfterBytes).toBeGreaterThan(
+    config.policy.keepRecentGroups
+    * (config.policy.maxCallsPerResponse * config.policy.maxToolResultBytes
+      + config.policy.maxAssistantBytes) * ESCAPE_FACTOR);
+  expect(config.policy.compactAfterBytes).toBeLessThanOrEqual(
+    ceiling - IDENTITY_FLOOR - PLAN_MARGIN - fixed);
+  expect(budget).toBe(ceiling - reserved);
+  expect(budget).toBe(identity + BOUNDARY_HEADROOM);
+  expect(identity).toBeGreaterThan(IDENTITY_FLOOR);
+
+  const srv = await serve(
+    (_request, index) => (index === 0 ? new Promise<ReplyBody>(() => {}) : idleReply),
+    BOUNDARY_CATALOG,
+  );
+  const groups = sizedControlGroups(
+    config.policy.compactAfterBytes - 512, config.policy.keepRecentGroups);
+  const run = await measureBoundary(srv, config, groups);
+  const { fold, plan, planBytes, wireBytes, wireBody, seededH } = run;
+  // Just below K, and already below the trigger: the compaction span never
+  // becomes eligible because selection stops at the threshold check.
+  expect(seededH).toBeLessThan(config.policy.compactAfterBytes);
+  expect(config.policy.compactAfterBytes - seededH).toBeLessThanOrEqual(1024);
+
+  const state = fold.snapshot();
+  const liveConfig = state.config?.value;
+  expect(liveConfig).toBeDefined();
+  const committed = state.surface?.nodes.filter((node) => node.group.kind !== 'heading') ?? [];
+  expect(committed.map((node) => node.group.kind)).toEqual(
+    Array.from({ length: config.policy.keepRecentGroups }, () => 'dialogue'));
+  const all = await readC13(home, 'node-0');
+  expect(all.some((event) => event.type === 'compaction/start'
+    || event.type === 'compaction/summary')).toBe(false);
+  const history = canonicalMessagesBytes(plan.history).length;
+  expect(history).toBe(seededH);
+  const offering = canonicalBytes(plan.tools).length;
+  const substrate = plan.substrate === undefined ? 0 : canonicalBytes(plan.substrate).length;
+  const overhead = planBytes - identity - history - offering - substrate;
+  const liveIdentity = identityBytes(liveConfig!);
+  const liveBudget = identityBudget(liveConfig!, BOUNDARY_CATALOG);
+  expect(liveIdentity).toBe(identity);
+  expect(liveBudget).toBe(budget);
+  expect(overhead).toBeLessThanOrEqual(PLAN_MARGIN);
+  expect(liveIdentity + history + overhead).toBeLessThan(ceiling);
+  expect(liveIdentity).toBeLessThan(liveBudget - overhead);
+  expect(planBytes).toBeLessThan(MAX_CAPTURE_BYTES);
+  expect(planBytes).toBeGreaterThanOrEqual(wireBytes);
+  expect(wireBytes).toBeLessThanOrEqual(ceiling);
+  // The wire carries the seeded history, not just the identity: at least H
+  // body bytes and the exact six-byte U+0001 escape the seed wrote.
+  expect(wireBytes).toBeGreaterThanOrEqual(seededH);
+  expect(wireBody).toContain('\\u0001');
+}, 240_000);
 
 it('a journaled configuration wins over --charter-file', async () => {
   await serve();
