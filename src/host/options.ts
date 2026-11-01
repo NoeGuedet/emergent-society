@@ -74,10 +74,13 @@ A live or unverified host.json blocks a new host; delete it only if you are cert
 configuration (including the boot-recovery start); the kernel appends the node identity sentence;
 resume refuses it — the journaled config wins. The file's content is journaled as configuration;
 never point it at a secret-bearing file.
---nodes-file is a JSON array of {uid, model, heading, charterFile?} entries (at most 16, unique
-uids): each node gets its own local log, scratch leaf and cgroup leaf, and all share the home's
-world and frontier journal. It replaces --uid/--model/--heading/--charter-file and is read at
-the config gate; on resume entries declare only uid — the journaled config wins.
+--nodes-file is a JSON array of {uid, model, heading, charterFile?, spawn?} entries (at most 16,
+unique uids): each node gets its own local log, scratch leaf and cgroup leaf, and all share the
+home's world and frontier journal. spawn: true declares the kernel's spawn capability for that
+node; the grant is declared, never implicit — a solo boot grants nobody; grant by booting a
+one-entry nodes file with spawn: true. --nodes-file replaces --uid/--model/--heading/
+--charter-file and is read at the config gate; on resume entries declare only uid and spawn —
+the journaled config wins.
 `;
 
 /**

@@ -43,7 +43,8 @@ export type ExtendPort = {
   /**
    * The kernel's spawn capability (A3), when this node was granted it. A node
    * without the grant sees the honest denial in inspect and in the verb; the
-   * host owns composition, custody and the caps.
+   * host owns composition and the home's flat roster — a node's end removes
+   * only that node, never the nodes it composed.
    */
   readonly spawn?: SpawnPort;
   /**
@@ -64,14 +65,13 @@ export type SpawnRequest = {
 /** What this node may still create; inspect's honesty, never a promise. */
 export type SpawnCaps = {
   readonly available: boolean;
-  readonly childrenLeft: number;
+  /** The home's remaining roster places: one flat ceiling, no per-node cap. */
   readonly nodesLeft: number;
-  readonly depthLeft: number;
 };
 
 /** The host's spawn seam: compose a node, or refuse with a bounded reason. */
 export type SpawnPort = {
-  spawn(request: SpawnRequest): Promise<{ readonly uid: string; readonly depth: number }>;
+  spawn(request: SpawnRequest): Promise<{ readonly uid: string }>;
   caps(): SpawnCaps;
 };
 
@@ -314,10 +314,11 @@ function renderInspect(
   if (port.spawn !== undefined) {
     const caps = port.spawn.caps();
     lines.push(caps.available
-      ? `- spawn: creating new nodes — available: ${caps.childrenLeft} children left`
-        + ` for this node, ${caps.nodesLeft} nodes left in the home, depth ${caps.depthLeft}.`
+      ? `- spawn: creating new nodes — available: ${caps.nodesLeft} nodes left in the home.`
         + ' extend {verb:"spawn", model?, heading?, charter?, spawn?}; the child'
-        + ' inherits this node\'s tools and budget, and dies with this node (LIFO).'
+        + ' inherits this node\'s tools and budget, gets its own local log and cgroup'
+        + ' leaf, and keeps running when this node ends; pass spawn: true to pass the'
+        + ' capability on (a node grants only what it holds).'
       : '- spawn: creating new nodes — not granted to this node.');
   } else {
     lines.push('- spawn: creating new nodes — not granted to this node.');
@@ -454,8 +455,9 @@ export async function executeExtend(opts: {
       });
       const caps = port.spawn.caps();
       await appendResult(gate, id, callId,
-        `spawned ${spawned.uid} (depth ${spawned.depth}) — ${caps.childrenLeft}`
-        + ` children left for this node, ${caps.nodesLeft} nodes left in the home`,
+        `spawned ${spawned.uid} — ${caps.nodesLeft} nodes left in the home; the child`
+        + ' keeps running when this node ends'
+        + (decision.spawn === true ? ', and the spawn capability was passed on' : ''),
         false, max);
     } catch (err) {
       if (err instanceof SpawnRefusedError) {

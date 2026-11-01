@@ -465,6 +465,19 @@ export class NodeDriver {
     return this.nodeState;
   }
 
+  /**
+   * The reason this node's end is journaled under: the last `stop(reason)`'s
+   * value, or the failure the run ended on (`handler-error`,
+   * `maintenance-error`, `driver-error`).
+   *
+   * The stop bookkeeping is private; the host pool reads it here so
+   * `host/ended` names the ends the pool did not initiate as honestly as the
+   * ones it did. It is a plain read: it never changes the node's state.
+   */
+  shutdownReason(): ShutdownReason {
+    return this.stopReason;
+  }
+
   stop(reason: ShutdownReason = 'stop-requested'): void {
     if (this.nodeState === 'stopping' || this.nodeState === 'stopped') return;
     this.stopReason = reason;

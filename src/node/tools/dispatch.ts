@@ -245,9 +245,10 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
     return { kind: 'extend', verb: 'speak', text };
   }
   if (verb === 'spawn') {
-    // The kernel capability: the child inherits the parent's tools and budget,
-    // and the host caps the tree. The keys are exactly the optional four; a
-    // wrong key set names the rule, a wrong type is the bare refusal.
+    // The kernel capability: the child inherits the requester's tools and
+    // budget, and the host keeps the home's flat roster (one ceiling, no
+    // tree). The keys are exactly the optional four; a wrong key set names the
+    // rule, a wrong type is the bare refusal.
     if (!only('verb', 'model', 'heading', 'charter', 'spawn')) {
       return invalidDetail('spawn takes verb and optionally model, heading, charter, spawn');
     }

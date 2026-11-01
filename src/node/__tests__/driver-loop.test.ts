@@ -349,3 +349,46 @@ describe('NodeDriver run loop', () => {
     expect(keys).toEqual(['gate', 'now', 'signal', 'trigger', 'turn', 'world']);
   });
 });
+
+describe('NodeDriver shutdownReason', () => {
+  // The getter's assertion matrix: the reason the host's `host/ended` line
+  // carries, for every kind of end — the private stop bookkeeping is invisible
+  // to the pool, so this read is the one bridge.
+  it('reports stop-requested by default and after a clean stop', async () => {
+    const { home, world } = fixture();
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
+    expect(d.shutdownReason()).toBe('stop-requested');
+    const running = d.run();
+    await vi.waitFor(() => expect(d.state).toBe('waiting'));
+    d.stop();
+    await running;
+    expect(d.shutdownReason()).toBe('stop-requested');
+  });
+
+  it('reports an explicit stop reason verbatim', async () => {
+    const { home, world } = fixture();
+    const d = await openTestDriver(home, 'n1', wait, world, { worldPollMs: 0 });
+    d.stop('driver-error');
+    await d.run();
+    expect(d.shutdownReason()).toBe('driver-error');
+  });
+
+  it('reports a handler failure as handler-error', async () => {
+    const { home, world } = fixture();
+    const d = await openTestDriver(home, 'n1', () => { throw new Error('boom'); }, world, {
+      worldPollMs: 0,
+    });
+    await expect(d.run()).rejects.toThrow('boom');
+    expect(d.shutdownReason()).toBe('handler-error');
+  });
+
+  it('reports a maintenance failure as maintenance-error', async () => {
+    const { home, world } = fixture();
+    const d = await openTestDriver(home, 'n1', wait, world, {
+      worldPollMs: 0,
+      onMaintenance: () => { throw new Error('maint boom'); },
+    });
+    await expect(d.run()).rejects.toThrow('maint boom');
+    expect(d.shutdownReason()).toBe('maintenance-error');
+  });
+});

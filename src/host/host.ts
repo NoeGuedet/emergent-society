@@ -1,3 +1,4 @@
+import { readdirSync } from 'node:fs';
 import { lstat, open, stat, type FileHandle } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import {
@@ -8,7 +9,7 @@ import { C13_EVENT_TYPES } from '../context/events.js';
 import { ContextFold } from '../context/fold.js';
 import { loadVerifiedEvents } from '../context/loader.js';
 import { openFrontierJournal, type FrontierJournal } from '../frontier/index.js';
-import { nodeLayout } from '../journal/index.js';
+import { NODE_UID_RE, nodeLayout } from '../journal/index.js';
 import { createPackageStore, createRunSupervisor } from '../node/packages/index.js';
 import { singleLine } from '../text.js';
 import { readWorldState, type WorldState } from '../node/world-state.js';
@@ -130,9 +131,10 @@ export type CellOptions = {
    */
   readonly doctorRunner?: (world: WorldRepo, opts: { home: string }) => Promise<DoctorReport>;
   /**
-   * The kernel's spawn capability (A3), when this node was granted it. The host
-   * passes its own port only to the first booted node; every child receives one
-   * only through an explicit grant.
+   * The kernel's spawn capability (A3), when the operator declared it for this
+   * node. The host passes a port only to a node whose nodes-file entry says
+   * `spawn: true`; a solo flag boot grants nobody, and a composed child
+   * receives one only when the requester asked for it.
    */
   readonly spawn?: SpawnPort;
   /** The human channel, granted to agent zero (the first booted node) only. */
@@ -188,14 +190,16 @@ export type CellSet = {
 /** Everything a multi-node composition needs; each node's config is resolved. */
 export type CellSetOptions = {
   readonly home: string;
-  readonly nodes: readonly { readonly uid: string; readonly config: AgentConfig }[];
+  readonly nodes: readonly {
+    readonly uid: string; readonly config: AgentConfig;
+    /** The spawn port for a node whose nodes-file entry declared the grant. */
+    readonly spawn?: SpawnPort;
+  }[];
   readonly credential: LlmCredential; readonly providers: ProviderRegistry;
   readonly sandbox: CellOptions['sandbox'];
   readonly fence?: FencePort;
   readonly storage?: StorageConfig;
   readonly doctorRunner?: CellOptions['doctorRunner'];
-  /** The spawn capability, granted to the first node of the set only. */
-  readonly spawn?: SpawnPort;
   /** The human channel, granted to agent zero (the first booted node) only. */
   readonly speak?: SpeakPort;
   readonly pollMs?: number; readonly log: HostLog;
@@ -203,6 +207,41 @@ export type CellSetOptions = {
 
 /** The states in which closing would cut a live turn's journal. */
 const UNSETTLED: ReadonlySet<string> = new Set(['active', 'waiting', 'stopping']);
+
+/**
+ * The pool's child-composition seam type (test-only): production is
+ * `composeNode`, reached through the thunk the pool supplies.
+ */
+export type ChildComposeSeam = (
+  options: CellOptions, compose: () => Promise<NodeCell>,
+) => Promise<NodeCell>;
+
+/**
+ * The uid grammar as an inner-pattern fragment. `NODE_UID_RE.source` is the
+ * one grammar (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`); only its anchors are
+ * removed, so the sentence patterns below can never drift from it.
+ */
+const UID_FRAGMENT = NODE_UID_RE.source.replace(/^\^/, '').replace(/\$$/, '');
+
+/**
+ * The authored-strip pattern: a trailing kernel identity sentence —
+ * ` You are <uid>.` or ` You are <uid>, composed by <uid>.` — over the uid
+ * grammar, never a hardcoded `node-\d+`. The kernel owns the final sentence of
+ * every charter, so any authored one is stripped before the kernel stamps its
+ * own: a world charter written by another node cannot smuggle a second
+ * identity past it.
+ */
+export const AUTHORED_IDENTITY_RE =
+  new RegExp(` You are ${UID_FRAGMENT}(?:, composed by ${UID_FRAGMENT})?\\.$`);
+
+/**
+ * The kernel's composer sentence for a spawned node: the child's uid and the
+ * requester that composed it. The requester is information, not structure —
+ * the world records no parentage.
+ */
+function composerSentence(uid: string, requesterUid: string): string {
+  return ` You are ${uid}, composed by ${requesterUid}.`;
+}
 
 /** The parts one home shares across every node it runs. */
 type SharedCell = {
@@ -441,10 +480,8 @@ export async function composeCellSet(options: CellSetOptions): Promise<CellSet> 
   try {
     for (const [index, spec] of options.nodes.entries()) {
       nodes.push(await composeNode(
-        nodeOptionsOf(
-          options, spec, index === 0 ? options.spawn : undefined,
-          index === 0 ? options.speak : undefined,
-        ), shared,
+        nodeOptionsOf(options, spec, spec.spawn, index === 0 ? options.speak : undefined),
+        shared,
       ));
     }
   } catch (err) {
@@ -472,7 +509,8 @@ export async function composeCellSet(options: CellSetOptions): Promise<CellSet> 
 
 /** One node's composition options from the set's shared fields. */
 function nodeOptionsOf(
-  options: CellSetOptions, spec: { readonly uid: string; readonly config: AgentConfig },
+  options: CellSetOptions,
+  spec: { readonly uid: string; readonly config: AgentConfig; readonly spawn?: SpawnPort },
   spawn?: SpawnPort, speak?: SpeakPort,
 ): CellOptions {
   return {
@@ -620,6 +658,13 @@ export type HostDeps = {
   readonly compose?: (options: CellOptions) => Promise<Cell>;
   /** The multi-node composition seam: production is `composeCellSet`. */
   readonly composeSet?: (options: CellSetOptions) => Promise<CellSet>;
+  /**
+   * TEST-ONLY pool child composition (the pause-mid-spawn and
+   * composed-rejection cases): the pool hands the seam the child's options and
+   * the production composition as a thunk. Production never sets it — no env
+   * switch or CLI flag reaches it.
+   */
+  readonly composeChild?: ChildComposeSeam;
   readonly now?: () => number;
   readonly proc?: ProcessHandlersTarget;
   /**
@@ -843,6 +888,9 @@ async function resolveNodeConfig(
     // or operator base — the uid is the git author of this node's commits and
     // the self-name the wake predicate excludes (its own commits never wake
     // it), and the charter is the pinned place it lives, outside compaction.
+    // The kernel owns the final sentence at boot too: any authored trailing
+    // identity sentence (any uid — an operator file may echo another node's)
+    // is stripped before the stamp, so it never stacks.
     const base = charterFile !== undefined
       ? await readCharterFile(home, uid, charterFile)
       : defaultAgentConfig().charter;
@@ -850,7 +898,7 @@ async function resolveNodeConfig(
       ...defaultAgentConfig(),
       model,
       heading,
-      charter: `${base} You are ${uid}.`,
+      charter: `${base.replace(AUTHORED_IDENTITY_RE, '')} You are ${uid}.`,
     });
   }
   if (model !== undefined || heading !== undefined) {
@@ -865,36 +913,74 @@ async function resolveNodeConfig(
   return state.config;
 }
 
-/** The spawn-tree caps: a society, not a fork bomb. */
-export const MAX_SPAWN_CHILDREN = 8;
-export const MAX_SPAWN_DEPTH = 3;
+/**
+ * The minted-uid form: `node-<n>`. Operator-chosen uids are exempt from the
+ * scan (they carry no n), so a home booted as `alice` still mints from the
+ * pool and the on-disk directory set.
+ */
+const MINTED_UID_RE = /^node-(\d+)$/;
 
+/** The pool's per-node record: the cell, its grant and the run the pool owns. */
 type PoolNode = {
   readonly cell: NodeCell;
-  readonly parent: string | null;
-  readonly depth: number;
   readonly canSpawn: boolean;
-  /** The spawned node's run, awaited on close; null for a host-booted node. */
-  readonly run: Promise<void> | null;
+  /** Whether the host booted this node (fault semantics differ from composed). */
+  readonly booted: boolean;
+  /** The run this pool started and observes; null before `startAll`/registration. */
+  run: Promise<void> | null;
 };
 
+/** One pending drain: the host body's single lifetime await. */
+type DrainWaiter = {
+  readonly promise: Promise<void>;
+  resolve(): void;
+  reject(err: unknown): void;
+};
+
+function createDrainWaiter(): DrainWaiter {
+  let resolve!: () => void;
+  let reject!: (err: unknown) => void;
+  const promise = new Promise<void>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
 /**
- * The host's live node pool (A3): the custody tree over one home's shared
- * world and frontier. A booted node enters as a root; `spawn` composes a child
- * on the same shared parts with a kernel-minted uid, attenuates the child's
- * configuration to the parent's, and enforces the caps (8 live children per
- * node, 3 levels deep, the home's 16-node ceiling). A node's death unloads its
- * descendants in reverse spawn order (LIFO), and the host's stop unloads
- * everything deepest-first. Spawned nodes are in-memory, like a Run: their
- * local logs survive, the pool does not.
+ * The host's live node pool (A3): the flat roster over one home's shared world
+ * and frontier. A node's end removes only that node — never the nodes it
+ * composed — and the pool starts, owns and observes every run, booted and
+ * composed alike.
+ *
+ * The pool is the host's sole lifetime anchor. Its drain promise resolves only
+ * when no live node remains (a later spawn re-arms it) and rejects at the first
+ * BOOTED run's rejection: the body's await propagates that rejection into the
+ * host's existing catch (exit 1, `host/error`), and the exit `finally` then
+ * stops and settles everything. A composed node's rejection ends only that node
+ * (`host/ended` carries the reason) and the host keeps running while any other
+ * node is live.
+ *
+ * `host/spawned {requester, uid}` and `host/ended {uid, reason}` are the host
+ * log's lines for birth and death; the frontier journal is untouched (it
+ * records kernel-mediated HTTP exchanges only, and is node-blind).
+ *
+ * Spawned nodes are in-memory, like a Run: their local logs survive, the pool
+ * does not. A restart reaps them; the next boot's roster is the nodes file.
  */
 class NodePool {
   private readonly nodes = new Map<string, PoolNode>();
-  /** Spawn order; the unload walk runs backwards over it. */
+  /** Registration/spawn order; the shutdown walk runs backwards over it. */
   private readonly order: string[] = [];
-  /** parent uid -> live child uids, in spawn order. */
-  private readonly children = new Map<string, string[]>();
+  /**
+   * Uids a spawn has claimed and not yet registered: the synchronous
+   * reservation that lets concurrent spawns mint distinct uids and count
+   * against the one ceiling before either composes anything.
+   */
+  private readonly reservations = new Set<string>();
+  /** Every run the pool ever started: `close` awaits them all, settled or not. */
+  private readonly runs = new Set<Promise<void>>();
   private closing = false;
+  /** The first booted run's rejection; the drain rejects with it. */
+  private fault: unknown = null;
+  private drainWait: DrainWaiter | null = null;
 
   constructor(private readonly deps: {
     readonly home: string;
@@ -905,18 +991,41 @@ class NodePool {
     readonly storage: StorageConfig;
     readonly log: HostLog;
     readonly maxNodes: number;
+    readonly composeChild?: ChildComposeSeam;
   }) {}
 
-  /** Registers a node the host composed at boot; the host runs it. */
+  /**
+   * Registers a node the host composed at boot. Registration happens for every
+   * booted node BEFORE any run starts (`startAll`), so a first-turn spawn sees
+   * the whole roster and mints over it.
+   */
   addBooted(cell: NodeCell, canSpawn: boolean): void {
-    this.nodes.set(cell.uid, { cell, parent: null, depth: 0, canSpawn, run: null });
+    this.nodes.set(cell.uid, { cell, canSpawn, booted: true, run: null });
     this.order.push(cell.uid);
-    if (canSpawn) this.children.set(cell.uid, []);
   }
 
-  /** The live nodes in spawn order (booted first). */
+  /** Starts and observes every booted run, in registration order. */
+  startAll(): void {
+    for (const uid of this.order) {
+      const node = this.nodes.get(uid);
+      if (node !== undefined && node.run === null) this.start(uid, node);
+    }
+  }
+
+  /** The live nodes in registration order (booted first). */
   snapshot(): readonly NodeCell[] {
     return this.order.map((uid) => this.nodes.get(uid)!.cell);
+  }
+
+  /**
+   * The host lifetime's one anchor: resolves when no live node remains (a later
+   * spawn re-arms it), rejects with the first booted run's rejection.
+   */
+  drain(): Promise<void> {
+    if (this.fault !== null) return Promise.reject(this.fault);
+    if (this.nodes.size === 0) return Promise.resolve();
+    if (this.drainWait === null) this.drainWait = createDrainWaiter();
+    return this.drainWait.promise;
   }
 
   /** The port handed to a node that may spawn; its caps are read live. */
@@ -930,84 +1039,96 @@ class NodePool {
   caps(uid: string): SpawnCaps {
     const node = this.nodes.get(uid);
     if (node === undefined || !node.canSpawn || this.closing) {
-      return { available: false, childrenLeft: 0, nodesLeft: 0, depthLeft: 0 };
+      return { available: false, nodesLeft: 0 };
     }
-    return {
-      available: true,
-      childrenLeft: Math.max(0, MAX_SPAWN_CHILDREN - (this.children.get(uid)?.length ?? 0)),
-      nodesLeft: Math.max(0, this.deps.maxNodes - this.nodes.size),
-      depthLeft: Math.max(0, MAX_SPAWN_DEPTH - node.depth),
-    };
+    return { available: true, nodesLeft: this.placesLeft() };
   }
 
+  /**
+   * Composes a child of `requesterUid` on the home's shared parts.
+   *
+   * The uid and a roster place are reserved synchronously, before any await:
+   * two turns may spawn at once, and the reservation is what keeps their uids
+   * distinct and the home inside its one ceiling. The reservation is released
+   * by ONE shared, unconditional `finally` around the whole reserve-to-register
+   * sequence — so a refusal, a compose failure and the closing branch all give
+   * the place back.
+   *
+   * Order: (1) reserve; (2) compose the child's config from the requester's
+   * live config; (3) compose the child cell through the test-only seam
+   * (production: `composeNode`); (4) re-check `closing` — no await separates it
+   * from registration, and a pause that landed mid-spawn closes the fresh cell
+   * (the one path that stops and settles a composed-but-unrun cell) and throws
+   * the bounded refusal, never registering a child; (5) register, start and
+   * observe.
+   */
   async spawn(
-    parentUid: string, request: SpawnRequest,
-  ): Promise<{ readonly uid: string; readonly depth: number }> {
+    requesterUid: string, request: SpawnRequest,
+  ): Promise<{ readonly uid: string }> {
     if (this.closing) throw new SpawnRefusedError('the host is stopping');
-    const parent = this.nodes.get(parentUid);
-    if (parent === undefined) throw new SpawnRefusedError('the parent node is not live');
-    if (!parent.canSpawn) {
+    const requester = this.nodes.get(requesterUid);
+    if (requester === undefined) {
+      throw new SpawnRefusedError('the requester node is not live');
+    }
+    if (!requester.canSpawn) {
       throw new SpawnRefusedError('this node was not granted the spawn capability');
     }
-    const depth = parent.depth + 1;
-    if (depth > MAX_SPAWN_DEPTH) {
-      throw new SpawnRefusedError(`the depth cap (${MAX_SPAWN_DEPTH}) is reached`);
-    }
-    const live = this.children.get(parentUid) ?? [];
-    if (live.length >= MAX_SPAWN_CHILDREN) {
-      throw new SpawnRefusedError(`this node already has ${MAX_SPAWN_CHILDREN} live children`);
-    }
-    if (this.nodes.size >= this.deps.maxNodes) {
-      throw new SpawnRefusedError(`this home already holds ${this.deps.maxNodes} nodes`);
-    }
-    const uid = await this.mintUid();
-    if (uid === null) throw new SpawnRefusedError('no free node uid is available');
-    const base = parent.cell.config;
-    // The identity sentence is the one kernel-composed line (the parent's was
-    // composed at boot); the child's replaces it rather than stacking a second.
-    const sentence = ` You are ${parentUid}.`;
-    const charter = request.charter ?? (base.charter.endsWith(sentence)
-      ? `${base.charter.slice(0, -sentence.length)} You are ${uid}.`
-      : `${base.charter} You are ${uid}.`);
-    const config = validateAgentConfig({
-      ...base,
-      model: request.model ?? base.model,
-      heading: request.heading ?? base.heading,
-      charter,
-      // Attenuation: a child can hold only what the parent holds.
-      allowedTools: [...base.allowedTools],
-      policy: {
-        ...base.policy,
-        wakeBudgetPerHour: base.policy.wakeBudgetPerHour ?? DEFAULT_WAKE_BUDGET_PER_HOUR,
-      },
-    });
-    const canSpawn = request.spawn === true && parent.canSpawn;
-    let cell: NodeCell;
+    const uid = this.reserveUid(requesterUid);
     try {
-      cell = await composeNode({
+      // The requester's LIVE config, not its boot snapshot: a rewrite is
+      // already the identity the next child is composed from.
+      const base = requester.cell.runtime.snapshot().config?.value
+        ?? requester.cell.config;
+      const canSpawn = request.spawn === true && requester.canSpawn;
+      const config = composedChildConfig(base, uid, requesterUid, request);
+      const options: CellOptions = {
         home: this.deps.home, uid, config,
         credential: this.deps.credential, providers: this.deps.providers,
         sandbox: this.deps.sandbox, log: this.deps.log,
         storage: this.deps.storage,
         ...(canSpawn ? { spawn: this.portFor(uid) } : {}),
-      }, this.deps.shared);
-    } catch (err) {
-      this.deps.log.emit('host/degraded', {
-        home: this.deps.home, uid, reason: `spawn-failed: ${errorName(err)}`,
-      });
-      throw new SpawnRefusedError('the child could not be composed');
+      };
+      let cell: NodeCell;
+      try {
+        cell = await this.composeChild(options);
+      } catch (err) {
+        this.deps.log.emit('host/degraded', {
+          home: this.deps.home, uid, reason: `spawn-failed: ${errorName(err)}`,
+        });
+        throw new SpawnRefusedError('the child could not be composed');
+      }
+      // The pause re-check and the registration share one synchronous turn: a
+      // stop delivered while the child composed is caught here, never by an
+      // already-passed `stopAll` walk. The whole branch is try/finally: a
+      // close failure is a bounded diagnostic and is swallowed, so the
+      // bounded refusal is unconditional and a booted parent's run is never
+      // faulted by a raw error.
+      if (this.closing) {
+        try {
+          await cell.close();
+        } catch (err) {
+          this.deps.log.emit('host/degraded', {
+            home: this.deps.home, uid,
+            reason: `spawn-close-failed: ${errorName(err)}`,
+          });
+        }
+        throw new SpawnRefusedError('the host is stopping');
+      }
+      const node: PoolNode = { cell, canSpawn, booted: false, run: null };
+      this.nodes.set(uid, node);
+      this.order.push(uid);
+      this.start(uid, node);
+      this.deps.log.emit('host/spawned', { requester: requesterUid, uid });
+      return { uid };
+    } finally {
+      // Only the reservation: the requester is live for the whole spawn (its
+      // run awaits the call), so the pool cannot be empty here and no drain
+      // can be pending — the drain is settled by `onEnd`, never by this path.
+      this.reservations.delete(uid);
     }
-    const run = cell.driver.run();
-    void run.then(() => this.onEnd(uid), () => this.onEnd(uid));
-    this.nodes.set(uid, { cell, parent: parentUid, depth, canSpawn, run });
-    this.order.push(uid);
-    this.children.set(parentUid, [...live, uid]);
-    if (canSpawn) this.children.set(uid, []);
-    this.deps.log.emit('host/spawned', { parent: parentUid, uid, depth });
-    return { uid, depth };
   }
 
-  /** Stops every node deepest-first; each spawned run is awaited by `close`. */
+  /** Stops every live node, in reverse registration order. */
   stopAll(): void {
     this.closing = true;
     for (const uid of [...this.order].reverse()) {
@@ -1015,44 +1136,151 @@ class NodePool {
     }
   }
 
-  /** The host's one pool exit: stop everything, await every spawned run. */
+  /** The host's one pool exit: stop everything, await every owned run. */
   async close(): Promise<void> {
     this.stopAll();
-    await Promise.allSettled(
-      [...this.nodes.values()].flatMap((node) => (node.run === null ? [] : [node.run])),
+    await Promise.allSettled([...this.runs]);
+  }
+
+  /**
+   * Starts one node's run and observes it: clean or rejecting, its settlement
+   * lands in `onEnd`, which removes only that node, names the end on
+   * `host/ended` and decides the host's fate (a booted rejection faults the
+   * drain; a composed rejection does not).
+   */
+  private start(uid: string, node: PoolNode): void {
+    const run = node.cell.driver.run();
+    node.run = run;
+    this.runs.add(run);
+    void run.then(
+      () => { this.onEnd(uid, null, node); },
+      (err: unknown) => { this.onEnd(uid, err, node); },
     );
   }
 
   /**
-   * A node's end unloads its descendants in reverse spawn order, then drops the
-   * node. A child's own end runs this again for its subtree, so the walk is
-   * recursive by construction and LIFO by the spawn order.
+   * A node's end: remove only that node (no cascade), journal
+   * `host/ended {uid, reason}` and settle the drain. The reason is the driver's
+   * own shutdown vocabulary, read through the getter, so ends the pool did not
+   * initiate are named as honestly as stops.
    */
-  private onEnd(uid: string): void {
-    for (const child of [...(this.children.get(uid) ?? [])].reverse()) {
-      this.nodes.get(child)?.cell.driver.stop('stop-requested');
-    }
-    this.children.delete(uid);
+  private onEnd(uid: string, err: unknown, node: PoolNode): void {
     this.nodes.delete(uid);
     const at = this.order.indexOf(uid);
     if (at !== -1) this.order.splice(at, 1);
+    this.deps.log.emit('host/ended', {
+      uid, reason: node.cell.driver.shutdownReason(),
+    });
+    if (node.booted && err !== null) this.fault ??= err;
+    this.settleDrain();
   }
 
-  /** Mints `node-<n>` for the first free n not in the pool or on disk. */
-  private async mintUid(): Promise<string | null> {
-    for (let n = 1; n <= this.deps.maxNodes * 4; n += 1) {
-      const uid = `node-${n}`;
-      if (this.nodes.has(uid)) continue;
-      const dir = nodeLayout(this.deps.home, uid).dir;
-      try {
-        await lstat(dir);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return uid;
-        throw err;
-      }
+  /** Resolves or rejects the pending drain from the pool's own state. */
+  private settleDrain(): void {
+    if (this.drainWait === null) return;
+    if (this.fault !== null) {
+      const wait = this.drainWait;
+      this.drainWait = null;
+      wait.reject(this.fault);
+      return;
     }
-    return null;
+    if (this.nodes.size === 0) {
+      const wait = this.drainWait;
+      this.drainWait = null;
+      wait.resolve();
+    }
   }
+
+  /** The home's remaining roster places (live nodes plus live reservations). */
+  private placesLeft(): number {
+    return Math.max(0, this.deps.maxNodes - this.nodes.size - this.reservations.size);
+  }
+
+  /**
+   * Mints `node-<max-known+1>` and claims it, synchronously: the highest n in
+   * the pool, its live reservations or on disk, plus one. The disk term is why
+   * a uid whose cell directory already exists is never reused; the
+   * synchronization is why two concurrent spawns can neither mint the same uid
+   * nor both take the ceiling's last place.
+   */
+  private reserveUid(requesterUid: string): string {
+    if (this.nodes.size + this.reservations.size >= this.deps.maxNodes) {
+      throw new SpawnRefusedError(`this home already holds ${this.deps.maxNodes} nodes`);
+    }
+    const known = this.knownUidNumbers(requesterUid);
+    let n = (known.size === 0 ? 0 : Math.max(...known)) + 1;
+    while (known.has(n)) n += 1;
+    const uid = `node-${n}`;
+    this.reservations.add(uid);
+    return uid;
+  }
+
+  /** The known minted-uid numbers: the pool, its reservations and the disk. */
+  private knownUidNumbers(requesterUid: string): Set<number> {
+    const known = new Set<number>();
+    const add = (uid: string): void => {
+      const match = MINTED_UID_RE.exec(uid);
+      if (match === null) return;
+      const n = Number(match[1]);
+      if (Number.isSafeInteger(n)) known.add(n);
+    };
+    for (const uid of this.nodes.keys()) add(uid);
+    for (const uid of this.reservations) add(uid);
+    for (const uid of this.diskUids(requesterUid)) add(uid);
+    return known;
+  }
+
+  /**
+   * The on-disk node directory names: an earlier lifetime's uid must never be
+   * minted again over its local log. The read is synchronous on purpose — the
+   * mint's max must be computed and claimed in one turn (see `reserveUid`), so
+   * the reservation happens before any await. There is no separate entry cap:
+   * the directory is the home's own, one entry per node.
+   */
+  private diskUids(requesterUid: string): string[] {
+    try {
+      return readdirSync(join(this.deps.home, 'nodes'));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return [];
+      this.deps.log.emit('host/degraded', {
+        home: this.deps.home, uid: requesterUid,
+        reason: `spawn-mint: ${code ?? 'read-failed'}`,
+      });
+      throw new SpawnRefusedError('the child uid could not be minted');
+    }
+  }
+
+  /** The one child-composition call: the test seam or the production path. */
+  private composeChild(options: CellOptions): Promise<NodeCell> {
+    const compose = (): Promise<NodeCell> => composeNode(options, this.deps.shared);
+    return this.deps.composeChild === undefined
+      ? compose() : this.deps.composeChild(options, compose);
+  }
+}
+
+/**
+ * The child's configuration from the requester's live one: identity fields as
+ * requested, the tools and budget inherited (attenuated, never widened), and
+ * the kernel's composer sentence in place of ANY authored trailing identity
+ * sentence — on a derived charter and on a requested one alike.
+ */
+function composedChildConfig(
+  base: AgentConfig, uid: string, requesterUid: string, request: SpawnRequest,
+): AgentConfig {
+  const authored = (request.charter ?? base.charter).replace(AUTHORED_IDENTITY_RE, '');
+  return validateAgentConfig({
+    ...base,
+    model: request.model ?? base.model,
+    heading: request.heading ?? base.heading,
+    charter: `${authored}${composerSentence(uid, requesterUid)}`,
+    // Attenuation: a child can hold only what the requester holds.
+    allowedTools: [...base.allowedTools],
+    policy: {
+      ...base.policy,
+      wakeBudgetPerHour: base.policy.wakeBudgetPerHour ?? DEFAULT_WAKE_BUDGET_PER_HOUR,
+    },
+  });
 }
 
 /**
@@ -1227,18 +1455,20 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       }
       const providers = await loadProviderStore(home);
       const credential = llmCredentialFrom(providers);
-      // The root's spawn capability: a closure over the pool, which exists only
-      // after the shared parts are composed. A spawn call can only come from a
-      // running turn, so the pool is always bound by then.
-      const rootSpawn: SpawnPort = {
+      // The declared spawn grant: one port per node whose nodes-file entry
+      // says `spawn: true` (a solo flag boot grants nobody). The port closes
+      // over the pool, which exists only after the shared parts are composed;
+      // a spawn call can only come from a running turn, so the pool is always
+      // bound by then.
+      const spawnPortFor = (uid: string): SpawnPort => ({
         spawn: async (request) => {
           if (pool === null) throw new SpawnRefusedError('the node pool is not open');
-          return pool.spawn(primaryUid, request);
+          return pool.spawn(uid, request);
         },
         caps: () => (pool === null
-          ? { available: false, childrenLeft: 0, nodesLeft: 0, depthLeft: 0 }
-          : pool.caps(primaryUid)),
-      };
+          ? { available: false, nodesLeft: 0 }
+          : pool.caps(uid)),
+      });
       // The human channel, granted to the root only (agent zero). Delivery is
       // the chat log; the frontier already holds the exact call bytes.
       const rootSpeak: SpeakPort = {
@@ -1260,9 +1490,11 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         ...(pollMs !== undefined ? { pollMs } : {}),
       };
       if (specs.length === 1) {
+        const spec = specs[0]!;
         const cell = await (deps.compose ?? composeCell)({
-          ...sharedOptions, uid: specs[0]!.uid, config: configs[0]!,
-          spawn: rootSpawn, speak: rootSpeak,
+          ...sharedOptions, uid: spec.uid, config: configs[0]!,
+          ...(spec.spawn === true ? { spawn: spawnPortFor(spec.uid) } : {}),
+          speak: rootSpeak,
         });
         composed = {
           nodes: [cell], world: cell.world, frontier: cell.frontier,
@@ -1270,14 +1502,16 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         };
       } else {
         composed = await (deps.composeSet ?? composeCellSet)({
-          ...sharedOptions, spawn: rootSpawn, speak: rootSpeak,
-          nodes: specs.map((spec, index) => ({ uid: spec.uid, config: configs[index]! })),
+          ...sharedOptions, speak: rootSpeak,
+          nodes: specs.map((spec, index) => ({
+            uid: spec.uid, config: configs[index]!,
+            ...(spec.spawn === true ? { spawn: spawnPortFor(spec.uid) } : {}),
+          })),
         });
       }
-      // The custody pool: the shared parts are known now, and the booted nodes
-      // enter as roots. Only the first booted node carries the spawn grant; the
-      // others receive it only if the operator's file/root grants one — no
-      // implicit grant exists.
+      // The flat roster: the shared parts are known now, and every booted node
+      // enters before any run starts (`startAll`, below), so a first-turn spawn
+      // sees the whole roster. The grant is per entry, never implicit.
       pool = new NodePool({
         home,
         shared: {
@@ -1285,9 +1519,10 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
           doctor: undefined, storage, storageState,
         },
         providers, credential, sandbox: cellSandbox, storage, log, maxNodes: MAX_NODES,
+        ...(deps.composeChild !== undefined ? { composeChild: deps.composeChild } : {}),
       });
       for (const [index, node] of composed.nodes.entries()) {
-        pool.addBooted(node, index === 0);
+        pool.addBooted(node, specs[index]?.spawn === true);
       }
       for (const node of composed.nodes) {
         log.emit('host/boot', {
@@ -1309,10 +1544,15 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
           world: node.worldState.degraded ? 'degraded' : 'healthy',
         });
       }
+      // Two-phase boot: every booted node is registered (above), then the pool
+      // starts and observes every run; the body then awaits the pool's drain —
+      // the host lives while ANY node is live, booted or composed. A stop that
+      // landed during boot is delivered here, before the await.
+      pool.startAll();
       if (stopRequested) {
         for (const node of composed.nodes) node.driver.stop('stop-requested');
       }
-      await Promise.all(composed.nodes.map((node) => node.driver.run()));
+      await pool.drain();
     } catch (err) {
       // A usage/config refusal is exit 2, matching AGENTS: the host's own
       // configuration classes plus the world open/trust family (a legacy or
@@ -1332,8 +1572,8 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       // Both cleanup steps can reject, and neither may replace the code the
       // failure itself earned: a host that cannot close its cell or release its
       // owner has still failed, but the journal is the record of why.
-      // The pool is closed before the frontier: its spawned runs must settle
-      // (deepest-first) while the shared journal is still open.
+      // The pool is closed before the frontier: every run it owns (booted and
+      // composed) must settle while the shared journal is still open.
       if (pool !== null) {
         try {
           await pool.close();

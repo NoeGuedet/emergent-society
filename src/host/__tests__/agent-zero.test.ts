@@ -74,14 +74,20 @@ async function providers(home: string, url: string): Promise<void> {
 }
 
 function start(home: string, lines: string[]) {
-  return startHost({
-    home, uid: 'node-0', command: 'start', model: 'first-light-test',
-    heading: 'Seed heading.', sandbox: false,
+  // A one-entry nodes file with the declared grant: the human channel is the
+  // root's, and the spawn capability is declared, never implicit (a solo flag
+  // boot grants nobody). The journaled config is composed exactly as a solo
+  // start's would be.
+  const nodesFile = join(home, 'nodes.json');
+  return writeFile(nodesFile, JSON.stringify([
+    { uid: 'node-0', model: 'first-light-test', heading: 'Seed heading.', spawn: true },
+  ]), 'utf8').then(() => startHost({
+    home, uid: 'node-0', command: 'start', nodesFile, sandbox: false,
     log: createHostLog((line) => lines.push(line)),
   }, {
     installSignals: false, keepAlive: false,
     freeSpace: async () => ({ bytes: 10 ** 12, inodes: 10 ** 9 }),
-  });
+  }));
 }
 
 it('pins the human-ratified DIRECTION.md, never a node draft', async () => {
@@ -99,7 +105,7 @@ it('pins the human-ratified DIRECTION.md, never a node draft', async () => {
   servers.push(server);
   await providers(home, server.url);
   const lines: string[] = [];
-  const handle = start(home, lines);
+  const handle = await start(home, lines);
   await vi.waitFor(() => expect(bodies).toHaveLength(1), { timeout: 20_000 });
   expect(bodies[0]).toContain('v1: hold the line');
   // The draft is committed by node-0; the human then ratifies v2.
@@ -138,7 +144,9 @@ it('delivers speak outside the world to the root and denies it to a child', asyn
   await commitAs(world, 'human', { 'seed.txt': 'seed\n' }, 'seed');
   const counts = new Map<string, number>();
   const server = await serveJson((request) => {
-    const uid = request.body.toString('utf8').includes('You are node-1.')
+    // The composer sentence names the requester: the child is node-1,
+    // composed by the root.
+    const uid = request.body.toString('utf8').includes('You are node-1, composed by node-0.')
       ? 'node-1' : 'node-0';
     const count = counts.get(uid) ?? 0;
     counts.set(uid, count + 1);
@@ -159,7 +167,7 @@ it('delivers speak outside the world to the root and denies it to a child', asyn
   servers.push(server);
   await providers(home, server.url);
   const lines: string[] = [];
-  const handle = start(home, lines);
+  const handle = await start(home, lines);
   await vi.waitFor(async () => {
     const events = await loadVerifiedEvents(home, 'node-1', C13_EVENT_TYPES);
     expect(events.filter((event) => event.type === 'turn/end').length).toBeGreaterThan(0);

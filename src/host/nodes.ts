@@ -8,8 +8,10 @@ import { HostConfigError } from './errors.js';
  *
  * The file is a strict JSON array of node entries; each entry names a uid and,
  * on a start, its model and heading (and optionally an absolute charter file).
- * A resume takes only the uids — the journaled config wins, exactly as the
- * single-node resume refuses `--model`/`--heading`.
+ * An entry may also declare `spawn: true` — the kernel's spawn capability is
+ * declared, never implicit, and a solo flag boot grants nobody. A resume takes
+ * the uids and the spawn grant only — the journaled config wins for everything
+ * else, exactly as the single-node resume refuses `--model`/`--heading`.
  *
  * The file is read at the host gate, not by the CLI parser: a missing, foreign
  * or malformed file is a configuration refusal (exit `2`) that releases the
@@ -31,9 +33,11 @@ export type NodeSpec = {
   readonly model?: string;
   readonly heading?: string;
   readonly charterFile?: string;
+  /** The declared spawn capability: present and true, absent for nobody. */
+  readonly spawn?: boolean;
 };
 
-const ENTRY_KEYS = new Set(['uid', 'model', 'heading', 'charterFile']);
+const ENTRY_KEYS = new Set(['uid', 'model', 'heading', 'charterFile', 'spawn']);
 
 /** Reads and validates one nodes file for `start` or `resume`. */
 export async function readNodesFile(
@@ -102,13 +106,17 @@ function parseEntry(
   const model = record['model'];
   const heading = record['heading'];
   const charterFile = record['charterFile'];
+  const spawn = record['spawn'];
+  if (spawn !== undefined && typeof spawn !== 'boolean') {
+    throw new HostConfigError(`${at} has a spawn that is not a boolean`);
+  }
   if (command === 'resume') {
     if (model !== undefined || heading !== undefined || charterFile !== undefined) {
       throw new HostConfigError(
-        `${at} may declare only a uid on resume; the journaled config wins`,
+        `${at} may declare only a uid and a spawn grant on resume; the journaled config wins`,
       );
     }
-    return { uid };
+    return { uid, ...(spawn !== undefined ? { spawn } : {}) };
   }
   if (typeof model !== 'string' || model === '') {
     throw new HostConfigError(`${at} requires a model`);
@@ -124,5 +132,6 @@ function parseEntry(
   return {
     uid, model, heading,
     ...(charterFile !== undefined ? { charterFile } : {}),
+    ...(spawn !== undefined ? { spawn } : {}),
   };
 }

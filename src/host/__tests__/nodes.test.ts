@@ -48,7 +48,33 @@ it('reads a start declaration, with an optional absolute charter file', async ()
   ]);
 });
 
-it('reads a resume declaration: uids only, the journaled config wins', async () => {
+it('reads the declared spawn grant on a start and on a resume', async () => {
+  const start = await fileOf('start.json', JSON.stringify([
+    { uid: 'node-0', model: 'm', heading: 'h', spawn: true },
+    { uid: 'node-1', model: 'm', heading: 'h' },
+  ]));
+  expect(await readNodesFile(start, 'start')).toEqual([
+    { uid: 'node-0', model: 'm', heading: 'h', spawn: true },
+    { uid: 'node-1', model: 'm', heading: 'h' },
+  ]);
+  const resume = await fileOf('resume.json', JSON.stringify([
+    { uid: 'node-0', spawn: true }, { uid: 'node-1' },
+  ]));
+  expect(await readNodesFile(resume, 'resume')).toEqual([
+    { uid: 'node-0', spawn: true }, { uid: 'node-1' },
+  ]);
+});
+
+it('refuses a spawn grant that is not a boolean, on a start and on a resume', async () => {
+  expect((await refusal(await fileOf('spawn-string.json', JSON.stringify([
+    { uid: 'node-0', model: 'm', heading: 'h', spawn: 'yes' },
+  ])), 'start')).message).toMatch(/spawn that is not a boolean/);
+  expect((await refusal(await fileOf('spawn-number.json', JSON.stringify([
+    { uid: 'node-0', spawn: 1 },
+  ])), 'resume')).message).toMatch(/spawn that is not a boolean/);
+});
+
+it('reads a resume declaration: uids and the spawn grant, the journaled config wins', async () => {
   const path = await fileOf('nodes.json', JSON.stringify([{ uid: 'node-0' }, { uid: 'node-1' }]));
   expect(await readNodesFile(path, 'resume')).toEqual([
     { uid: 'node-0' }, { uid: 'node-1' },
