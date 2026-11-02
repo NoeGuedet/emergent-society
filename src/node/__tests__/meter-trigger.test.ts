@@ -1125,4 +1125,80 @@ describe('the remember verb: the pending authored survival', () => {
     expect((await eventsOf(fx)).filter((event) => event.type === 'compaction/start'))
       .toHaveLength(0);
   });
+
+  // The M1×M2 seam: the early flag and the token trigger are two admission
+  // paths to the SAME transaction. These two rows prove the combination, which
+  // neither brick's own tests exercised (the remember rows use the byte path
+  // and the token rows never set memory).
+  it('the early flag suppresses the routine/token compaction: one transaction when both would fire', async () => {
+    const fx = fixture();
+    const diagnostics: RuntimeDiagnostic[] = [];
+    const gated = {
+      compactAfterBytes: 1_000_000, keepRecentGroups: 0,
+      compactAfterTokens: WIDE_RULE, memory: GATE_ON,
+    };
+    const transport = new ScriptedTransport([
+      calling([waitCall('w1')]), // turn 0: one committed dialogue, the wide rule silent
+      calling([rememberCall('r1', 'early under the token trigger', true), waitCall('w2')]),
+      reply('idle'), // turn 2: the consuming plan site
+    ]);
+    const runtime = await runtimeFor(fx, configWith({ policy: gated }), transport,
+      {
+        models: MODELS, diagnose: (diagnostic) => diagnostics.push(diagnostic),
+        extend: await memoryExtendPort(fx),
+      });
+    await runTurn(fx, runtime); // turn 0
+    await runTurn(fx, runtime); // turn 1: the flag is recorded; its own plan site had none
+    expect((await eventsOf(fx)).filter((event) => event.type === 'compaction/start'))
+      .toHaveLength(0);
+    // Turn 2: the tiny token rule AND the byte threshold would both fire. The
+    // early flag is consumed first and is the ONE erasure; the token branch
+    // re-prices instead of firing a second.
+    runtime.scheduleConfig(configWith({
+      version: 2,
+      policy: { ...gated, compactAfterBytes: 1, compactAfterTokens: TINY_RULE },
+    }));
+    await runTurn(fx, runtime);
+    const events = await eventsOf(fx);
+    expect(events.filter((event) => event.type === 'compaction/start')).toHaveLength(1);
+    expect(events.filter((event) => event.type === 'compaction/end')).toHaveLength(1);
+    const summary = (await summariesOf(fx))[0]!;
+    expect(summary.replacement).toBe('authored-applied');
+    expect(summary.message.content).toContain('early under the token trigger');
+    // The token branch evaluated and observed the still-over price: the re-price
+    // diagnostic is the proof it did not fire a second transaction.
+    expect(diagnostics).toContainEqual({
+      kind: 'over-window-after-compaction',
+      estimate: expect.any(Number), threshold: 10,
+    });
+  }, 20_000);
+
+  it('lands the authored survival under the TOKEN trigger (the meter path carries the replacement)', async () => {
+    const fx = fixture();
+    const gated = {
+      compactAfterBytes: 1_000_000, keepRecentGroups: 0,
+      compactAfterTokens: WIDE_RULE, memory: GATE_ON,
+    };
+    const transport = new ScriptedTransport([
+      calling([waitCall('w1')]), // turn 0: the committed span
+      calling([rememberCall('r1', 'survival under the token trigger')]), // turn 1, step 0
+      reply('idle'), // turn 1, step 1
+      reply('idle'), // turn 2: the token trigger fires
+    ]);
+    const runtime = await runtimeFor(fx, configWith({ policy: gated }), transport,
+      { models: MODELS, extend: await memoryExtendPort(fx) });
+    await runTurn(fx, runtime); // turn 0
+    await runTurn(fx, runtime); // turn 1: the payload is pending, the wide rule silent
+    runtime.scheduleConfig(configWith({
+      version: 2, policy: { ...gated, compactAfterTokens: TINY_RULE },
+    }));
+    await runTurn(fx, runtime); // turn 2: the token trigger decides the transaction
+    const starts = (await eventsOf(fx)).filter((event) => event.type === 'compaction/start');
+    expect(starts).toHaveLength(1);
+    // The TOKEN path decided it: the start carries the kernel's meter payload.
+    expect((starts[0]!.data as unknown as { meter?: unknown }).meter).toBeDefined();
+    const summary = (await summariesOf(fx))[0]!;
+    expect(summary.replacement).toBe('authored-applied');
+    expect(summary.message.content).toContain('survival under the token trigger');
+  }, 20_000);
 });

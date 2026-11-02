@@ -87,7 +87,7 @@ not individually logged.
 | `web.ts` | `web_search`/`web_fetch`: the Tavily client, renderers, `webToolsFromProviders`; every invocation crosses the frontier |
 | `providers.ts` | `loadProviders`: the kernel-side `providers.json` store (see §7) |
 | `dispatch.ts` | `dispatchCalls`: completes tool dialogues through the gate; `wait` takes `{}` or an ISO-8601 `{until}` (1 s–7 days ahead, carried back as `wakeAt`); owns the extend verbs' recognition (the twelve factory verbs plus the gated `remember`; `run`/`undefine` take name or id; `stop` takes name, id or nothing — the bare stop names THE live Run; `spawn` takes optional model/heading/charter/spawn; `request_death` takes only `verb` and runs the capture-free synchronous departure branch; `send_message` takes `text` and an optional `to` that is absent or the reserved `gateway` — any other addressee is the explicit node-to-node teaching refusal; `get_messages` takes an optional positive integer `n`; `history` takes only an optional `n` of 1..64 — a `uid` is the explicit no-peer-history refusal — and the gated `remember` takes a non-blank `text` bounded by the tool-argument cap plus an optional boolean `compact`; the recognition refusal lists `remember` last) and the native-call bridge — a live-registered package tool called by its bare name runs through the funnel |
-| `extend.ts` | The extend executor: the verbs, the verb facts, the funnel's kernel-side schema validation, the honest inspect catalogue. The conversation's two branches run over the runtime-bound `ConversationPort` (`send_message` appends and names the resolved addressee; `get_messages` renders the caller's thread self-bounded under `maxToolResultBytes`, oldest-first, with the kernel framing sentence and an "older records exist" line); the port-less composition answers the honest denial. The `history` branch runs over the runtime-bound `HistoryPort` (`src/node/history.ts` renders the window; the port-less composition denies with the same shape), and inspect renders a port-conditional `== your own history ==` section. `speak` and its `SpeakPort` are gone. The gated `remember` branch reads the JOURNALED `memory.remember` policy as a real refusal (an OFF cell gets `error: denied`, never an execution; a pre-wave cell that guesses the name gets the same denial), records the pending text on the runtime-composed `MemoryPort` and returns a numberless, runtime-only result; inspect lists `== your survival ==` only when the gate is ON |
+| `extend.ts` | The extend executor: the verbs, the verb facts, the funnel's kernel-side schema validation, the honest inspect catalogue. The conversation's two branches run over the runtime-bound `ConversationPort` (`send_message` appends and names the resolved addressee; `get_messages` renders the caller's thread self-bounded under `maxToolResultBytes`, oldest-first, with the kernel framing sentence and an "older records exist" line); the port-less composition answers the honest denial. The `history` branch runs over the runtime-bound `HistoryPort` (`src/node/history.ts` renders the window; the port-less composition denies with the same shape), and inspect renders a port-conditional `== your own history ==` section. `speak` and its `SpeakPort` are gone. The gated `remember` branch reads the JOURNALED `memory.remember` policy as a real refusal (an OFF cell gets `denied: the remember verb is not enabled in this cell`, never an execution; a pre-wave cell that guesses the name gets the same denial), records the pending text on the runtime-composed `MemoryPort` and returns a numberless, runtime-only result; inspect lists `== your survival ==` only when the gate is ON |
 | `text.ts` | `boundToolText`: the model-visible tool-text bound |
 
 ### `src/node/packages/` — the Package layer
@@ -292,10 +292,19 @@ The `providers.json` schema is enforced in `src/node/tools/providers.ts`: exactl
 named entries — `llm` (`{key, endpoint, models?}`, no defaults, the model endpoint;
 `models`, when present, is the operator-declared served-model catalog — at most 64
 unique one-line printable ASCII ids of at most 256 characters each (0x20–0x7E; no
-control characters, newlines, DEL or non-ASCII), operator-declared, unverified,
-not a routing table; the kernel lists it in `inspect`, projects it as the
-third kernel-owned system block, and validates every start, every spawn that names a
-model and every `update_self` that names a model against it) and the optional `tavily` (the web tools: `key` required nonempty, sent only in the
+control characters, newlines, DEL or non-ASCII), in TWO accepted shapes: the old
+ids-only form (`"id"`, a windowless entry) and the object form
+`{id, contextTokens, maxOutputTokens}` with BOTH window fields declared together.
+The window's domain is the declaration's — positive safe integers at or below the
+4,194,304-token cap, `maxOutputTokens < contextTokens`, and a window wide enough
+that the factory trigger does not degenerate (a too-small window is refused at
+declaration); a fresh START on an entry that declares no window is refused with the
+bounded teaching refusal, while an absent catalog keeps the free-string contract and
+a resume never re-validates. The catalog is operator-declared, unverified, not a
+routing table; the kernel lists it in `inspect`, projects it as the third
+kernel-owned system block, and validates every start, every spawn that names a model
+and every `update_self` that names a model against it; its full domain and the
+fresh-start rule are in [kernel.md](kernel.md) (the model manifest)) and the optional `tavily` (the web tools: `key` required nonempty, sent only in the
 `Authorization` header; `baseUrl` optional, `https`-only unless the host is loopback, no
 embedded credentials, query or fragment; `timeoutMs` 1–120000, default 20000;
 `maxResults` 1–20, default 8; `maxResponseBytes` 1024–8388608, default 1 MiB). Unknown

@@ -32,7 +32,8 @@ machine default shell may be older, always select 24 via nvm first.
   `policy.memory {remember: true, messages: false}` into every node this start composes (home-level;
   a `--nodes-file` boot takes it for every entry) and composes the gated `remember` verb into the
   extend offering; without it the factory notice-only arm stands, and `resume` refuses the flag
-  (the journaled config wins).
+  (the journaled config wins). A node spawned by a gated parent inherits the journaled `memory`
+  policy and the composed offering (attenuation inherits, never widens).
 - `start --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--memory-remember] [--no-sandbox]` — boot a declared
   node set on one home: a strict JSON array of at most 16 `{uid, model, heading,
   charterFile?, spawn?}` entries with unique uids, read at the config gate (exit 2
