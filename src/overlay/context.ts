@@ -4,6 +4,7 @@ import {
 } from '../journal/index.js';
 import type { ConversationLog, ConversationThread } from '../node/conversation.js';
 import { readChatWindow } from '../host/chat.js';
+import { isoInstant } from '../util.js';
 import { OVERLAY_CHAT_WINDOW, OVERLAY_THREAD_WINDOW } from './policy.js';
 
 /**
@@ -64,5 +65,5 @@ export function renderConversationWindow(thread: ConversationThread): string {
 
 /** One ISO-8601 UTC stamp for the model; the readers never assert times. */
 function stamp(at: number): string {
-  return new Date(at).toISOString();
+  return isoInstant(at);
 }

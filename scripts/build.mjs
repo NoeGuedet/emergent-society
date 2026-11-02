@@ -47,7 +47,7 @@ async function walk(dir, prefix = '') {
 
 export async function copyRuntimeAssets(root, out = join(root, 'dist')) {
   // The two runtime assets tsc does not emit: the journal's ownership guard and
-  // the conversation stream's flock writer helper (both are plain .mjs children).
+  // the shared line-log flock writer helper (both are plain .mjs children).
   for (const rel of [
     ['journal', 'lock-guard.mjs'],
     ['node', 'conversation-append.mjs'],

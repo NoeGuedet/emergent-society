@@ -1,5 +1,7 @@
-// The conversation stream's cross-process writer: one short-lived helper under
-// `<home>/.es/conversation.lock`, the lock-guard precedent (journal/lock.ts).
+// The kernel-owned line logs' shared cross-process writer: one short-lived
+// helper under the caller's lock (`.es/conversation.lock` for the conversation
+// stream, `.es/chat.lock` for the chat log), the lock-guard precedent
+// (journal/lock.ts). The parent (`src/locked-append.ts`) supplies the file.
 //
 // Node has no flock binding, so the kernel's appends run here, under the lock
 // held by util-linux flock (`flock -F` execs this helper in place, so the lock
@@ -25,7 +27,7 @@ const MAX_LINE_BYTES = 64 * 1024;
 const TAIL_READ_BYTES = 64 * 1024;
 const NEWLINE = 0x0a;
 
-const [, , command, file] = process.argv;
+const [, , command, file, mode] = process.argv;
 
 function fail(message) {
   process.stderr.write(`conversation-append: ${message}\n`);
@@ -96,8 +98,15 @@ async function append() {
 
 /**
  * Truncates one incomplete trailing fragment. A clean stream (empty, or
- * newline-terminated) is untouched; a tail window with no newline at all is a
- * corrupted stream the helper refuses rather than truncating blindly.
+ * newline-terminated) is untouched; a file with no newline anywhere in the tail
+ * window is a corrupted file:
+ *   - `truncate-whole` (the chat log, with its own truncate-to-zero precedent):
+ *     a file that fits the WHOLE repair window and is nothing but a torn first
+ *     append is truncated to 0 — one crashed first append must never make the
+ *     host unbootable. A longer no-newline file is beyond the window and is
+ *     refused like the default.
+ *   - the default (the conversation stream): refuse rather than truncate
+ *     blindly.
  */
 async function repair() {
   let size;
@@ -129,7 +138,15 @@ async function repair() {
       return;
     }
     const cut = tail.lastIndexOf(NEWLINE);
-    if (cut === -1) fail('the trailing fragment is longer than the repair window');
+    if (cut === -1) {
+      if (mode === 'truncate-whole' && size <= TAIL_READ_BYTES) {
+        await handle.truncate(0);
+        await handle.sync();
+        process.stdout.write(`${JSON.stringify({ repaired: size, size: 0 })}\n`);
+        return;
+      }
+      fail('the trailing fragment is longer than the repair window');
+    }
     const kept = size - readBytes + cut + 1;
     await handle.truncate(kept);
     await handle.sync();
@@ -139,7 +156,7 @@ async function repair() {
   }
 }
 
-if (file === undefined) fail('usage: conversation-append <append|repair> <file>');
+if (file === undefined) fail('usage: conversation-append <append|repair> <file> [truncate-whole]');
 
 try {
   if (command === 'append') await append();

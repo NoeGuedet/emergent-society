@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { KernelError } from '../errors.js';
 import { WorldNotARepoError, UnsafeWorldPathError } from '../node/errors.js';
+import { createProcessStdin, runChatSession, type ChatStdin } from './chat.js';
 import { HostConfigError, UsageError } from './errors.js';
 import { startHost, type HostHandle, type HostOptions } from './host.js';
 import { initHome } from './layout.js';
@@ -22,10 +23,11 @@ import { formatStatus, readStatus, type StatusReport } from './status.js';
  *
  * The seams exist so the mapping is testable without a process, a signal or
  * a network: `startHost` returns a handle instead of owning the process, the
- * log takes the CLI's own stderr sink, and `requestPause`/`readStatus` are
- * substitutable. `runCli` resolves each default exactly once at entry, so a
- * `deps` object with no fields is the production behavior — including
- * `process.stdout`/`stderr`.
+ * log takes the CLI's own stderr sink, `requestPause`/`readStatus` are
+ * substitutable, and the interactive `chat` session reads lines through the
+ * `stdin` seam (production is `process.stdin`). `runCli` resolves each default
+ * exactly once at entry, so a `deps` object with no fields is the production
+ * behavior — including `process.stdout`/`stderr`.
  *
  * A refused `start`/`resume` is not caught here: `startHost` never rejects
  * `done`, it resolves the code the host already journaled, so the lifetime's
@@ -40,6 +42,8 @@ export type CliDeps = {
   readonly startHost?: (options: HostOptions) => HostHandle;
   readonly requestPause?: (home: string) => Promise<PauseOutcome>;
   readonly readStatus?: (home: string) => Promise<StatusReport>;
+  /** The interactive chat's stdin seam; production is `process.stdin`. */
+  readonly stdin?: ChatStdin;
   readonly stdout?: (text: string) => void;
   readonly stderr?: (text: string) => void;
   readonly createLog?: (write: (line: string) => void) => HostLog;
@@ -52,6 +56,9 @@ type HostRun = Extract<HostCliCommand, { readonly command: 'start' | 'resume' }>
 
 /** The one read-only command. */
 type StatusRun = Extract<HostCliCommand, { readonly command: 'status' }>;
+
+/** The one interactive command. */
+type ChatRun = Extract<HostCliCommand, { readonly command: 'chat' }>;
 
 /** The bounded failure label: a kernel refusal's message, otherwise a name. */
 function failureOf(error: unknown): string {
@@ -210,6 +217,38 @@ async function runStatus(
 }
 
 /**
+ * `chat`: the interactive human↔overlay session, one exit code and two sinks.
+ *
+ * The session renders the history first and, on a non-TTY stdin, exits without
+ * a read — the scripted `chat --home` can never hang. A missing home is a
+ * `HostConfigError` (`2`); any other throw is a runtime failure (`1`) with the
+ * bounded label, and the session's own exit code (a degraded history's `1`,
+ * EOF's `0`) is the authority otherwise.
+ */
+async function runChat(
+  command: ChatRun,
+  deps: CliDeps,
+  out: Sink,
+  err: Sink,
+): Promise<number> {
+  try {
+    const result = await runChatSession({
+      home: command.home,
+      tail: command.tail,
+      conversation: command.conversation,
+      json: command.json,
+      stdin: deps.stdin ?? createProcessStdin(),
+      stdout: out,
+      stderr: err,
+    });
+    return result.code;
+  } catch (error) {
+    err(`error: ${failureOf(error)}\n`);
+    return error instanceof HostConfigError ? 2 : 1;
+  }
+}
+
+/**
  * Runs one command line and resolves the process exit code.
  *
  * Usage is resolved first because a malformed command line still has to be able
@@ -240,5 +279,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps = {}): Promi
       return await runPause(command.home, deps, out, err);
     case 'status':
       return await runStatus(command, deps, out, err);
+    case 'chat':
+      return await runChat(command, deps, out, err);
   }
 }

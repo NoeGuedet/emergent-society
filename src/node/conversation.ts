@@ -1,13 +1,14 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Buffer } from 'node:buffer';
 import { open, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
-  GATEWAY_ADDRESSEE, assertConversationActor, assertConversationAddressee,
-  ensureDurableDirectory, isErrno,
+  GATEWAY_ADDRESSEE, assertConversationActor, assertConversationAddressee, isErrno,
 } from '../journal/index.js';
+import {
+  LOCK_DIR, appendLineUnderLock, ensureLockSidecar, repairUnderLock,
+} from '../locked-append.js';
 import { utf8Prefix } from '../text.js';
+import { isoInstant } from '../util.js';
 
 /**
  * The conversation stream — the interface between the far west and the
@@ -30,16 +31,17 @@ import { utf8Prefix } from '../text.js';
  * bounded TAIL read: the last-n records of one participant's thread, a torn
  * tail dropped, never the whole stream.
  *
- * Node has no flock binding, so each append runs the short-lived writer helper
- * (`conversation-append.mjs`) under util-linux `flock -F`, the lock-guard
- * precedent (journal/lock.ts).
+ * Node has no flock binding, so each append runs the shared short-lived writer
+ * helper (`src/locked-append.ts`, `node/conversation-append.mjs`) under
+ * util-linux `flock -F`, the lock-guard precedent (journal/lock.ts). The same
+ * primitive serves the chat log with its own `chat.lock`.
  */
 
 /** The conversation stream's file name inside the cell home. */
 export const CONVERSATION_FILE = 'conversation.v0.jsonl';
 
 /** The kernel-owned sidecar directory the stream's flock lives in. */
-export const CONVERSATION_DIR = '.es';
+export const CONVERSATION_DIR = LOCK_DIR;
 
 /** The stream's flock sidecar, inside `.es`. */
 export const CONVERSATION_LOCK_FILE = 'conversation.lock';
@@ -104,12 +106,6 @@ export class ConversationRefusedError extends Error {
   }
 }
 
-const HELPER_PATH = fileURLToPath(new URL('./conversation-append.mjs', import.meta.url));
-const FLOCK_PATH = '/usr/bin/flock';
-/** The blocking wait's ceiling (the journal guard's own five seconds). */
-const LOCK_WAIT_SECONDS = 5;
-const HELPER_TIMEOUT_MS = 15_000;
-
 /**
  * The append-only conversation log of one cell home. The instance is
  * stateless (every append's critical section lives in the helper); it exists
@@ -158,10 +154,11 @@ export class ConversationLog {
     const record: ConversationRecord = { v: 0, at, from: actor, to: addressee, text };
     const line = `${JSON.stringify(record)}\n`;
     const lock = await ensureConversationSidecar(this.home);
-    const result = await runHelper(lock, 'append', this.path(), line);
-    const offset = result['offset'];
-    if (typeof offset !== 'number' || !Number.isSafeInteger(offset)) {
-      throw new ConversationWriteError('the conversation writer returned no result');
+    let offset: number;
+    try {
+      offset = (await appendLineUnderLock(lock, this.path(), line)).offset;
+    } catch {
+      throw new ConversationWriteError(WRITE_FAILED);
     }
     return { to: addressee, at, offset };
   }
@@ -194,7 +191,11 @@ export async function openConversationLog(home: string): Promise<ConversationLog
   }
   if (present) {
     const lock = await ensureConversationSidecar(home);
-    await runHelper(lock, 'repair', path, '');
+    try {
+      await repairUnderLock(lock, path);
+    } catch {
+      throw new ConversationWriteError(WRITE_FAILED);
+    }
   }
   return ConversationLog.for(home);
 }
@@ -206,7 +207,7 @@ export async function openConversationLog(home: string): Promise<ConversationLog
  */
 async function ensureConversationSidecar(home: string): Promise<string> {
   try {
-    return await ensureLock(home);
+    return await ensureLockSidecar(home, CONVERSATION_LOCK_FILE);
   } catch {
     throw new ConversationWriteError(
       'the conversation stream could not be written: the kernel-owned lock sidecar'
@@ -215,84 +216,8 @@ async function ensureConversationSidecar(home: string): Promise<string> {
   }
 }
 
-async function ensureLock(home: string): Promise<string> {
-  const dir = join(home, CONVERSATION_DIR);
-  // 0700, created and proven durable from the trust anchor (the home) down.
-  await ensureDurableDirectory(dir, home);
-  const lock = join(dir, CONVERSATION_LOCK_FILE);
-  const handle = await open(lock, 'a', 0o600);
-  await handle.close();
-  return lock;
-}
-
-/**
- * Runs the writer helper under the flock. `flock -F` execs the helper in place,
- * so the lock fd is held for the whole critical section and a timed-out wait
- * never runs the helper at all.
- *
- * Every failure is the FIXED path-free writer refusal. The helper's own stderr
- * (a raw errno line, which would carry the absolute stream path) is drained
- * and dropped: it is never model-visible, and the kernel has no logging seam
- * at this layer to keep it.
- */
+/** The append/repair refusals' one fixed message (path-free by construction). */
 const WRITE_FAILED = 'the conversation stream could not be written';
-function runHelper(
-  lock: string, command: 'append' | 'repair', file: string, stdin: string,
-): Promise<Record<string, unknown>> {
-  const args = [
-    '-F', '--exclusive', `--wait=${LOCK_WAIT_SECONDS}`, lock,
-    process.execPath, HELPER_PATH, command, file,
-  ];
-  return new Promise<Record<string, unknown>>((resolve, reject) => {
-    let child: ChildProcessWithoutNullStreams;
-    try {
-      child = spawn(FLOCK_PATH, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: HELPER_TIMEOUT_MS,
-        killSignal: 'SIGKILL',
-      });
-    } catch {
-      reject(new ConversationWriteError(WRITE_FAILED));
-      return;
-    }
-    let stdout = '';
-    child.stdout.setEncoding('utf8');
-    // Drained but never read: the helper's raw diagnostic can carry the stream
-    // path, and a model-visible result must not.
-    child.stderr.on('data', () => { /* dropped on purpose */ });
-    child.stdout.on('data', (chunk: string) => {
-      if (stdout.length < 4096) stdout += chunk;
-    });
-    // A helper that never reads (the wait expired) leaves the pipe closed; the
-    // EPIPE is the exit path's business, not an unhandled stream error.
-    child.stdin.on('error', () => { /* the exit code is the outcome */ });
-    child.once('error', () => {
-      reject(new ConversationWriteError(WRITE_FAILED));
-    });
-    child.once('close', (code) => {
-      if (code !== 0) {
-        // A nonzero exit (including a refused/timed-out flock wait) is the one
-        // fixed refusal; the helper's stderr may name the absolute path.
-        reject(new ConversationWriteError(WRITE_FAILED));
-        return;
-      }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(stdout);
-      } catch {
-        reject(new ConversationWriteError('the conversation writer returned no result'));
-        return;
-      }
-      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-        reject(new ConversationWriteError('the conversation writer returned no result'));
-        return;
-      }
-      resolve(parsed as Record<string, unknown>);
-    });
-    child.stdin.end(stdin);
-  });
-}
-
 
 /**
  * The last-n records of one participant's thread, from a bounded tail read.
@@ -310,6 +235,30 @@ export async function readConversationThread(
   maxBytes: number = MAX_THREAD_READ_BYTES,
 ): Promise<ConversationThread> {
   const reader = assertConversationActor(uid);
+  return await readConversationTail(
+    home, n, maxBytes,
+    (record) => record.from === reader || record.to === reader,
+  );
+}
+
+/**
+ * The stream's newest n records of EVERY thread — the human's read-only window
+ * (`chat --conversation`). Same bounded tail read, same tolerance, no privacy
+ * filter: the operator reads the whole interface, and the log is kernel-owned
+ * (this is not a world read).
+ */
+export async function readConversationStream(
+  home: string, n: number = DEFAULT_THREAD_READ,
+  maxBytes: number = MAX_THREAD_READ_BYTES,
+): Promise<ConversationThread> {
+  return await readConversationTail(home, n, maxBytes, () => true);
+}
+
+/** The one bounded tail read behind both readers. */
+async function readConversationTail(
+  home: string, n: number, maxBytes: number,
+  keep: (record: ConversationRecord) => boolean,
+): Promise<ConversationThread> {
   const limit = Number.isSafeInteger(n) && n > 0 ? n : DEFAULT_THREAD_READ;
   const path = join(home, CONVERSATION_FILE);
   let size: number;
@@ -336,8 +285,7 @@ export async function readConversationThread(
     const text = decodeTail(buffer.subarray(0, read), from > 0);
     const records = text.lines
       .map((line) => parseConversationLineOrNull(line))
-      .filter((record): record is ConversationRecord =>
-        record !== null && (record.from === reader || record.to === reader));
+      .filter((record): record is ConversationRecord => record !== null && keep(record));
     const older = start > 0 || text.droppedLeading || records.length > limit;
     return { records: records.slice(-limit), older };
   } finally {
@@ -443,7 +391,7 @@ function renderOlder(shown: number): string {
 }
 
 function stamp(record: ConversationRecord): string {
-  return `${new Date(record.at).toISOString()} from ${record.from} to ${record.to}`;
+  return `${isoInstant(record.at)} from ${record.from} to ${record.to}`;
 }
 
 function renderRecord(record: ConversationRecord): string {

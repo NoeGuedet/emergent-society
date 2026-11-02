@@ -22,13 +22,16 @@ import { UsageError } from './errors.js';
  * the host gate's decision (also exit `2`, but after a real fold), not argv
  * parsing's.
  *
- * `USAGE` names the five commands, the exit codes, and the eight §3.9
- * disclosures, so `--help` is honest about what a stop, a resume, a pause and
- * a status actually guarantee.
+ * `USAGE` names the six commands, the exit codes, and the eight §3.9
+ * disclosures, so `--help` is honest about what a stop, a resume, a pause, a
+ * status and the interactive chat session actually guarantee.
  */
 
 /** The uid a host uses when the operator does not pass `--uid`. */
 const DEFAULT_UID = 'node-0';
+
+/** The chat session's default history bound (`--tail`). */
+const CHAT_DEFAULT_TAIL = 20;
 
 /**
  * One command's parsed option table, read by flag name. `parseArgs` may yield a
@@ -53,12 +56,17 @@ export type HostCliCommand =
       readonly noSandbox: boolean; readonly nodesFile?: string;
     }
   | { readonly command: 'pause'; readonly home: string }
-  | { readonly command: 'status'; readonly home: string; readonly json: boolean };
+  | { readonly command: 'status'; readonly home: string; readonly json: boolean }
+  | {
+      readonly command: 'chat'; readonly home: string; readonly tail: number;
+      readonly conversation: boolean; readonly json: boolean;
+    };
 
 /**
- * The five-command help text, its exit codes and the disclosures: the charter
+ * The six-command help text, its exit codes and the disclosures: the charter
  * file's discipline, the nodes file's contract, the gateway overlay's config
- * home, and the eight §3.9 stop/resume/status facts.
+ * home, the interactive chat session's prompt loop, and the eight §3.9
+ * stop/resume/status facts.
  */
 export const USAGE = `Usage:
   node dist/host/main.js init   --home <abs-dir>
@@ -68,6 +76,7 @@ export const USAGE = `Usage:
   node dist/host/main.js resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]
   node dist/host/main.js pause  --home <abs-dir>
   node dist/host/main.js status --home <abs-dir> [--json]
+  node dist/host/main.js chat   --home <abs-dir> [--tail N] [--conversation] [--json]
 
 Exit codes: 0 ok, 1 runtime failure, 2 usage/config/no running host, 3 pause delivered, host still stopping.
 The LLM key lives only in <home>/providers.json (mode 0600); it is never accepted on argv or in the environment.
@@ -94,6 +103,17 @@ pair is already persisted); resume takes the persisted configuration — the fla
 there (the persisted configuration wins). The charter is read up to the capture bound, but the
 assembled request is bounded by the overlay policy (2 MiB) and refused at send: an oversize
 charter starts and then fails every cycle.
+chat is the interactive human↔overlay session (the CLI's first interactive command): it renders
+the recent chat log first (both sides' records, the newest --tail records, default 20), then reads
+one message per line from stdin — each non-blank line of at most 8192 bytes is saved as a human
+record and the overlay's response is rendered when it arrives. The wait is bounded (60 s, with a
+still-waiting note at intervals): on timeout the message stays saved and the next overlay cycle
+digests it; Ctrl-C aborts the wait, not the session. An absent gateway charter sidecar is detected
+up front and the message is saved for when the overlay is configured. --conversation renders the
+raw nodes↔overlay stream beside the chat; --json prints the chat records as JSON and exits. A
+non-TTY stdin (a pipe or EOF) renders the history and exits, so a scripted chat never blocks.
+EOF/Ctrl-D exits 0; a corrupt interior chat record renders what it can with a degraded notice and
+exits 1; a missing home exits 2.
 `;
 
 /**
@@ -271,6 +291,39 @@ function parsePause(args: readonly string[]): HostCliCommand {
 }
 
 /**
+ * The chat session's flags: `--tail` bounds the rendered history (a positive
+ * integer, default 20), `--conversation` adds the raw stream beside the chat,
+ * and `--json` is the one-shot scripted read. No `--uid`: the session is the
+ * human's surface, not a node's.
+ */
+function parseChat(args: readonly string[]): HostCliCommand {
+  const values = parseStrict(args, {
+    home: { type: 'string' },
+    tail: { type: 'string' },
+    conversation: { type: 'boolean' },
+    json: { type: 'boolean' },
+  });
+  let tail = CHAT_DEFAULT_TAIL;
+  const raw = values['tail'];
+  if (raw !== undefined) {
+    if (typeof raw !== 'string' || !/^[0-9]+$/.test(raw)) {
+      throw new UsageError('--tail takes a positive integer');
+    }
+    tail = Number(raw);
+    if (!Number.isSafeInteger(tail) || tail < 1) {
+      throw new UsageError('--tail takes a positive integer');
+    }
+  }
+  return {
+    command: 'chat',
+    home: homeOf(values, 'chat'),
+    tail,
+    conversation: values['conversation'] === true,
+    json: values['json'] === true,
+  };
+}
+
+/**
  * No `--uid`/`--model` here: status reports on the whole home, not on one
  * node's configuration, so both are an unknown-flag refusal.
  */
@@ -287,7 +340,7 @@ function parseStatus(args: readonly string[]): HostCliCommand {
  *
  * Help is resolved before the subcommand is sliced: an empty argv, `--help` or
  * `-h` is the help command, because printing usage must not require a valid
- * command line. Any other leading token must be one of the five commands.
+ * command line. Any other leading token must be one of the six commands.
  *
  * @throws UsageError for an unknown command, an unknown or missing flag, a
  * relative home, a malformed uid, an empty `--model`/`--heading`, or a relative
@@ -303,6 +356,7 @@ export function parseHostCommand(argv: readonly string[]): HostCliCommand {
     case 'resume': return parseResume(rest);
     case 'pause': return parsePause(rest);
     case 'status': return parseStatus(rest);
+    case 'chat': return parseChat(rest);
     default: throw new UsageError(`unknown command: ${name}`);
   }
 }

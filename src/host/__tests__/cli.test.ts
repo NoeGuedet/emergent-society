@@ -1,10 +1,11 @@
 import { execFileSync } from 'node:child_process';
-import { access, lstat, mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
+import { access, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   afterEach, beforeEach, expect, it, vi,
 } from 'vitest';
+import { CHAT_FILE } from '../chat.js';
 import { runCli, type CliDeps } from '../cli.js';
 import { HostPauseError } from '../errors.js';
 import type { HostOptions } from '../host.js';
@@ -37,6 +38,43 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(home, { recursive: true, force: true });
+});
+
+it('dispatches chat through the stdin seam: a non-TTY stdin renders and exits 0', async () => {
+  await writeFile(join(home, CHAT_FILE),
+    `${JSON.stringify({ v: 0, at: 1, uid: 'human', text: 'hello from the log' })}\n`,
+    { encoding: 'utf8', mode: 0o600 });
+  const stdin = {
+    isTTY: false,
+    readLine: async (): Promise<string | null> => { throw new Error('must not read'); },
+  };
+  expect(await runCli(['chat', '--home', home], { ...deps, stdin })).toBe(0);
+  expect(stdout.join('')).toContain('[1970-01-01T00:00:00.001Z] human: hello from the log');
+});
+
+it('chat --tail bounds the render, --json is the one-shot read, a missing home exits 2', async () => {
+  await writeFile(join(home, CHAT_FILE),
+    `${JSON.stringify({ v: 0, at: 1, uid: 'human', text: 'first' })}\n`
+    + `${JSON.stringify({ v: 0, at: 2, uid: 'gateway', text: 'second' })}\n`,
+    { encoding: 'utf8', mode: 0o600 });
+  const stdin = { isTTY: false, readLine: async (): Promise<string | null> => null };
+  expect(await runCli(['chat', '--home', home, '--tail', '1'], { ...deps, stdin })).toBe(0);
+  expect(stdout.join('')).toContain('second');
+  expect(stdout.join('')).not.toContain('first');
+  stdout.length = 0;
+  expect(await runCli(['chat', '--home', home, '--json'], { ...deps, stdin })).toBe(0);
+  const parsed = JSON.parse(stdout.join('')) as { records: { text: string }[] };
+  expect(parsed.records.map((record) => record.text)).toEqual(['first', 'second']);
+  stderr.length = 0;
+  expect(await runCli(['chat', '--home', join(home, 'nope')], { ...deps, stdin })).toBe(2);
+  expect(stderr.join('')).toContain('error:');
+});
+
+it('chat exits 1 for a degraded history (the status precedent)', async () => {
+  await writeFile(join(home, CHAT_FILE), 'not json\n', { encoding: 'utf8', mode: 0o600 });
+  const stdin = { isTTY: false, readLine: async (): Promise<string | null> => null };
+  expect(await runCli(['chat', '--home', home], { ...deps, stdin })).toBe(1);
+  expect(stdout.join('')).toContain('degraded');
 });
 
 it('runCli init prints the providers path/schema hint and never creates providers.json', async () => {

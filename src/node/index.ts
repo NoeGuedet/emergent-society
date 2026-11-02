@@ -49,7 +49,7 @@ export {
 export {
   CONVERSATION_FILE, CONVERSATION_FRAMING, CONVERSATION_LOCK_FILE, DEFAULT_THREAD_READ,
   MAX_SPEAK_BYTES, ConversationLog, ConversationRefusedError, ConversationWriteError,
-  openConversationLog, readConversationThread, renderConversationNotice,
+  openConversationLog, readConversationStream, readConversationThread, renderConversationNotice,
   renderConversationThread,
   type ConversationRecord, type ConversationSent, type ConversationThread,
 } from './conversation.js';

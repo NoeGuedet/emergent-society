@@ -9,7 +9,7 @@ as the test runner. Runtime dependencies are exactly two — `@lydell/node-pty` 
 `canonicalize` — check `package.json` before adding any. Node `>=24 <25` (see `.nvmrc`); the
 machine default shell may be older, always select 24 via nvm first.
 
-## CLI (five commands plus help; `npm run build` then `npm start`)
+## CLI (six commands plus help; `npm run build` then `npm start`)
 
 - `init --home <abs-dir>` — create the cell home; prints the real `providers.json` path and a
   0600-mode hint, never writes the file.
@@ -48,12 +48,26 @@ machine default shell may be older, always select 24 via nvm first.
   detected) do not degrade the exit. The report carries the gateway overlay's persisted
   configuration: `overlay: configured (<model>)` or `overlay: none` (a damaged pair reads
   `unknown` as the model).
+- `chat --home <abs-dir> [--tail N] [--conversation] [--json]` — the human↔overlay
+  conversation, the CLI's first INTERACTIVE command: it renders the recent chat log (both
+  sides' records interleaved, the newest `--tail` records, default 20), then runs the prompt
+  loop — each non-blank line (≤ 8192 bytes) is saved as a `{v:0, at, uid:human, text}` record
+  under `<home>/.es/chat.lock`, the host's `ChatWatcher` triggers the overlay's cycle, and the
+  new `uid: gateway` response record renders before the prompt returns. The wait is bounded
+  (60 s, a "still waiting…" note at intervals): on timeout the message stays saved and the
+  overlay's next cycle digests it; Ctrl-C aborts the wait, not the session; an absent gateway
+  charter sidecar is detected up front and the message is saved for when the overlay is
+  configured. EOF/Ctrl-D exits `0`; a degraded history (an unreadable interior record) exits
+  `1`; a missing home exits `2`. `--conversation` renders the raw nodes↔overlay stream
+  (read-only) beside the chat; `--json` prints the chat records as JSON and exits. A non-TTY
+  stdin (a pipe or EOF) renders the history and exits without a read, so a scripted
+  `chat --home` never hangs.
 - `help` — `--help`, `-h`, or empty argv; prints usage, exit `0`.
 
 Parsing is strict (no positionals, no unknown flags; relative `--home` and bad `--uid` are
 usage errors). Exit codes: `0` ok; `1` runtime failure; `2` usage/config refusal (including
-"no running host" for `pause`, missing home for `status`); `3` pause delivered but the host
-is still stopping.
+"no running host" for `pause`, a missing home for `status`/`chat`); `3` pause delivered but
+the host is still stopping.
 
 ## npm scripts
 

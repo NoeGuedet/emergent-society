@@ -65,6 +65,32 @@ it('rejects a relative home, a missing flag, an unknown flag and an invalid uid 
     .toThrow(/charter-file/);
 });
 
+it('parses chat with the default tail and its session flags', () => {
+  expect(parseHostCommand(['chat', '--home', '/x'])).toEqual({
+    command: 'chat', home: '/x', tail: 20, conversation: false, json: false,
+  });
+  expect(parseHostCommand([
+    'chat', '--home', '/x', '--tail', '5', '--conversation', '--json',
+  ])).toEqual({
+    command: 'chat', home: '/x', tail: 5, conversation: true, json: true,
+  });
+  expect(parseHostCommand(['chat', '--home', '/x', '--tail=3'])).toMatchObject({ tail: 3 });
+  for (const argv of [
+    ['chat', '--home', '/x', '--tail', '0'],
+    ['chat', '--home', '/x', '--tail', 'abc'],
+    ['chat', '--home', '/x', '--tail', '1.5'],
+    ['chat', '--home', '/x', '--tail=-2'],
+    ['chat', '--home', '/x', '--tail'],
+    ['chat', '--home', '/x', '--uid', 'node-0'],
+    ['chat', '--home', '/x', '--model', 'm'],
+    ['chat', '--home', 'x'],
+    ['chat', '--home'],
+    ['chat', '--home', '/x', 'stray'],
+  ]) {
+    expect(() => parseHostCommand(argv)).toThrow(UsageError);
+  }
+});
+
 it('parses status with --json and refuses the flags it does not own', () => {
   expect(parseHostCommand(['status', '--home', '/x', '--json'])).toEqual({
     command: 'status', home: '/x', json: true,
@@ -98,17 +124,23 @@ it('parses --nodes-file and refuses the solo flags it replaces', () => {
   }
 });
 
-it('USAGE lists the five commands, the exit codes and the eight disclosures', () => {
+it('USAGE lists the six commands, the exit codes and the eight disclosures', () => {
   for (const s of [
-    'init', 'start', 'resume', 'pause', 'Exit codes: 0', 'interrupts in-flight',
-    'partial world writes', 'fresh PTY', 'not re-executed', 'one turn',
-    'released its cell', 'blocks a new host', '--charter-file', 'no journaled',
-    'resume refuses it', 'config wins.', 'secret-bearing file',
+    'init', 'start', 'resume', 'pause', 'status', 'chat', 'Exit codes: 0',
+    'interrupts in-flight', 'partial world writes', 'fresh PTY', 'not re-executed',
+    'one turn', 'released its cell', 'blocks a new host', '--charter-file',
+    'no journaled', 'resume refuses it', 'config wins.', 'secret-bearing file',
   ]) {
     expect(USAGE).toContain(s);
   }
   expect(USAGE).toContain('[--charter-file <abs-path>]');
   expect(USAGE).toContain('status --home');
   expect(USAGE).toContain('--json');
+  // The six-command contract: chat is the CLI's first interactive command, and
+  // the help text states its prompt loop, its flags and its non-TTY behavior.
+  expect(USAGE).toContain('chat   --home <abs-dir> [--tail N] [--conversation] [--json]');
+  expect(USAGE).toContain('interactive human↔overlay session');
+  expect(USAGE).toContain('non-TTY stdin');
+  expect(USAGE).toContain('Ctrl-C aborts the wait');
   expect(USAGE).not.toContain('SECRET');
 });

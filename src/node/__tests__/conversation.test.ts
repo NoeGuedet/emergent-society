@@ -10,6 +10,7 @@ import {
   renderConversationThread,
 } from '../conversation.js';
 import { NODE_EVENT_TYPES } from '../events.js';
+import { UNRENDERABLE_INSTANT } from '../../util.js';
 import { ChatLog, CHAT_FILE, readChat } from '../../host/chat.js';
 
 /**
@@ -201,6 +202,18 @@ describe('ConversationLog: the append', () => {
 });
 
 describe('the boot repair (host-only)', () => {
+  it('refuses a stream that is nothing but one torn fragment (the chat log is the truncating one)', async () => {
+    const dir = await home();
+    const path = join(dir, CONVERSATION_FILE);
+    const fragment = '{"v":0,"at":1,"from":"n1","to":"gateway","text":"tor';
+    await writeFile(path, fragment, 'utf8');
+    // The conversation stream's records are kernel-stamped exchanges; a file
+    // with no newline anywhere in the repair window is refused, never
+    // truncated blindly. (The chat log has its own truncate-to-zero precedent.)
+    await expect(openConversationLog(dir)).rejects.toBeInstanceOf(ConversationWriteError);
+    expect(await readFile(path, 'utf8')).toBe(fragment);
+  });
+
   it('truncates at most one incomplete trailing fragment under the lock', async () => {
     const dir = await home();
     const path = join(dir, CONVERSATION_FILE);
@@ -263,6 +276,16 @@ describe('readConversationThread: the privacy filter and the guards', () => {
     await writeFile(join(dir, CHAT_FILE),
       `${raw}${JSON.stringify({ v: 0, at: 3, uid: 'bad uid', text: 'x' })}\n`, 'utf8');
     await expect(readChat(dir)).rejects.toThrow(/invalid node uid/);
+  });
+
+  it('renders an out-of-range at as the fixed unrenderable stamp instead of throwing', async () => {
+    const dir = await home();
+    const log = ConversationLog.for(dir);
+    await log.append('n1', undefined, 'far future', 1e16); // finite, beyond Date's range
+    const thread = await readConversationThread(dir, 'n1', 16);
+    const rendered = renderConversationThread(thread, 4096);
+    expect(rendered).toContain(`${UNRENDERABLE_INSTANT} from n1 to gateway`);
+    expect(rendered).toContain('far future');
   });
 
   it('windows the thread, reports older records, and self-bounds its render', async () => {

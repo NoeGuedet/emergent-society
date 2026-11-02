@@ -3,10 +3,10 @@
  *
  * The context validators, the provider adapters and the tool dispatchers all need
  * the same non-throwing "plain JSON object" test, and the layers above need one
- * sleep primitive, one no-op callback and one wall-clock read instead of a local
- * copy per module. Keeping them below every layer avoids a provider → context
- * import (which would invert the layering) while still leaving exactly one
- * definition.
+ * sleep primitive, one no-op callback, one wall-clock read and one tolerant
+ * instant render instead of a local copy per module. Keeping them below every
+ * layer avoids a provider → context import (which would invert the layering)
+ * while still leaving exactly one definition.
  */
 
 /** True for a non-null, non-array object — the shape every JSON parser narrows to. */
@@ -36,6 +36,28 @@ export function delay(ms: number): Promise<void> {
 
 /** A no-op callback: a `.then` sink that swallows either branch by design. */
 export const NOOP = (): void => {};
+
+/**
+ * The largest instant a `Date` can carry: ±8.64e15 ms — ECMA-262's time-value
+ * range. A record's `at` is host wall-clock and is untrusted on the read side
+ * (the readers guard finite, but a finite value outside this range still makes
+ * `Date#toISOString` throw a `RangeError`), so every renderer shares this one
+ * bound instead of throwing a bare error at an operator's terminal.
+ */
+const MAX_INSTANT_MS = 8_640_000_000_000_000;
+
+/** The fixed stamp an out-of-range `at` renders as. */
+export const UNRENDERABLE_INSTANT = '(unrenderable time)';
+
+/** True when `at` can be rendered by `Date#toISOString` without throwing. */
+export function isRenderableInstant(at: number): boolean {
+  return Number.isFinite(at) && Math.abs(at) <= MAX_INSTANT_MS;
+}
+
+/** `at` as ISO-8601 UTC, or the fixed unrenderable stamp — never throws. */
+export function isoInstant(at: number): string {
+  return isRenderableInstant(at) ? new Date(at).toISOString() : UNRENDERABLE_INSTANT;
+}
 
 /**
  * The default wall clock, in epoch milliseconds: the kernel's shared `now`, and
