@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { KernelError } from '../errors.js';
 import { WorldNotARepoError, UnsafeWorldPathError } from '../node/errors.js';
 import { createProcessStdin, runChatSession, type ChatStdin } from './chat.js';
+import { runDirect as runDirectCommand, type DirectOptions } from './direct.js';
 import { HostConfigError, UsageError } from './errors.js';
 import { startHost, type HostHandle, type HostOptions } from './host.js';
 import { initHome } from './layout.js';
@@ -44,6 +45,8 @@ export type CliDeps = {
   readonly readStatus?: (home: string) => Promise<StatusReport>;
   /** The interactive chat's stdin seam; production is `process.stdin`. */
   readonly stdin?: ChatStdin;
+  /** The human's two write acts; production is `runDirect`. */
+  readonly runDirect?: (options: DirectOptions) => Promise<number>;
   readonly stdout?: (text: string) => void;
   readonly stderr?: (text: string) => void;
   readonly createLog?: (write: (line: string) => void) => HostLog;
@@ -59,6 +62,9 @@ type StatusRun = Extract<HostCliCommand, { readonly command: 'status' }>;
 
 /** The one interactive command. */
 type ChatRun = Extract<HostCliCommand, { readonly command: 'chat' }>;
+
+/** The human's two write acts. */
+type DirectRun = Extract<HostCliCommand, { readonly command: 'direct' }>;
 
 /** The bounded failure label: a kernel refusal's message, otherwise a name. */
 function failureOf(error: unknown): string {
@@ -249,6 +255,31 @@ async function runChat(
 }
 
 /**
+ * `direct`: the human's two write acts — the chat reply (the batch twin of the
+ * session's typing) and the `--path` ratification.
+ *
+ * The command maps its own refusals (exit `2` for the usage/config family,
+ * `1` for a runtime failure) and prints the one bounded `error:` line itself,
+ * so no raw git stderr or absolute temp path can reach the operator through
+ * this dispatch; its `0`/`1` is the authority and is returned unchanged.
+ */
+async function runDirect(
+  command: DirectRun,
+  deps: CliDeps,
+  out: Sink,
+  err: Sink,
+): Promise<number> {
+  return await (deps.runDirect ?? runDirectCommand)({
+    home: command.home,
+    ...(command.text !== undefined ? { text: command.text } : {}),
+    ...(command.file !== undefined ? { file: command.file } : {}),
+    ...(command.path !== undefined ? { path: command.path } : {}),
+    stdout: out,
+    stderr: err,
+  });
+}
+
+/**
  * Runs one command line and resolves the process exit code.
  *
  * Usage is resolved first because a malformed command line still has to be able
@@ -281,5 +312,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps = {}): Promi
       return await runStatus(command, deps, out, err);
     case 'chat':
       return await runChat(command, deps, out, err);
+    case 'direct':
+      return await runDirect(command, deps, out, err);
   }
 }

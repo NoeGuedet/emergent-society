@@ -107,8 +107,10 @@ export class CommitBudgetError extends Error {
  * compare-and-swap, or the world flock's reserved conflict exit (the wrapper
  * rewrites it into this same wording). All of them are retryable: the holder
  * is another turn-end, and the commit machinery retries the whole attempt.
+ * Exported so the human's ratification (`world-ratify.ts`) retries on exactly
+ * the kernel's contention wording rather than a copy that can drift.
  */
-const LOCK_CONTENTION =
+export const LOCK_CONTENTION =
   /index\.lock|cannot lock ref|Another git process seems to be running|world lock is held/i;
 
 /**

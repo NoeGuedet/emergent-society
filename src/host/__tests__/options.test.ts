@@ -124,9 +124,9 @@ it('parses --nodes-file and refuses the solo flags it replaces', () => {
   }
 });
 
-it('USAGE lists the six commands, the exit codes and the eight disclosures', () => {
+it('USAGE lists the seven commands, the exit codes and the eight disclosures', () => {
   for (const s of [
-    'init', 'start', 'resume', 'pause', 'status', 'chat', 'Exit codes: 0',
+    'init', 'start', 'resume', 'pause', 'status', 'chat', 'direct', 'Exit codes: 0',
     'interrupts in-flight', 'partial world writes', 'fresh PTY', 'not re-executed',
     'one turn', 'released its cell', 'blocks a new host', '--charter-file',
     'no journaled', 'resume refuses it', 'config wins.', 'secret-bearing file',
@@ -136,11 +136,67 @@ it('USAGE lists the six commands, the exit codes and the eight disclosures', () 
   expect(USAGE).toContain('[--charter-file <abs-path>]');
   expect(USAGE).toContain('status --home');
   expect(USAGE).toContain('--json');
-  // The six-command contract: chat is the CLI's first interactive command, and
-  // the help text states its prompt loop, its flags and its non-TTY behavior.
+  // The chat contract: the CLI's first interactive command, with its prompt
+  // loop, its flags and its non-TTY behavior stated in the help text.
   expect(USAGE).toContain('chat   --home <abs-dir> [--tail N] [--conversation] [--json]');
   expect(USAGE).toContain('interactive human↔overlay session');
   expect(USAGE).toContain('non-TTY stdin');
   expect(USAGE).toContain('Ctrl-C aborts the wait');
+  // The seventh command: the human's two write acts, both invocations, the
+  // stricter flag combinations and the audit sentence are in the help text.
+  expect(USAGE).toContain(
+    'direct --home <abs-dir> (--text "<msg>" | --file <abs-path>)');
+  expect(USAGE).toContain(
+    'direct --home <abs-dir> --path <world-relative> --file <abs-path>');
+  expect(USAGE).toContain('the human\'s write act, two acts in one command');
+  expect(USAGE).toContain('--path requires --file');
+  expect(USAGE).toContain('providers.json is refused by path and inode');
+  expect(USAGE).toContain('unchanged: no commit — the pin did not move');
   expect(USAGE).not.toContain('SECRET');
+});
+
+it('parses direct: the reply default, then the strict flag combinations', () => {
+  expect(parseHostCommand(['direct', '--home', '/x', '--text', 'hello'])).toEqual({
+    command: 'direct', home: '/x', text: 'hello',
+  });
+  expect(parseHostCommand(['direct', '--home', '/x', '--file', '/tmp/msg.txt'])).toEqual({
+    command: 'direct', home: '/x', file: '/tmp/msg.txt',
+  });
+  expect(parseHostCommand([
+    'direct', '--home', '/x', '--path', 'DIRECTION.md', '--file', '/tmp/d.md',
+  ])).toEqual({
+    command: 'direct', home: '/x', path: 'DIRECTION.md', file: '/tmp/d.md',
+  });
+  // A nested tree path survives; --text carries its own record, never a path.
+  expect(parseHostCommand([
+    'direct', '--home', '/x', '--path', 'notes/2026/plan.md', '--file', '/tmp/p.md',
+  ])).toMatchObject({ path: 'notes/2026/plan.md' });
+  for (const argv of [
+    // --text XOR --file: both, then neither.
+    ['direct', '--home', '/x', '--text', 'a', '--file', '/tmp/a.txt'],
+    ['direct', '--home', '/x'],
+    // --path requires --file and refuses --text.
+    ['direct', '--home', '/x', '--path', 'DIRECTION.md', '--text', 'a'],
+    ['direct', '--home', '/x', '--path', 'DIRECTION.md'],
+    // The path escapes (the tree-path form): absolute, .., ., empty segments,
+    // a backslash and a control character are all usage refusals.
+    ['direct', '--home', '/x', '--path', '/etc/passwd', '--file', '/tmp/a.txt'],
+    ['direct', '--home', '/x', '--path', '../world/x', '--file', '/tmp/a.txt'],
+    ['direct', '--home', '/x', '--path', 'a/../b', '--file', '/tmp/a.txt'],
+    ['direct', '--home', '/x', '--path', './x', '--file', '/tmp/a.txt'],
+    ['direct', '--home', '/x', '--path', 'a//b', '--file', '/tmp/a.txt'],
+    ['direct', '--home', '/x', '--path', 'a\\b', '--file', '/tmp/a.txt'],
+    ['direct', '--home', '/x', '--path', 'x\u0001', '--file', '/tmp/a.txt'],
+    ['direct', '--home', '/x', '--path', '', '--file', '/tmp/a.txt'],
+    // Relative/missing files, relative home, unknown flags, stray positionals.
+    ['direct', '--home', '/x', '--file', 'rel.txt'],
+    ['direct', '--home', '/x', '--file'],
+    ['direct', '--home', '/x', '--text'],
+    ['direct', '--home', '/x', '--text='],
+    ['direct', '--home', 'x', '--text', 'a'],
+    ['direct', '--home', '/x', '--text', 'a', '--uid', 'node-0'],
+    ['direct', '--home', '/x', '--text', 'a', 'stray'],
+  ]) {
+    expect(() => parseHostCommand(argv)).toThrow(UsageError);
+  }
 });

@@ -114,6 +114,24 @@ async function deepestExistingAncestor(path: string): Promise<string> {
 }
 
 /**
+ * The cell home's world pair — the layout's one spelling, shared by
+ * `cellPaths`, `initHome` and the one-shot `direct` command (which opens the
+ * world without composing a node).
+ */
+export function worldPairOf(home: string): { readonly world: string; readonly gitDir: string } {
+  return worldPaths(home);
+}
+
+/**
+ * The cell home's credential store path — the layout's one spelling, shared by
+ * `cellPaths` and every read that must refuse the store (the charter file's
+ * and `direct`'s `--file`).
+ */
+export function providersFileOf(home: string): string {
+  return join(home, PROVIDERS_BASENAME);
+}
+
+/**
  * The cell home's paths. The node paths go through the journal's constructors,
  * so the uid is validated once, there, and `'nodes'`/`'frontier'` are never
  * spelled here.
@@ -130,7 +148,7 @@ export function cellPaths(home: string, uid: string): CellPaths {
     frontierDir: frontierLayout(home).dir,
     nodeDir: nodeDir(home, uid),
     nodeLogFile: join(local.dir, local.logFile),
-    providersFile: join(home, PROVIDERS_BASENAME),
+    providersFile: providersFileOf(home),
     ownerFile: join(home, OWNER_BASENAME),
   };
 }

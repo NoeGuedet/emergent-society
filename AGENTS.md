@@ -9,7 +9,7 @@ as the test runner. Runtime dependencies are exactly two — `@lydell/node-pty` 
 `canonicalize` — check `package.json` before adding any. Node `>=24 <25` (see `.nvmrc`); the
 machine default shell may be older, always select 24 via nvm first.
 
-## CLI (six commands plus help; `npm run build` then `npm start`)
+## CLI (seven commands plus help; `npm run build` then `npm start`)
 
 - `init --home <abs-dir>` — create the cell home; prints the real `providers.json` path and a
   0600-mode hint, never writes the file.
@@ -62,12 +62,38 @@ machine default shell may be older, always select 24 via nvm first.
   (read-only) beside the chat; `--json` prints the chat records as JSON and exits. A non-TTY
   stdin (a pipe or EOF) renders the history and exits without a read, so a scripted
   `chat --home` never hangs.
+- `direct --home <abs-dir> (--text "<msg>" | --file <abs-path>)` — the human's batch reply, the
+  twin of typing in `chat`: exactly one of `--text`/`--file` (non-blank, ≤ 8192 bytes) is appended
+  as one `{v:0, at, uid:human, text}` record to `<home>/chat.v0.jsonl` under
+  `<home>/.es/chat.lock` through the same `ChatWriter` the session uses; the host's `ChatWatcher`
+  triggers the overlay's cycle cross-process and the command returns without waiting. No world
+  commit: the human's words are chat-private, readable by the society only if the overlay relays a
+  direction.
+  `direct --home <abs-dir> --path <world-relative> --file <abs-path>` is the ratification (the
+  `--path` act takes a file, never `--text`): the file's bytes — a regular, non-symlinked, UTF-8
+  file under the read bound, `providers.json` refused by path and inode — are committed authored
+  the reserved `human` from a fresh private index seeded at the current HEAD (a root commit on an
+  unborn branch), the worktree copy is materialized, and the shared index is staged with that one
+  entry only after the rename. A `--path` that is absolute, empty or carries `.`/`..` is refused.
+  Every outcome prints the commit hash, or the no-commit sentence ("unchanged: no commit — the pin
+  did not move"). Exit codes: `2` usage, a missing home, the flag refusals (both `--text` and
+  `--file`, neither, `--path` with `--text`, a path escape, a blank or over-8192-byte reply), and
+  — for the `--path` act only — the world's gates (a foreign-owned or permissive cell home, a
+  legacy in-world layout, a refused trust scan); `1` runtime failure (a git failure, or an
+  unwritable home on the reply's chat write or the ratification's `.es` write, whose raw `EACCES`
+  is a bounded refusal); `0` ok. The reply act never runs the world gates, so it saves on a home
+  whose layout the ratification would refuse. A failed worktree rename or shared-index staging
+  after a landed commit is a named warning on stderr and still exits `0`. The `--path` act's git
+  children contend with the nodes' turn-end commits: a held world lock is a typed refusal,
+  retried on both sides within the kernel's bounded discipline, so a ratification and a turn-end
+  commit may each briefly refuse the other.
 - `help` — `--help`, `-h`, or empty argv; prints usage, exit `0`.
 
 Parsing is strict (no positionals, no unknown flags; relative `--home` and bad `--uid` are
 usage errors). Exit codes: `0` ok; `1` runtime failure; `2` usage/config refusal (including
-"no running host" for `pause`, a missing home for `status`/`chat`); `3` pause delivered but
-the host is still stopping.
+"no running host" for `pause`, a missing home for `status`/`chat`/`direct`, `direct`'s flag
+combinations, and the `--path` act's world gates); `3` pause delivered but the host is still
+stopping.
 
 ## npm scripts
 

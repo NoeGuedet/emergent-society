@@ -1,6 +1,7 @@
 import { isAbsolute } from 'node:path';
 import { parseArgs, type ParseArgsOptionsConfig } from 'node:util';
 import { assertNodeUid } from '../journal/index.js';
+import { validateTreePath } from '../overlay/world-read.js';
 import { UsageError } from './errors.js';
 
 /**
@@ -22,9 +23,10 @@ import { UsageError } from './errors.js';
  * the host gate's decision (also exit `2`, but after a real fold), not argv
  * parsing's.
  *
- * `USAGE` names the six commands, the exit codes, and the eight §3.9
+ * `USAGE` names the seven commands, the exit codes, and the eight §3.9
  * disclosures, so `--help` is honest about what a stop, a resume, a pause, a
- * status and the interactive chat session actually guarantee.
+ * status, the interactive chat session and the human's two `direct` acts
+ * actually guarantee.
  */
 
 /** The uid a host uses when the operator does not pass `--uid`. */
@@ -60,13 +62,20 @@ export type HostCliCommand =
   | {
       readonly command: 'chat'; readonly home: string; readonly tail: number;
       readonly conversation: boolean; readonly json: boolean;
+    }
+  | {
+      readonly command: 'direct'; readonly home: string;
+      /** The reply's inline message or the ratified bytes' file (exactly one). */
+      readonly text?: string; readonly file?: string;
+      /** The ratification's world-relative tree path (requires `file`). */
+      readonly path?: string;
     };
 
 /**
- * The six-command help text, its exit codes and the disclosures: the charter
+ * The seven-command help text, its exit codes and the disclosures: the charter
  * file's discipline, the nodes file's contract, the gateway overlay's config
- * home, the interactive chat session's prompt loop, and the eight §3.9
- * stop/resume/status facts.
+ * home, the interactive chat session's prompt loop, the human's two `direct`
+ * acts, and the eight §3.9 stop/resume/status facts.
  */
 export const USAGE = `Usage:
   node dist/host/main.js init   --home <abs-dir>
@@ -77,6 +86,8 @@ export const USAGE = `Usage:
   node dist/host/main.js pause  --home <abs-dir>
   node dist/host/main.js status --home <abs-dir> [--json]
   node dist/host/main.js chat   --home <abs-dir> [--tail N] [--conversation] [--json]
+  node dist/host/main.js direct --home <abs-dir> (--text "<msg>" | --file <abs-path>)
+  node dist/host/main.js direct --home <abs-dir> --path <world-relative> --file <abs-path>
 
 Exit codes: 0 ok, 1 runtime failure, 2 usage/config/no running host, 3 pause delivered, host still stopping.
 The LLM key lives only in <home>/providers.json (mode 0600); it is never accepted on argv or in the environment.
@@ -114,6 +125,26 @@ raw nodes↔overlay stream beside the chat; --json prints the chat records as JS
 non-TTY stdin (a pipe or EOF) renders the history and exits, so a scripted chat never blocks.
 EOF/Ctrl-D exits 0; a corrupt interior chat record renders what it can with a degraded notice and
 exits 1; a missing home exits 2.
+direct is the human's write act, two acts in one command. Without --path it is the batch twin of
+the chat session: exactly one of --text or --file (a non-blank message of at most 8192 bytes) is
+saved as one {v:0, at, uid:human, text} record in <home>/chat.v0.jsonl under <home>/.es/chat.lock;
+the host's ChatWatcher triggers the overlay's next cycle, this command does not wait, and no world
+commit is made — the chat log is the only home of the human's words. With --path <world-relative>
+and --file (never --text; --path requires --file and refuses --text) it is the ratification:
+the file's bytes (a regular, non-symlinked, UTF-8
+file under the read bound; providers.json is refused by path and inode) are committed authored
+human with a private index, and the worktree copy is materialized. A path that is absolute, empty
+or carries a . or .. segment is refused. Every outcome prints the commit hash, or the no-commit
+sentence "unchanged: no commit — the pin did not move"; a failed worktree rename or shared-index
+staging after a landed commit is a named warning on stderr and still exits 0. The --path act's git children contend with
+the nodes' turn-end commits: a held world lock is a typed refusal, self-retried on both sides
+within the kernel's bounded discipline. Exit codes: 0 ok (saved, committed, or unchanged);
+1 runtime failure (a git failure, or an unwritable home on the reply's chat write or the
+ratification's .es write, whose raw EACCES is a bounded refusal); 2 usage, a missing home, a
+refused flag combination, a path escape, a refused file (the providers store, a non-regular file
+or committed entry), and — for --path only — the world's gates (a foreign-owned or permissive
+cell home, a legacy in-world layout, a refused trust scan). The reply act never runs the world
+gates, so it saves on a home whose layout the ratification would refuse.
 `;
 
 /**
@@ -324,6 +355,64 @@ function parseChat(args: readonly string[]): HostCliCommand {
 }
 
 /**
+ * The `direct` command's flags (A6's strict combinations): `--text` XOR
+ * `--file`, exactly one; `--path` requires `--file` and refuses `--text`; the
+ * bare default is the chat reply. The ratification's path is validated in
+ * tree-path form here (the overlay's `read_world` discipline: relative,
+ * normalized, no `.`/`..` segment, no absolute path, no control character), so
+ * a path escape is a usage refusal before any world is opened.
+ */
+function parseDirect(args: readonly string[]): HostCliCommand {
+  const values = parseStrict(args, {
+    home: { type: 'string' },
+    text: { type: 'string' },
+    file: { type: 'string' },
+    path: { type: 'string' },
+  });
+  const home = homeOf(values, 'direct');
+  const text = values['text'];
+  const file = values['file'];
+  const path = values['path'];
+  if (text !== undefined && (typeof text !== 'string' || text === '')) {
+    throw new UsageError('--text takes a message');
+  }
+  if (file !== undefined) {
+    if (typeof file !== 'string' || file === '') throw new UsageError('--file takes a path');
+    if (!isAbsolute(file)) throw new UsageError(`--file must be an absolute path: ${file}`);
+  }
+  if (path !== undefined && (typeof path !== 'string' || path === '')) {
+    throw new UsageError('--path takes a world-relative tree path');
+  }
+  // A6's strict combinations, in the order the refusal sentences need: both or
+  // neither first, then the ratify act's own requirement.
+  if (text !== undefined && file !== undefined) {
+    throw new UsageError('direct takes exactly one of --text and --file, not both');
+  }
+  if (text === undefined && file === undefined) {
+    throw new UsageError('direct requires --text "<msg>" or --file <abs-path>');
+  }
+  if (path !== undefined && file === undefined) {
+    throw new UsageError(
+      '--path requires --file: the ratification takes a file, never inline text');
+  }
+  let treePath: string | undefined;
+  if (typeof path === 'string') {
+    try {
+      treePath = validateTreePath(path);
+    } catch (error) {
+      throw new UsageError(error instanceof Error ? error.message : '--path is invalid');
+    }
+  }
+  return {
+    command: 'direct',
+    home,
+    ...(typeof text === 'string' ? { text } : {}),
+    ...(typeof file === 'string' ? { file } : {}),
+    ...(treePath !== undefined ? { path: treePath } : {}),
+  };
+}
+
+/**
  * No `--uid`/`--model` here: status reports on the whole home, not on one
  * node's configuration, so both are an unknown-flag refusal.
  */
@@ -340,11 +429,11 @@ function parseStatus(args: readonly string[]): HostCliCommand {
  *
  * Help is resolved before the subcommand is sliced: an empty argv, `--help` or
  * `-h` is the help command, because printing usage must not require a valid
- * command line. Any other leading token must be one of the six commands.
+ * command line. Any other leading token must be one of the seven commands.
  *
  * @throws UsageError for an unknown command, an unknown or missing flag, a
- * relative home, a malformed uid, an empty `--model`/`--heading`, or a relative
- * or empty `--charter-file`.
+ * relative home, a malformed uid, an empty `--model`/`--heading`, a relative
+ * or empty `--charter-file`, and `direct`'s flag combinations and tree path.
  */
 export function parseHostCommand(argv: readonly string[]): HostCliCommand {
   const name = argv[0];
@@ -357,6 +446,7 @@ export function parseHostCommand(argv: readonly string[]): HostCliCommand {
     case 'pause': return parsePause(rest);
     case 'status': return parseStatus(rest);
     case 'chat': return parseChat(rest);
+    case 'direct': return parseDirect(rest);
     default: throw new UsageError(`unknown command: ${name}`);
   }
 }
