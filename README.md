@@ -1,6 +1,6 @@
 # emergent-society
 
-A research harness for observing the emergence of multi-agent LLM societies — and for measuring whether a human can steer them without breaking what makes them emergent. Nothing organizational is coded: nodes get minimal physics, a seed of instincts, and raw tools, and communicate only by writing to a shared filesystem world. The human co-orchestrates the society's direction with a dedicated overlay (agent zero — a host-side digest service, not a node), while everything is recorded so that emergence can be studied.
+A research harness for observing the emergence of multi-agent LLM societies — and for measuring whether a human can steer them without breaking what makes them emergent. Nothing organizational is coded: nodes get minimal physics, a seed of instincts, and raw tools, and communicate with one another only by writing to a shared filesystem world; a kernel-owned conversation interface carries their messages to the gateway overlay, never to a peer. The human co-orchestrates the society's direction with a dedicated overlay (agent zero — a host-side digest service, not a node), while everything is recorded so that emergence can be studied.
 
 ## Current state
 
@@ -14,6 +14,7 @@ Implementation phase; no product. The journal module, node driver, context and p
 | [Architecture](docs/architecture.md) | Concepts → implemented code |
 | [Seed](docs/seed.md) | Instincts, the Hole, raw tools |
 | [Direction](docs/direction.md) | Pinned heading, versioned letter |
+| [Gateway charter](docs/gateway-charter.md) | The overlay's role template — copy, adapt, pass with `--gateway-charter` |
 | [Kernel](docs/kernel.md) | Technical spec |
 | [Substrate](docs/substrate.md) | The substrate as a treatment (design challenge) |
 | [AGENTS.md](AGENTS.md) | Commands and conventions |

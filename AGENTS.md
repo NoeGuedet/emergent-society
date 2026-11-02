@@ -1,11 +1,13 @@
 # AGENTS.md — emergent-society
 
 `emergent-society` is a research harness for observing the emergence of multi-agent LLM
-societies: nodes communicate only by committing to a shared git world, and every
-kernel-mediated HTTP exchange is durably recorded in an append-only frontier journal before
-the effect happens. The toolchain is TypeScript compiled in strict mode (plus
-`noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`) with Vitest
-as the test runner. Runtime dependencies are exactly two — `@lydell/node-pty` and
+societies: nodes communicate with one another only by committing to a shared git world (a
+kernel-owned conversation interface carries their messages to a host-side gateway overlay,
+never to a peer), and every kernel-mediated HTTP exchange is durably recorded in an
+append-only frontier journal before the effect happens. The toolchain is TypeScript compiled
+in strict mode (plus `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
+`verbatimModuleSyntax`) with Vitest as the test runner. Runtime dependencies are exactly
+two — `@lydell/node-pty` and
 `canonicalize` — check `package.json` before adding any. Node `>=24 <25` (see `.nvmrc`); the
 machine default shell may be older, always select 24 via nvm first.
 
@@ -24,7 +26,8 @@ machine default shell may be older, always select 24 via nvm first.
   nodes-only host — even when a pair is already persisted — and `resume` takes the persisted
   pair instead. The charter is accepted up to the boot read's capture bound, but the assembled
   request is bounded by the overlay policy (2 MiB), refused at send: an oversize charter starts
-  and then fails every cycle.
+  and then fails every cycle. A template ships at
+  [docs/gateway-charter.md](docs/gateway-charter.md): copy and adapt it, then pass the copy.
 - `start --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--no-sandbox]` — boot a declared
   node set on one home: a strict JSON array of at most 16 `{uid, model, heading,
   charterFile?, spawn?}` entries with unique uids, read at the config gate (exit 2
@@ -51,11 +54,12 @@ machine default shell may be older, always select 24 via nvm first.
 - `chat --home <abs-dir> [--tail N] [--conversation] [--json]` — the human↔overlay
   conversation, the CLI's first INTERACTIVE command: it renders the recent chat log (both
   sides' records interleaved, the newest `--tail` records, default 20), then runs the prompt
-  loop — each non-blank line (≤ 8192 bytes) is saved as a `{v:0, at, uid:human, text}` record
-  under `<home>/.es/chat.lock`, the host's `ChatWatcher` triggers the overlay's cycle, and the
-  new `uid: gateway` response record renders before the prompt returns. The wait is bounded
-  (60 s, a "still waiting…" note at intervals): on timeout the message stays saved and the
-  overlay's next cycle digests it; Ctrl-C aborts the wait, not the session; an absent gateway
+  loop — each non-blank line (≤ 8192 bytes) is saved as one `{v:0, at, uid:human, text}`
+  record in `<home>/chat.v0.jsonl`, under `<home>/.es/chat.lock`; the host's `ChatWatcher`
+  triggers the overlay's cycle, and the new `uid: gateway` response record renders before the
+  prompt returns. The wait is bounded (60 s, a "still waiting…" note at intervals): on
+  timeout the message stays saved and the overlay's next cycle digests it; Ctrl-C aborts
+  the wait, not the session; an absent gateway
   charter sidecar is detected up front and the message is saved for when the overlay is
   configured. EOF/Ctrl-D exits `0`; a degraded history (an unreadable interior record) exits
   `1`; a missing home exits `2`. `--conversation` renders the raw nodes↔overlay stream
