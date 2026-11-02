@@ -85,7 +85,11 @@ async function fixture(options: {
   await writeFile(join(home, 'providers.json'), JSON.stringify({
     llm: {
       key: 'k', endpoint: `${server.url}/v1/chat/completions`,
-      models: ['gateway-default', 'node-model', 'gateway-resume-model'],
+      // Windowed declarations: the nodes-file start names `node-model`, and a
+      // fresh START on a windowless entry is refused (A3).
+      models: ['gateway-default', 'node-model', 'gateway-resume-model'].map(
+        (id) => ({ id, contextTokens: 200_000, maxOutputTokens: 32_000 })),
+
     },
   }), { encoding: 'utf8', mode: 0o600 });
   const nodesFile = join(home, 'nodes.json');

@@ -24,7 +24,7 @@ import { HISTORY_FRAMING, type HistoryPort } from '../history.js';
 import { ConversationLog } from '../conversation.js';
 import type { RunSupervisor, RunSupervisorEvents } from '../packages/supervisor.js';
 import type {
-  AgentConfig, AssistantProjection, FunctionCall, RequestId, Source,
+  AgentConfig, AssistantProjection, FunctionCall, LlmModel, RequestId, Source,
 } from '../../context/contracts.js';
 
 /**
@@ -153,7 +153,7 @@ interface Dispatched {
 
 async function extendCall(
   s: Session, args: JsonValue, over: Partial<AgentConfig> = {},
-  portSandbox = false, models?: readonly string[], self?: SelfPort,
+  portSandbox = false, models?: readonly LlmModel[], self?: SelfPort,
   depart?: DepartPort, conversation?: ConversationPort, history?: HistoryPort,
 ): Promise<Dispatched> {
   const gate = s.gate('turn', 0);
@@ -273,7 +273,7 @@ describe('extend: the six verbs', () => {
       expect(bare.results[0]!.content).not.toContain('not a routing table');
 
       const declared = await extendCall(
-        s, { verb: 'inspect' }, {}, false, ['served-a', 'vendor/model-b']);
+        s, { verb: 'inspect' }, {}, false, [{ id: 'served-a' }, { id: 'vendor/model-b' }]);
       const content = declared.results[0]!.content;
       expect(content).toContain(
         '== the substrate this kernel serves (operator-declared, unverified) ==');
@@ -1573,14 +1573,14 @@ describe('extend: update_self (the identity rewrite)', () => {
       await seedConfig(s, before);
       const self = createSelfPort(() => before, 'n1');
       const denied = await extendCall(
-        s, { verb: 'update_self', model: 'model-b' }, {}, false, ['model-a'], self,
+        s, { verb: 'update_self', model: 'model-b' }, {}, false, [{ id: 'model-a' }], self,
       );
       expect(denied.results[0]!.isError).toBe(true);
       expect(denied.results[0]!.content).toMatch(/^denied: model "model-b" is not served/);
       expect(await configEvents(s)).toHaveLength(1);
       const accepted = await extendCall(
         s, { verb: 'update_self', model: 'model-b' }, {}, false,
-        ['model-a', 'model-b'], self,
+        [{ id: 'model-a' }, { id: 'model-b' }], self,
       );
       expect(accepted.results[0]!.isError).toBe(false);
       expect(accepted.results[0]!.content).toBe('self updated (version 2): model');

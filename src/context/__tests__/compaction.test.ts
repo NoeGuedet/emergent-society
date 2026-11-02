@@ -15,7 +15,7 @@ import { loadVerifiedEvents } from '../loader.js';
 import type { VerifiedEvents } from '../loader.js';
 import { useTempHome } from '../../journal/__tests__/helpers.js';
 import type {
-  AgentConfig, AssistantProjection, CompactionStart, FunctionCall,
+  AgentConfig, AssistantProjection, CompactionStart, FunctionCall, MeterRecord,
   RequestId, SeedPolicy, Source, WorldPerception,
 } from '../contracts.js';
 
@@ -698,6 +698,120 @@ describe('compaction: refusal groups are whole balanced units', () => {
       expect(after.surface?.nodes[1]?.group.messages[0]?.content).toBe(message.content);
     } finally {
       await writer.close();
+    }
+  });
+});
+
+// ==================================================================================
+// The forced mode: the token trigger and the overflow answer (A4)
+// ==================================================================================
+
+/** The decision numbers the token trigger journals on a forced transaction. */
+const METER: MeterRecord = {
+  window: 200_000, output: 32_000, headroom: 16_000, threshold: 152_000,
+  percent: 76, estimate: 160_000, anchor: 'estimate', outcome: 'compact',
+};
+
+describe('the forced selection and its meter payload', () => {
+  it('bypasses the byte threshold only when forced, and retain 0 takes the whole span', async () => {
+    const session = await openSession();
+    try {
+      await session.appendConfig(testConfig({ policy: { keepRecentGroups: 1 } }));
+      // Two committed dialogues, each far below compactAfterBytes.
+      await closedDialogue(session, 0, ['a0'], 200);
+      await closedDialogue(session, 1, ['a1'], 200);
+      session.lifecycle('turn/start', { turn: 2, trigger: 'boot', world: { from: null, to: null } });
+      await session.flush();
+      // The byte trigger is nowhere near: an unforced selection is null.
+      expect(selectCompaction(session.fold.snapshot())).toBeNull();
+      // Forced, the selection ignores the byte threshold but keeps the tail.
+      const forced = selectCompaction(session.fold.snapshot(), { force: true });
+      expect(forced).not.toBeNull();
+      expect(forced!.groupIds).toHaveLength(1);
+      // The overflow answer's maximal reduction retains nothing.
+      const maximal = selectCompaction(
+        session.fold.snapshot(), { force: true, retainGroups: 0 });
+      expect(maximal!.groupIds).toHaveLength(2);
+      expect(maximal!.groupIds).toEqual(
+        (session.fold.snapshot().surface?.nodes ?? [])
+          .filter((node) => node.group.kind !== 'heading')
+          .map((node) => node.group.id));
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('journals the meter on compaction/start; the fold replays it untouched', async () => {
+    const session = await openSession();
+    try {
+      await session.appendConfig(testConfig({ policy: { keepRecentGroups: 0 } }));
+      await closedDialogue(session, 0, ['a0'], 200);
+      session.lifecycle('turn/start', { turn: 1, trigger: 'boot', world: { from: null, to: null } });
+      await session.flush();
+      const gate = session.gate({ phase: 'turn', turn: 1 });
+      let outcome: string;
+      try {
+        outcome = await runCompaction(session.fold, gate.gate, {
+          force: true, retainGroups: 0, meter: METER,
+        });
+      } finally {
+        gate.close();
+      }
+      expect(outcome).toBe('applied');
+      const all = await eventsAt(home());
+      const start = all.find((event) => event.type === 'compaction/start');
+      const data = start?.data as unknown as {
+        id: string; meter?: MeterRecord; groupIds: unknown[];
+      };
+      expect(data.meter).toEqual(METER);
+      // The candidate's own shape and id never move: the meter is a companion
+      // field beside the candidate, not part of its canonical identity.
+      const { meter: _meter, ...candidate } = data as unknown as Record<string, unknown>;
+      expect(data.id).toMatch(/^[0-9a-f]{64}$/);
+      expect(Object.keys(candidate).sort()).toEqual([
+        'groupIds', 'id', 'revision', 'shadowBytes', 'shadowHash', 'sources',
+      ]);
+      // A fresh fold replays the transaction with the payload skipped: the
+      // surface is the same as the live fold's, and nothing is pending.
+      const rebuilt = new ContextFold();
+      await rebuilt.observe(all);
+      expect(rebuilt.snapshot().surface).toEqual(session.fold.snapshot().surface);
+      expect(rebuilt.snapshot().pendingCompactions).toEqual([]);
+      expect(all.filter((event) => event.type === 'compaction/end')).toHaveLength(1);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('refuses a malformed meter payload at the boundary', async () => {
+    const session = await openSession();
+    try {
+      await session.appendConfig(testConfig({ policy: { keepRecentGroups: 0 } }));
+      await closedDialogue(session, 0, ['a0'], 200);
+      session.lifecycle('turn/start', { turn: 1, trigger: 'boot', world: { from: null, to: null } });
+      await session.flush();
+      const candidate = selectCompaction(
+        session.fold.snapshot(), { force: true, retainGroups: 0 });
+      expect(candidate).not.toBeNull();
+      const gate = session.gate({ phase: 'turn', turn: 1 });
+      try {
+        for (const bad of [
+          { ...METER, window: 0 },
+          { ...METER, threshold: 0 },
+          { ...METER, percent: 101 },
+          { ...METER, anchor: 'other' },
+          { ...METER, outcome: 'applied' },
+          { ...METER, window: 'x' },
+        ]) {
+          expect(() => gate.gate.append('compaction/start', {
+            ...candidate!, meter: bad as unknown as MeterRecord,
+          })).toThrow(/compaction\/start\.meter/);
+        }
+      } finally {
+        gate.close();
+      }
+    } finally {
+      await session.shutdown();
     }
   });
 });

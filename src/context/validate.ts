@@ -199,9 +199,16 @@ export function createValidator(fail: Fail, dialect: ShapeDialect = GATE_DIALECT
     return message;
   }
 
-  function compactionStart(value: unknown, where: string): CompactionStart {
+  /**
+   * `extraKeys` admits a caller's optional companion field beside the candidate
+   * (the gate's `compaction/start` carries the meter payload there); the field is
+   * not returned, so the candidate's own shape — and its id — never move.
+   */
+  function compactionStart(
+    value: unknown, where: string, extraKeys: readonly string[] = [],
+  ): CompactionStart {
     const o = record(value, where);
-    onlyKeys(o, ['id', 'revision', 'groupIds', 'sources', 'shadowHash', 'shadowBytes'], where);
+    onlyKeys(o, ['id', 'revision', 'groupIds', 'sources', 'shadowHash', 'shadowBytes', ...extraKeys], where);
     return {
       id: hash(o['id'], `${where}.id`),
       revision: hash(o['revision'], `${where}.revision`),

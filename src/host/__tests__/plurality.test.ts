@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
-import type { AgentConfig } from '../../context/contracts.js';
+import type { AgentConfig, LlmModel } from '../../context/contracts.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { ContextFold } from '../../context/fold.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
@@ -108,8 +108,12 @@ async function initFixture(): Promise<{ home: string; world: WorldRepo }> {
   return { home, world };
 }
 
+/** A windowed declaration: a fresh START on any named model needs one (A3). */
+const catalog = (...modelIds: readonly string[]): readonly LlmModel[] =>
+  modelIds.map((id) => ({ id, contextTokens: 200_000, maxOutputTokens: 32_000 }));
+
 async function providers(
-  home: string, url: string, models?: readonly string[],
+  home: string, url: string, models?: readonly LlmModel[],
 ): Promise<void> {
   await writeFile(join(home, 'providers.json'), JSON.stringify({
     llm: {
@@ -307,12 +311,12 @@ it('refuses an out-of-catalog spawned model with the whole clamp-budgeted enumer
   // Sixty-four declared models and one long, unserved requested id: the
   // refusal enumerates the catalog and must still render whole inside the
   // executor's `denied:` clamp — the tail pointer survives by construction.
-  const catalog = [
+  const declared = [
     'first-light-test',
     ...Array.from({ length: 63 }, (_, index) =>
       `served-vendor/model-${String(index + 1).padStart(2, '0')}`),
   ];
-  expect(catalog).toHaveLength(64);
+  expect(declared).toHaveLength(64);
   const requested = `not-served-${'x'.repeat(300)}`;
   const counts = new Map<string, number>();
   const server = await serveJson((request) => {
@@ -324,7 +328,7 @@ it('refuses an out-of-catalog spawned model with the whole clamp-budgeted enumer
       : { content: 'idle' });
   });
   servers.push(server);
-  await providers(home, server.url, catalog);
+  await providers(home, server.url, catalog(...declared));
   const nodesFile = await writeNodes(home, [
     { uid: 'node-0', model: 'first-light-test', heading: 'Lead.', spawn: true },
   ]);
@@ -351,7 +355,7 @@ it('refuses an out-of-catalog spawned model with the whole clamp-budgeted enumer
 
 it('spawns an in-catalog model and the live child runs on it', async () => {
   const { home } = await initFixture();
-  const catalog = ['first-light-test', 'served-child-model'];
+  const declared = ['first-light-test', 'served-child-model'];
   const counts = new Map<string, number>();
   const server = await serveJson((request) => {
     const body = request.body.toString('utf8');
@@ -364,7 +368,7 @@ it('spawns an in-catalog model and the live child runs on it', async () => {
       : { content: 'idle' });
   });
   servers.push(server);
-  await providers(home, server.url, catalog);
+  await providers(home, server.url, catalog(...declared));
   const nodesFile = await writeNodes(home, [
     { uid: 'node-0', model: 'first-light-test', heading: 'Lead.', spawn: true },
   ]);

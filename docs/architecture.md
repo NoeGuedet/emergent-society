@@ -60,7 +60,7 @@ not individually logged.
 | Module | Role |
 |---|---|
 | `driver.ts` | `NodeDriver`: the turn ritual, lifecycle states (`booting/active/waiting/stopping/stopped`), watermark, resume, park/wake, shutdown; hands the handler a narrow `TurnContext` (`{turn, trigger, world, gate, signal, now}` — no journal, no commit) so only the kernel emits. Holds the `FencePort` seam: one `acquire`/`release` wraps ONE `commitWorld` attempt (outside the queue and the git retries), `release` in `finally`, and any non-fenced outcome or a throwing acquire is the typed refusal `freeze-timeout` (only the absence of a port is the unfenced host). The storage home: the effective `StorageConfig` (injected or `DEFAULT_STORAGE`) is shared by the local writer and the turn start; a low probe defers the turn (one bounded diagnostic, `waiting`, a cancellable `storageRetryMs` wait, default 5 s), and the boot barriers tolerate a storage refusal so a low disk never refuses the boot. The optional `doctor` report is validated with the report's own replay validator before it is written as the ignorable local event `world/doctor` after `node/boot`; an invalid report is a named `InvalidDoctorReportError` on the error channel and writes NO event (a write failure is otherwise diagnostic). A `wait {until}` arms one timer (the driver's `schedule` seam) that requests the wake latch; a commit wake cancels it in the park's exit, the next turn then carries `trigger: 'timer'`, and the sliding-hour `wakeBudgetPerHour` budget (default 12, absent reads as 12) refuses an excess fire with the named `WakeBudgetExhaustedError` label. A storage refusal at the closer's flush keeps the `world/commit-refused` carrier attempt, arms the bounded self-retry even when the carrier also refuses, and does not end the run |
-| `loop.ts` | `createAgentRuntime`: the trusted handler — folds the local log, presents one bounded world perception per turn, assembles exactly one plan per logical request, sends it through the adapter, dispatches the resulting tool calls, and composes the runtime-only seams beside the fold that only it can hold (`self` and `history`; the host cannot compose them) |
+| `loop.ts` | `createAgentRuntime`: the trusted handler — folds the local log, presents one bounded world perception per turn, assembles exactly one plan per logical request, prices it for the token trigger when the policy key AND the model's declared window resolve (one forced compaction and one re-price over the threshold, the typed uncompactable escape, the typed degenerate-reservation refusal; otherwise the byte trigger), sends it through the adapter (the anchor's sample kept beside `pendingConfig` and re-formed from the fold at ready), answers the provider's typed context-window refusal with one forced maximal reduction and one resend, dispatches the resulting tool calls, and composes the runtime-only seams beside the fold that only it can hold (`self` and `history`; the host cannot compose them) |
 | `history.ts` | The node's own history projection behind `extend {verb:"history", n?}`: the `HistoryPort` (the fold's observed events + a read-time `commitPaths(hash)` reader, bound to the caller's uid by construction and fakeable with synthetic event lists), the five-kind entry model ordered by the opening event's seq (`lifecycle` boot/shutdown/compaction-marker, `identity` bounded to version/model/heading/charter bytes + SHA-256 and never the past text, `turn` with its trigger, range, commit and read-time changed paths plus a folded `world/commit-refused`, `perception` with the stored text verbatim and first-K lists, `pin`), and the renderers: 1..64 entries (default 16) oldest-first, the kernel framing line leading every result at or above the framing floor (a sub-floor cell cap gets a bounded floor note, never a cut framing), stateless, self-bounded under `maxToolResultBytes` — the newest entry kept with its list windows and text clamped to the room when the cap is small, "older records exist" whenever the cap can carry it — no aggregate, metric or peer record; the open-turn label comes from the events (the highest `turn/start` with no `turn/end`) |
 | `world-paths.ts` | The read-time paths reader: `readCommitPaths(world, hash)` runs one `git diff-tree --no-commit-id --name-only -r --root <hash>` child through the world's read plumbing (the `direction.ts`/overlay precedents; `world.ts` untouched), clamps at 64 paths or 8 KiB ("N more"), and returns the typed unreadable marker for an unreachable/missing commit, a git timeout (10 s) or any other git failure — never a throw. One sequential child per distinct committed entry in a history window; a read is not wired to the turn's abort signal |
 | `gate.ts` | The trusted local effect boundary: chunking, artifact manifests, the claim-check inline threshold; `flush()` re-reads and digest/size-verifies every pending claim-check before the effect |
@@ -122,7 +122,12 @@ verified claim-check read), `fold.ts` (`ContextFold`: config, committed surface,
 turn, recovery), `surface.ts` (committed surface + transactional compaction),
 `compaction.ts`/`groups.ts` (policy + neutral group rules), `diff.ts` (`presentWorld`:
 the bounded pinned git perception), `assembler.ts` (`assemble()`: the one canonical plan,
-pure, never journaled), `snapshots.ts` (disposable projection checkpoints, retention 2),
+pure, never journaled), `meter.ts` (the token meter: the estimator's exact chars/4
+arithmetic over the wire's own parts — never the plan's canonical bytes — the
+request-header digest `model + parameters + toolsHash`, the anchor's adoption rule
+`usage + (surface − sampled surface)` and the threshold
+`floor(min(ratio·W, W − O − headroom))`; pure), `snapshots.ts` (disposable projection
+checkpoints, retention 2),
 `validate.ts` (shared gate/snapshot schema dialects), `contracts.ts` (the shared JSON
 contracts of the assembler), `parameters.ts` (the one model-parameter contract — the
 permitted provider dialect and each key's bound — shared by config validation and wire
@@ -134,7 +139,10 @@ inject the hook themselves.
 
 `wire.ts` (`serializeWire`: the canonical non-streaming body), `adapter.ts`
 (`ProviderAdapter`: plan → wire → `begin` → send → `complete`, with classified, bounded
-retries), `transport.ts` (`OpenAITransport`: exact wire bytes, bounded body),
+retries; the OpenAI-compatible usage normalized and journalled with the anchor sample on
+the assistant record, and the structured context-window refusal classified as the typed
+local `context-exceeded` over the frozen frontier `http`), `transport.ts`
+(`OpenAITransport`: exact wire bytes, bounded body),
 `policy.ts` (the production timing port for the adapter's retry delay).
 
 ### `src/frontier/` — the truth

@@ -2,6 +2,9 @@ import { Buffer } from 'node:buffer';
 import { KernelError } from '../errors.js';
 import { toJson } from '../context/artifacts.js';
 import { toFrontierCode } from '../context/contracts.js';
+import {
+  headerDigest, priceMessage, priceWire, usageWithinWindow,
+} from '../context/meter.js';
 import { truncationNotice, utf8Prefix } from '../text.js';
 import { isRecord } from '../util.js';
 import { filterHeaders } from '../frontier/index.js';
@@ -9,7 +12,8 @@ import { serializeWire, type WirePlan } from './wire.js';
 import type { Frontier, FrontierOutcome } from '../frontier/index.js';
 import type { BoundaryGate } from '../node/gate.js';
 import type {
-  AssistantProjection, ChatMessage, FunctionCall, RequestId, SafeFailure, SeedPolicy,
+  AssistantAccounting, AssistantProjection, ChatMessage, FunctionCall, MeterUsage, RequestId,
+  SafeFailure, SeedPolicy,
 } from '../context/contracts.js';
 import type { SerializedTransport, TransportResult } from './transport.js';
 
@@ -26,10 +30,15 @@ import type { SerializedTransport, TransportResult } from './transport.js';
  *
  * The local log keeps only the semantic success fact: the assistant
  * `projection` (carrying the frontier `call` id) is stored and journaled as
- * `assistant/message`, flushed before the caller proceeds. Nothing else is
- * journaled locally: the plan is never journaled anywhere (its serialized bytes
- * are the request body), and the wire, raw response, usage and attempt facts
- * belong to the frontier. A terminal failure records nothing local — the
+ * `assistant/message`, flushed before the caller proceeds — and, when the
+ * provider reports an adoptable usage, the anchor's sample
+ * `{headerDigest, surfacePriceAtSample, usage}` journals on that same record
+ * (A7; the normalized usage's own numbers become the anchor's input, never a
+ * price, and the raw body stays the frontier's). The plan is never journaled
+ * anywhere (its serialized bytes are the request body), the raw response and
+ * attempt facts belong to the frontier, and the retired local `request/usage`
+ * event does not return: this optional field on the assistant record is the
+ * one durable home. A terminal failure records nothing local — the
  * driver's `turn/end` carries the error. A flush/invariant failure raised while
  * journaling the projection is rethrown fatally and is never converted into a
  * `SendResult.failure`; a frontier `begin`/`complete` failure propagates the
@@ -66,8 +75,83 @@ export type ProviderPolicy = {
  */
 export type SendPlan = WirePlan & { readonly id: RequestId };
 
-export type SendResult = { readonly kind: 'response'; readonly projection: AssistantProjection }
+/**
+ * The response carries, beside the projection, the journaled anchor sample when
+ * one was produced — the SAME value the `assistant/message` record holds, so the
+ * runtime's anchor is the durable one rather than a divergent recomputation.
+ */
+export type SendResult =
+  | {
+      readonly kind: 'response'; readonly projection: AssistantProjection;
+      readonly accounting?: AssistantAccounting;
+    }
   | { readonly kind: 'failure'; readonly failure: SafeFailure };
+
+/**
+ * The send's host facts. `window` is the operator-declared context window the
+ * usage is range-checked at (A2(iii)): a usage above it is a misreport and
+ * flattens to absent. The wire never carries it.
+ */
+export type SendOptions = { readonly window?: number };
+
+/** The structured OpenAI error code that names a context-window refusal. */
+const CONTEXT_EXCEEDED_CODE = 'context_length_exceeded';
+
+/**
+ * The provider's own window refusal, recognized from the STRUCTURED error body
+ * only: `{error: {code: 'context_length_exceeded'}}` (or the same value under
+ * `type`). Message text is never scanned — a hostile or unlucky phrase must not
+ * divert the loop into a destructive reduction — and a body that does not decode
+ * or parse simply is not the classification (an unrelated 400 is never one).
+ */
+function isContextExceeded(body: Uint8Array): boolean {
+  if (body.length === 0) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(body));
+  } catch {
+    return false;
+  }
+  if (!isRecord(parsed)) return false;
+  const error = parsed['error'];
+  if (!isRecord(error)) return false;
+  return error['code'] === CONTEXT_EXCEEDED_CODE || error['type'] === CONTEXT_EXCEEDED_CODE;
+}
+
+/** A non-negative safe integer, or null when the value is not one. */
+function count(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * The OpenAI-compatible usage normalization (A2(iii)): `total = prompt +
+ * completion`, and `prompt_tokens` ALREADY includes the cached subset, so the
+ * cached details are informational and never added (a prompt+cache+completion
+ * sum would double-count). Every number is range-checked; anything malformed —
+ * a missing or non-integer or negative field, a total that is not a safe
+ * integer — flattens to absent, because a bad usage must never break a turn.
+ * The declared-window bound is applied by the caller (`usageWithinWindow`), since
+ * the window is a host fact this module receives per send.
+ *
+ * The Anthropic-native dialect (the disjoint input/cacheRead/cacheWrite/output
+ * sum) is UNREACHABLE on this wire today (A2(v)): a future non-OpenAI adapter
+ * re-derives the normalization there; this one reads the OpenAI shape only.
+ */
+export function parseUsage(raw: unknown): MeterUsage | null {
+  if (!isRecord(raw)) return null;
+  const promptTokens = count(raw['prompt_tokens']);
+  const completionTokens = count(raw['completion_tokens']);
+  if (promptTokens === null || completionTokens === null) return null;
+  const totalTokens = promptTokens + completionTokens;
+  if (!Number.isSafeInteger(totalTokens)) return null;
+  let cachedTokens: number | null = null;
+  const details = raw['prompt_tokens_details'];
+  if (isRecord(details) && details['cached_tokens'] !== undefined) {
+    cachedTokens = count(details['cached_tokens']);
+    if (cachedTokens !== null && cachedTokens > promptTokens) cachedTokens = null;
+  }
+  return { promptTokens, completionTokens, totalTokens, cachedTokens };
+}
 
 const RETRYABLE_STATUS: ReadonlySet<number> = new Set([408, 429, 500, 502, 503, 504]);
 
@@ -85,13 +169,15 @@ class MalformedResponseError extends KernelError {
   }
 }
 
-type Projected = { readonly message: AssistantMessage };
+type Projected = { readonly message: AssistantMessage; readonly usage: unknown };
 
 /**
  * Decode (fatal UTF-8), parse and project only the fields that enter the
- * assistant projection. `toJson` runs on exactly those fields, so a UTF-8-valid
- * JSON body carrying an escaped lone surrogate parses but cannot be projected,
- * and throws `MalformedResponseError` — a safe terminal failure, never fatal.
+ * assistant projection, and hand the raw `usage` value out for the one
+ * normalization (`parseUsage`) — never a re-parse of the body. `toJson` runs on
+ * exactly the projected fields, so a UTF-8-valid JSON body carrying an escaped
+ * lone surrogate parses but cannot be projected, and throws
+ * `MalformedResponseError` — a safe terminal failure, never fatal.
  */
 function project(body: Uint8Array, plan: WirePlan): Projected {
   let text: string;
@@ -166,6 +252,7 @@ function project(body: Uint8Array, plan: WirePlan): Projected {
 
   return {
     message: { role: 'assistant', content: content as string | null, tool_calls: calls },
+    usage: parsed['usage'],
   };
 }
 
@@ -205,7 +292,9 @@ export class ProviderAdapter {
     private readonly frontier: Frontier,
   ) {}
 
-  async send(plan: SendPlan, gate: BoundaryGate): Promise<SendResult> {
+  async send(
+    plan: SendPlan, gate: BoundaryGate, options: SendOptions = {},
+  ): Promise<SendResult> {
     const id = plan.id;
     const policy = plan.policy;
 
@@ -308,15 +397,28 @@ export class ProviderAdapter {
           contentTruncated: bounded.contentTruncated,
           frontierCall: call.call,
         };
-        gate.append('assistant/message', { id, value: await gate.store(projection) });
+        // The anchor's sample (A2(ii), A7): the header identity, the surface
+        // price AFTER this completion is appended (so the next request's delta
+        // never counts it twice), and the normalized usage — journaled TOGETHER
+        // on the assistant record. A usage above the declared window is a
+        // misreport and flattens to absent; with no usage there is no sample.
+        const usage = usageWithinWindow(parseUsage(projected.usage), options.window);
+        const accounting: AssistantAccounting | null = usage === null ? null : {
+          headerDigest: headerDigest(plan),
+          surfacePriceAtSample: priceWire(plan) + priceMessage(bounded.message),
+          usage,
+        };
+        gate.append('assistant/message', {
+          id, value: await gate.store(projection),
+          ...(accounting !== null ? { accounting } : {}),
+        });
         await gate.flush();
-        return { kind: 'response', projection };
+        return { kind: 'response', projection, ...(accounting !== null ? { accounting } : {}) };
       }
 
       const classified: { readonly failure: SafeFailure; readonly retryable: boolean } =
         result.complete
-          ? { failure: { code: 'http', status: result.status },
-              retryable: RETRYABLE_STATUS.has(result.status) }
+          ? this.classifyStatus(result)
           : this.classifyIncomplete(result, posted.timedOut, gate);
       const failure = classified.failure;
       // The terminal is the outcome classified at the exchange. A stop that
@@ -343,6 +445,25 @@ export class ProviderAdapter {
       }
       return { kind: 'failure', failure };
     }
+  }
+
+  /**
+   * Classifies a complete non-200 exchange (T6 + the overflow slice). The
+   * provider's own structured window refusal is its typed local code
+   * (`context-exceeded`, non-retryable: retrying the same too-long body is
+   * pointless); the loop answers it with one forced maximal reduction and one
+   * resend. Everything else keeps the ordinary `http` classification, with the
+   * retryable status set unchanged. The frontier terminal for both is `http` —
+   * the frozen frontier set admits no new code (A2/A4).
+   */
+  private classifyStatus(
+    result: TransportResult,
+  ): { readonly failure: SafeFailure; readonly retryable: boolean } {
+    const status = result.status;
+    if (isContextExceeded(result.body)) {
+      return { failure: { code: 'context-exceeded', status }, retryable: false };
+    }
+    return { failure: { code: 'http', status }, retryable: status !== null && RETRYABLE_STATUS.has(status) };
   }
 
   /**

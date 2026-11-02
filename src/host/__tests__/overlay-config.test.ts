@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import { startHost, type HostOptions } from '../host.js';
+import type { LlmModel } from '../../context/contracts.js';
 import { initHome } from '../layout.js';
 import { createHostLog } from '../observe.js';
 import { readNodesFile } from '../nodes.js';
@@ -25,7 +26,11 @@ afterEach(async () => {
 
 type Fixture = { readonly home: string; readonly nodesFile: string };
 
-async function fixture(models?: readonly string[]): Promise<Fixture> {
+/** A windowed declaration: a fresh START on any named model needs one (A3). */
+const catalog = (...modelIds: readonly string[]): readonly LlmModel[] =>
+  modelIds.map((id) => ({ id, contextTokens: 200_000, maxOutputTokens: 32_000 }));
+
+async function fixture(models?: readonly LlmModel[]): Promise<Fixture> {
   const home = await mkdtemp(join(tmpdir(), 'es-overlay-config-'));
   dirs.push(home);
   await initHome(home);
@@ -62,7 +67,7 @@ function errorLine(lines: readonly string[]): string {
 }
 
 it('refuses a missing, empty, non-regular, non-UTF-8 or credential-store charter as a bounded host refusal', async () => {
-  const fx = await fixture(['node-model', 'gw-model']);
+  const fx = await fixture(catalog('node-model', 'gw-model'));
   const directory = join(fx.home, 'a-directory');
   await mkdir(directory, { mode: 0o700 });
   const badUtf8 = join(fx.home, 'bad.md');
@@ -90,7 +95,7 @@ it('refuses a missing, empty, non-regular, non-UTF-8 or credential-store charter
 });
 
 it('validates the model against the catalog, defaults to its first entry, and needs one when none is declared', async () => {
-  const fx = await fixture(['node-model', 'gw-model']);
+  const fx = await fixture(catalog('node-model', 'gw-model'));
   const charter = join(fx.home, 'charter.md');
   await writeFile(charter, 'You are the gateway.\n', 'utf8');
   // An unknown model is the ordinary model refusal.
@@ -108,7 +113,7 @@ it('validates the model against the catalog, defaults to its first entry, and ne
 });
 
 it('refuses a nodes-file entry named gateway, the reserved overlay identity', async () => {
-  const fx = await fixture(['node-model']);
+  const fx = await fixture(catalog('node-model'));
   const nodesFile = join(fx.home, 'bad-nodes.json');
   await writeFile(nodesFile, JSON.stringify([
     { uid: 'gateway', model: 'node-model', heading: 'I am the overlay.' },

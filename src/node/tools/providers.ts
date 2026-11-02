@@ -1,6 +1,10 @@
 import { open, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { toJson } from '../../context/artifacts.js';
+import type { LlmModel, LlmModelWindow } from '../../context/contracts.js';
+import {
+  DEFAULT_TOKEN_TRIGGER, MAX_MODEL_CONTEXT_TOKENS, meterHeadroom,
+} from '../../context/meter.js';
 import { validateFrontierUrl } from '../../frontier/index.js';
 import { singleLine } from '../../text.js';
 import { isLoopback } from '../../util.js';
@@ -13,8 +17,8 @@ import { isLoopback } from '../../util.js';
  * outside the project checkout; a missing file is an empty registry, never an
  * error, and a malformed file is refused loudly. It carries one `llm` entry —
  * `{ key, endpoint, models? }`, the model endpoint the host's provider
- * transport posts to plus the operator's optional declaration of the model ids
- * it serves — and an optional `tavily` entry for the web tools. The host
+ * transport posts to plus the operator's optional declaration of the models it
+ * serves (ids with an optional declared context window) — and an optional `tavily` entry for the web tools. The host
  * enforces the
  * two properties this library can only document: `init`/`start`/`resume` refuse
  * a home inside the project checkout and an existing home that is not a
@@ -74,13 +78,22 @@ export type ProviderEntry = {
 };
 
 /**
+ * The declared catalog's shape lives in the context contracts (the substrate
+ * block's own input): two shapes are accepted at load (A3) — the old ids-only
+ * string and the new `{id, contextTokens, maxOutputTokens}` object, whose window
+ * fields are both required together. The loader below enforces the domain; see
+ * `LlmModel` in `src/context/contracts.ts` for the full statement.
+ */
+export type { LlmModel, LlmModelWindow };
+
+/**
  * The model endpoint the host's provider transport posts to. No defaults: an
  * absent `endpoint` is a refusal, because a guessed endpoint could send the key
  * somewhere the operator never chose, and the endpoint is validated with the
  * frontier's own URL predicate so `begin` can never refuse what the store
  * accepted.
  *
- * `models` is the operator's declaration of the model ids the endpoint serves:
+ * `models` is the operator's declaration of the models the endpoint serves:
  * **operator-declared, unverified, not a routing table**. The kernel does not
  * probe the endpoint; a declared id selects nothing but the `model` field of a
  * request, and every id is a non-secret by declaration — ids only, never keys.
@@ -91,7 +104,7 @@ export type ProviderEntry = {
  * every `update_self` that names a model against them.
  */
 export type LlmEntry = {
-  readonly key: string; readonly endpoint: string; readonly models?: readonly string[];
+  readonly key: string; readonly endpoint: string; readonly models?: readonly LlmModel[];
 };
 
 export type ProviderRegistry = {
@@ -107,6 +120,7 @@ const MAX_RESULTS_CEILING = 20;
 const MAX_RESPONSE_BYTES_CEILING = 8 * 1024 * 1024;
 const ENTRY_FIELDS = ['key', 'baseUrl', 'timeoutMs', 'maxResults', 'maxResponseBytes'];
 const LLM_FIELDS = ['key', 'endpoint', 'models'];
+const MODEL_FIELDS = ['id', 'contextTokens', 'maxOutputTokens'];
 /** The provider store's ceiling: an oversize file is refused before parsing. */
 const MAX_PROVIDERS_BYTES = 1024 * 1024;
 
@@ -228,36 +242,91 @@ function llmEndpoint(value: unknown): string {
 }
 
 /**
- * The declared model ids: a JSON array of unique one-line printable ASCII ids
- * (the class is `MODEL_ID_RE`, 0x20–0x7E), at most `MAX_MODEL_IDS` entries of
- * at most `MAX_MODEL_ID_CHARS` characters each. Refusals name a position and
- * never quote a value — a mistyped entry cannot leak through an exception any
- * more than a key could. An empty array is a declaration of no served models
- * (every start is then refused with the honest zero-catalog message), never
- * "today's behavior": only an ABSENT `models` key is the pre-manifest store.
+ * The declared catalog (A3): a JSON array whose entries are EITHER the old
+ * ids-only string form or the new `{id, contextTokens, maxOutputTokens}` object
+ * form. Both are accepted at load; an object entry requires BOTH window fields
+ * (no family-default table exists) and is validated against the declaration's
+ * domain — positive safe integers at or below `MAX_MODEL_CONTEXT_TOKENS`,
+ * `maxOutputTokens < contextTokens`, and a window wide enough that the trigger
+ * does not degenerate under the factory rule. Refusals name a position and never
+ * quote a value — a mistyped entry cannot leak through an exception any more
+ * than a key could. An empty array is a declaration of no served models (every
+ * start is then refused with the honest zero-catalog message), never "today's
+ * behavior": only an ABSENT `models` key is the pre-manifest store.
  */
-function modelIds(value: unknown): readonly string[] {
-  if (!Array.isArray(value)) fail('llm.models: expected an array of model ids');
+function modelCatalog(value: unknown): readonly LlmModel[] {
+  if (!Array.isArray(value)) fail('llm.models: expected an array of models');
   if (value.length > MAX_MODEL_IDS) {
     fail(`llm.models: expected at most ${MAX_MODEL_IDS} entries`);
   }
   const seen = new Set<string>();
-  const ids: string[] = [];
+  const models: LlmModel[] = [];
   for (const [index, raw] of value.entries()) {
-    const at = `llm.models[${index}]`;
-    if (typeof raw !== 'string') fail(`${at}: expected a string`);
-    if (raw.length === 0) fail(`${at}: expected a nonempty model id`);
-    if ([...raw].length > MAX_MODEL_ID_CHARS) {
-      fail(`${at}: expected at most ${MAX_MODEL_ID_CHARS} characters`);
-    }
-    if (!MODEL_ID_RE.test(raw)) {
-      fail(`${at}: expected a one-line printable ASCII model id`);
-    }
-    if (seen.has(raw)) fail(`${at}: repeats an earlier model id`);
-    seen.add(raw);
-    ids.push(raw);
+    const model = declaredModel(raw, `llm.models[${index}]`);
+    if (seen.has(model.id)) fail(`llm.models[${index}]: repeats an earlier model id`);
+    seen.add(model.id);
+    models.push(model);
   }
-  return ids;
+  return models;
+}
+
+/** The model-id grammar both shapes share. */
+function declaredId(value: unknown, where: string): string {
+  if (typeof value !== 'string') fail(`${where}: expected a string`);
+  if (value.length === 0) fail(`${where}: expected a nonempty model id`);
+  if ([...value].length > MAX_MODEL_ID_CHARS) {
+    fail(`${where}: expected at most ${MAX_MODEL_ID_CHARS} characters`);
+  }
+  if (!MODEL_ID_RE.test(value)) {
+    fail(`${where}: expected a one-line printable ASCII model id`);
+  }
+  return value;
+}
+
+/** A positive safe integer at or below `max`, value-free on refusal. */
+function positiveInt(value: unknown, where: string, max: number): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > max) {
+    fail(`${where}: expected a safe integer in [1, ${max}]`);
+  }
+  return value;
+}
+
+/**
+ * One declared model: the ids-only string, or the object whose window fields
+ * are both required. The window's domain is the declaration's own: the caps, the
+ * output/context order, and the degenerate band the trigger cannot serve.
+ */
+function declaredModel(value: unknown, at: string): LlmModel {
+  if (typeof value === 'string') return { id: declaredId(value, at) };
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    fail(`${at}: expected a model id or an {id, contextTokens, maxOutputTokens} object`);
+  }
+  const o = value as Record<string, unknown>;
+  for (const [index, key] of Object.keys(o).entries()) {
+    if (!MODEL_FIELDS.includes(key)) fail(`${at}: unexpected field at position ${index + 1}`);
+  }
+  const id = declaredId(o['id'], `${at}.id`);
+  const hasContext = o['contextTokens'] !== undefined;
+  const hasOutput = o['maxOutputTokens'] !== undefined;
+  if (hasContext !== hasOutput) {
+    fail(`${at}: contextTokens and maxOutputTokens must be declared together`);
+  }
+  if (!hasContext) return { id };
+  const contextTokens = positiveInt(
+    o['contextTokens'], `${at}.contextTokens`, MAX_MODEL_CONTEXT_TOKENS);
+  const maxOutputTokens = positiveInt(
+    o['maxOutputTokens'], `${at}.maxOutputTokens`, MAX_MODEL_CONTEXT_TOKENS);
+  if (maxOutputTokens >= contextTokens) {
+    fail(`${at}.maxOutputTokens: expected a value below contextTokens`);
+  }
+  // The factory rule's degenerate band: the output reservation plus the headroom
+  // leave no positive threshold. A journaled policy with different constants can
+  // still degenerate at request time; that is the runtime's typed refusal.
+  if (contextTokens - maxOutputTokens
+    - meterHeadroom(contextTokens, DEFAULT_TOKEN_TRIGGER) <= 0) {
+    fail(`${at}.contextTokens: too small for the output reservation and the headroom`);
+  }
+  return { id, contextTokens, maxOutputTokens };
 }
 
 /**
@@ -276,7 +345,7 @@ function llmEntry(value: unknown): LlmEntry {
   if (typeof o['key'] !== 'string' || o['key'].length === 0) {
     fail('llm.key: expected a nonempty string');
   }
-  const models = o['models'] === undefined ? undefined : modelIds(o['models']);
+  const models = o['models'] === undefined ? undefined : modelCatalog(o['models']);
   return {
     key: o['key'], endpoint: llmEndpoint(o['endpoint']),
     ...(models !== undefined ? { models } : {}),
@@ -353,6 +422,40 @@ export function modelRefusal(model: string, served: readonly string[]): string {
   const budget = MODEL_REFUSAL_CODE_POINTS - codePoints(head) - codePoints(pointer) - 1;
   const listing = servedListing(served, budget);
   return `${head}${listing === '' ? '' : ` ${listing}`}${pointer}`;
+}
+
+/**
+ * The taught declaration on a fresh START: the model is served, but its catalog
+ * entry declares no window, so no token trigger can be resolved. Bounded like
+ * every refusal here: the echoed id is clamped and the message names the shape
+ * to add, never a value that could be a credential.
+ */
+export function windowRefusal(model: string): string {
+  return `model ${echoedModel(model)} has no declared context window; declare`
+    + ' {id, contextTokens, maxOutputTokens} for it in providers.json';
+}
+
+/** The ids of a validated catalog, in declaration order — the substrate block's own projection. */
+export function modelIds(models: readonly LlmModel[]): readonly string[] {
+  return models.map((model) => model.id);
+}
+
+/** One entry's window, or null when it declares none (the transition form). */
+export function windowOf(model: LlmModel): LlmModelWindow | null {
+  const contextTokens = model.contextTokens;
+  const maxOutputTokens = model.maxOutputTokens;
+  return contextTokens !== undefined && maxOutputTokens !== undefined
+    ? { contextTokens, maxOutputTokens }
+    : null;
+}
+
+/** The declared window of `model`, or null when the catalog is absent or declares none. */
+export function windowForModel(
+  models: readonly LlmModel[] | undefined, model: string,
+): LlmModelWindow | null {
+  if (models === undefined) return null;
+  const entry = models.find((candidate) => candidate.id === model);
+  return entry === undefined ? null : windowOf(entry);
 }
 
 /**

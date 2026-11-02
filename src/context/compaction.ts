@@ -8,7 +8,8 @@ import {
 import type { BoundaryGate } from '../node/gate.js';
 import type { ContextFold } from './fold.js';
 import type {
-  ChatMessage, CompactionStart, CompactionSummary, ProjectionState, Source, SurfaceGroup,
+  ChatMessage, CompactionStart, CompactionSummary, MeterRecord, ProjectionState, Source,
+  SurfaceGroup,
 } from './contracts.js';
 
 /**
@@ -51,10 +52,25 @@ function mergeSources(existing: readonly Source[], incoming: readonly Source[]):
 }
 
 /**
+ * The caller's override of the selection's two admission decisions (A4). `force`
+ * bypasses the BYTE threshold only — the span, balance and strict-smaller rules
+ * are transaction validity and still hold, so a forced selection that cannot
+ * reduce the wire returns null (the trigger's uncompactable escape).
+ * `retainGroups` overrides the retained tail: the overflow answer's one maximal
+ * reduction retains 0.
+ */
+export type CompactionSelection = {
+  readonly force?: boolean;
+  readonly retainGroups?: number;
+};
+
+/**
  * Selects the next compaction, or null when none is warranted. Pure: it reads the
  * folded projection, journals nothing and performs no I/O.
  */
-export function selectCompaction(state: ProjectionState): CompactionStart | null {
+export function selectCompaction(
+  state: ProjectionState, selection: CompactionSelection = {},
+): CompactionStart | null {
   const surface = state.surface;
   const config = state.config;
   if (surface === null || config === null) return null;
@@ -72,9 +88,13 @@ export function selectCompaction(state: ProjectionState): CompactionStart | null
   for (const group of committed) {
     for (const message of group.messages) history.push(message);
   }
-  if (canonicalMessagesBytes(history).length < policy.compactAfterBytes) return null;
+  // The byte trigger governs an unforced selection only: the token trigger and
+  // the overflow answer have already decided to compact.
+  if (selection.force !== true
+    && canonicalMessagesBytes(history).length < policy.compactAfterBytes) return null;
 
-  const keep = Math.min(policy.keepRecentGroups, committed.length);
+  const retained = selection.retainGroups ?? policy.keepRecentGroups;
+  const keep = Math.min(retained, committed.length);
   const eligible = committed.slice(0, committed.length - keep);
   if (eligible.length === 0) return null;
 
@@ -126,6 +146,13 @@ function transactionValid(state: ProjectionState, candidate: CompactionStart): b
     canonicalMessagesBytes([noticeMessage()]).length, verdict.shadow.length);
 }
 
+/**
+ * What one transaction carries beyond its candidate: the forced-selection
+ * override and the kernel-owned decision numbers the token trigger journals on
+ * `compaction/start` (they never enter the candidate or its id).
+ */
+export type CompactionOptions = CompactionSelection & { readonly meter?: MeterRecord };
+
 async function abortStale(gate: BoundaryGate, id: string): Promise<'aborted'> {
   gate.append('compaction/abort', { id, reason: 'stale' });
   await gate.flush();
@@ -143,7 +170,7 @@ async function abortStale(gate: BoundaryGate, id: string): Promise<'aborted'> {
  * candidate aborts with no replacement.
  */
 export async function runCompaction(
-  fold: ContextFold, gate: BoundaryGate,
+  fold: ContextFold, gate: BoundaryGate, options: CompactionOptions = {},
 ): Promise<'applied' | 'skipped' | 'aborted'> {
   const orphans = fold.orphanCompactions();
   if (orphans.length > 0) {
@@ -154,10 +181,12 @@ export async function runCompaction(
     return 'aborted';
   }
 
-  const candidate = selectCompaction(fold.snapshot());
+  const candidate = selectCompaction(fold.snapshot(), options);
   if (candidate === null) return 'skipped';
 
-  gate.append('compaction/start', candidate);
+  gate.append('compaction/start', options.meter === undefined
+    ? candidate
+    : { ...candidate, meter: options.meter });
   await gate.flush();
   if (!transactionValid(fold.snapshot(), candidate)) return abortStale(gate, candidate.id);
 

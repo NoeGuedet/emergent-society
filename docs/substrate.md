@@ -14,14 +14,14 @@ The argument is not that the current choices are wrong. It is that they are *cho
 | **Commit per turn** | A clean unit of observation; authorship; the journal/turn/world join; a bounded effect; a fence around the critical section | A turn-batched society; intra-turn acts are invisible; a crash loses the turn; attribution stops at the commit |
 | **Wake on a foreign commit** | No idle cost; an observable trigger; simple and deterministic | A reactive society; no initiative; the human becomes the clock; "perpetual" becomes "suspended" when nothing happens |
 | **A pinned heading** | The direction survives compaction; a stable reference for drift; the metronome | A static, top-down direction; a strong prior; compliance pressure; the rich letter is absent |
-| **Compaction at 256 KiB** | A physical pressure to externalize; bounded cost; a visible transaction | A byte threshold, not the model window; short runs never reach it; a prompt above the window but below the threshold can deadlock a node; compaction is deletion, not summarization |
+| **Compaction at the declared window's fraction** | A physical pressure to externalize, now tied to each model's own window; bounded cost; a visible, journaled transaction; the operator declares the window and reads the effective percent | The threshold is only as good as the declaration (a store edit changes it between boots); the estimator is a calibrated chars/4, not a tokenizer; a prompt the provider refuses for its size needs the overflow answer; compaction is deletion, not summarization (the byte threshold survives as the pre-wave path) |
 | **One host per home** | Simplicity; one writer; no concurrency bugs; a safe prototype | No concurrent society; the operator is the scheduler; the multi-node claim is aspirational |
 
 Three choices are easy to miss because they are not in the list above: **one public square** (a single world biases the topology toward one room), **one model family** (a society of clones is a weak analogue), and **one frontier per cell without node identity** (the record has a total order but no actor).
 
 ## 2. Why the substrate is the experiment
 
-The medium is the message. A shared mutable worktree makes communication an overwrite and coordination a convention. A commit per turn makes the society batch-like. A wake on a foreign commit makes it reactive. A static pinned heading makes it compliant. A 256 KiB hole decides when memory begins to matter. A single host makes plurality impossible.
+The medium is the message. A shared mutable worktree makes communication an overwrite and coordination a convention. A commit per turn makes the society batch-like. A wake on a foreign commit makes it reactive. A static pinned heading makes it compliant. The hole's trigger — the declared window's fraction now, the 256 KiB byte count before it — decides when memory begins to matter. A single host makes plurality impossible.
 
 The experiment therefore measures *which society this substrate produces*, not *society from nothing*. That is not a defect: it is the condition of any observation. The defect would be to leave the constitution unexamined. The question is not "how do we remove structure?" but "which structure is load-bearing for the phenomenon?"
 
@@ -80,13 +80,13 @@ The minimum is not zero. The minimum is the set of constraints whose ablation ma
 
 *Verdict.* Keep the pin; it is the anti-drift mechanism. The static heading is a placeholder, not the thesis. Separate the invariants (a constitution that should not drift) from the direction (a goal that should be revisable); the pin protects the former, the version carries the latter.
 
-### 4.5 The 256 KiB hole
+### 4.5 The hole, measured in tokens
 
-*What it buys.* A physical pressure to externalize. The context is finite, so whatever is not written down is lost. Cost is bounded. The compaction is a visible transaction.
+*What it buys.* A physical pressure to externalize. The context is finite, so whatever is not written down is lost. Cost is bounded. The compaction is a visible transaction — and its trigger now follows the model: the operator declares each model's context window, the kernel prices the request's exact wire composition with the calibrated chars/4 estimator (repaired by the provider's own reported usage), and the transaction fires at `floor(min(0.80·W, W − O − headroom))` with the headroom clamped to `[16,000, 64,000]` and `O` the request's output reservation. The effective percent is published operator-side — 69.4% on a 1M/256k model, 76% on a 200k/32k one — so the operator knows what the rule actually does. The pre-wave byte threshold (`compactAfterBytes`, 256 KiB) stays in the vocabulary as the legacy path for cells journaled before the window key existed.
 
-*What it costs.* The threshold is a byte count, not the model's window. It is high enough that short live runs never reach it, so the Necessity leg is untested. A prompt above the model's window but below the threshold can receive a terminal refusal and leave a node parked. Compaction is deletion, not summarization: the removed text is gone from the model's context.
+*What it costs.* The trigger is only as good as the operator's declaration: no family-default table exists, and a store edit between boots changes the next decision with no journaled config version (each decision copies its inputs into its accounting record). The estimator underprices CJK and dense JSON; the headroom absorbs it and the provider's own refusal is answered by one forced maximal reduction. A prompt above the model's window but below the threshold is still possible, and it receives the provider's terminal refusal — the overflow answer reduces once, and a second failure passes the original error through. Compaction is deletion, not summarization: the removed text is gone from the model's context. And the memory physics is now model-relative: a mixed-model home gives each node a different plane, which is the object of study, never a controlled variable (pin one model across an arm, or one conservative declared window).
 
-*Alternative.* A token-based threshold calibrated to the model window, with a reserve for the response and the pinned prefix. Test at least two sizes, small and large, as an ablation. Keep the transaction durable and visible; the notice is the minimum.
+*Alternative.* A true tokenizer, or a provider `count_tokens` call. Neither is taken: the two-runtime-dependency set holds, the local chars/4 estimator is the calibrated branch, and no network call is added to the trigger. The ablation that remains is the one worth running: two declared window sizes, small and large, with the transaction durable and visible and the notice as the minimum.
 
 *Verdict.* Keep the Hole; calibrate it. A hole that never binds is not a necessity, it is scenery. The Necessity leg of the hypothesis is untested until compaction actually fires and the agent must adapt.
 

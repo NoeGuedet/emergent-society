@@ -12,9 +12,9 @@ import { validateAgentConfig } from './config.js';
 import { createBoundaryRegistry } from './events.js';
 import { SAME, sortUnique } from './groups.js';
 import type {
-  AgentConfig, ArtifactRef, AssistantProjection, ChatMessage, CompactionStart, CompactionSummary,
-  FunctionCall, OpenTurn, ProjectionState, RecoveryGroup, RequestId, Source, Stored,
-  SurfaceGroup, WorldPerception,
+  AgentConfig, ArtifactRef, AssistantAccounting, AssistantProjection, ChatMessage,
+  CompactionStart, CompactionSummary, FunctionCall, OpenTurn, ProjectionState, RecoveryGroup,
+  RequestId, Source, Stored, SurfaceGroup, WorldPerception,
 } from './contracts.js';
 import type { VerifiedEvent, VerifiedEvents } from './loader.js';
 import { ArtifactMismatchError, sourceOf } from './loader.js';
@@ -83,6 +83,38 @@ function dataRequestId(value: unknown, where: string): RequestId {
   return {
     turn: dataInt(o['turn'], `${where}.turn`),
     ordinal: dataInt(o['ordinal'], `${where}.ordinal`),
+  };
+}
+
+/**
+ * The anchor's journaled sample, re-validated at the replay boundary: a
+ * chain-verified event proves the bytes, not the shape. The totals must agree
+ * and the cached subset must stay inside the prompt — a forged triple fails as
+ * a fold invariant, never as a silently adopted usage.
+ */
+function dataAccounting(value: unknown, where: string): AssistantAccounting {
+  const o = dataRecord(value, where);
+  const usage = dataRecord(o['usage'], `${where}.usage`);
+  const promptTokens = dataInt(usage['promptTokens'], `${where}.usage.promptTokens`);
+  const completionTokens = dataInt(usage['completionTokens'], `${where}.usage.completionTokens`);
+  const totalTokens = dataInt(usage['totalTokens'], `${where}.usage.totalTokens`);
+  if (totalTokens !== promptTokens + completionTokens) {
+    invariant(`${where}.usage.totalTokens does not equal prompt + completion`);
+  }
+  const cached = usage['cachedTokens'];
+  let cachedTokens: number | null;
+  if (cached === null) cachedTokens = null;
+  else {
+    cachedTokens = dataInt(cached, `${where}.usage.cachedTokens`);
+    if (cachedTokens > promptTokens) {
+      invariant(`${where}.usage.cachedTokens exceeds promptTokens`);
+    }
+  }
+  return {
+    headerDigest: dataString(o['headerDigest'], `${where}.headerDigest`),
+    surfacePriceAtSample: dataInt(
+      o['surfacePriceAtSample'], `${where}.surfacePriceAtSample`),
+    usage: { promptTokens, completionTokens, totalTokens, cachedTokens },
   };
 }
 
@@ -198,6 +230,14 @@ export class ContextFold {
    */
   private perceptionProof: WorldAcknowledgement | null = null;
   private readonly pendingCompactions: CompactionStart[] = [];
+  /**
+   * The accounting triple of the LATEST `assistant/message` (A7): null when that
+   * record carried none (which is also how an old, pre-wave event reads). The
+   * runtime re-forms its anchor from it after a restart — never from a scan of
+   * older records, so a usage-less completion resets the anchor exactly as the
+   * live path does.
+   */
+  private lastAccounting: AssistantAccounting | null = null;
   private readonly pendingSummaries = new Map<string, { summary: CompactionSummary; source: Source }>();
   private readonly seen: VerifiedEvent[] = [];
   /**
@@ -477,6 +517,10 @@ export class ContextFold {
     buffer.assistant = projection.message;
     buffer.assistantSource = sourceOf(event);
     buffer.advertised = [...projection.message.tool_calls];
+    const accounting = raw['accounting'];
+    this.lastAccounting = accounting === undefined
+      ? null
+      : dataAccounting(accounting, 'assistant/message.accounting');
     // The queue entry is consumed by the turn's first assistant message: an
     // intra-turn assembly hint for history-vs-queue rendering. A turn whose
     // requests all failed at the transport, or whose only response failed
@@ -885,6 +929,12 @@ export class ContextFold {
     this.surface.replaceCommitted(start, offered.summary, offered.source);
     this.pendingCompactions.splice(index, 1);
     this.pendingSummaries.delete(id);
+    // The anchor's sample described a surface this replacement just rewrote (the
+    // mirror of the live runtime's reset): no later request may add its surface
+    // delta, and a restart must not re-form a stale anchor from the fold. A
+    // usage-less record after the transaction clears it anyway; an aborted or
+    // orphaned transaction changes no surface and keeps it.
+    this.lastAccounting = null;
   }
 
   private onCompactionAbort(event: VerifiedEvent): void {
@@ -1010,5 +1060,21 @@ export class ContextFold {
 
   orphanCompactions(): readonly CompactionStart[] {
     return this.pendingCompactions.slice();
+  }
+
+  /**
+   * The latest assistant record's accounting triple, as a fresh copy, or null
+   * when it carried no usage (an old event, or a response without a usable
+   * usage). This is the anchor's restart path: the runtime's in-memory state is
+   * a cache of what the fold can always re-derive from the journal it holds.
+   */
+  lastAssistantAccounting(): AssistantAccounting | null {
+    const accounting = this.lastAccounting;
+    if (accounting === null) return null;
+    return {
+      headerDigest: accounting.headerDigest,
+      surfacePriceAtSample: accounting.surfacePriceAtSample,
+      usage: { ...accounting.usage },
+    };
   }
 }

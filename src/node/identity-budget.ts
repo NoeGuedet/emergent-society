@@ -1,7 +1,7 @@
 import { canonicalBytes } from '../context/artifacts.js';
 import { substrateText } from '../context/assembler.js';
 import { MAX_COMPACTION_SOURCES } from '../context/groups.js';
-import type { AgentConfig } from '../context/contracts.js';
+import type { AgentConfig, LlmModel } from '../context/contracts.js';
 import { DIRECTION_MAX_BYTES } from './direction.js';
 import { MAX_CAPTURE_BYTES } from './gate.js';
 
@@ -43,6 +43,19 @@ import { MAX_CAPTURE_BYTES } from './gate.js';
  * wire's — an identity strictly below the budget composes with the nominal
  * bound under the ceiling; in the capped and degenerate bands the excess is
  * **policy-owned** (a config may always set budgets that wedge it).
+ *
+ * THE TOKEN TRIGGER'S PREMISE (A1/A4, a stated residual): the history term
+ * still keys off `compactAfterBytes`, but a token-triggered cell compacts at the
+ * DECLARED WINDOW's fraction, not at a byte count. Under the factory rule the
+ * 200k/32k arm compacts at 152,000 tokens — at the estimator's own four
+ * characters per token, 608,000 canonical bytes of history, more than twice
+ * `compactAfterBytes`. The reserve is therefore an UNDER-reserve for the history
+ * term under the token trigger; the factory floor and caps mask it (the factory
+ * reserve already exceeds the ceiling, so the budget is the floor), and a
+ * shrunk-ceiling cell must reason with the mask, not with the reserve alone.
+ * This block is byte-keyed on purpose: a sendability bound is a BYTE bound, and
+ * converting it would silently re-price every existing home's admission. The
+ * pins are re-derived beside the token rule, never deleted.
  *
  * The check lives at exactly three admission seams — the START composition
  * (S5), the spawn-side config composition, and `update_self`'s renew — and
@@ -116,7 +129,7 @@ function offeringBytes(config: AgentConfig): number {
 }
 
 /** The substrate block's canonical size; absent catalog, no block, no bytes. */
-function substrateBytes(models: readonly string[] | undefined): number {
+function substrateBytes(models: readonly LlmModel[] | undefined): number {
   return models === undefined ? 0 : canonicalBytes(substrateText(models)).length;
 }
 
@@ -126,7 +139,7 @@ function substrateBytes(models: readonly string[] | undefined): number {
  * AND the catalog (the offering comes from `config.tools`, the substrate from
  * `models`). The plan aliases this function `reserve`.
  */
-export function reserve(config: AgentConfig, models?: readonly string[]): number {
+export function reserve(config: AgentConfig, models?: readonly LlmModel[]): number {
   const policy = config.policy;
   const history = Math.max(
     policy.compactAfterBytes,
@@ -144,7 +157,7 @@ export function reserve(config: AgentConfig, models?: readonly string[]): number
  * IDENTITY_FLOOR` the budget collapses to `C`, and identities at or above `C`
  * are refused at the seam.
  */
-export function identityBudget(config: AgentConfig, models?: readonly string[]): number {
+export function identityBudget(config: AgentConfig, models?: readonly LlmModel[]): number {
   const ceiling = effectiveCeiling(config);
   return Math.min(Math.max(ceiling - reserve(config, models), IDENTITY_FLOOR), ceiling);
 }
@@ -178,7 +191,7 @@ function sendabilityMessage(
  * @throws IdentityBudgetError when `identityBytes(config) >= identityBudget(config, models)`.
  */
 export function assertSendableIdentity(
-  config: AgentConfig, models?: readonly string[],
+  config: AgentConfig, models?: readonly LlmModel[],
 ): void {
   const budget = identityBudget(config, models);
   const identity = identityBytes(config);

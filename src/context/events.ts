@@ -10,11 +10,13 @@ import { toJson } from './artifacts.js';
 import { validateAgentConfig } from './config.js';
 import { RENDER_POLICIES } from './contracts.js';
 import type { RenderPolicy } from './contracts.js';
+import { MAX_MODEL_CONTEXT_TOKENS } from './meter.js';
 import { GATE_DIALECT, createValidator } from './validate.js';
 import type {
-  AgentConfig, ArtifactChunk, ArtifactManifest, ArtifactRef, AssistantProjection,
-  ChatMessage, CompactionAbort, CompactionEnd, CompactionStart, CompactionSummary, ErrorCode,
-  FunctionCall, RequestId, SafeFailure, Source, Stored, WorldPerception,
+  AgentConfig, ArtifactChunk, ArtifactManifest, ArtifactRef, AssistantAccounting,
+  AssistantProjection, ChatMessage, CompactionAbort, CompactionEnd, CompactionStart,
+  CompactionSummary, ErrorCode, FunctionCall, MeterRecord, MeterUsage, RequestId, SafeFailure,
+  Source, Stored, WorldPerception,
 } from './contracts.js';
 
 /**
@@ -32,7 +34,16 @@ export interface ContextEventDataMap {
   /** `value.range` must equal `range`; the fold also ties `range` to the open turn's opening range. */
   'world/perception': { turn: number; range: WorldRange; value: Stored<WorldPerception> };
   'request/refused': { id: RequestId; bytes: number; limit: number; phase: 'plan' };
-  'assistant/message': { id: RequestId; value: Stored<AssistantProjection> };
+  /**
+   * The assistant projection plus, when the provider reported an adoptable
+   * usage, the anchor's sample — {headerDigest, surfacePriceAtSample, usage} —
+   * journaled TOGETHER (A7). The optional field is additive: an old event
+   * (absent field) replays untouched and reads as absent, and no `request/usage`
+   * event returns (that local type stays retired).
+   */
+  'assistant/message': {
+    id: RequestId; value: Stored<AssistantProjection>; accounting?: AssistantAccounting;
+  };
   'tool/call': { turn: number; request: RequestId; call: FunctionCall };
   'tool/result': {
     turn: number; request: RequestId; callId: string;
@@ -41,7 +52,12 @@ export interface ContextEventDataMap {
     /** The frontier call that produced this result, when one did; never for execute/wait. */
     frontierCall: CallId | null;
   };
-  'compaction/start': CompactionStart;
+  /**
+   * The candidate plus, for a token-triggered transaction, the kernel-owned
+   * decision numbers as an optional `meter` payload (A7). The candidate's own
+   * shape and id never move; the reader skips the companion field.
+   */
+  'compaction/start': CompactionStart & { meter?: MeterRecord };
   'compaction/summary': CompactionSummary;
   'compaction/end': CompactionEnd;
   'compaction/abort': CompactionAbort;
@@ -118,6 +134,7 @@ const ERROR_CODES = {
   http: true, network: true, timeout: true, cancelled: true, malformed: true,
   'body-limit': true, 'invalid-tool': true, 'unknown-tool': true, denied: true,
   spawn: true, signal: true, 'output-limit': true, 'request-limit': true,
+  'context-exceeded': true,
 } satisfies Record<ErrorCode, true>;
 
 function fail(where: string, message: string): never {
@@ -286,6 +303,83 @@ function worldPerception(value: unknown, where: string): WorldPerception {
 }
 
 /**
+ * One normalized usage (A2(iii)): non-negative safe integers, the exact
+ * `total = prompt + completion` identity, and the cached subset (which is
+ * already INSIDE the prompt, so it is never added) bounded by it. The adapter
+ * flattens a malformed body before this shape can be appended; a chain-valid
+ * event that still disagrees is a forged payload and fails here.
+ */
+function meterUsage(value: unknown, where: string): MeterUsage {
+  const o = record(value, where);
+  onlyKeys(o, ['promptTokens', 'completionTokens', 'totalTokens', 'cachedTokens'], where);
+  const promptTokens = safeInt(o['promptTokens'], `${where}.promptTokens`, 0);
+  const completionTokens = safeInt(o['completionTokens'], `${where}.completionTokens`, 0);
+  const totalTokens = safeInt(o['totalTokens'], `${where}.totalTokens`, 0);
+  if (totalTokens !== promptTokens + completionTokens) {
+    fail(`${where}.totalTokens`, 'must equal promptTokens + completionTokens');
+  }
+  if (totalTokens > MAX_MODEL_CONTEXT_TOKENS) {
+    fail(`${where}.totalTokens`, 'exceeds the declared-window ceiling');
+  }
+  let cachedTokens: number | null = null;
+  if (o['cachedTokens'] !== null) {
+    cachedTokens = safeInt(o['cachedTokens'], `${where}.cachedTokens`, 0);
+    if (cachedTokens > promptTokens) {
+      fail(`${where}.cachedTokens`, 'must not exceed promptTokens');
+    }
+  }
+  return { promptTokens, completionTokens, totalTokens, cachedTokens };
+}
+
+/** The anchor's journaled sample (A2(ii)/A7): header identity, sample surface price, usage. */
+function assistantAccounting(value: unknown, where: string): AssistantAccounting {
+  const o = record(value, where);
+  onlyKeys(o, ['headerDigest', 'surfacePriceAtSample', 'usage'], where);
+  return {
+    headerDigest: hash(o['headerDigest'], `${where}.headerDigest`),
+    surfacePriceAtSample: safeInt(
+      o['surfacePriceAtSample'], `${where}.surfacePriceAtSample`, 0),
+    usage: meterUsage(o['usage'], `${where}.usage`),
+  };
+}
+
+/** One published percent: a finite number in [0, 100], one decimal at the producer. */
+function percentValue(value: unknown, where: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 100) {
+    fail(where, 'expected a finite number in [0, 100]');
+  }
+  return value;
+}
+
+/**
+ * The kernel-owned decision numbers of a token-triggered compaction (A7). The
+ * window and the output reservation are HOST facts copied into the record (a
+ * store edit between boots never rewrites a decision); `threshold` is positive
+ * because a degenerate reservation is refused before any transaction.
+ */
+function meterRecord(value: unknown, where: string): MeterRecord {
+  const o = record(value, where);
+  onlyKeys(o, [
+    'window', 'output', 'headroom', 'threshold', 'percent', 'estimate', 'anchor', 'outcome',
+  ], where);
+  const anchor = o['anchor'];
+  if (anchor !== 'usage' && anchor !== 'estimate') {
+    fail(`${where}.anchor`, "expected 'usage' or 'estimate'");
+  }
+  if (o['outcome'] !== 'compact') fail(`${where}.outcome`, "must be 'compact'");
+  return {
+    window: safeInt(o['window'], `${where}.window`, 1, MAX_MODEL_CONTEXT_TOKENS),
+    output: safeInt(o['output'], `${where}.output`, 0),
+    headroom: safeInt(o['headroom'], `${where}.headroom`, 0),
+    threshold: safeInt(o['threshold'], `${where}.threshold`, 1),
+    percent: percentValue(o['percent'], `${where}.percent`),
+    estimate: safeInt(o['estimate'], `${where}.estimate`, 0),
+    anchor,
+    outcome: 'compact',
+  };
+}
+
+/**
  * Validates a resolved `AssistantProjection` (the stored payload the fold
  * parses) and requires the frontier call that produced it: the raw artifact
  * back-pointer is gone — the frontier journal holds the exchange.
@@ -436,12 +530,19 @@ export function createBoundaryRegistry(): BoundaryRegistry {
     },
 
     'assistant/message': (data: unknown, scope: GateScope): JsonValue => {
-      const { o, id } = requestScoped(data, scope, 'assistant/message', ['id', 'value']);
+      const { o, id } = requestScoped(
+        data, scope, 'assistant/message', ['id', 'value', 'accounting']);
       const value = storedValue<AssistantProjection>(
         scope, o['value'], 'assistant/message.value', (raw) =>
           assistantProjection(raw, 'assistant/message.value.value'),
       );
-      return toJson({ id, value });
+      // The anchor's sample is optional and additive: absent stays absent (an
+      // old event replays untouched), present is validated whole. It is the one
+      // key this request-scoped payload grew (A7), and it brings no event type.
+      const accounting = o['accounting'] === undefined
+        ? undefined
+        : assistantAccounting(o['accounting'], 'assistant/message.accounting');
+      return toJson({ id, value, ...(accounting !== undefined ? { accounting } : {}) });
     },
 
     'tool/call': (data: unknown, scope: GateScope): JsonValue => {
@@ -489,10 +590,14 @@ export function createBoundaryRegistry(): BoundaryRegistry {
 
     'compaction/start': (data: unknown, scope: GateScope): JsonValue => {
       turnScope(scope, 'compaction/start');
-      const start = v.compactionStart(data, 'compaction/start');
+      const raw = record(data, 'compaction/start');
+      const meter = raw['meter'] === undefined
+        ? undefined
+        : meterRecord(raw['meter'], 'compaction/start.meter');
+      const start = v.compactionStart(data, 'compaction/start', ['meter']);
       receipts(scope, start.groupIds, 'compaction/start.groupIds');
       receipts(scope, start.sources, 'compaction/start.sources');
-      return toJson(start);
+      return toJson({ ...start, ...(meter !== undefined ? { meter } : {}) });
     },
 
     'compaction/summary': (data: unknown, scope: GateScope): JsonValue => {

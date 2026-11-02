@@ -99,6 +99,14 @@ describe('defaultAgentConfig', () => {
         maxDiffBytes: 32768, maxCommits: 4096, maxAssistantBytes: 32768,
         maxToolResultBytes: 65536, maxToolArgumentBytes: 262144, maxCallsPerResponse: 32,
         wakeBudgetPerHour: 12,
+        // The token trigger (A4): 80% of the window, headroom clamp(5%·W, 16,000,
+        // 64,000) — DECIMAL thousands, as the published 200k/32k → 76% row
+        // requires — in permille and integer tokens. The fresh-cell default; a
+        // pre-wave cell lacks the key and keeps the byte trigger.
+        compactAfterTokens: {
+          ratioPermille: 800,
+          headroom: { ratioPermille: 50, minTokens: 16000, maxTokens: 64000 },
+        },
       },
     });
   });
@@ -132,6 +140,47 @@ describe('validateAgentConfig', () => {
       .toBe(3);
     expect(() => validateAgentConfig(withPolicy({ wakeBudgetPerHour: -1 }))).toThrow();
     expect(() => validateAgentConfig(withPolicy({ wakeBudgetPerHour: 1.5 }))).toThrow();
+  });
+
+  it('accepts a pre-wave policy (no compactAfterTokens) and validates one when present', () => {
+    const cfg = base();
+    const policy: Record<string, unknown> = { ...cfg.policy };
+    delete policy['compactAfterTokens'];
+    const validated = validateAgentConfig({ ...cfg, policy });
+    // Absent stays absent: the old cell keeps the byte trigger, never a rewrite.
+    expect('compactAfterTokens' in validated.policy).toBe(false);
+    expect(validateAgentConfig(withPolicy({
+      compactAfterTokens: {
+        ratioPermille: 900,
+        headroom: { ratioPermille: 50, minTokens: 1_000, maxTokens: 2_000 },
+      },
+    })).policy.compactAfterTokens).toEqual({
+      ratioPermille: 900,
+      headroom: { ratioPermille: 50, minTokens: 1_000, maxTokens: 2_000 },
+    });
+    // The window is NOT a policy value: a stray key is refused like any other.
+    expect(() => validateAgentConfig(withPolicy({
+      compactAfterTokens: {
+        ratioPermille: 900,
+        headroom: { ratioPermille: 50, minTokens: 1_000, maxTokens: 2_000 },
+        window: 200_000,
+      },
+    } as never))).toThrow();
+    for (const bad of [
+      { ratioPermille: 0, headroom: { ratioPermille: 50, minTokens: 1, maxTokens: 2 } },
+      { ratioPermille: 1001, headroom: { ratioPermille: 50, minTokens: 1, maxTokens: 2 } },
+      { ratioPermille: 1.5, headroom: { ratioPermille: 50, minTokens: 1, maxTokens: 2 } },
+      { ratioPermille: 800, headroom: { ratioPermille: -1, minTokens: 1, maxTokens: 2 } },
+      { ratioPermille: 800, headroom: { ratioPermille: 50, minTokens: 3, maxTokens: 2 } },
+      { ratioPermille: 800, headroom: { ratioPermille: 50, minTokens: -1, maxTokens: 2 } },
+      { ratioPermille: 800, headroom: { ratioPermille: 50, minTokens: 1 } },
+      { ratioPermille: 800 },
+      7,
+      null,
+    ]) {
+      expect(() => validateAgentConfig(withPolicy({ compactAfterTokens: bad } as never)))
+        .toThrow(/policy\.compactAfterTokens/);
+    }
   });
 
   it('rejects a missing or malformed shape', () => {

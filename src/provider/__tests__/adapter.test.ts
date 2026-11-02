@@ -15,6 +15,7 @@ import type { BoundaryGate, GateCallbacks, GateScope } from '../../node/gate.js'
 import { failFrontierFlushes, openTestFrontier, readFrontier } from '../../frontier/__tests__/helpers.js';
 import type { Frontier, FrontierJournal } from '../../frontier/index.js';
 import { serializeWire } from '../wire.js';
+import { headerDigest, priceMessage, priceWire } from '../../context/meter.js';
 import { ProviderAdapter, type ProviderPolicy } from '../adapter.js';
 import { OpenAITransport } from '../transport.js';
 import type { SerializedTransport, TransportFacts, TransportResult } from '../transport.js';
@@ -364,6 +365,198 @@ describe('ProviderAdapter: real HTTP acceptance', () => {
     } finally {
       await session.shutdown();
       await close(server);
+    }
+  });
+});
+
+// --- the usage dialect and the anchor's sample ------------------------------------
+
+describe('ProviderAdapter: the usage dialect and the anchor sample (A2iii/A7)', () => {
+  it('journals the OpenAI shape once, the cached subset informational, with the sample', async () => {
+    const session = await openSession();
+    const subject = plan();
+    const transport = new ScriptedTransport([transportResult(validBody({
+      usage: {
+        prompt_tokens: 100, completion_tokens: 5,
+        prompt_tokens_details: { cached_tokens: 70 },
+      },
+    }))]);
+    const adapter = await adapterWith(transport);
+    try {
+      const result = await adapter.send(subject, session.gate('turn', 0), { window: 10_000 });
+      expect(result.kind).toBe('response');
+      const accounting = result.kind === 'response' ? result.accounting : undefined;
+      // prompt_tokens ALREADY includes the cached subset: 100 + 5, never 175.
+      expect(accounting).toEqual({
+        headerDigest: headerDigest(subject),
+        surfacePriceAtSample: priceWire(subject)
+          + priceMessage({ role: 'assistant', content: 'hello', tool_calls: [] }),
+        usage: {
+          promptTokens: 100, completionTokens: 5, totalTokens: 105, cachedTokens: 70,
+        },
+      });
+      // The SAME triple journals on the assistant record: the anchor's input is
+      // durable, and no retired request/usage event returns.
+      const durable = await events();
+      const record = ofType(durable, 'assistant/message')[0]!.data as unknown as {
+        accounting?: unknown;
+      };
+      expect(record.accounting).toEqual(accounting);
+      expect(durable.some((event) => event.type === 'request/usage')).toBe(false);
+      expect(C13_EVENT_TYPES.has('request/usage')).toBe(false);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it.each<readonly [string, unknown, { totalTokens: number; cachedTokens: number | null } | null]>([
+    ['a string field', { prompt_tokens: '100', completion_tokens: 5 }, null],
+    ['a fractional field', { prompt_tokens: 100.5, completion_tokens: 5 }, null],
+    ['a negative field', { prompt_tokens: -1, completion_tokens: 5 }, null],
+    ['a missing prompt', { completion_tokens: 5 }, null],
+    ['a non-object usage', 7, null],
+    ['a malformed detail flattens the detail only',
+      { prompt_tokens: 10, completion_tokens: 5, prompt_tokens_details: 'x' },
+      { totalTokens: 15, cachedTokens: null }],
+    ['a cached subset above the prompt flattens the detail only',
+      { prompt_tokens: 10, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 50 } },
+      { totalTokens: 15, cachedTokens: null }],
+  ])('flattens a malformed usage to absent: %s', async (_name, usage, expected) => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult(validBody({ usage }))]);
+    const adapter = await adapterWith(transport);
+    try {
+      const result = await adapter.send(plan(), session.gate('turn', 0));
+      // A bad usage must never break a turn: the response succeeds either way.
+      expect(result.kind).toBe('response');
+      const accounting = result.kind === 'response' ? result.accounting : undefined;
+      if (expected === null) {
+        expect(accounting).toBeUndefined();
+      } else {
+        expect(accounting?.usage.totalTokens).toBe(expected.totalTokens);
+        expect(accounting?.usage.cachedTokens).toBe(expected.cachedTokens);
+      }
+      expect(ofType(await events(), 'assistant/message')).toHaveLength(1);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('journals no accounting for a usage-less response: the old record replays untouched', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult(validBody())]);
+    const adapter = await adapterWith(transport);
+    try {
+      const result = await adapter.send(plan(), session.gate('turn', 0));
+      expect(result.kind).toBe('response');
+      expect(result.kind === 'response' ? result.accounting : null).toBeUndefined();
+      const durable = await events();
+      const record = ofType(durable, 'assistant/message')[0]!.data as unknown as {
+        accounting?: unknown;
+      };
+      // The field is absent, never null and never a zero triple: an absent field
+      // reads as absent on every replay (the fold's own re-derivation row lives
+      // beside the loop harness, where a turn is open).
+      expect('accounting' in record).toBe(false);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('grew exactly ONE key on assistant/message: the accounting; any other is refused', async () => {
+    const session = await openSession();
+    try {
+      const gate = session.gate('turn', 0);
+      const projection = {
+        message: { role: 'assistant' as const, content: 'hello', tool_calls: [] },
+        contentTruncated: false, frontierCall: 'call-1',
+      };
+      expect(() => gate.append('assistant/message', {
+        id: { turn: 0, ordinal: 0 },
+        value: { kind: 'inline', value: projection },
+        usage: { promptTokens: 1 },
+      } as never)).toThrow(/unexpected key/);
+      // The one accepted companion is the accounting triple, and its shape is
+      // validated whole.
+      expect(() => gate.append('assistant/message', {
+        id: { turn: 0, ordinal: 0 },
+        value: { kind: 'inline', value: projection },
+        accounting: { headerDigest: 'not-a-hash', surfacePriceAtSample: 1, usage: {} },
+      } as never)).toThrow(/accounting\.headerDigest/);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('flattens a usage above the declared window (a misreport, never adopted)', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult(validBody({
+      usage: { prompt_tokens: 9_000, completion_tokens: 2_000 },
+    }))]);
+    const adapter = await adapterWith(transport);
+    try {
+      const result = await adapter.send(plan(), session.gate('turn', 0), { window: 10_000 });
+      expect(result.kind).toBe('response');
+      expect(result.kind === 'response' ? result.accounting : null).toBeUndefined();
+      // The very same body under a wider window is adopted: the bound is the
+      // declared window, not the body.
+      const wider = new ScriptedTransport([transportResult(validBody({
+        usage: { prompt_tokens: 9_000, completion_tokens: 2_000 },
+      }))]);
+      const second = await adapterWith(wider);
+      const adopted = await second.send(plan(), session.gate('turn', 0), { window: 20_000 });
+      expect(adopted.kind === 'response' ? adopted.accounting?.usage.totalTokens : null)
+        .toBe(11_000);
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+describe('ProviderAdapter: the context-window refusal (the overflow slice)', () => {
+  const windowBody = (code: string): string => JSON.stringify({
+    error: {
+      message: 'This model\'s maximum context length is 10000 tokens.',
+      type: 'invalid_request_error', code,
+    },
+  });
+
+  it('classifies the structured refusal as the typed local code, terminal `http`, no retry', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([
+      transportResult(windowBody('context_length_exceeded'), 400),
+    ]);
+    const adapter = await adapterWith(transport);
+    try {
+      const result = await adapter.send(plan(), session.gate('turn', 0));
+      expect(result).toEqual({
+        kind: 'failure', failure: { code: 'context-exceeded', status: 400 },
+      });
+      // Non-retryable: exactly one exchange, its terminal the frozen `http`.
+      expect(transport.sends).toBe(1);
+      const { requests, responses } = await frontierRecords();
+      expect(requests).toHaveLength(1);
+      expect(responses).toHaveLength(1);
+      expect(responses[0]!.status).toBe(400);
+      expect(responses[0]!.error).toEqual({ code: 'http' });
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('never classifies an unrelated 400 (message text alone is not the signal)', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([
+      transportResult(windowBody('model_not_found'), 400),
+    ]);
+    const adapter = await adapterWith(transport);
+    try {
+      const result = await adapter.send(plan(), session.gate('turn', 0));
+      expect(result).toEqual({ kind: 'failure', failure: { code: 'http', status: 400 } });
+      const { responses } = await frontierRecords();
+      expect(responses[0]!.error).toEqual({ code: 'http' });
+    } finally {
+      await session.shutdown();
     }
   });
 });

@@ -122,7 +122,7 @@ describe('assemble: prefix and stable sections', () => {
     // No catalog, no block: today's plan, byte for byte.
     expect(absent.substrate).toBeUndefined();
 
-    const models = ['served-a', 'served-b'];
+    const models = [{ id: 'served-a' }, { id: 'served-b' }];
     const present = assemble({ id: ID, state: makeState(), models });
     expect(present.substrate)
       .toBe('The substrate this kernel serves — models: served-a, served-b');
@@ -143,7 +143,7 @@ describe('assemble: prefix and stable sections', () => {
       { name: 'history', cache: 'advance' },
       { name: 'queue', cache: 'volatile' },
     ]);
-    const declared = assemble({ id: ID, state: makeState(), models: ['served-a'] });
+    const declared = assemble({ id: ID, state: makeState(), models: [{ id: 'served-a' }] });
     expect(declared.sections.map((s) => ({ name: s.name, cache: s.cache }))).toEqual([
       { name: 'tools', cache: 'stable' },
       { name: 'charter', cache: 'stable' },
@@ -160,7 +160,7 @@ describe('assemble: prefix and stable sections', () => {
 describe('assemble: the substrate block is a host fact, never journaled state', () => {
   it('leaves the state hash untouched and never rides the charter or heading', () => {
     const absent = assemble({ id: ID, state: makeState() });
-    const present = assemble({ id: ID, state: makeState(), models: ['catalog-id'] });
+    const present = assemble({ id: ID, state: makeState(), models: [{ id: 'catalog-id' }] });
     expect(present.stateHash).toBe(absent.stateHash);
     expect(present.config).toEqual(absent.config);
     expect(present.charter).not.toContain('catalog-id');

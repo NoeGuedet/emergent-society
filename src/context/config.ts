@@ -1,8 +1,9 @@
 import type { JsonValue } from '../journal/index.js';
 import { canonicalBytes, toJson } from './artifacts.js';
+import { DEFAULT_TOKEN_TRIGGER } from './meter.js';
 import { validateProviderParameters } from './parameters.js';
 import { createValidator } from './validate.js';
-import type { AgentConfig, SeedPolicy, ToolSchema } from './contracts.js';
+import type { AgentConfig, SeedPolicy, TokenTriggerPolicy, ToolSchema } from './contracts.js';
 
 /**
  * The default, fully-expanded agent configuration (kernel.md §4, §1.4).
@@ -105,6 +106,7 @@ export function defaultAgentConfig(): AgentConfig {
       maxDiffBytes: 32768, maxCommits: 4096, maxAssistantBytes: 32768,
       maxToolResultBytes: 65536, maxToolArgumentBytes: 262144, maxCallsPerResponse: 32,
       wakeBudgetPerHour: DEFAULT_WAKE_BUDGET_PER_HOUR,
+      compactAfterTokens: DEFAULT_TOKEN_TRIGGER,
     },
   }) as unknown as AgentConfig;
 }
@@ -149,10 +151,44 @@ const POLICY_KEYS = [
   'requestTimeoutMs', 'shellTimeoutMs', 'killGraceMs', 'maxCaptureBytes', 'maxRequestBytes',
   'maxShellCaptureBytes', 'maxDiffBytes', 'maxCommits', 'maxAssistantBytes',
   'maxToolResultBytes', 'maxToolArgumentBytes', 'maxCallsPerResponse', 'wakeBudgetPerHour',
+  'compactAfterTokens',
 ] as const;
 
-/** The policy keys a config journaled before the timer may legitimately omit. */
-const OPTIONAL_POLICY_KEYS: ReadonlySet<string> = new Set(['wakeBudgetPerHour']);
+/**
+ * The policy keys a journaled config may legitimately omit: the timer's budget
+ * (a pre-timer cell) and the token trigger (a pre-token cell). Both absent keys
+ * read as their documented defaults, never as a rewrite.
+ */
+const OPTIONAL_POLICY_KEYS: ReadonlySet<string> = new Set([
+  'wakeBudgetPerHour', 'compactAfterTokens',
+]);
+
+/**
+ * The token trigger's journaled rule (A4): the ratio and the headroom clamp, in
+ * permille and integer tokens — no float ever enters a journal. The window
+ * itself is NOT a policy value: it is the operator's host fact, re-resolved at
+ * each request from the declared catalog.
+ */
+function tokenTrigger(value: unknown, where: string): TokenTriggerPolicy {
+  const o = record(value, where);
+  onlyKeys(o, ['ratioPermille', 'headroom'], where);
+  const headroom = record(o['headroom'], `${where}.headroom`);
+  onlyKeys(headroom, ['ratioPermille', 'minTokens', 'maxTokens'], `${where}.headroom`);
+  const minTokens = safeInt(headroom['minTokens'], `${where}.headroom.minTokens`, 0);
+  const maxTokens = safeInt(headroom['maxTokens'], `${where}.headroom.maxTokens`, 0);
+  if (minTokens > maxTokens) {
+    fail(`${where}.headroom.minTokens: expected a value at or below maxTokens`);
+  }
+  return {
+    ratioPermille: safeInt(o['ratioPermille'], `${where}.ratioPermille`, 1, 1000),
+    headroom: {
+      ratioPermille: safeInt(
+        headroom['ratioPermille'], `${where}.headroom.ratioPermille`, 0, 1000),
+      minTokens,
+      maxTokens,
+    },
+  };
+}
 
 export function validateSeedPolicy(value: unknown, where = 'policy'): SeedPolicy {
   const o = record(value, where);
@@ -183,6 +219,9 @@ export function validateSeedPolicy(value: unknown, where = 'policy'): SeedPolicy
     maxCallsPerResponse: safeInt(o['maxCallsPerResponse'], 'policy.maxCallsPerResponse', 1, 32),
     ...(o['wakeBudgetPerHour'] !== undefined
       ? { wakeBudgetPerHour: safeInt(o['wakeBudgetPerHour'], 'policy.wakeBudgetPerHour', 0, 1000) }
+      : {}),
+    ...(o['compactAfterTokens'] !== undefined
+      ? { compactAfterTokens: tokenTrigger(o['compactAfterTokens'], 'policy.compactAfterTokens') }
       : {}),
   };
 }

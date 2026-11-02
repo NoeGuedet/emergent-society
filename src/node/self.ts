@@ -1,5 +1,5 @@
 import { validateAgentConfig } from '../context/config.js';
-import type { AgentConfig } from '../context/contracts.js';
+import type { AgentConfig, LlmModel } from '../context/contracts.js';
 import { composerOf, identitySentence, stripAuthoredIdentity } from './identity.js';
 import { IdentityBudgetError, assertSendableIdentity } from './identity-budget.js';
 
@@ -89,7 +89,7 @@ export function renewedIdentityConfig(
  * The budget check runs at renew, **before** the executor journals anything.
  */
 export function createSelfPort(
-  current: () => AgentConfig | null, uid: string, models?: readonly string[],
+  current: () => AgentConfig | null, uid: string, models?: readonly LlmModel[],
 ): SelfPort {
   return {
     renew: (update) => {

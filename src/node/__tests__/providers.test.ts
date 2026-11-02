@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  MAX_MODEL_ID_CHARS, MAX_MODEL_IDS, MODEL_REFUSAL_CODE_POINTS, loadProviders, modelRefusal,
+  MAX_MODEL_ID_CHARS, MAX_MODEL_IDS, MODEL_REFUSAL_CODE_POINTS, loadProviders, modelIds,
+  modelRefusal, windowForModel, windowOf, windowRefusal,
 } from '../tools/providers.js';
 import { singleLine } from '../../text.js';
 
@@ -182,10 +183,11 @@ describe('loadProviders', () => {
 describe('the declared model catalog (llm.models)', () => {
   const ENDPOINT = 'https://api.example.test/v1/chat/completions';
 
-  it('carries the ids through in declaration order, deep-frozen', async () => {
+  it('carries the entries through in declaration order, deep-frozen', async () => {
     await write({ llm: { key: 'k', endpoint: ENDPOINT, models: ['vendor/model-a', 'model-b:free'] } });
     const registry = await loadProviders(home);
-    expect(registry.llm?.models).toEqual(['vendor/model-a', 'model-b:free']);
+    // The old ids-only form normalizes into the one entry shape, with no window.
+    expect(registry.llm?.models).toEqual([{ id: 'vendor/model-a' }, { id: 'model-b:free' }]);
     expect(Object.isFrozen(registry.llm?.models)).toBe(true);
     // The endpoint and key still load exactly as before the manifest existed.
     expect(registry.llm?.key).toBe('k');
@@ -204,13 +206,13 @@ describe('the declared model catalog (llm.models)', () => {
     await write({ llm: { key: 'k', endpoint: ENDPOINT, models: ids } });
     const registry = await loadProviders(home);
     expect(registry.llm?.models).toHaveLength(MAX_MODEL_IDS);
-    for (const id of ids) expect(registry.llm?.models).toContain(id);
+    for (const id of ids) expect(registry.llm?.models).toContainEqual({ id });
   });
 
   it('accepts printable ASCII and refuses every other class, by position and value-free', async () => {
     for (const value of ['a b', 'A-Z0-9._:/@-', 'x!y']) {
       await write({ llm: { key: 'k', endpoint: ENDPOINT, models: [value] } });
-      await expect(loadProviders(home)).resolves.toMatchObject({ llm: { models: [value] } });
+      await expect(loadProviders(home)).resolves.toMatchObject({ llm: { models: [{ id: value }] } });
     }
     const refused = ['a\nb', 'a\tb', 'a\u0000b', 'a\u001fb', 'a\u007fb', 'a€b', 'a\u0085b'];
     for (const value of refused) {
@@ -235,6 +237,88 @@ describe('the declared model catalog (llm.models)', () => {
     const err = await loadProviders(home).catch((e: unknown) => e);
     expect(String(err)).toMatch(/llm\.models\[2\]: repeats an earlier model id/);
     expect(String(err)).not.toContain('dup-SECRET-id');
+  });
+});
+
+describe('the window shapes and the declaration\'s domain (A3)', () => {
+  const ENDPOINT = 'https://api.example.test/v1/chat/completions';
+  const withModels = (models: unknown): unknown => ({ llm: { key: 'k', endpoint: ENDPOINT, models } });
+
+  it('accepts BOTH shapes at load: the old ids-only form and the new windowed object', async () => {
+    await write(withModels([
+      'vendor/legacy-model',
+      { id: 'windowed-model', contextTokens: 200_000, maxOutputTokens: 32_000 },
+    ]));
+    const registry = await loadProviders(home);
+    expect(registry.llm?.models).toEqual([
+      { id: 'vendor/legacy-model' },
+      { id: 'windowed-model', contextTokens: 200_000, maxOutputTokens: 32_000 },
+    ]);
+    expect(modelIds(registry.llm!.models!)).toEqual(['vendor/legacy-model', 'windowed-model']);
+    // The transition (ids-only) entry declares no window; the object one does.
+    expect(windowForModel(registry.llm!.models!, 'vendor/legacy-model')).toBeNull();
+    expect(windowForModel(registry.llm!.models!, 'windowed-model')).toEqual({
+      contextTokens: 200_000, maxOutputTokens: 32_000,
+    });
+    expect(windowForModel(undefined, 'windowed-model')).toBeNull();
+    expect(windowOf({ id: 'x' })).toBeNull();
+  });
+
+  it('requires the window fields together, by position and value-free', async () => {
+    for (const [entry, pattern] of [
+      [{ id: 'SECRET-half-context', contextTokens: 200_000 },
+        /llm\.models\[0\]: contextTokens and maxOutputTokens must be declared together/],
+      [{ id: 'SECRET-half-output', maxOutputTokens: 1_000 },
+        /llm\.models\[0\]: contextTokens and maxOutputTokens must be declared together/],
+    ] as const) {
+      await write(withModels([entry]));
+      const err = await loadProviders(home).catch((error: unknown) => error);
+      expect(String(err)).toMatch(pattern);
+      expect(String(err)).not.toContain('SECRET-half');
+    }
+  });
+
+  it.each<readonly [string, unknown, RegExp]>([
+    ['a non-integer window', { id: 'm', contextTokens: 1.5, maxOutputTokens: 1 },
+      /llm\.models\[0\]\.contextTokens: expected a safe integer in \[1, \d+\]/],
+    ['a zero window', { id: 'm', contextTokens: 0, maxOutputTokens: 1 },
+      /llm\.models\[0\]\.contextTokens: expected a safe integer in \[1, \d+\]/],
+    ['an oversize window', { id: 'm', contextTokens: 4_194_305, maxOutputTokens: 1 },
+      /llm\.models\[0\]\.contextTokens: expected a safe integer in \[1, \d+\]/],
+    ['an oversize output', { id: 'm', contextTokens: 200_000, maxOutputTokens: 4_194_305 },
+      /llm\.models\[0\]\.maxOutputTokens: expected a safe integer in \[1, \d+\]/],
+    ['an output at the window', { id: 'm', contextTokens: 200_000, maxOutputTokens: 200_000 },
+      /llm\.models\[0\]\.maxOutputTokens: expected a value below contextTokens/],
+    ['a degenerate window', { id: 'm', contextTokens: 32_000, maxOutputTokens: 20_000 },
+      /llm\.models\[0\]\.contextTokens: too small for the output reservation and the headroom/],
+    ['a missing id', { contextTokens: 200_000, maxOutputTokens: 32_000 },
+      /llm\.models\[0\]\.id: expected a string/],
+    ['an unknown field', { id: 'm', contextTokens: 200_000, maxOutputTokens: 32_000, window: 1 },
+      /llm\.models\[0\]: unexpected field at position 4/],
+    ['a non-entry value', 7, /llm\.models\[0\]: expected a model id or an \{id, contextTokens, maxOutputTokens\} object/],
+  ])('refuses %s', async (_name, entry, pattern) => {
+    await write(withModels([entry]));
+    const err = await loadProviders(home).catch((error: unknown) => error);
+    expect(String(err)).toMatch(pattern);
+    expect(String(err)).not.toContain(JSON.stringify(entry));
+  });
+
+  it('refuses a duplicate id across the two shapes', async () => {
+    await write(withModels(['dup-model', { id: 'dup-model', contextTokens: 200_000, maxOutputTokens: 32_000 }]));
+    const err = await loadProviders(home).catch((error: unknown) => error);
+    expect(String(err)).toMatch(/llm\.models\[1\]: repeats an earlier model id/);
+    expect(String(err)).not.toContain('dup-model');
+  });
+
+  it('windowRefusal is bounded and names the declaration to add', () => {
+    const message = windowRefusal('some-model');
+    expect(message).toContain('has no declared context window');
+    expect(message).toContain('{id, contextTokens, maxOutputTokens}');
+    expect([...message].length).toBeLessThanOrEqual(MODEL_REFUSAL_CODE_POINTS);
+    // The echoed id is clamped like every refusal's: an unbounded tool argument
+    // cannot inflate the message.
+    expect([...windowRefusal('x'.repeat(10_000))].length)
+      .toBeLessThanOrEqual(MODEL_REFUSAL_CODE_POINTS);
   });
 });
 

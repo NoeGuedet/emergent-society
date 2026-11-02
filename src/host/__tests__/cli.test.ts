@@ -80,6 +80,9 @@ it('chat exits 1 for a degraded history (the status precedent)', async () => {
 it('runCli init prints the providers path/schema hint and never creates providers.json', async () => {
   expect(await runCli(['init', '--home', home], deps)).toBe(0);
   expect(stdout.join('')).toMatch(/initialized/);
+  // init's hint shows the DECLARED-WINDOW shape (the operator's hand migration).
+  expect(stdout.join('')).toContain(
+    '"models": [{ "id": "…", "contextTokens": 200000, "maxOutputTokens": 32000 }]');
   expect(stdout.join('')).toContain(home);
   expect(stdout.join('')).toContain(join(home, 'providers.json'));
   await expect(access(join(home, 'providers.json'))).rejects.toThrow();

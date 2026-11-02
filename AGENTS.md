@@ -143,6 +143,13 @@ stopping.
 - `providers.json` must be a regular file, mode `0600` (0400 accepted; group/other bits
   refused), owned by the same UID as the process. The API key is never placed on argv, in
   env, in logs, in the journal, or in the world.
+- The `llm.models` catalog accepts both the old ids-only form and the object form
+  `{id, contextTokens, maxOutputTokens}` with BOTH window fields declared together; the
+  window's domain is validated at load (`maxOutputTokens < contextTokens`, the caps, no
+  degenerate window). A fresh `start` on a served model whose entry declares no window is
+  refused (the operator declares it); an absent catalog keeps the free-string contract,
+  and `resume` never re-validates. The window is a host fact: it selects the token
+  trigger's threshold and never rides the wire, so the substrate block stays ids-only.
 - Frontier journal format v0 is frozen: never modify the envelope or event schema.
 - Secrets are never journaled.
 - Tests are never deleted or weakened; the suite only grows.

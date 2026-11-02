@@ -90,7 +90,8 @@ async function runInit(home: string, out: Sink, err: Sink): Promise<number> {
     out(`${created ? 'initialized' : 'already initialized'} ${home}\n`);
     out(
       `write ${join(home, 'providers.json')} (mode 0600) with `
-      + '{ "llm": { "key": "…", "endpoint": "https://…/v1/chat/completions" } }\n',
+      + '{ "llm": { "key": "…", "endpoint": "https://…/v1/chat/completions",'
+      + ' "models": [{ "id": "…", "contextTokens": 200000, "maxOutputTokens": 32000 }] } }\n',
     );
     return 0;
   } catch (error) {

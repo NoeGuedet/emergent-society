@@ -1,6 +1,7 @@
 import type { Stats } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { LlmModel } from '../context/contracts.js';
 import { loadProviders, type ProviderRegistry } from '../node/tools/providers.js';
 import { HostConfigError } from './errors.js';
 
@@ -28,8 +29,8 @@ import { HostConfigError } from './errors.js';
  * yields the one credential literal the frontier journals: `'llm'`. The
  * optional `llm.models` catalog rides through that credential unchanged: it is
  * the operator's declaration, not a secret, and the host hands it to the
- * runtime (the substrate block), the extend port (inspect) and the pool (spawn
- * validation) from this one value.
+ * runtime (the substrate block's ids and the token trigger's window), the
+ * extend port (inspect) and the pool (spawn validation) from this one value.
  */
 
 /** The model endpoint and key, under the credential id the frontier journals. */
@@ -37,10 +38,12 @@ export type LlmCredential = {
   readonly endpoint: string; readonly key: string; readonly credentialId: 'llm';
   /**
    * The operator-declared served-model catalog, carried through from the
-   * store's `llm.models` (ids only — never a secret). Absent means the store
-   * declares none: no substrate block, no validation, today's behavior.
+   * store's `llm.models` (ids with an optional declared window — never a
+   * secret). Absent means the store declares none: no substrate block, no
+   * validation, no token trigger (today's behavior). The window is a host fact:
+   * the runtime resolves it per request and it never rides the wire.
    */
-  readonly models?: readonly string[];
+  readonly models?: readonly LlmModel[];
 };
 
 const PROVIDERS_BASENAME = 'providers.json';

@@ -2,7 +2,8 @@ import { sha256HexOf } from '../journal/index.js';
 import { canonicalBytes, toJson } from './artifacts.js';
 import { sortUnique } from './groups.js';
 import type {
-  ChatMessage, PlanSection, ProjectionState, RequestId, RequestPlan, Source, ToolSchema,
+  ChatMessage, LlmModel, PlanSection, ProjectionState, RequestId, RequestPlan, Source,
+  ToolSchema,
 } from './contracts.js';
 
 /**
@@ -33,12 +34,13 @@ export type AssembleInput = {
   readonly direction?: { readonly text: string; readonly source: Source };
   /**
    * The operator-declared served-model catalog, handed in by the runtime from
-   * its own host fact. Presentation only: it rides the plan's substrate block
-   * as the third kernel-owned system message, never inside the charter or
-   * heading text, and it never enters `stateHash` (which covers the journaled
-   * state alone). Absent means no catalog: no block, today's plan.
+   * its own host fact. Presentation only: the plan's substrate block renders the
+   * declared IDS (the window never rides the wire — A3), it is the third
+   * kernel-owned system message, never inside the charter or heading text, and
+   * it never enters `stateHash` (which covers the journaled state alone). Absent
+   * means no catalog: no block, today's plan.
    */
-  readonly models?: readonly string[];
+  readonly models?: readonly LlmModel[];
   /**
    * The kernel's pending conversation notice, rendered as a SYSTEM message in
    * the VOLATILE queue — after the breakpoint, never before it. It is host
@@ -63,9 +65,9 @@ const SUBSTRATE_PREFIX = 'The substrate this kernel serves — models: ';
  * declaration rather than a dangling list. Exported so the identity budget
  * measures the exact block the plan carries instead of a restated sentence.
  */
-export function substrateText(models: readonly string[]): string {
+export function substrateText(models: readonly LlmModel[]): string {
   return `${SUBSTRATE_PREFIX}${models.length === 0
-    ? '(none declared)' : models.join(', ')}`;
+    ? '(none declared)' : models.map((model) => model.id).join(', ')}`;
 }
 
 function refuse(message: string): never {

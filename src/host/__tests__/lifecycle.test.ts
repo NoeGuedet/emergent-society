@@ -5,11 +5,13 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { canonicalBytes } from '../../context/artifacts.js';
 import { assemble } from '../../context/assembler.js';
 import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
-import type { AgentConfig, ChatMessage, RequestPlan } from '../../context/contracts.js';
+import type {
+  AgentConfig, ChatMessage, LlmModel, RequestPlan,
+} from '../../context/contracts.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { ContextFold } from '../../context/fold.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
@@ -24,7 +26,7 @@ import {
   serveJson, type LoopServer, type RecordedRequest,
 } from '../../node/__tests__/helpers.js';
 import { MAX_CAPTURE_BYTES } from '../../node/gate.js';
-import { modelRefusal } from '../../node/tools/providers.js';
+import { modelRefusal, windowRefusal } from '../../node/tools/providers.js';
 import {
   ESCAPE_FACTOR, IDENTITY_FLOOR, PLAN_MARGIN, assertSendableIdentity, effectiveCeiling,
   identityBudget, identityBytes, reserve,
@@ -82,7 +84,7 @@ let log: HostLog;
 let opts: HostOptions;
 let server: LoopServer | null = null;
 /** The catalog the current case's store declares (undefined = none). */
-let servedModels: readonly string[] | undefined;
+let servedModels: readonly LlmModel[] | undefined;
 
 /**
  * A fresh cell per case. The world pair is initialized here because `start`
@@ -120,9 +122,20 @@ function track(handle: HostHandle): HostHandle {
   return handle;
 }
 
+/**
+ * A windowed declaration — the fresh-start boot rule (A3) needs one for any
+ * model a START names. The 200k/32k pair is the plan's own 76% arm.
+ */
+const windowed = (...modelIds: readonly string[]): readonly LlmModel[] =>
+  modelIds.map((id) => ({ id, contextTokens: 200_000, maxOutputTokens: 32_000 }));
+
+/** The ids-only transition shape: fine where no START reaches the entry. */
+const idsOnly = (...modelIds: readonly string[]): readonly LlmModel[] =>
+  modelIds.map((id) => ({ id }));
+
 /** Starts this case's loopback provider and writes the 0600 credential store. */
 async function serve(
-  respond: Responder = () => idleReply, models?: readonly string[],
+  respond: Responder = () => idleReply, models?: readonly LlmModel[],
 ): Promise<LoopServer> {
   const started = await serveJson(respond);
   server = started;
@@ -178,6 +191,19 @@ async function readC13(target: string, uid: string): Promise<EventEnvelope[]> {
   const events: EventEnvelope[] = [];
   for await (const event of reader.events()) events.push(event);
   return events;
+}
+
+/** The first journaled configuration of a node, resolved from its inline payload. */
+function firstConfig(events: readonly EventEnvelope[]): AgentConfig {
+  const event = events.find((candidate) => candidate.type === 'system/message');
+  if (event === undefined) throw new Error('no journaled configuration');
+  const stored = (event.data as unknown as {
+    value: { kind: string; value?: AgentConfig };
+  }).value;
+  if (stored.kind !== 'inline' || stored.value === undefined) {
+    throw new Error('the fixture configuration is not inline');
+  }
+  return stored.value;
 }
 
 async function frontierEvents(target: string): Promise<EventEnvelope[]> {
@@ -255,8 +281,15 @@ async function seedBootOnly(target: string): Promise<void> {
 
 /** The model the boundary fixture's store declares and its config names. */
 const BOUNDARY_MODEL = 'boundary-model';
-/** The declared catalog, so the reserve's substrate term is real. */
-const BOUNDARY_CATALOG = [BOUNDARY_MODEL] as const;
+/**
+ * The declared catalog, so the reserve's substrate term is real — and a WINDOWED
+ * entry, because a fresh START on a windowless declaration is refused (A3). The
+ * boundary fixture's own journaled policy deliberately lacks the token key (it
+ * measures the BYTE reserve, the identity budget's own premise).
+ */
+const BOUNDARY_CATALOG: readonly LlmModel[] = [
+  { id: BOUNDARY_MODEL, contextTokens: 200000, maxOutputTokens: 32000 },
+];
 /** Headroom between the fixture identity and the derived budget (over the actual O). */
 const BOUNDARY_HEADROOM = 128 * 1024;
 /** A C0 control character: JSON-escaped as a six-byte \u00XX — the true 6× case. */
@@ -286,12 +319,17 @@ function shrunkBoundaryConfig(
   patch: Partial<AgentConfig['policy']>, identityFill: number,
 ): { readonly config: AgentConfig; readonly ceiling: number } {
   const base = defaultAgentConfig();
+  // The fixture holds the BYTE trigger: its premise is the byte-keyed reserve,
+  // and a token-triggered cell is different memory physics (the identity-budget
+  // note states the under-reserve). Dropping the optional token key is the
+  // legitimate pre-wave cell shape.
+  const { compactAfterTokens: _tokens, ...bytePolicy } = base.policy;
   const compose = (maxRequestBytes: number): AgentConfig => validateAgentConfig({
     ...base,
     model: BOUNDARY_MODEL,
     heading: 'Boundary seed.',
     charter: 'c'.repeat(identityFill) + ' You are node-0.',
-    policy: { ...base.policy, ...patch, maxRequestBytes },
+    policy: { ...bytePolicy, ...patch, maxRequestBytes },
   });
   const probe = compose(1 * 1024 * 1024);
   const ceiling = reserve(probe, BOUNDARY_CATALOG) + identityBytes(probe) + BOUNDARY_HEADROOM;
@@ -517,6 +555,147 @@ async function runHostOnce(command: 'start' | 'resume', setup: HostOnceSetup = {
   return await handle.done;
 }
 
+describe('the declared context window: the boot rule and the migration (A3)', () => {
+  it('refuses a fresh START on a catalog entry that declares no window', async () => {
+    await serve(undefined, idsOnly('first-light-test'));
+    expect(await runHostOnce('start', { expectRefusal: true })).toBe(2);
+    const error = logged(log).find((entry) => entry['event'] === 'host/error');
+    expect(error).toMatchObject({ error: 'HostConfigError' });
+    // The bounded teaching refusal names the declaration to add.
+    expect(String(error?.['message'])).toBe(windowRefusal('first-light-test'));
+    expect(logged(log).some((entry) => entry['event'] === 'host/boot')).toBe(false);
+  }, 20_000);
+
+  it('boots BOTH catalog shapes: the windowed entry starts, the ids-only sibling refuses', async () => {
+    await serve(undefined, [
+      { id: 'first-light-test', contextTokens: 200_000, maxOutputTokens: 32_000 },
+      { id: 'legacy-model' },
+    ]);
+    expect(await runHostOnce('start', {})).toBe(0);
+    // The fresh cell's journaled policy carries the factory token trigger...
+    const config = firstConfig(await readC13(home, 'node-0'));
+    expect(config.policy.compactAfterTokens)
+      .toEqual(defaultAgentConfig().policy.compactAfterTokens);
+    // ...and the substrate block still renders IDS ONLY: the window never rides
+    // the wire, so the cached prefix does not grow.
+    const body = JSON.parse(server!.requests[0]!.body.toString('utf8')) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(body.messages[2]).toEqual({
+      role: 'system',
+      content: 'The substrate this kernel serves — models: first-light-test, legacy-model',
+    });
+    expect(JSON.stringify(body)).not.toContain('contextTokens');
+    // The ids-only sibling is served but windowless: a fresh START refuses it.
+    await resetHome();
+    expect(await runHostOnce('start', { fresh: true, model: 'legacy-model' })).toBe(2);
+    const error = logged(log).find((entry) => entry['event'] === 'host/error');
+    expect(String(error?.['message'])).toBe(windowRefusal('legacy-model'));
+  }, 40_000);
+
+  it('resumes a pre-wave cell on the byte trigger: the journaled config wins, no re-validation', async () => {
+    const { compactAfterTokens: _tokens, ...preWavePolicy } = defaultAgentConfig().policy;
+    const preWave = validateAgentConfig({
+      ...defaultAgentConfig(), model: 'first-light-test', heading: 'First light.',
+      policy: preWavePolicy,
+    });
+    // A windowed catalog cannot save or damn the resume: it is never consulted.
+    await serve(undefined, windowed('first-light-test'));
+    await seedConfig(preWave);
+    const { model: _model, heading: _heading, ...resumeOpts } = opts;
+    const resumed = track(startHost({ ...resumeOpts, command: 'resume' }, hostDeps));
+    await waitForLog(log, 'host/parked');
+    resumed.stop();
+    expect(await resumed.done).toBe(0);
+    // The journaled pre-wave policy is intact — no key written, no version bump.
+    expect(firstConfig(await readC13(home, 'node-0')).policy.compactAfterTokens).toBeUndefined();
+    // And the windowless FALLBACK never fires: the cell lacks the key, which is
+    // the old cell's legitimate forever path (no diagnostic).
+    expect(logged(log).some((entry) => entry['event'] === 'host/meter-fallback')).toBe(false);
+    expect(server!.requests.length).toBeGreaterThan(0);
+  }, 30_000);
+
+  it('plumbs a two-model store (1M/200k) to each fresh cell', async () => {
+    await serve(undefined, [
+      { id: 'model-1m', contextTokens: 1_000_000, maxOutputTokens: 256_000 },
+      { id: 'model-200k', contextTokens: 200_000, maxOutputTokens: 32_000 },
+    ]);
+    expect(await runHostOnce('start', { model: 'model-1m' })).toBe(0);
+    const first = firstConfig(await readC13(home, 'node-0'));
+    expect(first.model).toBe('model-1m');
+    expect(first.policy.compactAfterTokens).toEqual(defaultAgentConfig().policy.compactAfterTokens);
+    // A fresh cell on the second model: the same journaled rule, a different
+    // resolved window (a host fact, never journaled in the config).
+    await resetHome();
+    expect(await runHostOnce('start', { fresh: true, model: 'model-200k' })).toBe(0);
+    const second = firstConfig(await readC13(home, 'node-0'));
+    expect(second.model).toBe('model-200k');
+    expect(second.policy.compactAfterTokens).toEqual(first.policy.compactAfterTokens);
+    expect(JSON.stringify(second)).not.toContain('200000');
+    // The windows resolved (no windowless fallback), and the substrate block
+    // carries both ids on the wire.
+    expect(logged(log).some((entry) => entry['event'] === 'host/meter-fallback')).toBe(false);
+    const body = JSON.parse(server!.requests.at(-1)!.body.toString('utf8')) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(body.messages[2]!.content)
+      .toBe('The substrate this kernel serves — models: model-1m, model-200k');
+  }, 40_000);
+
+  it('states the uncompactable escape in the bounded host diagnostic (the typed policy)', async () => {
+    await serve(undefined, windowed('first-light-test'));
+    // A journaled rule whose threshold (200 tokens on the 200k arm) sits below
+    // the bare offering: the first request fires with nothing committed.
+    const tiny = validateAgentConfig({
+      ...defaultAgentConfig(), model: 'first-light-test', heading: 'First light.',
+      policy: {
+        ...defaultAgentConfig().policy,
+        compactAfterTokens: {
+          ratioPermille: 1, headroom: { ratioPermille: 0, minTokens: 0, maxTokens: 0 },
+        },
+      },
+    });
+    await seedConfig(tiny);
+    const { model: _model, heading: _heading, ...resumeOpts } = opts;
+    const resumed = track(startHost({ ...resumeOpts, command: 'resume' }, hostDeps));
+    // The escape is diagnosed BEFORE the request is sent — "sent anyway" is the
+    // policy, so the send that follows is the proof.
+    await waitForLog(log, 'host/meter-over-window');
+    await vi.waitFor(() => { expect(server!.requests.length).toBeGreaterThan(0); },
+      { timeout: 5000 });
+    resumed.stop();
+    expect(await resumed.done).toBe(0);
+    const line = logged(log).find((entry) => entry['event'] === 'host/meter-over-window');
+    // The log line carries the typed sentence: the request is sent anyway.
+    expect(line).toMatchObject({
+      reason: 'over the window but uncompactable: sent anyway', threshold: 200,
+    });
+    expect(typeof line?.['estimate']).toBe('number');
+    // The host journals nothing for the escape: its local log carries no event
+    // for the decision (only the request's own facts).
+    const events = await readC13(home, 'node-0');
+    expect(types(events)).not.toContain('request/refused');
+    expect(events.filter((event) => event.type === 'compaction/start')).toHaveLength(0);
+  }, 30_000);
+
+  it('takes the gateway default from the first entry even when it declares no window', async () => {
+    // The overlay has no meter and no compaction (A8(h)): its default model is
+    // the first declared ID, windowed or not.
+    await serve(undefined, [
+      { id: 'gateway-windowless' },
+      { id: 'first-light-test', contextTokens: 200_000, maxOutputTokens: 32_000 },
+    ]);
+    const charter = join(home, 'charter.md');
+    await writeFile(charter, 'You are the gateway.\n', 'utf8');
+    const h = track(startHost({ ...opts, gatewayCharter: charter }, hostDeps));
+    await waitForLog(log, 'host/parked');
+    h.stop();
+    expect(await h.done).toBe(0);
+    expect(JSON.parse(await readFile(join(home, 'gateway.json'), 'utf8')))
+      .toMatchObject({ model: 'gateway-windowless' });
+  }, 30_000);
+});
+
 it('stops cleanly while parked and leaves no owner record', async () => {
   await serve();
   const h = track(startHost(opts, hostDeps));
@@ -603,7 +782,7 @@ it('refuses mock-model, a missing heading and a corrupt log with exit 2', async 
 }, 20_000);
 
 it('validates a solo start against the declared manifest, after the store loads', async () => {
-  await serve(undefined, ['served-a', 'served-b']);
+  await serve(undefined, idsOnly('served-a', 'served-b'));
   expect(await runHostOnce('start', { expectRefusal: true })).toBe(2);
   const error = logged(log).find((entry) => entry['event'] === 'host/error');
   expect(error).toMatchObject({ error: 'HostConfigError' });
@@ -618,7 +797,7 @@ it('validates a solo start against the declared manifest, after the store loads'
 }, 20_000);
 
 it('validates every nodes-file start entry against the declared manifest', async () => {
-  await serve(undefined, ['served-a']);
+  await serve(undefined, windowed('served-a'));
   const nodesFile = join(home, 'nodes.json');
   await writeFile(nodesFile, JSON.stringify([
     { uid: 'node-0', model: 'served-a', heading: 'Lead.' },
@@ -696,7 +875,7 @@ it('never re-validates a resume: the journaled config wins over a newer manifest
   // The operator then declares a catalog that does not serve the journaled
   // model. A start would be refused; the resume is admitted, and its request
   // still carries the newly declared substrate block.
-  servedModels = ['served-a'];
+  servedModels = windowed('served-a');
   await writeProviders(srv);
   const { model, heading, ...resumeOpts } = opts;
   const resumed = track(startHost({ ...resumeOpts, command: 'resume' }, hostDeps));
@@ -715,7 +894,7 @@ it('never re-validates a resume: the journaled config wins over a newer manifest
 }, 30_000);
 
 it('projects the declared models as the third kernel system block on the wire', async () => {
-  const srv = await serve(undefined, ['first-light-test', 'served-b']);
+  const srv = await serve(undefined, windowed('first-light-test', 'served-b'));
   const h = track(startHost(opts, hostDeps));
   await waitForLog(log, 'host/parked');
   h.stop();

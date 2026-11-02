@@ -44,7 +44,7 @@ it('accepts a same-uid 0600 regular file with an llm entry', async () => {
   expect('models' in cred).toBe(false);
 });
 
-it('carries the declared model catalog through the credential, ids only', async () => {
+it('carries the declared model catalog through the credential, unchanged', async () => {
   const home = await freshHome();
   const path = join(home, 'providers.json');
   await writeFile(path, JSON.stringify({
@@ -55,9 +55,10 @@ it('carries the declared model catalog through the credential, ids only', async 
   }), { mode: 0o600 });
   await chmod(path, 0o600);
   const cred = llmCredentialFrom(await loadProviderStore(home));
-  expect(cred.models).toEqual(['vendor/model-a', 'model-b:free']);
+  // The ids-only entries normalize into the one shape, with no window.
+  expect(cred.models).toEqual([{ id: 'vendor/model-a' }, { id: 'model-b:free' }]);
   // The catalog is non-secret by declaration; the key never rides it.
-  expect(cred.models).not.toContain('sentinel-llm-key');
+  expect(JSON.stringify(cred.models)).not.toContain('sentinel-llm-key');
 });
 
 it('accepts 0400 and 0600; refuses 0640, 0660 and 0644', async () => {

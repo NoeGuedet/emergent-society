@@ -5,10 +5,10 @@ import {
   type ConversationSent, type ConversationThread,
 } from '../conversation.js';
 import type { RequestId } from '../../context/contracts.js';
-import type { AgentConfig } from '../../context/contracts.js';
+import type { AgentConfig, LlmModel } from '../../context/contracts.js';
 import { canonicalizeJson } from '../../journal/index.js';
 import { boundToolText } from './text.js';
-import { modelRefusal } from './providers.js';
+import { modelIds, modelRefusal } from './providers.js';
 import { Buffer } from 'node:buffer';
 import { singleLine } from '../../text.js';
 import { PackageError } from '../packages/errors.js';
@@ -76,11 +76,13 @@ export type ExtendPort = {
   readonly history?: HistoryPort;
   /**
    * The operator-declared served-model catalog (providers.json `llm.models`),
-   * when the store declares one. inspect lists it honestly; it is the one
+   * when the store declares one. inspect lists its IDS honestly; it is the one
    * source for validating a model a verb requests (the host's pool validates
-   * `spawn` against it, the executor validates `update_self`).
+   * `spawn` against it, the executor validates `update_self`). The declared
+   * context window never appears here: it is a host fact the wire does not
+   * carry, and no verb reads it.
    */
-  readonly models?: readonly string[];
+  readonly models?: readonly LlmModel[];
   /**
    * The node's own identity rewrite (§0.7), supplied by the runtime — it reads
    * the live folded config, so the seam cannot be constructed by a caller that
@@ -425,7 +427,7 @@ function renderInspect(
       lines.push('not a routing table: the kernel does not probe these ids. A start, a'
         + ' spawn or an update_self that names a model outside the declared catalog is'
         + ' refused:');
-      for (const model of port.models) lines.push(`- ${model}`);
+      for (const model of port.models) lines.push(`- ${model.id}`);
     }
   }
   lines.push('');
@@ -744,9 +746,9 @@ export async function executeExtend(opts: {
     // catalog the model stays the free string it was; the identity budget below
     // is what keeps the catalog-less model hole closed.
     if (decision.model !== undefined && port.models !== undefined
-      && !port.models.includes(decision.model)) {
+      && !port.models.some((model) => model.id === decision.model)) {
       await appendResult(gate, id, callId,
-        `denied: ${modelRefusal(decision.model, port.models)}`, true, max);
+        `denied: ${modelRefusal(decision.model, modelIds(port.models))}`, true, max);
       return;
     }
     let next: AgentConfig;

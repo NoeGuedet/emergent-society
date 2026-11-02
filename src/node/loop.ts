@@ -10,16 +10,23 @@ import { presentWorld } from '../context/diff.js';
 import { createBoundaryRegistry } from '../context/events.js';
 import { ContextFold } from '../context/fold.js';
 import { loadVerifiedEvents } from '../context/loader.js';
+import {
+  headerDigest, meterFires, meterHeadroom, meterPercent, meterThreshold, meterTotal, priceWire,
+} from '../context/meter.js';
 import { writeSnapshot } from '../context/snapshots.js';
 import { dispatchCalls } from './tools/dispatch.js';
 import { renderConversationNotice } from './conversation.js';
 import type { ConversationNoticeSource } from './conversation-watcher.js';
 import { createSelfPort } from './self.js';
 import { readCommitPaths } from './world-paths.js';
+import { windowForModel } from './tools/providers.js';
 import type { ExtendPort } from './tools/extend.js';
 import type { RunSupervisorEvents } from './packages/supervisor.js';
 import type { ProviderAdapter } from '../provider/adapter.js';
-import type { AgentConfig, ProjectionState, RequestId } from '../context/contracts.js';
+import type {
+  AgentConfig, AssistantAccounting, LlmModel, LlmModelWindow, MeterRecord, ProjectionState,
+  RequestId, RequestPlan, TokenTriggerPolicy,
+} from '../context/contracts.js';
 import { MAX_CAPTURE_BYTES } from './gate.js';
 import type { BoundaryGate, DriverHooks, DurableWatermark } from './gate.js';
 import type { TurnContext, TurnHandler, TurnResult } from './driver.js';
@@ -100,12 +107,22 @@ export type RuntimeOptions = {
   /** Kernel-mediated web tools; when absent, offered web calls resolve as `denied`. */
   readonly webTools?: WebTools;
   /**
-   * The operator-declared served-model catalog (providers.json `llm.models`),
-   * handed to the assembler as the plan's substrate block. A host fact, not a
-   * journaled one: absent means the store declares no catalog, so no block is
-   * rendered and a node's model stays the free string it was.
+   * The operator-declared model catalog (providers.json `llm.models`): handed to
+   * the assembler for the plan's substrate block (its IDS — the window never
+   * rides the wire) and read for the current model's declared window, which
+   * drives the token trigger. A host fact, not a journaled one: absent means the
+   * store declares no catalog, so no block is rendered, no window resolves and a
+   * node's model stays the free string it was.
    */
-  readonly models?: readonly string[];
+  readonly models?: readonly LlmModel[];
+  /**
+   * One bounded, NON-JOURNALED host diagnostic (host state, never a journal
+   * fact): the token trigger's windowless fallback (once per boot — the absent
+   * catalog cell and the out-of-catalog spawn both land here) and the
+   * uncompactable-over-window escape. The host writes it to its log; the
+   * runtime journals nothing for either.
+   */
+  readonly diagnose?: (diagnostic: RuntimeDiagnostic) => void;
   /**
    * The extend port factory (C1.5): the loop owns the event router (it alone
    * knows which gate the current dispatch holds), the caller owns the
@@ -141,6 +158,55 @@ export interface AgentRuntime {
 // implementation detail of this module (the runtime validates its own config),
 // so it is imported and used, never re-exported.
 export { defaultAgentConfig };
+
+/**
+ * The uncompactable escape's typed sentence (A4): the priced request is over the
+ * threshold and no transaction can reduce it, so it is sent anyway — a stated
+ * policy, its accounting home the bounded host diagnostic (the escape branch
+ * journals nothing).
+ */
+export const UNCOMPACTABLE_OVER_WINDOW = 'over the window but uncompactable: sent anyway';
+
+/**
+ * The re-price's observed sentence: the forced compaction reduced the surface
+ * but the re-assembled request is still over the threshold, so it is sent
+ * anyway (the bounded loop never compacts twice for one logical request).
+ */
+export const AFTER_COMPACTION_OVER_WINDOW =
+  'still over the window after the forced compaction: sent anyway';
+
+/** One bounded runtime diagnostic: host state, never a journal fact. */
+export type RuntimeDiagnostic =
+  | { readonly kind: 'token-trigger-fallback' }
+  | {
+      readonly kind: 'uncompactable-over-window';
+      readonly estimate: number; readonly threshold: number;
+    }
+  | {
+      readonly kind: 'over-window-after-compaction';
+      readonly estimate: number; readonly threshold: number;
+    };
+
+/** The resolved token rule of one request: the declared window, `O`, and the journaled rule. */
+type TokenRule = {
+  readonly window: number;
+  readonly output: number;
+  readonly policy: TokenTriggerPolicy;
+};
+
+/**
+ * `O`'s exact precedence (A4): `parameters.max_tokens ?? catalog.maxOutputTokens
+ * ?? 0`. The parameters validator already bounds `max_tokens` to a positive safe
+ * integer; anything else falls through to the declaration.
+ */
+function outputReservation(
+  parameters: AgentConfig['parameters'], declaredOutput: number,
+): number {
+  const maxTokens = parameters['max_tokens'];
+  return typeof maxTokens === 'number' && Number.isSafeInteger(maxTokens) && maxTokens > 0
+    ? maxTokens
+    : declaredOutput;
+}
 
 /** Stop-time kill grace when no config was ever journaled (pre-ready stop). */
 const FALLBACK_KILL_GRACE_MS = 200;
@@ -180,6 +246,16 @@ class Runtime implements AgentRuntime {
   private liveRuntime: TerminalRuntime | null = null;
   /** The last probed status, surviving a stop; null until a probe succeeds. */
   private lastStatus: SandboxStatus | null = null;
+  /**
+   * The token meter's anchor, beside `pendingConfig` (runtime state, never
+   * journaled): the latest journaled sample — {headerDigest,
+   * surfacePriceAtSample, usage} — which the adoption rule reads at the next
+   * plan site. It is a CACHE of the fold's `lastAssistantAccounting()`: `ready`
+   * re-forms it, so a restart re-anchors exactly from the journal.
+   */
+  private anchor: AssistantAccounting | null = null;
+  /** The windowless fallback is diagnosed once per boot (the stated bound). */
+  private fallbackDiagnosed = false;
   /** Set by the driver's stop: a late run can never respawn a session. */
   private terminalStopped = false;
   private readonly terminalPort: TerminalPort;
@@ -403,6 +479,10 @@ class Runtime implements AgentRuntime {
       });
     }
     if (this.fold.orphanCompactions().length > 0) await runCompaction(this.fold, gate);
+    // The anchor re-forms from the fold (A2(ii)/A7): the latest assistant
+    // record's journaled triple is the durable source of the runtime state, so
+    // the restart claim is the journal's, not a remembered estimate.
+    this.anchor = this.fold.lastAssistantAccounting();
     await gate.flush();
   }
 
@@ -553,11 +633,74 @@ class Runtime implements AgentRuntime {
   }
 
   /**
-   * The turn's logical requests. Before each one: run a committed compaction,
-   * assemble, measure the canonical plan against the capture ceiling (refusing an
-   * oversize plan durably before any storage or send), send through the adapter,
-   * then dispatch the calls. A no-call response or an explicit wait parks; an
-   * exhausted call group chains while the quantum lasts.
+   * The declared window of the current model, from the operator's catalog. A
+   * key-present/windowless cell (the absent-catalog home, an out-of-catalog
+   * spawn-inherited model, or a store edited to the ids-only form) keeps the
+   * byte trigger and is diagnosed ONCE per boot with a bounded host fact.
+   */
+  private resolveWindow(config: AgentConfig): LlmModelWindow | null {
+    const window = windowForModel(this.options.models, config.model);
+    if (window === null && config.policy.compactAfterTokens !== undefined
+      && !this.fallbackDiagnosed) {
+      this.fallbackDiagnosed = true;
+      this.diagnose({ kind: 'token-trigger-fallback' });
+    }
+    return window;
+  }
+
+  /** The bounded, non-journaled diagnostic: a throwing sink never breaks a turn. */
+  private diagnose(diagnostic: RuntimeDiagnostic): void {
+    try {
+      this.options.diagnose?.(diagnostic);
+    } catch { /* the diagnostic is not the turn */ }
+  }
+
+  /**
+   * One priced request at the plan site: the full wire price, the anchor's
+   * adoption (A2(ii)), the threshold and its published effective percent, and
+   * the domain verdict. Pure — no journal, no send, no model.
+   */
+  private tokenDecision(
+    plan: RequestPlan, rule: TokenRule,
+  ): {
+    readonly total: number; readonly kind: 'usage' | 'estimate';
+    readonly headroom: number; readonly threshold: number; readonly percent: number;
+    readonly degenerate: boolean;
+  } {
+    const headroom = meterHeadroom(rule.window, rule.policy);
+    const threshold = meterThreshold(rule.window, rule.output, rule.policy);
+    const priced = meterTotal({
+      headerDigest: headerDigest(plan),
+      surfacePrice: priceWire(plan),
+      anchor: this.anchor,
+    });
+    return {
+      ...priced,
+      headroom,
+      threshold,
+      percent: meterPercent(rule.window, threshold),
+      // O >= W is the typed refusal the plan names; a threshold at or below zero
+      // is the same degenerate domain reached by a journaled rule (the
+      // declaration refuses only the factory's band).
+      degenerate: rule.output >= rule.window || threshold <= 0,
+    };
+  }
+
+  /**
+   * The turn's logical requests. Before each one: the trigger (the byte trigger
+   * on a legacy/windowless cell, the token trigger when the policy key AND a
+   * declared window resolve), assemble, measure the canonical plan against the
+   * capture ceiling (refusing an oversize plan durably before any storage or
+   * send), send through the adapter, then dispatch the calls. A no-call response
+   * or an explicit wait parks; an exhausted call group chains while the quantum
+   * lasts.
+   *
+   * The token trigger (A4) lives at the plan site: the priced request's total
+   * (never the plan's canonical bytes — the input-is-the-wire rule) is compared
+   * to `floor(min(ratio·W, W − O − headroom))`; over it, ONE forced compaction
+   * and ONE re-assemble + re-price follow, and a request no transaction can
+   * reduce is sent anyway under the typed uncompactable escape. A compaction
+   * makes NO adapter send: the kernel never calls a model for memory.
    */
   private async run(ctx: TurnContext): Promise<TurnResult> {
     const slot = this.fold.snapshot().config;
@@ -566,17 +709,36 @@ class Runtime implements AgentRuntime {
     let accepted = 0;
     let ordinal = 0;
     for (let step = 0; step < config.policy.stepsPerTurn; step += 1) {
-      await runCompaction(this.fold, ctx.gate);
+      // The LIVE configuration, per step: an `update_self` earlier in the turn
+      // re-resolves the model (and so the window) from the next request on.
+      const live = this.fold.snapshot().config?.value ?? config;
+      // The window is a host fact resolved per request (A3); it also bounds the
+      // usage the adapter accepts, whether or not the token trigger is armed.
+      const window = this.resolveWindow(live);
+      const rule = window === null || live.policy.compactAfterTokens === undefined
+        ? null
+        : {
+          window: window.contextTokens,
+          output: outputReservation(live.parameters, window.maxOutputTokens),
+          policy: live.policy.compactAfterTokens as TokenTriggerPolicy,
+        };
+      if (rule === null) {
+        // The byte trigger (the pre-wave cells' forever path, and the windowless
+        // fallback): an applied replacement rewrites the sampled surface, so the
+        // anchor resets.
+        if (await runCompaction(this.fold, ctx.gate) === 'applied') this.anchor = null;
+      }
       const id: RequestId = { turn: ctx.turn, ordinal };
       // Host state, not journaled state: the notice rides the volatile queue,
       // so a new arrival never invalidates the cached prefix.
       const notice = this.options.notice?.current() ?? null;
-      const plan = assemble({
+      const assemblePlan = (): RequestPlan => assemble({
         id, state: this.fold.snapshot(),
         ...(ctx.direction !== undefined ? { direction: ctx.direction } : {}),
         ...(this.options.models !== undefined ? { models: this.options.models } : {}),
         ...(notice !== null ? { notice: renderConversationNotice(notice) } : {}),
       });
+      let plan = assemblePlan();
       const bytes = canonicalBytes(plan).length;
       if (bytes >= MAX_CAPTURE_BYTES) {
         ctx.gate.append('request/refused', { id, bytes, limit: MAX_CAPTURE_BYTES, phase: 'plan' });
@@ -586,7 +748,92 @@ class Runtime implements AgentRuntime {
           error: { code: 'request-limit', status: null },
         };
       }
-      const sent = await this.options.adapter.send(plan, ctx.gate);
+      if (rule !== null) {
+        const decision = this.tokenDecision(plan, rule);
+        // The domain guards: an output reservation at or above the declared
+        // window — and the equivalent degenerate band a journaled rule can
+        // produce — is a TYPED request refusal at the plan site, never a silent
+        // assertion. Nothing is journaled: no plan was sent, and the turn's
+        // closer carries the typed failure.
+        if (decision.degenerate) {
+          return {
+            outcome: 'error', toolCalls: accepted > 0,
+            error: { code: 'request-limit', status: null },
+          };
+        }
+        if (meterFires(decision.total, decision.threshold)) {
+          const meter: MeterRecord = {
+            window: rule.window,
+            output: rule.output,
+            headroom: decision.headroom,
+            threshold: decision.threshold,
+            percent: decision.percent,
+            estimate: decision.total,
+            anchor: decision.kind,
+            outcome: 'compact',
+          };
+          const outcome = await runCompaction(this.fold, ctx.gate, { force: true, meter });
+          // The reset on compaction: an APPLIED replacement rewrites the sampled
+          // surface, so the anchor's delta can no longer describe it — the
+          // estimate stands wholesale from here. A skipped transaction changes
+          // nothing, so the anchor survives it.
+          if (outcome === 'applied') {
+            this.anchor = null;
+            // ONE re-assemble and ONE re-price (the bound): the re-assembled plan
+            // is what is sent, and a price still over the threshold is sent
+            // anyway — a second compaction would be a second erasure for one
+            // logical request. The re-price is not journaled (the transaction's
+            // start record is the accounting home); when it is still over, the
+            // bounded host diagnostic carries the fact to the operator.
+            plan = assemblePlan();
+            const repriced = this.tokenDecision(plan, rule);
+            if (meterFires(repriced.total, repriced.threshold)) {
+              this.diagnose({
+                kind: 'over-window-after-compaction',
+                estimate: repriced.total, threshold: repriced.threshold,
+              });
+            }
+          } else {
+            // The uncompactable escape (A4): nothing eligible, an unbalanced
+            // first group, an empty span, a notice not smaller — or a stale
+            // abort. The request is sent anyway under the typed policy, its only
+            // accounting the bounded host diagnostic (this branch journals
+            // nothing).
+            this.diagnose({
+              kind: 'uncompactable-over-window',
+              estimate: decision.total, threshold: decision.threshold,
+            });
+          }
+        }
+      }
+      const sendOptions = window === null ? {} : { window: window.contextTokens };
+      let sent = await this.options.adapter.send(plan, ctx.gate, sendOptions);
+      if (sent.kind === 'failure' && sent.failure.code === 'context-exceeded') {
+        // The overflow answer (the separable M2b slice): ONE forced maximal
+        // reduction (retain 0, bypassing the threshold) and ONE resend in a NEW
+        // frontier group. A second failure — or a reduction no transaction can
+        // make — passes the ORIGINAL error through.
+        const reduced = await runCompaction(
+          this.fold, ctx.gate, { force: true, retainGroups: 0 });
+        if (reduced === 'applied') {
+          this.anchor = null;
+          plan = assemblePlan();
+          const resent = await this.options.adapter.send(plan, ctx.gate, sendOptions);
+          if (resent.kind === 'response') {
+            sent = resent;
+          } else if (resent.failure.code === 'cancelled') {
+            // A stop that landed during the resend is a boundary cancellation,
+            // never an error closer: park like every other cancelled request,
+            // and never journal the original provider error over the stop.
+            return { outcome: 'waiting', toolCalls: accepted > 0 };
+          } else {
+            // The second failure passes the ORIGINAL error through.
+            return { outcome: 'error', toolCalls: accepted > 0, error: sent.failure };
+          }
+        } else {
+          return { outcome: 'error', toolCalls: accepted > 0, error: sent.failure };
+        }
+      }
       if (sent.kind === 'failure') {
         // A failure the aborted signal caused is a boundary cancellation, not a
         // failed turn: park like the dispatch policy below, so a clean stop
@@ -596,6 +843,10 @@ class Runtime implements AgentRuntime {
         if (sent.failure.code === 'cancelled') return { outcome: 'waiting', toolCalls: accepted > 0 };
         return { outcome: 'error', toolCalls: accepted > 0, error: sent.failure };
       }
+      // Every successful send replaces the anchor: the sample journals on the
+      // assistant record, and a response without a usable usage resets it to the
+      // estimate — exactly what a restart re-forms from the fold.
+      this.anchor = sent.accounting ?? null;
       // The CLEAR rule: the notice is consumed only by a request the kernel
       // actually sent (the exchange is journaled and answered). A failed
       // request leaves it pending and the next attempt re-renders it.

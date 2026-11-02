@@ -18,6 +18,7 @@ import {
   SelfRefusedError, createSelfPort, renewedIdentityConfig,
 } from '../self.js';
 import { canonicalBytes } from '../../context/artifacts.js';
+import { METER_CHARS_PER_TOKEN, meterThreshold } from '../../context/meter.js';
 
 /**
  * The identity vocabulary (plan §0.5 and §0.8): the two sentence patterns, the
@@ -210,8 +211,9 @@ describe('the identity budget: constants and the arithmetic', () => {
       [...config.tools].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
     ).length;
     expect(reserve(config)).toBe(history + offering + DIRECTION_MAX_BYTES + PLAN_MARGIN);
-    expect(reserve(config, ['model-a', 'model-b']))
-      .toBe(reserve(config) + canonicalBytes(substrateText(['model-a', 'model-b'])).length);
+    const models = [{ id: 'model-a' }, { id: 'model-b' }];
+    expect(reserve(config, models))
+      .toBe(reserve(config) + canonicalBytes(substrateText(models)).length);
     expect(reserve(config, [])).toBe(reserve(config) + canonicalBytes(substrateText([])).length);
   });
 
@@ -286,6 +288,25 @@ describe('the self port: renew over the live fold', () => {
       expect(caught).toBeInstanceOf(SelfRefusedError);
       expect((caught as Error).message).toMatch(/sendability budget/);
     }
+  });
+
+  it('re-derives the reserve premise under the token trigger (a stated under-reserve)', () => {
+    // The reserve's history term still keys off compactAfterBytes. Under the
+    // token trigger a cell's history can hold the whole threshold in TOKENS: at
+    // the estimator's own 4 chars/token the 200k arm's 152,000 tokens are 608,000
+    // canonical bytes — more than 262,144, so the byte term under-reserves the
+    // history under the token rule. The factory floor/caps mask it (the budget
+    // collapses to the floor), and the pins are re-derived, never deleted.
+    const factory = defaultAgentConfig();
+    const rule = factory.policy.compactAfterTokens!;
+    const threshold = meterThreshold(200_000, 32_000, rule);
+    expect(threshold).toBe(152_000);
+    expect(threshold * METER_CHARS_PER_TOKEN)
+      .toBeGreaterThan(factory.policy.compactAfterBytes);
+    // The factory's own reserve already exceeds its ceiling, so the budget is
+    // the floor: the under-reserve is masked, not active, in the factory cell.
+    expect(reserve(factory)).toBeGreaterThan(effectiveCeiling(factory));
+    expect(identityBudget(factory)).toBe(IDENTITY_FLOOR);
   });
 
   it('admits an under-budget rewrite', () => {

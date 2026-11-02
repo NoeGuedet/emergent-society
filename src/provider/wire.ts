@@ -98,6 +98,16 @@ function encodeTool(tool: ToolSchema): JsonValue {
   };
 }
 
+/**
+ * The wire's WRAPPED tool array as JSON-ready values, exactly as `serializeWire`
+ * emits it. Exported so the token meter prices the array the wire actually
+ * sends: the raw `ToolSchema`s are not the wire's shape, and pricing them
+ * undercounts (A2(i)).
+ */
+export function encodeWireTools(tools: readonly ToolSchema[]): JsonValue[] {
+  return tools.map(encodeTool);
+}
+
 /** The canonical UTF-8 bytes of a message array, identical to the wire's own encoding. */
 export function canonicalMessagesBytes(messages: readonly ChatMessage[]): Uint8Array {
   return Buffer.from(canonicalizeJson(toJson(messages.map(encodeMessage))), 'utf8');
@@ -121,7 +131,7 @@ export function serializeWire(plan: WirePlan): Uint8Array {
   const wire: Record<string, JsonValue> = {
     model: plan.model,
     ...encodeParameters(plan.parameters),
-    tools: plan.tools.map(encodeTool),
+    tools: encodeWireTools(plan.tools),
     messages,
     stream: false,
     n: 1,

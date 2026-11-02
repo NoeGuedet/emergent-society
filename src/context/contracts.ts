@@ -41,6 +41,38 @@ export type ToolSchema = {
   readonly name: string; readonly description: string; readonly parameters: JsonValue;
 };
 
+/**
+ * One declared model of the operator's catalog (`providers.json`'s `llm.models`).
+ * TWO shapes are accepted at load (A3):
+ *
+ * - the old ids-only form, `"id"` — an id with NO window declared: the
+ *   transition form, accepted at load and usable where a window is not needed
+ *   (the substrate block, `inspect`, spawn/`update_self` validation). A fresh
+ *   START on such an entry is refused (the bounded window refusal) and a cell
+ *   that reaches one keeps the byte trigger with a bounded host diagnostic.
+ * - the new object form, `{id, contextTokens, maxOutputTokens}` — BOTH fields
+ *   required, together or not at all (no family-default table exists anywhere;
+ *   DSH's 256k is DeepSeek-specific). The window is a HOST fact: it selects the
+ *   token trigger's threshold and never rides the wire (the substrate block
+ *   stays ids-only, so the cached prefix does not grow).
+ *
+ * The type spells the window fields optional because the two shapes normalize
+ * into one entry; the store's loader enforces both-or-neither and the
+ * declaration's domain (positive safe integers at or below the context cap,
+ * `maxOutputTokens < contextTokens`, no degenerate window).
+ */
+export type LlmModel = {
+  readonly id: string;
+  readonly contextTokens?: number;
+  readonly maxOutputTokens?: number;
+};
+
+/** A declared entry's window, present only when the entry declares one. */
+export type LlmModelWindow = {
+  readonly contextTokens: number;
+  readonly maxOutputTokens: number;
+};
+
 /** A durable artifact reference: canonical journal data, never a journal `BlobRef`. */
 export type ArtifactRef = {
   readonly kind: 'c13-artifact'; readonly manifest: Source;
@@ -64,15 +96,19 @@ export type ArtifactManifest = {
 
 export type ErrorCode = 'http' | 'network' | 'timeout' | 'cancelled'
   | 'malformed' | 'body-limit' | 'invalid-tool' | 'unknown-tool' | 'denied'
-  | 'spawn' | 'signal' | 'output-limit' | 'request-limit';
+  | 'spawn' | 'signal' | 'output-limit' | 'request-limit' | 'context-exceeded';
 
 export type SafeFailure = { readonly code: ErrorCode; readonly status: number | null };
 
 /**
  * Maps a `SafeFailure` to the frontier terminal's error code. Only the wire
- * codes can describe an exchange: `malformed` (a 200 whose projection fails)
- * and `request-limit` never reach a terminal, so mapping one is a programmer
- * error and throws instead of inventing a code.
+ * codes can describe an exchange: `malformed` (a 200 whose projection fails) and
+ * `request-limit` (the kernel refuses the request before any send) never reach a
+ * terminal, so mapping one is a programmer error and throws instead of
+ * inventing a code. `context-exceeded` is the provider's own window refusal: the
+ * frontier's vocabularies are frozen with v0 and admit no new code, so the
+ * exchange is recorded as the HTTP exchange it was — the typed local code rides
+ * the local turn only.
  *
  * The two producers that cross the frontier — the provider adapter
  * (`src/provider/adapter.ts`) and the web tools (`src/node/tools/web.ts`) —
@@ -88,10 +124,30 @@ export function toFrontierCode(failure: SafeFailure): FrontierErrorCode {
     case 'cancelled':
     case 'body-limit':
       return failure.code;
+    case 'context-exceeded':
+      return 'http';
     default:
       throw new Error(`no frontier code for failure ${JSON.stringify(failure.code)}`);
   }
 }
+
+/**
+ * The token trigger's journaled rule (A4): the window fraction the trigger
+ * fires at and the headroom clamp. All integers, in the policy's own dialect —
+ * permille fractions never carry a float into the journal. The window itself is
+ * NOT here: it is a host fact (the operator's catalog), re-resolved at each
+ * request, never journaled in a config.
+ */
+export type TokenTriggerPolicy = {
+  /** The window fraction in permille: the ratio term is `floor(W · ratioPermille / 1000)`. */
+  readonly ratioPermille: number;
+  /** The headroom clamp: `clamp(floor(W · ratioPermille / 1000), minTokens, maxTokens)`. */
+  readonly headroom: {
+    readonly ratioPermille: number;
+    readonly minTokens: number;
+    readonly maxTokens: number;
+  };
+};
 
 /** The recorded runtime policy; every numeric limit is the effective one, expanded before journaling. */
 export type SeedPolicy = {
@@ -111,6 +167,13 @@ export type SeedPolicy = {
    * key; absent reads as the factory default (`12`), never as a rewrite.
    */
   readonly wakeBudgetPerHour?: number;
+  /**
+   * The token trigger (A4). Optional: a config journaled before the token wave
+   * has no such key and keeps the byte trigger forever, while a factory config
+   * carries it. The token branch runs only when this key AND a resolved window
+   * exist; a key-present/windowless cell stays on the byte trigger.
+   */
+  readonly compactAfterTokens?: TokenTriggerPolicy;
 };
 
 export type AgentConfig = {
@@ -207,6 +270,62 @@ export type CompactionSummary = {
 export type CompactionEnd = { readonly id: string; readonly summary: Source };
 
 export type CompactionAbort = { readonly id: string; readonly reason: 'stale' | 'orphan' };
+
+/**
+ * One provider-reported usage, normalized from the OpenAI-compatible body
+ * (A2(iii)): `total = prompt + completion`, and `promptTokens` ALREADY includes
+ * the cached subset — `cachedTokens` is informational and is never added (a
+ * prompt+cache+completion sum would double-count). Every number is a
+ * non-negative safe integer; a usage that cannot be normalized is absent, never
+ * a broken turn.
+ */
+export type MeterUsage = {
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+  readonly totalTokens: number;
+  /** The cached subset of `promptTokens`, informational only; null when not reported. */
+  readonly cachedTokens: number | null;
+};
+
+/**
+ * The anchor's sample (A2(ii), A7): the identity the adoption test is gated on
+ * (the request header: model + parameters + toolsHash), the surface price AFTER
+ * the sampled completion is appended (so the delta never counts the completion
+ * twice), and the usage that answers it. The three journal TOGETHER as the
+ * optional field on `assistant/message`, so the anchor re-forms exactly after a
+ * restart from the fold. Not a price, not a cost: tokens only.
+ */
+export type AssistantAccounting = {
+  readonly headerDigest: string;
+  readonly surfacePriceAtSample: number;
+  readonly usage: MeterUsage;
+};
+
+/**
+ * The kernel-owned decision numbers of one token-triggered compaction, journaled
+ * as the optional `meter` payload on `compaction/start` (A7). The window and the
+ * output reservation are host facts copied into the record — a store edit
+ * between boots changes the next decision, never this one — and `outcome` is
+ * the PLANNED outcome; the transaction's own summary/end records the actual one.
+ */
+export type MeterRecord = {
+  /** The declared context window the decision used. */
+  readonly window: number;
+  /** The output reservation `O` (the parameters' `max_tokens`, else the declared output). */
+  readonly output: number;
+  /** The headroom the threshold subtracted. */
+  readonly headroom: number;
+  /** `floor(min(ratio · W, W − O − headroom))`. */
+  readonly threshold: number;
+  /** The EFFECTIVE percent (operator-side): `threshold / W`, one decimal. */
+  readonly percent: number;
+  /** The priced request's total the trigger read. */
+  readonly estimate: number;
+  /** Which baseline the total's anchor supplied. */
+  readonly anchor: 'usage' | 'estimate';
+  /** The planned outcome of this decision; the actual one is the transaction's end. */
+  readonly outcome: 'compact';
+};
 
 /**
  * One opening world perception (T4): the bounded commit list and rendered diff

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import {
   DEFAULT_WAKE_BUDGET_PER_HOUR, defaultAgentConfig, validateAgentConfig,
 } from '../context/config.js';
-import type { AgentConfig } from '../context/contracts.js';
+import type { AgentConfig, LlmModel } from '../context/contracts.js';
 import { C13_EVENT_TYPES } from '../context/events.js';
 import { ContextFold } from '../context/fold.js';
 import { loadVerifiedEvents } from '../context/loader.js';
@@ -17,7 +17,12 @@ import { singleLine } from '../text.js';
 import { readWorldState, type WorldState } from '../node/world-state.js';
 import { runWorldDoctor, type DoctorReport } from '../node/world-doctor.js';
 import { fileURLToPath } from 'node:url';
-import { modelRefusal, type ProviderRegistry } from '../node/tools/providers.js';
+import {
+  modelIds, modelRefusal, windowOf, windowRefusal, type ProviderRegistry,
+} from '../node/tools/providers.js';
+import {
+  AFTER_COMPACTION_OVER_WINDOW, UNCOMPACTABLE_OVER_WINDOW,
+} from '../node/loop.js';
 import { DEFAULT_TERMINAL_ENV } from '../node/tools/terminal.js';
 import { webToolsFromProviders } from '../node/tools/web.js';
 import {
@@ -340,6 +345,30 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
     notice: {
       current: () => conversationWatcher.noticeFor(uid),
       consume: (version) => { conversationWatcher.consume(uid, version); },
+    },
+    // The token trigger's bounded host diagnostics (A4): host state, never a
+    // journal fact. The windowless fallback fires once per boot; the
+    // uncompactable escape names the decision it could not serve. Neither ever
+    // carries a credential or agent-authored text.
+    diagnose: (diagnostic) => {
+      if (diagnostic.kind === 'token-trigger-fallback') {
+        log.emit('host/meter-fallback', { home, uid, reason: 'no-declared-window' });
+        return;
+      }
+      if (diagnostic.kind === 'uncompactable-over-window') {
+        // The typed escape states its policy in the log line: the request is
+        // over the threshold and no transaction could reduce it.
+        log.emit('host/meter-over-window', {
+          home, uid, reason: UNCOMPACTABLE_OVER_WINDOW,
+          estimate: diagnostic.estimate, threshold: diagnostic.threshold,
+        });
+        return;
+      }
+      // The re-price's observed outcome: reduced, still over, sent anyway.
+      log.emit('host/meter-after-compaction', {
+        home, uid, reason: AFTER_COMPACTION_OVER_WINDOW,
+        estimate: diagnostic.estimate, threshold: diagnostic.threshold,
+      });
     },
     extend: (events, ports) => ({
       store,
@@ -880,21 +909,24 @@ async function resolveNodeConfig(
  */
 async function resolveGatewayOverlay(
   home: string, command: HostCommand, options: HostOptions,
-  models: readonly string[] | undefined,
+  models: readonly LlmModel[] | undefined,
 ): Promise<OverlayConfig | null> {
   if (command !== 'start') return await resolvePersistedOverlay(home);
   const charterFile = options.gatewayCharter;
   if (charterFile === undefined) return null;
   const charter = await readCharterFile(home, options.uid, charterFile);
-  const model = options.gatewayModel ?? models?.[0];
+  // The default is the FIRST declared entry's id. The overlay has no meter and
+  // no compaction, so a windowless first entry is a legitimate default here —
+  // the fresh-start window refusal is scoped to the nodes.
+  const model = options.gatewayModel ?? models?.[0]?.id;
   if (model === undefined) {
     throw new HostConfigError(
       'the gateway overlay needs --gateway-model: the provider store declares no'
       + ' served-model catalog, so there is no default to take',
     );
   }
-  if (models !== undefined && !models.includes(model)) {
-    throw new HostConfigError(modelRefusal(model, models));
+  if (models !== undefined && !models.some((entry) => entry.id === model)) {
+    throw new HostConfigError(modelRefusal(model, modelIds(models)));
   }
   const config: OverlayConfig = { model, charter };
   await persistOverlayConfig(home, config);
@@ -1139,8 +1171,8 @@ class NodePool {
     }
     const catalog = this.deps.credential.models;
     if (catalog !== undefined && request.model !== undefined
-      && !catalog.includes(request.model)) {
-      throw new SpawnRefusedError(modelRefusal(request.model, catalog));
+      && !catalog.some((entry) => entry.id === request.model)) {
+      throw new SpawnRefusedError(modelRefusal(request.model, modelIds(catalog)));
     }
     const uid = this.reserveUid(requesterUid);
     try {
@@ -1561,8 +1593,16 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         const catalog = credential.models;
         if (catalog !== undefined) {
           for (const config of configs) {
-            if (!catalog.includes(config.model)) {
-              throw new HostConfigError(modelRefusal(config.model, catalog));
+            const entry = catalog.find((candidate) => candidate.id === config.model);
+            if (entry === undefined) {
+              throw new HostConfigError(modelRefusal(config.model, modelIds(catalog)));
+            }
+            // The fresh-start boot rule (A3): a START on a declared model whose
+            // entry carries no window is refused with the bounded teaching
+            // refusal. A RESUME never re-validates (its journaled config won and
+            // may predate the declaration): the cell keeps the byte trigger.
+            if (windowOf(entry) === null) {
+              throw new HostConfigError(windowRefusal(config.model));
             }
           }
         }
