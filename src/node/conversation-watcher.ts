@@ -76,6 +76,14 @@ export class ConversationWatcher {
   /** The stream size already examined; starts at the boot size. */
   private watermark: number;
   private version = 0;
+  /**
+   * How many gateway-addressed records this watcher has observed. The gateway
+   * is not a node recipient (its records arm no node notice), so its arrivals
+   * are counted here instead: the overlay's host-side subscription compares
+   * this count across notifications and cycles only when it grew — the
+   * addressee filter, applied where the records are resolved.
+   */
+  private gatewayArrivals = 0;
   private checking: Promise<void> | null = null;
   private readonly listeners = new Set<() => void>();
   private timer: NodeJS.Timeout | null = null;
@@ -175,6 +183,14 @@ export class ConversationWatcher {
     return next;
   }
 
+  /**
+   * The gateway-addressed records observed so far (monotonic). The overlay's
+   * trigger: a notification whose count did not grow is not an arrival.
+   */
+  gatewayArrivalCount(): number {
+    return this.gatewayArrivals;
+  }
+
   /** The pending notice for `uid`, or null. */
   noticeFor(uid: string): ConversationNotice | null {
     const pending = this.pending.get(uid);
@@ -267,8 +283,15 @@ export class ConversationWatcher {
       const record = parseConversationLineOrNull(line);
       if (record === null) continue;
       // The gateway and the human are not node recipients; a record addressed
-      // to them waits in the stream (the absent-recipient rule).
-      if (record.to === GATEWAY_ADDRESSEE || record.to === record.from) continue;
+      // to them waits in the stream (the absent-recipient rule). A
+      // gateway-addressed record is the OVERLAY's arrival instead: counted, so
+      // its host-side subscription can filter on it (the overlay's own sends
+      // name a node addressee and are never counted, so they never re-trigger).
+      if (record.to === GATEWAY_ADDRESSEE) {
+        if (record.from !== GATEWAY_ADDRESSEE) this.gatewayArrivals += 1;
+        continue;
+      }
+      if (record.to === record.from) continue;
       this.arm(record.to, record.from);
     }
   }

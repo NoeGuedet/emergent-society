@@ -1,6 +1,6 @@
 import { readdirSync } from 'node:fs';
-import { lstat, open, stat, type FileHandle } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { lstat } from 'node:fs/promises';
+import { join } from 'node:path';
 import {
   DEFAULT_WAKE_BUDGET_PER_HOUR, defaultAgentConfig, validateAgentConfig,
 } from '../context/config.js';
@@ -9,10 +9,9 @@ import { C13_EVENT_TYPES } from '../context/events.js';
 import { ContextFold } from '../context/fold.js';
 import { loadVerifiedEvents } from '../context/loader.js';
 import { openFrontierJournal, type FrontierJournal } from '../frontier/index.js';
-import { nodeLayout } from '../journal/index.js';
+import { GATEWAY_ADDRESSEE, nodeLayout } from '../journal/index.js';
 import { createPackageStore, createRunSupervisor } from '../node/packages/index.js';
 import { identitySentence, stripAuthoredIdentity } from '../node/identity.js';
-import { MAX_CAPTURE_BYTES } from '../node/gate.js';
 import { IdentityBudgetError, assertSendableIdentity } from '../node/identity-budget.js';
 import { singleLine } from '../text.js';
 import { readWorldState, type WorldState } from '../node/world-state.js';
@@ -39,6 +38,7 @@ import { llmCredentialFrom, loadProviderStore } from './credentials.js';
 import {
   assertCellLayout, assertHomeOutsideCheckout, assertHomePermissions, cellPaths,
 } from './layout.js';
+import { readCharterFile } from './charter-file.js';
 import type { HostLog } from './observe.js';
 import {
   attachCell, bootHygiene, detectLaunchMode, ensureLeaf, LIMITS, limitLeaf, nodeLeaf, reapRunLeaf,
@@ -55,6 +55,10 @@ import {
 } from '../node/conversation.js';
 import { ConversationWatcher } from '../node/conversation-watcher.js';
 import { ChatLog } from './chat.js';
+import {
+  OverlayService, persistOverlayConfig, resolvePersistedOverlay,
+  type OverlayConfig,
+} from '../overlay/index.js';
 import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
 import { MAX_NODES, readNodesFile, type NodeSpec } from './nodes.js';
 import { HostAlreadyRunningError, HostConfigError } from './errors.js';
@@ -643,6 +647,15 @@ export type HostOptions = {
    * `--charter-file`; the host reads and validates the file at the config gate.
    */
   readonly nodesFile?: string;
+  /**
+   * The gateway overlay's config home (O4), start-only. `gatewayCharter` is the
+   * operator's absolute charter file, read once at the config gate and
+   * persisted beside the model; `gatewayModel` is validated against the
+   * declared catalog and defaults to its first entry. A start without
+   * `gatewayCharter` runs a nodes-only host, and a resume takes the persisted
+   * pair (the parser refuses both flags there).
+   */
+  readonly gatewayCharter?: string; readonly gatewayModel?: string;
   readonly sandbox: false | {
     readonly launcherPath?: string; readonly cgroupRoot?: string;
     readonly leafLimits?: { readonly memoryMaxBytes: number; readonly pidsMax: number };
@@ -788,94 +801,6 @@ async function readCellConfig(home: string, uid: string): Promise<CellConfigStat
 }
 
 /**
- * Reads the operator's charter file once, at the start gate. The path is the
- * operator's own (validated absolute by argv parsing) and must resolve to a
- * regular file — a FIFO, a device or a directory is refused rather than read;
- * symlinks are followed. At most `MAX_CAPTURE_BYTES + 1` raw bytes are ever
- * loaded, so an oversize file is refused by its byte count, never buffered
- * whole; the bytes must be valid UTF-8 — an invalid encoding is refused, not
- * silently rewritten into replacement characters — and nothing about the file
- * is ever echoed back except its path, never its content. The providers store
- * is refused by path AND by identity: a symlink or a hardlink to it carries
- * the same inode, so the opened file's `(dev, ino)` is compared to the
- * store's before a single byte is read — the credential store must never
- * enter the journal.
- *
- * The bound is the capture ceiling — the boot charter read's DoS guard, not an
- * arbitrary charter size: a file this large could never become a sendable
- * request anyway, and reading more of it would only spend the host's memory on
- * a value no bound admits, so an oversize file is REFUSED (never truncated).
- * The identity budget at the START-composition seam is the one identity bound;
- * this guard and `validateAgentConfig`'s canonical-config ceiling are separate,
- * file/DOS bounds and are named as such in the docs.
- */
-async function readCharterFile(home: string, uid: string, path: string): Promise<string> {
-  const resolved = resolve(path);
-  const { providersFile } = cellPaths(home, uid);
-  if (resolved === resolve(providersFile)) {
-    throw new HostConfigError(
-      'refusing the providers store as a charter file; its content would be journaled');
-  }
-  let providersInfo;
-  try {
-    providersInfo = await stat(providersFile);
-  } catch {
-    // The store may not exist yet in a fresh home: no inode to compare then.
-    providersInfo = null;
-  }
-  let info;
-  try {
-    info = await stat(resolved);
-  } catch (err) {
-    throw new HostConfigError(
-      `could not read the charter file ${path}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  if (!info.isFile()) {
-    throw new HostConfigError(`the charter file ${path} is not a regular file`);
-  }
-  let handle: FileHandle;
-  try {
-    handle = await open(resolved, 'r');
-  } catch (err) {
-    throw new HostConfigError(
-      `could not read the charter file ${path}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  try {
-    // The identity check the path check cannot give: a symlink or a hardlink
-    // to the providers store has a different path but the same inode, and
-    // the opened handle's own stat is the opened bytes' truth — no TOCTOU.
-    const opened = await handle.stat();
-    if (providersInfo !== null
-      && opened.dev === providersInfo.dev && opened.ino === providersInfo.ino) {
-      throw new HostConfigError(
-        'refusing the providers store as a charter file; its content would be journaled');
-    }
-    const buffer = Buffer.alloc(MAX_CAPTURE_BYTES + 1);
-    let bytesRead = 0;
-    while (bytesRead < buffer.length) {
-      const { bytesRead: chunk } = await handle.read(
-        buffer, bytesRead, buffer.length - bytesRead, bytesRead);
-      if (chunk === 0) break;
-      bytesRead += chunk;
-    }
-    if (bytesRead > MAX_CAPTURE_BYTES) {
-      throw new HostConfigError(
-        `the charter file is over ${MAX_CAPTURE_BYTES} bytes; the limit is ${MAX_CAPTURE_BYTES}`);
-    }
-    let text: string;
-    try {
-      text = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, bytesRead));
-    } catch {
-      throw new HostConfigError(`the charter file ${path} is not valid UTF-8`);
-    }
-    if (text.trim() === '') throw new HostConfigError('the charter file is empty');
-    return text;
-  } finally {
-    await handle.close();
-  }
-}
-
-/**
  * The start/resume gate, pinned by §3.5.
  *
  * `start` supplies a config only into a cell that has none; a log with a
@@ -931,6 +856,49 @@ async function resolveNodeConfig(
     throw new HostConfigError('no journaled configuration; use start');
   }
   return state.config;
+}
+
+/**
+ * The gateway overlay's configuration gate (O4).
+ *
+ * A start supplies it once: `--gateway-charter` is the operator's charter file,
+ * read with the one charter-file discipline (regular, UTF-8, bounded, the
+ * providers store refused by path and inode), and the model is
+ * `--gateway-model` — validated against the declared served-model catalog,
+ * defaulting to its FIRST entry; without either a model flag or a declared
+ * catalog there is no model, so a gateway-bearing start refuses. Both are then
+ * persisted as the home's overlay pair (`<home>/gateway.charter.md` and
+ * `<home>/gateway.json`, 0600, atomic) and that pair is what a resume reads.
+ *
+ * A start WITHOUT `--gateway-charter` runs a nodes-only host: no overlay
+ * service, no diagnostic, and records addressed to the absent `gateway`
+ * accumulate in the stream under the absent-recipient rule. A resume reads the
+ * persisted pair: absent means nodes-only (the overlay was never configured),
+ * a damaged or partial pair is a bounded host refusal, and the persisted model
+ * is NOT re-validated — it won, and may legally predate the declaration (the
+ * journaled-configs-win rule the node resume follows).
+ */
+async function resolveGatewayOverlay(
+  home: string, command: HostCommand, options: HostOptions,
+  models: readonly string[] | undefined,
+): Promise<OverlayConfig | null> {
+  if (command !== 'start') return await resolvePersistedOverlay(home);
+  const charterFile = options.gatewayCharter;
+  if (charterFile === undefined) return null;
+  const charter = await readCharterFile(home, options.uid, charterFile);
+  const model = options.gatewayModel ?? models?.[0];
+  if (model === undefined) {
+    throw new HostConfigError(
+      'the gateway overlay needs --gateway-model: the provider store declares no'
+      + ' served-model catalog, so there is no default to take',
+    );
+  }
+  if (models !== undefined && !models.includes(model)) {
+    throw new HostConfigError(modelRefusal(model, models));
+  }
+  const config: OverlayConfig = { model, charter };
+  await persistOverlayConfig(home, config);
+  return config;
 }
 
 /**
@@ -1472,6 +1440,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
   } | null = null;
   let pool: NodePool | null = null;
   let chat: ChatLog | null = null;
+  let overlay: OverlayService | null = null;
   let owner: OwnerHandle | null = null;
   let clearKeepAlive: (() => void) | null = null;
   let detach: (() => void) | null = null;
@@ -1480,6 +1449,9 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
     if (stopRequested) return;
     stopRequested = true;
     for (const node of composed?.nodes ?? []) node.driver.stop('stop-requested');
+    // The overlay has no turn or park to stop: aborting cancels an in-flight
+    // model exchange, and the finally awaits its settled cycle.
+    void overlay?.stop();
     pool?.stopAll();
   };
   const onUnhandled = (err: unknown): void => {
@@ -1509,7 +1481,8 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       // The human channel's delivery surface, opened once per host: outside the
       // world, kernel-owned, and independent of composition. A failed open is a
       // refused boot (a kernel-owned record that cannot be read is not reset).
-      chat = await ChatLog.open(home);
+      const openedChat = await ChatLog.open(home);
+      chat = openedChat;
       // The conversation stream's boot repair — HOST-ONLY: one TAIL read under
       // the stream's own flock, truncating at most one incomplete trailing
       // fragment. A missing stream is a new cell and creates nothing; a failed
@@ -1613,6 +1586,13 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
           }
         }
       }
+      // The gateway overlay's config home (O4). A start supplies it from the
+      // flags and persists it; a resume reads the persisted pair (or runs
+      // nodes-only when the home was never configured). This is a config-gate
+      // refusal (exit 2), so it sits where the other start/resume refusals do.
+      const overlayConfig = await resolveGatewayOverlay(
+        home, command, options, credential.models,
+      );
       // The declared spawn grant: one port per node whose nodes-file entry
       // says `spawn: true` (a solo flag boot grants nobody). The port closes
       // over the pool, which exists only after the shared parts are composed;
@@ -1688,6 +1668,34 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       for (const [index, node] of composed.nodes.entries()) {
         pool.addBooted(node, specs[index]?.spawn === true);
       }
+      // The gateway overlay: a host-side single-tenant service, never a pool
+      // member. Its model exchanges cross the SAME frontier through the
+      // gateway's attribution view (the `gateway` actor line beside the frozen
+      // envelope), and its cycle starts with exactly ONE boot cycle over the
+      // backlog both windows already hold.
+      if (overlayConfig !== null) {
+        const gatewayFrontier = composed.frontier.attribute(GATEWAY_ADDRESSEE);
+        const gatewayAdapter = new ProviderAdapter(
+          new OpenAITransport({
+            endpoint: credential.endpoint,
+            key: credential.key,
+            credentialId: credential.credentialId,
+          }),
+          systemProviderPolicy,
+          gatewayFrontier,
+        );
+        overlay = new OverlayService({
+          home,
+          config: overlayConfig,
+          chat: openedChat,
+          conversation: ConversationLog.for(home),
+          world: composed.world,
+          send: (plan, gate) => gatewayAdapter.send(plan, gate),
+          log,
+          ...(pollMs !== undefined ? { pollMs } : {}),
+        });
+        overlay.start();
+      }
       for (const node of composed.nodes) {
         log.emit('host/boot', {
           home, uid: node.uid, command, model: node.config.model,
@@ -1736,6 +1744,16 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       // Both cleanup steps can reject, and neither may replace the code the
       // failure itself earned: a host that cannot close its cell or release its
       // owner has still failed, but the journal is the record of why.
+      // The overlay is stopped FIRST: its cycle writes to the frontier, so it
+      // must settle while the shared journal is still open (it is not a pool
+      // member — no driver, no run, nothing else owns its lifetime).
+      if (overlay !== null) {
+        try {
+          await overlay.stop();
+        } catch {
+          code = 1;
+        }
+      }
       // The pool is closed before the frontier: every run it owns (booted and
       // composed) must settle while the shared journal is still open.
       if (pool !== null) {

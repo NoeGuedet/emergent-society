@@ -46,6 +46,7 @@ export type HostCliCommand =
       readonly command: 'start'; readonly home: string; readonly uid: string;
       readonly model?: string; readonly heading?: string; readonly noSandbox: boolean;
       readonly charterFile?: string; readonly nodesFile?: string;
+      readonly gatewayCharter?: string; readonly gatewayModel?: string;
     }
   | {
       readonly command: 'resume'; readonly home: string; readonly uid: string;
@@ -54,11 +55,15 @@ export type HostCliCommand =
   | { readonly command: 'pause'; readonly home: string }
   | { readonly command: 'status'; readonly home: string; readonly json: boolean };
 
-/** The five-command help text, its exit codes and the eight disclosures. */
+/**
+ * The five-command help text, its exit codes and the disclosures: the charter
+ * file's discipline, the nodes file's contract, the gateway overlay's config
+ * home, and the eight §3.9 stop/resume/status facts.
+ */
 export const USAGE = `Usage:
   node dist/host/main.js init   --home <abs-dir>
-  node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--uid node-0] [--no-sandbox]
-  node dist/host/main.js start  --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]
+  node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--no-sandbox]
+  node dist/host/main.js start  --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> [--uid node-0] [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]
   node dist/host/main.js pause  --home <abs-dir>
@@ -81,6 +86,14 @@ node; the grant is declared, never implicit — a solo boot grants nobody; grant
 one-entry nodes file with spawn: true. --nodes-file replaces --uid/--model/--heading/
 --charter-file and is read at the config gate; on resume entries declare only uid and spawn —
 the journaled config wins.
+--gateway-charter is the gateway overlay's charter (the host-side digest service over the
+conversation and chat logs, never a node): it is persisted as <home>/gateway.charter.md and
+--gateway-model (validated against the provider store's declared catalog, defaulting to its
+first entry) beside it. A start without --gateway-charter runs a nodes-only host (even when a
+pair is already persisted); resume takes the persisted configuration — the flags are refused
+there (the persisted configuration wins). The charter is read up to the capture bound, but the
+assembled request is bounded by the overlay policy (2 MiB) and refused at send: an oversize
+charter starts and then fails every cycle.
 `;
 
 /**
@@ -148,6 +161,8 @@ function parseStart(args: readonly string[]): HostCliCommand {
     heading: { type: 'string' },
     'charter-file': { type: 'string' },
     'nodes-file': { type: 'string' },
+    'gateway-charter': { type: 'string' },
+    'gateway-model': { type: 'string' },
     uid: { type: 'string' },
     'no-sandbox': { type: 'boolean' },
   });
@@ -163,6 +178,28 @@ function parseStart(args: readonly string[]): HostCliCommand {
       throw new UsageError(`--charter-file must be an absolute path: ${charterFile}`);
     }
   }
+  // The gateway overlay's config home (O4). The charter is the operator's own
+  // absolute path, read once at the start gate; the model is an id validated
+  // against the declared catalog, and a model without a charter would be
+  // silently unused, so the pair is enforced here.
+  const gatewayCharter = values['gateway-charter'];
+  if (gatewayCharter !== undefined) {
+    if (typeof gatewayCharter !== 'string' || gatewayCharter === '') {
+      throw new UsageError('--gateway-charter takes a value');
+    }
+    if (!isAbsolute(gatewayCharter)) {
+      throw new UsageError(`--gateway-charter must be an absolute path: ${gatewayCharter}`);
+    }
+  }
+  const gatewayModel = values['gateway-model'];
+  if (gatewayModel !== undefined) {
+    if (typeof gatewayModel !== 'string' || gatewayModel === '') {
+      throw new UsageError('--gateway-model takes a value');
+    }
+    if (gatewayCharter === undefined) {
+      throw new UsageError('--gateway-model requires --gateway-charter');
+    }
+  }
   const home = homeOf(values, 'start');
   const nodesFile = nodesFileOf(values);
   if (nodesFile !== undefined) {
@@ -176,6 +213,8 @@ function parseStart(args: readonly string[]): HostCliCommand {
     return {
       command: 'start', home, uid: DEFAULT_UID, noSandbox: values['no-sandbox'] === true,
       nodesFile,
+      ...(gatewayCharter !== undefined ? { gatewayCharter } : {}),
+      ...(gatewayModel !== undefined ? { gatewayModel } : {}),
     };
   }
   return {
@@ -186,6 +225,8 @@ function parseStart(args: readonly string[]): HostCliCommand {
     heading: textOf(values, 'heading', 'start'),
     noSandbox: values['no-sandbox'] === true,
     ...(charterFile !== undefined ? { charterFile } : {}),
+    ...(gatewayCharter !== undefined ? { gatewayCharter } : {}),
+    ...(gatewayModel !== undefined ? { gatewayModel } : {}),
   };
 }
 

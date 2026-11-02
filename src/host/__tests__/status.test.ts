@@ -151,11 +151,12 @@ it('does not read the local log: hostile log and byte-identical reports', async 
 });
 it('formats the exact lines and omits null last records', () => {
   const base = { home: '/h', host: { state: 'idle' as const },
+    overlay: { state: 'none' as const },
     frontier: { present: false, count: 0, lastHash: null, counts: {}, openCalls: 0,
       lastRequest: null, lastResponse: null, error: null },
     world: { present: true, head: null, error: null, state: 'healthy' as const } };
   expect(formatStatus(base).split('\n')).toEqual([
-    'home: /h', 'host: idle',
+    'home: /h', 'host: idle', 'overlay: none',
     'frontier: 0 events last=null http/request=0 http/response=0 http/incomplete=0 open=0',
     'world: head=null',
   ]);
@@ -165,7 +166,7 @@ it('formats the exact lines and omits null last records', () => {
       lastRequest: { call: 'c', url: 'https://h/v1/x', worldHead: null, attempt: 0 },
       lastResponse: { call: 'c', status: 200, error: null, durationMs: 3 } } };
   expect(formatStatus(full).split('\n')).toEqual([
-    'home: /h', 'host: running pid=7 uid=node-0 command=start',
+    'home: /h', 'host: running pid=7 uid=node-0 command=start', 'overlay: none',
     `frontier: 1 events last=${'a'.repeat(64)} http/request=1 http/response=1 http/incomplete=0 open=0`,
     'last-request: call=c url=https://h/v1/x world_head=null attempt=0',
     'last-response: call=c status=200 error=null duration_ms=3',
@@ -199,6 +200,24 @@ it('formats the exact lines and omits null last records', () => {
   })).toContain('unverified pid=9 fence=unavailable');
   expect(formatStatus({ ...base, world: { present: false, head: null, error: null, state: 'healthy' as const } })).toContain('world: absent');
 });
+it('reports the gateway overlay pair, including a damaged pair as configured (unknown)', async () => {
+  // No pair at all: nodes-only.
+  expect((await readStatus(home)).overlay).toEqual({ state: 'none' });
+  expect(formatStatus(await readStatus(home))).toContain('overlay: none');
+
+  // A readable pair names its model.
+  await writeFile(join(home, 'gateway.charter.md'), 'charter\n', { mode: 0o600 });
+  await writeFile(join(home, 'gateway.json'), '{"v":0,"model":"gw-model"}', { mode: 0o600 });
+  expect((await readStatus(home)).overlay).toEqual({ state: 'configured', model: 'gw-model' });
+  expect(formatStatus(await readStatus(home))).toContain('overlay: configured (gw-model)');
+
+  // A damaged pair is still a configuration: `unknown`, never `none`.
+  await writeFile(join(home, 'gateway.json'), 'not json', { mode: 0o600 });
+  expect((await readStatus(home)).overlay).toEqual({ state: 'configured', model: null });
+  expect(formatStatus(await readStatus(home))).toContain('overlay: configured (unknown)');
+  expect(formatStatus(await readStatus(home))).not.toContain('overlay: none');
+});
+
 it('reports the durable degraded world sidecar, and only a successful commit clears it', async () => {
   await markWorldDegraded(home, 'git-exit', 1);
   const degraded = await readStatus(home);
@@ -206,7 +225,7 @@ it('reports the durable degraded world sidecar, and only a successful commit cle
     present: true, head: null, error: null, state: 'degraded', reason: 'git-exit',
   });
   expect(formatStatus(degraded).split('\n')).toEqual([
-    'home: ' + home, 'host: idle',
+    'home: ' + home, 'host: idle', 'overlay: none',
     'frontier: 0 events last=null http/request=0 http/response=0 http/incomplete=0 open=0',
     'world: head=null',
     'world-state: degraded reason=git-exit',

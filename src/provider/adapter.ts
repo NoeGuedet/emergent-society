@@ -5,11 +5,11 @@ import { toFrontierCode } from '../context/contracts.js';
 import { truncationNotice, utf8Prefix } from '../text.js';
 import { isRecord } from '../util.js';
 import { filterHeaders } from '../frontier/index.js';
-import { serializeWire } from './wire.js';
+import { serializeWire, type WirePlan } from './wire.js';
 import type { Frontier, FrontierOutcome } from '../frontier/index.js';
 import type { BoundaryGate } from '../node/gate.js';
 import type {
-  AssistantProjection, ChatMessage, FunctionCall, RequestPlan, SafeFailure,
+  AssistantProjection, ChatMessage, FunctionCall, RequestId, SafeFailure, SeedPolicy,
 } from '../context/contracts.js';
 import type { SerializedTransport, TransportResult } from './transport.js';
 
@@ -57,6 +57,15 @@ export type ProviderPolicy = {
   readonly schedule: (ms: number, callback: () => void) => () => void;
 };
 
+/**
+ * What `ProviderAdapter.send` needs of a plan: the wire's subset plus the
+ * logical request id it hands the LOCAL gate's `assistant/message` append. The
+ * node's `RequestPlan` satisfies it; the overlay's minimal plan (no journal
+ * `Source`, no `stateHash`, no sections) supplies the id of the cycle step,
+ * which never reaches any journal because the overlay's gate is a no-op.
+ */
+export type SendPlan = WirePlan & { readonly id: RequestId };
+
 export type SendResult = { readonly kind: 'response'; readonly projection: AssistantProjection }
   | { readonly kind: 'failure'; readonly failure: SafeFailure };
 
@@ -84,7 +93,7 @@ type Projected = { readonly message: AssistantMessage };
  * JSON body carrying an escaped lone surrogate parses but cannot be projected,
  * and throws `MalformedResponseError` — a safe terminal failure, never fatal.
  */
-function project(body: Uint8Array, plan: RequestPlan): Projected {
+function project(body: Uint8Array, plan: WirePlan): Projected {
   let text: string;
   try {
     text = new TextDecoder('utf-8', { fatal: true }).decode(body);
@@ -196,7 +205,7 @@ export class ProviderAdapter {
     private readonly frontier: Frontier,
   ) {}
 
-  async send(plan: RequestPlan, gate: BoundaryGate): Promise<SendResult> {
+  async send(plan: SendPlan, gate: BoundaryGate): Promise<SendResult> {
     const id = plan.id;
     const policy = plan.policy;
 
@@ -381,7 +390,7 @@ export class ProviderAdapter {
    * transport returned must never be classified as that pre-send fault.
    */
   private async post(
-    body: Uint8Array, policy: RequestPlan['policy'], gate: BoundaryGate,
+    body: Uint8Array, policy: SeedPolicy, gate: BoundaryGate,
   ): Promise<Posted> {
     const controller = new AbortController();
     let timedOut = false;
@@ -436,7 +445,7 @@ export class ProviderAdapter {
    * frontier, and a local attempt fact no longer exists.
    */
   private async maybeRetry(
-    gate: BoundaryGate, attempt: number, retryable: boolean, policy: RequestPlan['policy'],
+    gate: BoundaryGate, attempt: number, retryable: boolean, policy: SeedPolicy,
   ): Promise<'continue' | 'stop'> {
     if (!retryable || attempt + 1 >= policy.maxAttempts) return 'stop';
     if (gate.signal.aborted) return 'stop';

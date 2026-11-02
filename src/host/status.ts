@@ -8,15 +8,17 @@ import { singleLine } from '../text.js';
 import { WorldRepo } from '../node/world.js';
 import { readWorldState } from '../node/world-state.js';
 import { readOwner, type OwnerStorage } from './owner.js';
+import { readOverlaySidecars } from '../overlay/charter.js';
 import { HostConfigError } from './errors.js';
 
 /**
  * The read-only `status` report: one cell home, observed, never perturbed.
  *
- * `readStatus` gathers three sections — the host owner record, the frontier
- * journal and the world repository (including the durable degraded-world
- * sidecar, a projection read through its own total reader) — and
- * `formatStatus` renders the human lines. Nothing here writes, takes a lock,
+ * `readStatus` gathers four sections — the host owner record, the frontier
+ * journal, the world repository (including the durable degraded-world sidecar,
+ * a projection read through its own total reader) and the gateway overlay's
+ * persisted configuration pair — and `formatStatus` renders the human lines.
+ * Nothing here writes, takes a lock,
  * reconciles, resolves a blob, opens the local node log or touches the network:
  * the frontier is served by
  * the journal's own reader, which loads the whole log once per report
@@ -71,6 +73,15 @@ export type StatusReport = {
     readonly lastRequest: { call: string; url: string; worldHead: string | null; attempt: number } | null;
     readonly lastResponse: { call: string; status: number | null; error: string | null; durationMs: number } | null;
     readonly error: string | null;
+  };
+  /**
+   * The gateway overlay's persisted configuration (a home fact, not a
+   * running-host fact): `configured` carries the model id, or null when the
+   * pair exists but cannot name one; `none` means neither sidecar exists.
+   */
+  readonly overlay: {
+    readonly state: 'configured' | 'none';
+    readonly model?: string | null;
   };
   readonly world: {
     readonly present: boolean; readonly head: string | null; readonly error: string | null;
@@ -330,6 +341,7 @@ export async function readStatus(home: string): Promise<StatusReport> {
     throw new HostConfigError(`home must be a directory: ${home}`);
   }
   const host = await hostOf(home);
+  const overlay = await overlayOf(home);
   const frontier = await frontierOf(home);
   const observedWorld = await worldOf(home);
   // The sidecar is a total read (missing/malformed = healthy), so a damaged
@@ -342,7 +354,26 @@ export async function readStatus(home: string): Promise<StatusReport> {
       ...(worldState.reason !== undefined ? { reason: worldState.reason } : {}),
     }
     : { ...observedWorld, state: 'healthy' };
-  return { home, host, frontier, world };
+  return { home, host, overlay, frontier, world };
+}
+
+/**
+ * The overlay's persisted configuration. A missing pair is `none`; a readable
+ * pair names its model; a damaged or partial pair exists but names no model —
+ * the report says `unknown` rather than inventing `none` for a config that is
+ * there. `readOverlaySidecars` never throws for a damaged record, so only a raw
+ * filesystem fault can propagate here (the home-probe class).
+ */
+async function overlayOf(home: string): Promise<StatusReport['overlay']> {
+  const sidecars = await readOverlaySidecars(home);
+  switch (sidecars.kind) {
+    case 'absent':
+      return { state: 'none' };
+    case 'present':
+      return { state: 'configured', model: sidecars.config.model };
+    case 'damaged':
+      return { state: 'configured', model: null };
+  }
 }
 
 /**
@@ -357,6 +388,7 @@ export async function readStatus(home: string): Promise<StatusReport> {
 export function formatStatus(report: StatusReport): string {
   const lines = [`home: ${report.home}`];
   lines.push(hostLine(report.host));
+  lines.push(overlayLine(report.overlay));
   lines.push(
     `frontier: ${report.frontier.count} events last=${report.frontier.lastHash} `
     + `http/request=${report.frontier.counts['http/request'] ?? 0} `
@@ -385,6 +417,18 @@ export function formatStatus(report: StatusReport): string {
     lines.push(`world-state: degraded reason=${bounded(report.world.reason ?? 'unknown')}`);
   }
   return lines.join('\n');
+}
+
+/**
+ * The overlay line: `overlay: configured (<model>)` or `overlay: none`. A
+ * configured pair whose model cannot be named prints the bounded `unknown`
+ * inside the same shape — never a third form.
+ */
+function overlayLine(overlay: StatusReport['overlay']): string {
+  if (overlay.state === 'none') return 'overlay: none';
+  const model = overlay.model === null || overlay.model === undefined
+    ? 'unknown' : bounded(overlay.model);
+  return `overlay: configured (${model})`;
 }
 
 /** One bounded single-line operator value for the human report. */

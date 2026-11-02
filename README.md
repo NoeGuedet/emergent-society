@@ -1,6 +1,6 @@
 # emergent-society
 
-A research harness for observing the emergence of multi-agent LLM societies — and for measuring whether a human can steer them without breaking what makes them emergent. Nothing organizational is coded: nodes get minimal physics, a seed of instincts, and raw tools, and communicate only by writing to a shared filesystem world. The human co-orchestrates the society's direction with a dedicated node (agent zero), while everything is recorded so that emergence can be studied.
+A research harness for observing the emergence of multi-agent LLM societies — and for measuring whether a human can steer them without breaking what makes them emergent. Nothing organizational is coded: nodes get minimal physics, a seed of instincts, and raw tools, and communicate only by writing to a shared filesystem world. The human co-orchestrates the society's direction with a dedicated overlay (agent zero — a host-side digest service, not a node), while everything is recorded so that emergence can be studied.
 
 ## Current state
 

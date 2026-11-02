@@ -2,7 +2,9 @@ import { canonicalizeJson } from '../journal/index.js';
 import type { JsonValue } from '../journal/index.js';
 import { toJson } from '../context/artifacts.js';
 import { validateProviderParameters } from '../context/parameters.js';
-import type { ChatMessage, RequestPlan, ToolSchema } from '../context/contracts.js';
+import type {
+  ChatMessage, SeedPolicy, ToolSchema,
+} from '../context/contracts.js';
 
 /**
  * The sole owner of wire serialization (kernel.md §4).
@@ -28,6 +30,33 @@ import type { ChatMessage, RequestPlan, ToolSchema } from '../context/contracts.
 function refuse(message: string): never {
   throw new Error(`serializeWire: refusing ${message}`);
 }
+
+/**
+ * What the wire actually reads of a plan. The node's `RequestPlan` is one value
+ * that satisfies it — with a journal `Source`, a `stateHash`, a `toolsHash` and
+ * the plan's section receipts that the wire never serializes — and the gateway
+ * overlay's plan is the other: it has no journal receipt to fabricate, so its
+ * plan is exactly this subset (plus the logical request id the local gate
+ * receives; see `SendPlan` in `provider/adapter.ts`). Widening the serializer
+ * to the subset it reads keeps one wire for both paths: a node's bytes are
+ * unchanged byte for byte.
+ */
+export type WirePlan = {
+  readonly model: string;
+  readonly parameters: { readonly [key: string]: JsonValue };
+  readonly policy: SeedPolicy;
+  readonly tools: ToolSchema[];
+  readonly history: ChatMessage[];
+  readonly queue: ChatMessage[];
+  readonly charter: string;
+  /**
+   * The second kernel-owned system block. The node's heading lives here; the
+   * overlay has no heading, so it passes its fixed framing line — the block's
+   * position in the wire is what the kernel owns, not its name.
+   */
+  readonly heading: string;
+  readonly substrate?: string;
+};
 
 function encodeParameters(
   parameters: { readonly [key: string]: JsonValue },
@@ -80,7 +109,7 @@ export function canonicalMessagesBytes(messages: readonly ChatMessage[]): Uint8A
  * — only when the operator declared a served-model catalog — the substrate
  * block, all before the history.
  */
-export function serializeWire(plan: RequestPlan): Uint8Array {
+export function serializeWire(plan: WirePlan): Uint8Array {
   const messages: JsonValue[] = [
     { role: 'system', content: plan.charter },
     { role: 'system', content: plan.heading },

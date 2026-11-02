@@ -13,12 +13,19 @@ machine default shell may be older, always select 24 via nvm first.
 
 - `init --home <abs-dir>` — create the cell home; prints the real `providers.json` path and a
   0600-mode hint, never writes the file.
-- `start --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--uid node-0] [--no-sandbox]` —
+- `start --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--no-sandbox]` —
   boot and run a node; Landlock confinement is the default, `--no-sandbox` is the explicit
   opt-out; `--charter-file` is the base of the composed charter on a start into a cell with no
   journaled configuration (its content is journaled as configuration; the kernel appends the
-  node identity sentence).
-- `start --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]` — boot a declared
+  node identity sentence). `--gateway-charter` / `--gateway-model` configure the gateway
+  overlay — a host-side digest service, never a node: the charter is persisted as
+  `<home>/gateway.charter.md` and the model beside it (validated against the provider store's
+  declared catalog, defaulting to its first entry); a start without the charter runs a
+  nodes-only host — even when a pair is already persisted — and `resume` takes the persisted
+  pair instead. The charter is accepted up to the boot read's capture bound, but the assembled
+  request is bounded by the overlay policy (2 MiB), refused at send: an oversize charter starts
+  and then fails every cycle.
+- `start --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--no-sandbox]` — boot a declared
   node set on one home: a strict JSON array of at most 16 `{uid, model, heading,
   charterFile?, spawn?}` entries with unique uids, read at the config gate (exit 2
   on a malformed file). `spawn: true` declares the kernel's spawn capability for
@@ -27,7 +34,8 @@ machine default shell may be older, always select 24 via nvm first.
   local log, scratch leaf and cgroup leaf; all share the home's world and frontier
   journal. `--nodes-file` replaces `--uid`/`--model`/`--heading`/`--charter-file`.
 - `resume --home <abs-dir> [--uid node-0] [--no-sandbox]` — resume a parked node;
-  `--model`/`--heading`/`--charter-file` are refused as unknown flags.
+  `--model`/`--heading`/`--charter-file` are refused as unknown flags, and so are
+  `--gateway-charter`/`--gateway-model` — the persisted configuration wins.
 - `resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]` — resume a
   declared node set; entries declare only `uid` and `spawn` (the journaled config
   wins for everything else).
@@ -37,7 +45,9 @@ machine default shell may be older, always select 24 via nvm first.
   exits `1` (a folded frontier/world error, the degraded-world sidecar, or a running host
   that requested confinement but carries `fence=unavailable`). An explicit `--no-sandbox`
   opt-out (`sandbox=off`) and the normal production fact `storage=unquoted` (no quota is
-  detected) do not degrade the exit.
+  detected) do not degrade the exit. The report carries the gateway overlay's persisted
+  configuration: `overlay: configured (<model>)` or `overlay: none` (a damaged pair reads
+  `unknown` as the model).
 - `help` — `--help`, `-h`, or empty argv; prints usage, exit `0`.
 
 Parsing is strict (no positionals, no unknown flags; relative `--home` and bad `--uid` are

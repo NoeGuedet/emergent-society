@@ -146,6 +146,7 @@ it('dispatches status: the report prints first, then the exit code it earns', as
   const report = {
     home: '/x',
     host: { state: 'idle' as const },
+    overlay: { state: 'none' as const },
     frontier: {
       present: false, count: 0, lastHash: null, counts: {}, openCalls: 0,
       lastRequest: null, lastResponse: null, error: null,
@@ -165,6 +166,7 @@ it('dispatches status: the report prints first, then the exit code it earns', as
   expect(stdout.join('')).toBe(
     'home: /x\n'
     + 'host: idle\n'
+    + 'overlay: none\n'
     + 'frontier: 0 events last=null http/request=0 http/response=0 http/incomplete=0 open=0\n'
     + 'world: absent\n',
   );
@@ -183,6 +185,7 @@ it('dispatches status: the report prints first, then the exit code it earns', as
   expect(stdout.join('')).toBe(
     'home: /x\n'
     + 'host: idle\n'
+    + 'overlay: none\n'
     + 'frontier: 0 events last=null http/request=0 http/response=0 http/incomplete=0 open=0\n'
     + 'world: absent\n'
     + 'world-state: degraded reason=git-exit\n',
@@ -196,6 +199,7 @@ it('exits 1 only for an unintended fence=unavailable, not for storage=unquoted o
       state: 'running' as const, pid: 1, uid: 'node-0', command: 'start' as const,
       sandbox: 'landlock' as const,
     },
+    overlay: { state: 'none' as const },
     frontier: {
       present: false, count: 0, lastHash: null, counts: {}, openCalls: 0,
       lastRequest: null, lastResponse: null, error: null,

@@ -1,4 +1,4 @@
-import { open, truncate } from 'node:fs/promises';
+import { open, stat, truncate } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
@@ -15,14 +15,19 @@ import { MAX_SPEAK_BYTES } from '../node/conversation.js';
  * read). The log is kernel-owned, mode 0600 and append-only, with one
  * `{v, at, uid, text}` line per record; `uid` follows the conversation actor
  * rule (a node uid, the reserved `human`, or the reserved `gateway`). The node
- * offering carries no `speak` verb: its successor, the overlay's native chat
- * (the human's typed records and the cycle's response records in this file),
- * is specified, not implemented. A torn tail from a crash inside one append is
- * dropped at open, exactly like the attribution sidecar's.
+ * offering carries no `speak` verb: its successor is the overlay's native chat.
+ * The DELIVERY half is implemented (the overlay's cycle appends one response
+ * record per cycle); the human's own writing surface (the interactive `chat`
+ * session and the `direct` batch act) is specified, not implemented. A torn
+ * tail from a crash inside one append is dropped at open, exactly like the
+ * attribution sidecar's.
  */
 
 /** The chat log's file name inside the cell home. */
 export const CHAT_FILE = 'chat.v0.jsonl';
+
+/** The bounded tail window a chat window read scans: never the whole log. */
+export const MAX_CHAT_READ_BYTES = 1024 * 1024;
 
 /** One delivered message. */
 export type ChatMessage = {
@@ -129,6 +134,90 @@ export async function readChat(home: string): Promise<ChatMessage[]> {
       v: 0, at: record['at'], uid: assertConversationActor(record['uid']), text: record['text'],
     };
   });
+}
+
+/**
+ * The chat log's last n records, from a bounded TAIL read.
+ *
+ * The cycle's chat window uses this: the read starts at most `maxBytes` before
+ * EOF, drops a leading fragment when it starts mid-record, and skips a complete
+ * line that does not parse (a crash fragment the next writer terminated). A
+ * torn trailing fragment is never a record. Missing file = an empty log.
+ */
+export async function readChatWindow(
+  home: string, n: number, maxBytes: number = MAX_CHAT_READ_BYTES,
+): Promise<ChatMessage[]> {
+  const limit = Number.isSafeInteger(n) && n > 0 ? n : 1;
+  const path = join(home, CHAT_FILE);
+  let size: number;
+  try {
+    size = (await stat(path)).size;
+  } catch (err) {
+    if (isErrno(err, 'ENOENT')) return [];
+    throw err;
+  }
+  if (size === 0) return [];
+  const window = Math.max(1, Math.floor(maxBytes));
+  const start = Math.max(0, size - window);
+  const from = start > 0 ? start - 1 : 0;
+  const length = size - from;
+  const buffer = Buffer.alloc(length);
+  const handle = await open(path, 'r');
+  let read = 0;
+  try {
+    while (read < length) {
+      const { bytesRead } = await handle.read(buffer, read, length - read, from + read);
+      if (bytesRead === 0) break;
+      read += bytesRead;
+    }
+  } finally {
+    await handle.close();
+  }
+  let text = buffer.subarray(0, read).toString('utf8');
+  if (from > 0) {
+    if (buffer[0] === 0x0a) text = text.slice(1);
+    else {
+      const newline = text.indexOf('\n');
+      text = newline === -1 ? '' : text.slice(newline + 1);
+    }
+  }
+  const lines = text.split('\n');
+  // Our writer always terminates a line: the last segment is empty or torn.
+  lines.pop();
+  const records: ChatMessage[] = [];
+  for (const line of lines) {
+    const record = parseChatLineOrNull(line);
+    if (record !== null) records.push(record);
+  }
+  return records.slice(-limit);
+}
+
+/**
+ * Parses one complete chat line tolerantly: a degraded line is `null`, never a
+ * throw. The strict reader (`readChat`) keeps its own throwing form for the
+ * scripted read; the cycle's window and the watcher share this one.
+ */
+export function parseChatLineOrNull(line: string): ChatMessage | null {
+  if (line === '') return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record['v'] !== 0) return null;
+  const at = record['at'];
+  if (typeof at !== 'number' || !Number.isFinite(at)) return null;
+  const uid = record['uid'];
+  const text = record['text'];
+  if (typeof uid !== 'string' || typeof text !== 'string') return null;
+  try {
+    return { v: 0, at, uid: assertConversationActor(uid), text };
+  } catch {
+    return null;
+  }
 }
 
 async function pathExists(path: string): Promise<boolean> {
