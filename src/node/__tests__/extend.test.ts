@@ -20,6 +20,7 @@ import { createPackageStore } from '../packages/store.js';
 import type { PackageStore } from '../packages/store.js';
 import { createRunSupervisor } from '../packages/supervisor.js';
 import { createSelfPort, type SelfPort } from '../self.js';
+import { HISTORY_FRAMING, type HistoryPort } from '../history.js';
 import { ConversationLog } from '../conversation.js';
 import type { RunSupervisor, RunSupervisorEvents } from '../packages/supervisor.js';
 import type {
@@ -153,7 +154,7 @@ interface Dispatched {
 async function extendCall(
   s: Session, args: JsonValue, over: Partial<AgentConfig> = {},
   portSandbox = false, models?: readonly string[], self?: SelfPort,
-  depart?: DepartPort, conversation?: ConversationPort,
+  depart?: DepartPort, conversation?: ConversationPort, history?: HistoryPort,
 ): Promise<Dispatched> {
   const gate = s.gate('turn', 0);
   s.packageGate(gate);
@@ -168,6 +169,7 @@ async function extendCall(
         ...(self !== undefined ? { self } : {}),
         ...(depart !== undefined ? { depart } : {}),
         ...(conversation !== undefined ? { conversation } : {}),
+        ...(history !== undefined ? { history } : {}),
       },
     );
   } finally {
@@ -1984,4 +1986,111 @@ describe('extend: the conversation verbs', () => {
       await s.shutdown();
     }
   }, 20_000);
+});
+
+
+describe('extend: the node\'s own history', () => {
+  const fakeHistory = (events: () => VerifiedEvents = () => []): HistoryPort => ({
+    events,
+    commitPaths: async () => ({ kind: 'paths', paths: [], omitted: 0 }),
+  });
+
+  it('renders the history through the port', async () => {
+    const s = await openSession();
+    try {
+      const { results } = await extendCall(
+        s, { verb: 'history', n: 4 }, {}, false, undefined, undefined, undefined,
+        undefined, fakeHistory());
+      expect(results[0]!.isError).toBe(false);
+      expect(results[0]!.content.startsWith(HISTORY_FRAMING)).toBe(true);
+      expect(results[0]!.content).toContain('(no records in your history yet)');
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('denies honestly when this cell composed no history port', async () => {
+    const s = await openSession();
+    try {
+      const { results } = await extendCall(s, { verb: 'history' });
+      expect(results[0]!.isError).toBe(true);
+      expect(results[0]!.content)
+        .toBe('denied: this cell was composed without a history port');
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('renders the port-conditional inspect section without the catalogue\'s bans', async () => {
+    const s = await openSession();
+    try {
+      const bare = await extendCall(s, { verb: 'inspect' });
+      const bareContent = bare.results[0]!.content;
+      expect(bareContent).toMatch(/(^|\n)== your own history ==/);
+      expect(bareContent).toMatch(
+        /(^|\n)- history: your own records — this cell was composed without a\s+history port\./);
+      // The catalogue's existing bans hold on the new section too.
+      expect(bareContent).not.toContain('not available yet');
+      expect(bareContent).not.toContain('EACCES');
+
+      const withPort = await extendCall(
+        s, { verb: 'inspect' }, {}, false, undefined, undefined, undefined,
+        undefined, fakeHistory());
+      const content = withPort.results[0]!.content;
+      expect(content).toContain('extend {verb:"history", n?}');
+      expect(content).toContain('oldest-first');
+      expect(content).toContain('There is no cursor: re-reading always returns the same records.');
+      const historySection = content.slice(content.indexOf('== your own history =='));
+      expect(historySection).not.toContain('without a history port');
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('executes history in a pre-wave cell that does not advertise it', async () => {
+    const s = await openSession();
+    try {
+      // A pre-wave journaled schema: eleven verbs, no history in the enum.
+      const fresh = config();
+      const stale: AgentConfig = {
+        ...fresh,
+        tools: fresh.tools.map((tool) => tool.name !== 'extend' ? tool : {
+          ...tool,
+          description: 'Manage this node\'s own capabilities. Eleven verbs: inspect; ...',
+          parameters: {
+            type: 'object',
+            properties: {
+              verb: {
+                type: 'string',
+                enum: ['inspect', 'define', 'run', 'call', 'stop', 'undefine', 'spawn',
+                  'update_self', 'request_death', 'send_message', 'get_messages'],
+              },
+            },
+            required: ['verb'], additionalProperties: false,
+          },
+        }),
+      };
+      const { results } = await extendCall(
+        s, { verb: 'history' }, { tools: stale.tools }, false, undefined, undefined,
+        undefined, undefined, fakeHistory());
+      // Capability without advertisement: the dispatch array is code.
+      expect(results[0]!.isError).toBe(false);
+      expect(results[0]!.content.startsWith(HISTORY_FRAMING)).toBe(true);
+    } finally {
+      await s.shutdown();
+    }
+  }, 20_000);
+
+  it('advertises twelve verbs in a fresh cell', () => {
+    const fresh = config();
+    const extendTool = fresh.tools.find((tool) => tool.name === 'extend');
+    if (extendTool === undefined) throw new Error('expected the extend tool');
+    const parameters = extendTool.parameters as unknown as {
+      properties: { verb: { enum: string[] } };
+    };
+    expect(parameters.properties.verb.enum).toHaveLength(12);
+    expect(parameters.properties.verb.enum[11]).toBe('history');
+    expect(extendTool.description).toContain('Twelve verbs:');
+    expect(extendTool.description).toContain('history (read your own records —');
+  });
 });

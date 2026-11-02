@@ -172,6 +172,48 @@ describe('buildSandboxSpec', () => {
   );
 
   it(
+    'never grants the cell home beyond the world and scratch, so the journals stay unreachable',
+    async () => {
+      // Production-faithful layout: the world is <home>/world (the only
+      // writable home grant besides the node's scratch leaf).
+      const prodHome = join(root, 'prod-home');
+      const prodWorld = join(prodHome, 'world');
+      await mkdir(prodWorld, { recursive: true });
+      const launcher = await launcherStub();
+      const spec = await buildSandboxSpec({
+        world: prodWorld, home: prodHome, uid: 'node-a', launcherPath: launcher,
+      });
+      const homeReal = await realpath(prodHome);
+      const worldReal = await realpath(prodWorld);
+      const dash = spec.spawnArgv.indexOf('--');
+      const grants = parseGrants(spec.spawnArgv.slice(0, dash));
+      const paths = grants.map((grant) => grant.path);
+      // The home itself is never a grant; the only in-home grants are the
+      // world and the node's own scratch leaf.
+      expect(paths).not.toContain(homeReal);
+      expect(flagsFor(grants, worldReal)).toEqual(['--rw']);
+      for (const path of paths) {
+        if (path.startsWith(`${homeReal}/`)) {
+          expect([worldReal, join(homeReal, 'tmp', 'node-a')]).toContain(path);
+        }
+      }
+      // The history read is kernel-mediated for exactly this reason: the
+      // frontier journal, the node's local log, the interface streams, the
+      // credential store, the flock sidecars and the external git dir are
+      // outside every grant.
+      for (const denied of [
+        'frontier', 'nodes', 'conversation.v0.jsonl', 'chat.v0.jsonl',
+        'providers.json', '.es', 'world.git',
+      ]) {
+        const target = join(homeReal, denied);
+        expect(paths.some((path) => path === target || path.startsWith(`${target}/`)))
+          .toBe(false);
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
     'places --cgroup after the grants and before the program, never in the probe',
     async () => {
       const launcher = await launcherStub();

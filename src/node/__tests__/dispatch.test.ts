@@ -1289,3 +1289,79 @@ describe('dispatchCalls: the conversation verbs', () => {
     }
   }, 15000);
 });
+
+describe('dispatchCalls: the history verb', () => {
+  // The recognition proof: accepted shapes reach the executor. With no extend
+  // port threaded, the honest denial is the proof — never unknown-tool and
+  // never invalid-tool.
+  const ACCEPTED: ReadonlyArray<readonly [string, JsonValue]> = [
+    ['history with no window', { verb: 'history' }],
+    ['history with a window', { verb: 'history', n: 4 }],
+    ['history at the cap', { verb: 'history', n: 64 }],
+  ];
+
+  it.each(ACCEPTED)('accepts %s and reaches the executor', async (_name, args) => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([call('u1', 'extend', JSON.stringify(args))]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'denied', status: null });
+      expect(data.message.content)
+        .toBe('error: denied\nthis cell was composed without an extend port');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  const REFUSED: ReadonlyArray<readonly [string, string, string]> = [
+    ['history with a zero window', '{"verb":"history","n":0}',
+      'n must be an integer from 1 to 64'],
+    ['history with a negative window', '{"verb":"history","n":-2}',
+      'n must be an integer from 1 to 64'],
+    ['history with a non-numeric window', '{"verb":"history","n":"4"}',
+      'n must be an integer from 1 to 64'],
+    ['history with a fractional window', '{"verb":"history","n":1.5}',
+      'n must be an integer from 1 to 64'],
+    ['history beyond the cap', '{"verb":"history","n":65}',
+      'n must be an integer from 1 to 64'],
+    ['history with an unknown key', '{"verb":"history","x":1}',
+      'history takes verb and optionally n'],
+    // The addressee refusal: there is no parameter to ask for a peer.
+    ['history addressed to a peer', '{"verb":"history","uid":"node-1"}',
+      'history reads only your own records — there is no parameter to ask for a peer\'s'
+      + ' history'],
+  ];
+
+  it.each(REFUSED)('refuses %s', async (_name, args, want) => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([call('u1', 'extend', args)]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'invalid-tool', status: null });
+      expect(data.message.content).toContain(want);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('appends history last in the recognition refusal', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([call('u1', 'extend', '{"verb":"make"}')]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.message.content).toContain(
+        'verb must be one of inspect, define, run, call, stop, undefine, spawn,'
+        + ' update_self, request_death, send_message, get_messages, history');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+});

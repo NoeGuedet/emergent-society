@@ -15,6 +15,7 @@ import { dispatchCalls } from './tools/dispatch.js';
 import { renderConversationNotice } from './conversation.js';
 import type { ConversationNoticeSource } from './conversation-watcher.js';
 import { createSelfPort } from './self.js';
+import { readCommitPaths } from './world-paths.js';
 import type { ExtendPort } from './tools/extend.js';
 import type { RunSupervisorEvents } from './packages/supervisor.js';
 import type { ProviderAdapter } from '../provider/adapter.js';
@@ -292,6 +293,17 @@ class Runtime implements AgentRuntime {
         self: createSelfPort(
           () => this.fold.snapshot().config?.value ?? null, options.uid, options.models,
         ),
+        // The history seam (the SelfPort precedent): composed HERE, beside the
+        // fold, because only the runtime holds the live ContextFold — the host
+        // cannot compose it. It is bound to this node's uid by construction
+        // (the fold is this node's journal): the port takes no uid and can
+        // answer only for this node. The paths reader is the world's read
+        // plumbing (`world-paths.ts`), one diff-tree child per committed entry
+        // in a read's window, each under its own read deadline.
+        history: {
+          events: () => this.fold.verifiedEvents(),
+          commitPaths: (hash) => readCommitPaths(this.options.world, hash),
+        },
       };
   }
 

@@ -11,6 +11,7 @@ import { boundToolText, decodeToolText } from './text.js';
 import { renderExtract, renderSearch } from './web.js';
 import type { WebOutcome, WebTools } from './web.js';
 import { executeExtend, type ExtendDecision, type ExtendPort } from './extend.js';
+import { MAX_HISTORY_ENTRIES } from '../history.js';
 import { MAX_SPEAK_BYTES } from '../conversation.js';
 
 /**
@@ -216,21 +217,21 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
     return { kind: 'execute', cmd };
   }
 
-  // `extend`: the eleven verbs, each with its exact key set (the funnel's
+  // `extend`: the twelve verbs, each with its exact key set (the funnel's
   // argument shapes are validated here — the one-decision-point rule). The two
-  // conversation verbs are APPENDED LAST so the published recognition refusal
-  // keeps its existing prefix — the teaching text a model may already have
-  // seen, and the string the dispatch pin asserts — and the vocabulary grows
-  // only by addition.
+  // conversation verbs and the history read are APPENDED LAST so the published
+  // recognition refusal keeps its existing prefix — the teaching text a model
+  // may already have seen, and the string the dispatch pin asserts — and the
+  // vocabulary grows only by addition.
   const verbs = [
     'inspect', 'define', 'run', 'call', 'stop', 'undefine', 'spawn', 'update_self',
-    'request_death', 'send_message', 'get_messages',
+    'request_death', 'send_message', 'get_messages', 'history',
   ];
   const verb = parsed['verb'];
   if (typeof verb !== 'string' || !verbs.includes(verb)) {
     return invalidDetail(
       'verb must be one of inspect, define, run, call, stop, undefine, spawn,'
-      + ' update_self, request_death, send_message, get_messages',
+      + ' update_self, request_death, send_message, get_messages, history',
     );
   }
   const keys = Object.keys(parsed);
@@ -289,6 +290,29 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
       return { kind: 'extend', verb: 'get_messages', n };
     }
     return { kind: 'extend', verb: 'get_messages' };
+  }
+  if (verb === 'history') {
+    // The node's own timeline: the last n ENTRIES, oldest-first, default 16,
+    // capped at 64 — stateless, so a re-read is consistent. There is no
+    // addressee parameter: the records are always the caller's own, and the
+    // teaching refusal says so when a `uid` is attempted (the kernel is not a
+    // node-to-node history transport any more than it is a message one).
+    if (!only('verb', 'n')) {
+      if (Object.hasOwn(parsed, 'uid')) {
+        return invalidDetail('history reads only your own records — there is no'
+          + ' parameter to ask for a peer\'s history');
+      }
+      return invalidDetail('history takes verb and optionally n');
+    }
+    const n = parsed['n'];
+    if (n !== undefined) {
+      if (typeof n !== 'number' || !Number.isSafeInteger(n)
+        || n < 1 || n > MAX_HISTORY_ENTRIES) {
+        return invalidDetail(`n must be an integer from 1 to ${MAX_HISTORY_ENTRIES}`);
+      }
+      return { kind: 'extend', verb: 'history', n };
+    }
+    return { kind: 'extend', verb: 'history' };
   }
   if (verb === 'spawn') {
     // The kernel capability: the child inherits the requester's tools and

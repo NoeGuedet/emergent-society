@@ -19,7 +19,8 @@ import {
  *   before any visible effect; a refusal lands nothing, and a collision
  *   inside the declaration is caught before the first tool moves.
  * - **Collision-checked against every reserved vocabulary** — the base five,
- *   the extend verbs, the kernel-owned `spawn`/`speak` and the conversation's
+ *   the extend verbs (including the node's own `history` read), the
+ *   kernel-owned `spawn`/`speak` and the conversation's
  *   `send_message`/`get_messages` (a package tool bearing one of those names
  *   would corrupt the honesty catalogue, and the reserved verb names are never
  *   released), already-registered names, and duplicates within the
@@ -80,7 +81,7 @@ const BASE_TOOLS: ReadonlySet<string> = new Set([
 
 const VERB_VOCABULARY: ReadonlySet<string> = new Set([
   'inspect', 'define', 'run', 'call', 'stop', 'undefine', 'verb', 'update_self',
-  'request_death',
+  'request_death', 'history',
 ]);
 
 const KERNEL_OWNED: ReadonlySet<string> = new Set([

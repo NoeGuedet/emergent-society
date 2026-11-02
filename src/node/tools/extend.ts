@@ -12,15 +12,17 @@ import { modelRefusal } from './providers.js';
 import { Buffer } from 'node:buffer';
 import { singleLine } from '../../text.js';
 import { PackageError } from '../packages/errors.js';
+import { DEFAULT_HISTORY_ENTRIES, renderHistory, type HistoryPort } from '../history.js';
 import { SelfRefusedError, type SelfPort } from '../self.js';
 import type { PackageDefinition, PackageStore } from '../packages/store.js';
 import type { RunSupervisor } from '../packages/supervisor.js';
 
 /**
  * The extend executor (kernel.md, the sandbox and local-log sections): the
- * peer of terminal and web — the eleven verbs, including the conversation's
- * two (send_message, get_messages; the node `speak` verb is removed), the
- * append home of the four verb facts (define, run, stop, undefine; the
+ * peer of terminal and web — the twelve verbs, including the conversation's
+ * two (send_message, get_messages; the node `speak` verb is removed) and the
+ * node's own history (`history`, the projection over the live fold's observed
+ * events); the append home of the four verb facts (define, run, stop, undefine; the
  * registry's effect facts and the supervisor's error/service facts ride the
  * injected event port), the funnel's kernel-side schema validation, and the
  * honest inspect catalogue.
@@ -63,6 +65,13 @@ export type ExtendPort = {
    * honest denial (the speak pattern, without the channel that owned speak).
    */
   readonly conversation?: ConversationPort;
+  /**
+   * The node's own history (the H1 read verb): the runtime-composed port over
+   * the live fold's observed events plus the read-time commit-paths reader.
+   * Bound to this node's uid at composition, never an argument. Absent is the
+   * port-less composition, which renders the honest denial.
+   */
+  readonly history?: HistoryPort;
   /**
    * The operator-declared served-model catalog (providers.json `llm.models`),
    * when the store declares one. inspect lists it honestly; it is the one
@@ -182,7 +191,8 @@ export type ExtendDecision =
     readonly kind: 'extend'; readonly verb: 'send_message';
     readonly to?: string; readonly text: string;
   }
-  | { readonly kind: 'extend'; readonly verb: 'get_messages'; readonly n?: number };
+  | { readonly kind: 'extend'; readonly verb: 'get_messages'; readonly n?: number }
+  | { readonly kind: 'extend'; readonly verb: 'history'; readonly n?: number };
 
 /** A schema violation the funnel refuses with, naming the field. */
 function schemaViolation(args: unknown, schema: unknown, where: string): string | null {
@@ -434,6 +444,22 @@ function renderInspect(
       + ' not available in this composition (no conversation port was composed).');
   }
   lines.push('');
+  lines.push('== your own history ==');
+  if (port.history !== undefined) {
+    lines.push('- history: read your own records —'
+      + ' extend {verb:"history", n?}; the last n entries of your own timeline'
+      + ` (default ${DEFAULT_HISTORY_ENTRIES}, at most 64), oldest-first, with an`
+      + ' "older records exist" line when the timeline is longer. The entries are the'
+      + ' kernel\'s record of your identity versions (charter bytes and digest, never'
+      + ' the text), your turns with the paths their commits changed, your perceptions'
+      + ' of the world\'s patches as you saw them, your lifecycle, compaction markers'
+      + ' and pinned directions. There is no cursor: re-reading always returns the'
+      + ' same records.');
+  } else {
+    lines.push('- history: your own records — this cell was composed without a'
+      + ' history port.');
+  }
+  lines.push('');
   lines.push('== kernel-owned, visible but never mounted ==');
   if (port.spawn !== undefined) {
     const caps = port.spawn.caps();
@@ -614,6 +640,28 @@ export async function executeExtend(opts: {
       await appendResult(gate, id, callId,
         `error: conversation/failed\n${singleLine(
           err instanceof Error ? err.message : 'the conversation thread could not be read',
+          200)}`, true, max);
+    }
+    return;
+  }
+
+  if (decision.verb === 'history') {
+    const history = port.history;
+    if (history === undefined) {
+      await appendResult(gate, id, callId,
+        'denied: this cell was composed without a history port', true, max);
+      return;
+    }
+    try {
+      // The renderer self-bounds under maxToolResultBytes (the per-entry bounds
+      // do the clamping), so the generic tool-text truncation never fires.
+      const content = await renderHistory(
+        history, decision.n ?? DEFAULT_HISTORY_ENTRIES, max);
+      await appendResult(gate, id, callId, content, false, max);
+    } catch (err) {
+      await appendResult(gate, id, callId,
+        `error: history/failed\n${singleLine(
+          err instanceof Error ? err.message : 'the history could not be rendered',
           200)}`, true, max);
     }
     return;

@@ -99,7 +99,7 @@ describe('run registry: name collisions (never half-registered)', () => {
   const COLLIDING = [
     'execute', 'wait', 'web_search', 'web_fetch', 'extend',
     'inspect', 'define', 'run', 'call', 'stop', 'undefine', 'verb',
-    'update_self', 'request_death',
+    'update_self', 'request_death', 'history',
     'spawn', 'speak', 'send_message', 'get_messages',
   ];
 
