@@ -15,7 +15,7 @@ machine default shell may be older, always select 24 via nvm first.
 
 - `init --home <abs-dir>` — create the cell home; prints the real `providers.json` path and a
   0600-mode hint, never writes the file.
-- `start --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--no-sandbox]` —
+- `start --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--memory-remember] [--no-sandbox]` —
   boot and run a node; Landlock confinement is the default, `--no-sandbox` is the explicit
   opt-out; `--charter-file` is the base of the composed charter on a start into a cell with no
   journaled configuration (its content is journaled as configuration; the kernel appends the
@@ -28,7 +28,12 @@ machine default shell may be older, always select 24 via nvm first.
   request is bounded by the overlay policy (2 MiB), refused at send: an oversize charter starts
   and then fails every cycle. A template ships at
   [docs/gateway-charter.md](docs/gateway-charter.md): copy and adapt it, then pass the copy.
-- `start --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--no-sandbox]` — boot a declared
+  `--memory-remember` is the start-only memory gate: it journals
+  `policy.memory {remember: true, messages: false}` into every node this start composes (home-level;
+  a `--nodes-file` boot takes it for every entry) and composes the gated `remember` verb into the
+  extend offering; without it the factory notice-only arm stands, and `resume` refuses the flag
+  (the journaled config wins).
+- `start --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--memory-remember] [--no-sandbox]` — boot a declared
   node set on one home: a strict JSON array of at most 16 `{uid, model, heading,
   charterFile?, spawn?}` entries with unique uids, read at the config gate (exit 2
   on a malformed file). `spawn: true` declares the kernel's spawn capability for
@@ -38,7 +43,8 @@ machine default shell may be older, always select 24 via nvm first.
   journal. `--nodes-file` replaces `--uid`/`--model`/`--heading`/`--charter-file`.
 - `resume --home <abs-dir> [--uid node-0] [--no-sandbox]` — resume a parked node;
   `--model`/`--heading`/`--charter-file` are refused as unknown flags, and so are
-  `--gateway-charter`/`--gateway-model` — the persisted configuration wins.
+  `--gateway-charter`/`--gateway-model` and `--memory-remember` — the persisted configuration
+  wins.
 - `resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]` — resume a
   declared node set; entries declare only `uid` and `spawn` (the journaled config
   wins for everything else).

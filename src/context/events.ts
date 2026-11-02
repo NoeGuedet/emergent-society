@@ -14,9 +14,9 @@ import { MAX_MODEL_CONTEXT_TOKENS } from './meter.js';
 import { GATE_DIALECT, createValidator } from './validate.js';
 import type {
   AgentConfig, ArtifactChunk, ArtifactManifest, ArtifactRef, AssistantAccounting,
-  AssistantProjection, ChatMessage, CompactionAbort, CompactionEnd, CompactionStart,
-  CompactionSummary, ErrorCode, FunctionCall, MeterRecord, MeterUsage, RequestId, SafeFailure,
-  Source, Stored, WorldPerception,
+  AssistantProjection, ChatMessage, CompactionAbort, CompactionEnd, CompactionReplacement,
+  CompactionStart, CompactionSummary, ErrorCode, FunctionCall, MeterRecord, MeterUsage, RequestId,
+  SafeFailure, Source, Stored, WorldPerception,
 } from './contracts.js';
 
 /**
@@ -331,6 +331,20 @@ function meterUsage(value: unknown, where: string): MeterUsage {
   return { promptTokens, completionTokens, totalTokens, cachedTokens };
 }
 
+/**
+ * The typed replacement outcome of one applied compaction (A5): exactly the
+ * three journaled literals. The field is optional for pre-wave records (an
+ * absent field reads as the notice); a present but unknown value is refused.
+ */
+function compactionReplacement(value: unknown): CompactionReplacement {
+  if (value !== 'authored-applied' && value !== 'authored-too-large-fallback-notice'
+    && value !== 'no-pending-notice') {
+    fail('compaction/summary.replacement', "expected 'authored-applied',"
+      + " 'authored-too-large-fallback-notice' or 'no-pending-notice'");
+  }
+  return value;
+}
+
 /** The anchor's journaled sample (A2(ii)/A7): header identity, sample surface price, usage. */
 function assistantAccounting(value: unknown, where: string): AssistantAccounting {
   const o = record(value, where);
@@ -603,15 +617,21 @@ export function createBoundaryRegistry(): BoundaryRegistry {
     'compaction/summary': (data: unknown, scope: GateScope): JsonValue => {
       turnScope(scope, 'compaction/summary');
       const o = record(data, 'compaction/summary');
-      onlyKeys(o, ['id', 'message', 'sources', 'replacementBytes'], 'compaction/summary');
+      onlyKeys(o, [
+        'id', 'message', 'sources', 'replacementBytes', 'replacement',
+      ], 'compaction/summary');
       const message = chatMessage(o['message'], 'compaction/summary.message');
       if (message.role !== 'user') fail('compaction/summary.message', 'must be a user message');
       const sources = array(o['sources'], 'compaction/summary.sources').map((s, i) =>
         source(s, `compaction/summary.sources[${i}]`));
       receipts(scope, sources, 'compaction/summary.sources');
+      const replacement = o['replacement'] === undefined
+        ? undefined : compactionReplacement(o['replacement']);
       return toJson({
         id: hash(o['id'], 'compaction/summary.id'), message, sources,
         replacementBytes: safeInt(o['replacementBytes'], 'compaction/summary.replacementBytes', 0),
+        ...(replacement !== undefined
+          ? { replacement: replacement as CompactionReplacement } : {}),
       });
     },
 

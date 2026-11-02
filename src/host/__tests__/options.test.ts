@@ -29,6 +29,29 @@ it('parses start with --charter-file, and keeps it absent otherwise', () => {
   )).toBe(false);
 });
 
+it('parses --memory-remember on start only (the start-only gate flag)', () => {
+  expect(parseHostCommand([
+    'start', '--home', '/x', '--model', 'm', '--heading', 'h', '--memory-remember',
+  ])).toEqual({
+    command: 'start', home: '/x', uid: 'node-0', model: 'm', heading: 'h', noSandbox: false,
+    memoryRemember: true,
+  });
+  // Home-level: it applies to every node of a declared boot.
+  expect(parseHostCommand([
+    'start', '--home', '/x', '--nodes-file', '/tmp/n.json', '--memory-remember',
+  ])).toEqual({
+    command: 'start', home: '/x', uid: 'node-0', noSandbox: false,
+    nodesFile: '/tmp/n.json', memoryRemember: true,
+  });
+  // Absent stays absent (never an explicit false in the command).
+  expect('memoryRemember' in parseHostCommand(
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h'],
+  )).toBe(false);
+  // The start-only rule: resume refuses the flag like the other start flags.
+  expect(() => parseHostCommand(['resume', '--home', '/x', '--memory-remember']))
+    .toThrow(/memory-remember/);
+});
+
 it('parses init/resume/pause', () => {
   expect(parseHostCommand(['init', '--home', '/x'])).toEqual({ command: 'init', home: '/x' });
   expect(parseHostCommand(['resume', '--home', '/x'])).toEqual({
@@ -124,16 +147,18 @@ it('parses --nodes-file and refuses the solo flags it replaces', () => {
   }
 });
 
-it('USAGE lists the seven commands, the exit codes and the eight disclosures', () => {
+it('USAGE lists the seven commands, the exit codes and the disclosures', () => {
   for (const s of [
     'init', 'start', 'resume', 'pause', 'status', 'chat', 'direct', 'Exit codes: 0',
     'interrupts in-flight', 'partial world writes', 'fresh PTY', 'not re-executed',
     'one turn', 'released its cell', 'blocks a new host', '--charter-file',
     'no journaled', 'resume refuses it', 'config wins.', 'secret-bearing file',
+    '--memory-remember', 'memory gate', 'runtime-only',
   ]) {
     expect(USAGE).toContain(s);
   }
   expect(USAGE).toContain('[--charter-file <abs-path>]');
+  expect(USAGE).toContain('[--memory-remember]');
   expect(USAGE).toContain('status --home');
   expect(USAGE).toContain('--json');
   // The chat contract: the CLI's first interactive command, with its prompt

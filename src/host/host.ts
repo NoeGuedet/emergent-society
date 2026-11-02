@@ -2,7 +2,8 @@ import { readdirSync } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  DEFAULT_WAKE_BUDGET_PER_HOUR, defaultAgentConfig, validateAgentConfig,
+  DEFAULT_CHARTER_AUTHORED, DEFAULT_WAKE_BUDGET_PER_HOUR, composeMemoryOffering,
+  defaultAgentConfig, validateAgentConfig,
 } from '../context/config.js';
 import type { AgentConfig, LlmModel } from '../context/contracts.js';
 import { C13_EVENT_TYPES } from '../context/events.js';
@@ -21,7 +22,8 @@ import {
   modelIds, modelRefusal, windowOf, windowRefusal, type ProviderRegistry,
 } from '../node/tools/providers.js';
 import {
-  AFTER_COMPACTION_OVER_WINDOW, UNCOMPACTABLE_OVER_WINDOW,
+  AFTER_COMPACTION_OVER_WINDOW, EARLY_COMPACT_ABORTED, EARLY_COMPACT_NOTHING_SELECTABLE,
+  UNCOMPACTABLE_OVER_WINDOW,
 } from '../node/loop.js';
 import { DEFAULT_TERMINAL_ENV } from '../node/tools/terminal.js';
 import { webToolsFromProviders } from '../node/tools/web.js';
@@ -346,10 +348,10 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
       current: () => conversationWatcher.noticeFor(uid),
       consume: (version) => { conversationWatcher.consume(uid, version); },
     },
-    // The token trigger's bounded host diagnostics (A4): host state, never a
-    // journal fact. The windowless fallback fires once per boot; the
-    // uncompactable escape names the decision it could not serve. Neither ever
-    // carries a credential or agent-authored text.
+    // The token trigger's bounded host diagnostics (A4) and the memory arm's
+    // early-trigger miss (A5): host state, never a journal fact. The windowless
+    // fallback fires once per boot; the uncompactable escape names the decision
+    // it could not serve. None ever carries a credential or agent-authored text.
     diagnose: (diagnostic) => {
       if (diagnostic.kind === 'token-trigger-fallback') {
         log.emit('host/meter-fallback', { home, uid, reason: 'no-declared-window' });
@@ -361,6 +363,22 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
         log.emit('host/meter-over-window', {
           home, uid, reason: UNCOMPACTABLE_OVER_WINDOW,
           estimate: diagnostic.estimate, threshold: diagnostic.threshold,
+        });
+        return;
+      }
+      if (diagnostic.kind === 'early-compact-nothing-selectable') {
+        // The remember verb's early trigger ran at the plan site and no
+        // transaction could reduce the surface: the uncompactable escape's
+        // shape, typed — never a silent no-op.
+        log.emit('host/memory-early-nothing', {
+          home, uid, reason: EARLY_COMPACT_NOTHING_SELECTABLE,
+        });
+        return;
+      }
+      if (diagnostic.kind === 'early-compact-aborted') {
+        // The other typed miss: the forced transaction aborted (stale/orphan).
+        log.emit('host/memory-early-aborted', {
+          home, uid, reason: EARLY_COMPACT_ABORTED,
         });
         return;
       }
@@ -670,6 +688,16 @@ export type HostOptions = {
   readonly home: string; readonly uid: string; readonly command: HostCommand;
   readonly model?: string; readonly heading?: string; readonly charterFile?: string;
   /**
+   * The memory gate's start-only, home-level switch (A5, `--memory-remember`):
+   * when true, every node this start composes journals
+   * `policy.memory = {remember:true, messages:false}` and the extend offering
+   * advertises the gated verb; the executor then enables it. A RESUME never
+   * takes it — the journaled config wins and the parser refuses the flag — and
+   * it applies to every entry of a `--nodes-file` boot. `messages` stays false
+   * (the reserved history arm, a later brick).
+   */
+  readonly memoryRemember?: boolean;
+  /**
    * A JSON nodes file declaring the whole boot: its uids (and, on a start, each
    * model, heading and optional absolute charter file) replace the solo flags.
    * The parser refuses `--nodes-file` together with `--uid`/`--model`/`--heading`/
@@ -842,9 +870,14 @@ async function readCellConfig(home: string, uid: string): Promise<CellConfigStat
  * (a fresh cell, or the boot-without-config recovery), and a resume carrying
  * it is refused; the file is read after the journaled-config refusal, so a
  * start on an already-configured cell never touches the operator's file.
+ *
+ * `memoryRemember` is the same start-only, home-level rule for the memory gate
+ * (A5): a START journals it into every composed node's policy and composes the
+ * gated offering; a RESUME never takes it (the parser refuses
+ * `--memory-remember` there), and the journaled config wins.
  */
 async function resolveNodeConfig(
-  home: string, command: HostCommand, spec: NodeSpec,
+  home: string, command: HostCommand, spec: NodeSpec, memoryRemember = false,
 ): Promise<AgentConfig> {
   const { uid, model, heading, charterFile } = spec;
   const state = await readCellConfig(home, uid);
@@ -865,15 +898,27 @@ async function resolveNodeConfig(
     // The kernel owns the final sentence at boot too: any authored trailing
     // identity sentence (any uid — an operator file may echo another node's)
     // is stripped before the stamp, so it never stacks.
+    //
+    // The memory gate (A5) is a START composition: when the operator asked for
+    // it, the composed config journals `memory = {remember:true, messages:false}`
+    // and the gated default charter (the notice-only sentence would be a partial
+    // lie under the authored arm); an operator's charter file is used unamended.
+    // The offering is then composed from the journaled gate — the only
+    // wire-visible carrier — and frozen on resume by the journaled config.
+    const factory = defaultAgentConfig();
     const base = charterFile !== undefined
       ? await readCharterFile(home, uid, charterFile)
-      : defaultAgentConfig().charter;
-    return validateAgentConfig({
-      ...defaultAgentConfig(),
+      : (memoryRemember ? DEFAULT_CHARTER_AUTHORED : factory.charter);
+    const composed = validateAgentConfig({
+      ...factory,
       model,
       heading,
       charter: `${stripAuthoredIdentity(base)}${identitySentence(uid)}`,
+      ...(memoryRemember
+        ? { policy: { ...factory.policy, memory: { remember: true, messages: false } } }
+        : {}),
     });
+    return composeMemoryOffering(composed);
   }
   if (model !== undefined || heading !== undefined) {
     throw new HostConfigError('resume takes no --model or --heading; the journaled config wins');
@@ -1537,8 +1582,16 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         uid: primaryUid, command, ...(deps.now !== undefined ? { now: deps.now } : {}),
         sandbox: sandbox === false ? 'off' : 'landlock',
       });
+      // The memory gate is HOME-LEVEL (A5): the start-only flag applies to
+      // every node of this boot — a solo node or a declared set alike — and a
+      // resume ignores it (the parser never yields one; the journaled config
+      // wins). The injected test seam keeps its three-argument shape.
+      const memoryRemember = options.memoryRemember === true;
+      const composeConfig = deps.readInitialConfig
+        ?? ((nodeHome: string, nodeCommand: HostCommand, nodeSpec: NodeSpec) =>
+          resolveNodeConfig(nodeHome, nodeCommand, nodeSpec, memoryRemember));
       const configs = await Promise.all(specs.map(
-        (spec) => (deps.readInitialConfig ?? resolveNodeConfig)(home, command, spec),
+        (spec) => composeConfig(home, command, spec),
       ));
       const storage = resolveStorage(deps);
       const storageState = storageFact(storage.policy);

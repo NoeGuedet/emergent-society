@@ -149,6 +149,23 @@ export type TokenTriggerPolicy = {
   };
 };
 
+/**
+ * The memory gate (A5): the optional journaled `memory` policy object, two
+ * INDEPENDENT booleans. `remember` gates the authored-survival verb; `messages`
+ * is the reserved second arm (the history messages kind, a later brick) — this
+ * wave accepts and journals its shape and builds no behavior for it. Absent
+ * means both OFF (the factory default: the fixed notice only).
+ *
+ * The object's presence is the journaled gate; the composed offering (the
+ * extend description's clause and the `remember` enum member) is derived from
+ * `remember` at START composition, and the executor re-reads it as a real
+ * refusal — an advertisement change alone would not be a control.
+ */
+export type MemoryGate = {
+  readonly remember: boolean;
+  readonly messages: boolean;
+};
+
 /** The recorded runtime policy; every numeric limit is the effective one, expanded before journaling. */
 export type SeedPolicy = {
   readonly stepsPerTurn: number; readonly compactAfterBytes: number;
@@ -174,6 +191,14 @@ export type SeedPolicy = {
    * exist; a key-present/windowless cell stays on the byte trigger.
    */
   readonly compactAfterTokens?: TokenTriggerPolicy;
+  /**
+   * The memory gate (A5). Optional: a config journaled before the memory arm
+   * has no such key and reads both booleans as OFF (the factory default arm),
+   * never as a rewrite. Present means both booleans are journaled explicitly —
+   * `remember` composes the verb into the offering and gates its execution;
+   * `messages` is accepted for the reserved second arm and behaves not at all.
+   */
+  readonly memory?: MemoryGate;
 };
 
 export type AgentConfig = {
@@ -265,7 +290,23 @@ export type CompactionSummary = {
   readonly id: string;
   readonly message: Extract<ChatMessage, { role: 'user' }>;
   readonly sources: Source[]; readonly replacementBytes: number;
+  /**
+   * The typed replacement outcome of THIS transaction (A5): which text filled
+   * the slot — the node's pending authored survival (`authored-applied`), the
+   * fixed notice because the authored text was not strictly smaller at apply
+   * time (`authored-too-large-fallback-notice`), or the notice with no pending
+   * payload (`no-pending-notice`). Optional only for the pre-wave records a
+   * journal already holds (they read as the notice); every transaction this
+   * kernel writes carries it, so no replacement outcome is ever silent.
+   */
+  readonly replacement?: CompactionReplacement;
 };
+
+/** The typed replacement outcome one applied compaction journals on its summary. */
+export type CompactionReplacement =
+  | 'authored-applied'
+  | 'authored-too-large-fallback-notice'
+  | 'no-pending-notice';
 
 export type CompactionEnd = { readonly id: string; readonly summary: Source };
 

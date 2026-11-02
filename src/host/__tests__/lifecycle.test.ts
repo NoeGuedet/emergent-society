@@ -8,7 +8,10 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { canonicalBytes } from '../../context/artifacts.js';
 import { assemble } from '../../context/assembler.js';
-import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
+import {
+  composeMemoryOffering, defaultAgentConfig, validateAgentConfig,
+} from '../../context/config.js';
+import { EARLY_COMPACT_NOTHING_SELECTABLE } from '../../node/loop.js';
 import type {
   AgentConfig, ChatMessage, LlmModel, RequestPlan,
 } from '../../context/contracts.js';
@@ -520,6 +523,8 @@ type HostOnceSetup = {
   readonly model?: string; readonly heading?: string; readonly charterFile?: string;
   readonly config?: AgentConfig; readonly fresh?: boolean;
   readonly expectRefusal?: boolean;
+  /** The start-only memory gate (A5): `--memory-remember` on a start. */
+  readonly memoryRemember?: boolean;
 };
 
 /**
@@ -538,6 +543,7 @@ async function runHostOnce(command: 'start' | 'resume', setup: HostOnceSetup = {
         ...(setup.model !== undefined ? { model: setup.model } : {}),
         ...(setup.heading !== undefined ? { heading: setup.heading } : {}),
         ...(setup.charterFile !== undefined ? { charterFile: setup.charterFile } : {}),
+        ...(setup.memoryRemember === true ? { memoryRemember: true } : {}),
       }
     : (() => {
         const { model, heading, ...resumeOpts } = opts;
@@ -1572,3 +1578,132 @@ it('attachProcessHandlers forwards SIGINT/SIGTERM and unhandledRejection then de
   proc.emit('SIGINT');
   expect(calls).toHaveLength(3);
 }, 20_000);
+
+describe('the memory gate at START composition (A5)', () => {
+  const enumOf = (config: AgentConfig): string[] => {
+    const tool = config.tools.find((candidate) => candidate.name === 'extend');
+    if (tool === undefined) throw new Error('expected the extend tool');
+    return (tool.parameters as unknown as {
+      properties: { verb: { enum: string[] } };
+    }).properties.verb.enum;
+  };
+  const extendOf = (config: AgentConfig) => {
+    const tool = config.tools.find((candidate) => candidate.name === 'extend');
+    if (tool === undefined) throw new Error('expected the extend tool');
+    return tool;
+  };
+
+  it('composes the gated offering on a --memory-remember start; the factory arm stays twelve', async () => {
+    await serve(undefined, [
+      { id: 'first-light-test', contextTokens: 200_000, maxOutputTokens: 32_000 },
+    ]);
+    // The factory arm: an ungated fresh cell journals no memory gate and the
+    // twelve-verb factory description.
+    expect(await runHostOnce('start', {})).toBe(0);
+    const plain = firstConfig(await readC13(home, 'node-0'));
+    expect('memory' in plain.policy).toBe(false);
+    expect(enumOf(plain)).toHaveLength(12);
+    expect(extendOf(plain).description).toContain('Twelve verbs:');
+    expect(extendOf(plain).description).not.toContain('remember');
+
+    // The gated arm: the policy journals both booleans (remember ON, the
+    // reserved messages arm OFF), the offering advertises the verb, and the
+    // default charter carries the amended memory sentence.
+    await resetHome();
+    expect(await runHostOnce('start', { fresh: true, memoryRemember: true })).toBe(0);
+    const gated = firstConfig(await readC13(home, 'node-0'));
+    expect(gated.policy.memory).toEqual({ remember: true, messages: false });
+    expect(enumOf(gated)).toHaveLength(13);
+    expect(enumOf(gated)[12]).toBe('remember');
+    expect(extendOf(gated).description).toContain('Thirteen verbs:');
+    expect(extendOf(gated).description).toContain(
+      'remember (author what survives the next compaction');
+    expect(gated.charter).toContain('runtime-only reprieve, never a durable record');
+    // THE WIRE VISIBILITY: the journaled description IS the START composition
+    // of the same policy — not a hand-appended sentence and not the factory one.
+    const expected = composeMemoryOffering(validateAgentConfig({
+      ...defaultAgentConfig(), model: 'first-light-test', heading: 'First light.',
+      policy: {
+        ...defaultAgentConfig().policy, memory: { remember: true, messages: false },
+      },
+    }));
+    expect(extendOf(gated).description).toBe(extendOf(expected).description);
+    expect(extendOf(gated).parameters).toEqual(extendOf(expected).parameters);
+
+    // FROZEN ON RESUME: the journaled config wins — a resume adds no new
+    // configuration version and no re-composition.
+    const { model: _model, heading: _heading, ...resumeOpts } = opts;
+    const parkedBefore = logged(log).filter((entry) => entry['event'] === 'host/parked').length;
+    const resumed = track(startHost({ ...resumeOpts, command: 'resume' }, hostDeps));
+    await vi.waitFor(() => {
+      expect(logged(log).filter((entry) => entry['event'] === 'host/parked').length)
+        .toBe(parkedBefore + 1);
+    }, { timeout: 10_000 });
+    resumed.stop();
+    expect(await resumed.done).toBe(0);
+    const after = await readC13(home, 'node-0');
+    expect(after.filter((event) => event.type === 'system/message')).toHaveLength(1);
+    expect(enumOf(firstConfig(after))).toHaveLength(13);
+  }, 40_000);
+
+  it('states the early-trigger miss in the bounded host diagnostic (the typed policy)', async () => {
+    const rememberEarly: ReplyBody = {
+      body: JSON.stringify({ choices: [{ message: {
+        role: 'assistant', content: null,
+        tool_calls: [{
+          id: 'r0', type: 'function',
+          function: {
+            name: 'extend',
+            arguments: JSON.stringify({
+              verb: 'remember', text: 'early text', compact: true,
+            }),
+          },
+        }],
+      } }] }),
+    };
+    await serve(
+      (_request, index) => (index === 0 ? rememberEarly : idleReply),
+      windowed('first-light-test'));
+    expect(await runHostOnce('start', { memoryRemember: true })).toBe(0);
+    const line = logged(log).find((entry) => entry['event'] === 'host/memory-early-nothing');
+    // The typed sentence is the log line's reason: the escape's shape, stated.
+    expect(line).toMatchObject({
+      home, uid: 'node-0', reason: EARLY_COMPACT_NOTHING_SELECTABLE,
+    });
+    // The escape journals nothing: no transaction ran, and the remember call
+    // itself is the ordinary tool/call pair (no new event type).
+    const events = await readC13(home, 'node-0');
+    expect(events.filter((event) => event.type === 'compaction/start')).toHaveLength(0);
+    expect(events.filter((event) => event.type === 'tool/call')).toHaveLength(1);
+  }, 30_000);
+
+  it('applies --memory-remember to every node of a --nodes-file boot (home-level)', async () => {
+    await serve(undefined, windowed('served-a', 'served-b'));
+    const nodesFile = join(home, 'nodes.json');
+    await writeFile(nodesFile, JSON.stringify([
+      { uid: 'node-0', model: 'served-a', heading: 'Lead.' },
+      { uid: 'node-1', model: 'served-b', heading: 'Worker.' },
+    ]));
+    const handle = track(startHost({ ...opts, nodesFile, memoryRemember: true }, hostDeps));
+    const configOf = async (uid: string): Promise<AgentConfig | null> => {
+      try {
+        const events = await readC13(home, uid);
+        return events.some((event) => event.type === 'system/message')
+          ? firstConfig(events) : null;
+      } catch { return null; }
+    };
+    await vi.waitFor(async () => {
+      expect(await configOf('node-0')).not.toBeNull();
+      expect(await configOf('node-1')).not.toBeNull();
+    }, { timeout: 15_000 });
+    handle.stop();
+    expect(await handle.done).toBe(0);
+    for (const uid of ['node-0', 'node-1']) {
+      const config = await configOf(uid);
+      if (config === null) throw new Error(`no journaled config for ${uid}`);
+      expect(config.policy.memory).toEqual({ remember: true, messages: false });
+      expect(enumOf(config)).toHaveLength(13);
+      expect(enumOf(config)[12]).toBe('remember');
+    }
+  }, 30_000);
+});

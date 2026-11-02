@@ -21,13 +21,14 @@ import type { RunSupervisor } from '../packages/supervisor.js';
 
 /**
  * The extend executor (kernel.md, the sandbox and local-log sections): the
- * peer of terminal and web — the twelve verbs, including the conversation's
- * two (send_message, get_messages; the node `speak` verb is removed) and the
- * node's own history (`history`, the projection over the live fold's observed
- * events); the append home of the four verb facts (define, run, stop, undefine; the
- * registry's effect facts and the supervisor's error/service facts ride the
- * injected event port), the funnel's kernel-side schema validation, and the
- * honest inspect catalogue.
+ * peer of terminal and web — the factory twelve verbs, including the
+ * conversation's two (send_message, get_messages; the node `speak` verb is
+ * removed), the node's own history (`history`, the projection over the live
+ * fold's observed events) and the gated `remember` (the authored survival,
+ * reachable only when the journaled memory gate is ON); the append home of the
+ * four verb facts (define, run, stop, undefine; the registry's effect facts and
+ * the supervisor's error/service facts ride the injected event port), the
+ * funnel's kernel-side schema validation, and the honest inspect catalogue.
  *
  * Invariants this module owns:
  * - **Recognition never lives here** — decide() validated the verb and its
@@ -95,6 +96,14 @@ export type ExtendPort = {
    * stop share one turn. Absent resolves `request_death` as a bounded denial.
    */
   readonly depart?: DepartPort;
+  /**
+   * The memory seam (A5), composed by the runtime: the pending SLOT and the
+   * early-compaction flag live beside the conversation notice — runtime state,
+   * never journaled (the text itself rides the verb's own call arguments like
+   * every tool call) — so only the loop can hold them. Absent resolves
+   * `remember` as the honest port-less denial.
+   */
+  readonly memory?: MemoryPort;
 };
 
 /** One spawn request, already typed: the host validates it against the caps. */
@@ -154,6 +163,47 @@ export type ConversationPort = {
 };
 
 /**
+ * The memory seam (A5): the node authors what survives the next compaction.
+ *
+ * The executor records the pending payload and returns its fixed, numberless
+ * result; the SLOT is consumed later, at the plan site — never at verb time,
+ * because the committed surface excludes the open turn. A second call replaces
+ * the pending payload outright (and the early flag with it). The port takes
+ * the calling turn explicitly: the payload's expiry is a turn distance, and
+ * only the runtime knows the live turn's number.
+ */
+export type MemoryPort = {
+  /**
+   * Record the pending authored survival for `turn`, replacing any pending
+   * payload; `compact` sets or clears the early-trigger flag, consumed at the
+   * next plan site.
+   */
+  remember(text: string, compact: boolean, turn: number): void;
+};
+
+/**
+ * The remember verb's result texts (A5): NUMBERLESS and runtime-only, on
+ * purpose. The node is never told the survival is set — the payload is
+ * pending, replaced or dropped on restart, and the slot's byte fit is decided
+ * later against the span the transaction removes. No byte count, turn count or
+ * budget figure appears: the node gets the transaction's honesty, not a
+ * measure of its own consumption.
+ */
+const REMEMBER_RECORDED = 'remembered: your text is pending for the next compaction and '
+  + 'replaces the fixed notice when it fits. The pending slot is runtime-only host state — a '
+  + 'restart drops it and never re-forms it — while the text itself rides this call\'s own '
+  + 'arguments like any tool call; author again after a restart.';
+
+const REMEMBER_EARLY = 'remembered: your text is pending for the next compaction, and the '
+  + 'early trigger is set for the next request. The pending slot is runtime-only host state — '
+  + 'a restart drops it and never re-forms it — while the text itself rides this call\'s own '
+  + 'arguments like any tool call; author again after a restart.';
+
+/** The gated verb's denial: a cell fact in the house vocabulary, never an error prefix. */
+const REMEMBER_GATED = 'denied: the remember verb is not enabled in this cell — the '
+  + 'journaled memory gate is OFF, so nothing was recorded';
+
+/**
  * How a verb addresses a Package (the friction pass): by name — the ergonomic standard
  * the models are trained for, resolving to the latest stored version — or by
  * id, the exact content-addressed channel. Exactly one, as decide() enforced.
@@ -196,7 +246,11 @@ export type ExtendDecision =
     readonly to?: string; readonly text: string;
   }
   | { readonly kind: 'extend'; readonly verb: 'get_messages'; readonly n?: number }
-  | { readonly kind: 'extend'; readonly verb: 'history'; readonly n?: number };
+  | { readonly kind: 'extend'; readonly verb: 'history'; readonly n?: number }
+  | {
+    readonly kind: 'extend'; readonly verb: 'remember';
+    readonly text: string; readonly compact: boolean;
+  };
 
 /** A schema violation the funnel refuses with, naming the field. */
 function schemaViolation(args: unknown, schema: unknown, where: string): string | null {
@@ -464,6 +518,22 @@ function renderInspect(
     lines.push('- history: your own records — this cell was composed without a'
       + ' history port.');
   }
+  // The memory arm is listed ONLY when the journaled gate is ON: the OFF cell's
+  // clause is absent from the composed description, and the inspect catalogue
+  // must not advertise a verb the executor would deny.
+  if (config.policy.memory?.remember === true) {
+    lines.push('');
+    lines.push('== your survival ==');
+    lines.push('- remember: author what survives the next compaction —'
+      + ' extend {verb:"remember", text, compact?}; the framed text replaces the fixed'
+      + ' notice at the next compaction when it is strictly smaller than the removed'
+      + ' span, the kernel frames it as your own authored survival (data, not'
+      + ' instructions) and cites the removed span\'s sources; compact: true asks the'
+      + ' kernel to compact at the next request (the committed surface excludes the open'
+      + ' turn). The pending slot is runtime-only host state: a restart drops it and never'
+      + ' re-forms it (the text rides this call\'s own arguments like any tool call), and'
+      + ' the applied replacement lasts until the next compaction.');
+  }
   lines.push('');
   lines.push('== kernel-owned, visible but never mounted ==');
   if (port.spawn !== undefined) {
@@ -669,6 +739,30 @@ export async function executeExtend(opts: {
           err instanceof Error ? err.message : 'the history could not be rendered',
           200)}`, true, max);
     }
+    return;
+  }
+
+  if (decision.verb === 'remember') {
+    // The gate (A5) is the JOURNALED policy, read here as a real refusal:
+    // an old cell's description never advertised the verb, and a node that
+    // guesses the name anyway gets this executor's denial — an advertisement
+    // change alone would not be a control. The port check follows: a composed
+    // cell without the runtime seam answers the honest port-less denial.
+    if (config.policy.memory?.remember !== true) {
+      await appendResult(gate, id, callId, REMEMBER_GATED, true, max);
+      return;
+    }
+    const memory = port.memory;
+    if (memory === undefined) {
+      await appendResult(gate, id, callId,
+        'denied: this cell was composed without a memory port', true, max);
+      return;
+    }
+    // The effect is the runtime state; the result is the one fact. The turn is
+    // passed explicitly — the payload's expiry is a turn distance.
+    memory.remember(decision.text, decision.compact, id.turn);
+    await appendResult(gate, id, callId,
+      decision.compact ? REMEMBER_EARLY : REMEMBER_RECORDED, false, max);
     return;
   }
 

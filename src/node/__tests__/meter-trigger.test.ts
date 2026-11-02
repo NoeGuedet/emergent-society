@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { DEFAULT_TERMINAL_ENV } from '../tools/terminal.js';
 import { NodeDriver } from '../driver.js';
 import { createAgentRuntime, type AgentRuntime, type RuntimeDiagnostic } from '../loop.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { ContextFold } from '../../context/fold.js';
 import { assemble } from '../../context/assembler.js';
+import { COMPACTION_NOTICE, AUTHORED_FRAME } from '../../context/compaction.js';
 import { defaultAgentConfig } from '../../context/config.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
 import { readFrontier } from '../../frontier/__tests__/helpers.js';
@@ -23,6 +26,10 @@ import type {
 } from '../../context/contracts.js';
 import type { JsonValue } from '../../journal/index.js';
 import { openTestDriver, useWorld, type WorldFixture } from './helpers.js';
+import type { ExtendPort } from '../tools/extend.js';
+import { createPackageStore } from '../packages/store.js';
+import { createRunSupervisor } from '../packages/supervisor.js';
+import { REMEMBER_PENDING_TURNS, earlyTriggerMiss } from '../loop.js';
 
 /**
  * The token trigger at the plan site (A4) and the accounting it journals (A7),
@@ -105,6 +112,19 @@ function reply(
   };
 }
 
+/** One gated `remember` call: the authored text, optionally the early trigger. */
+function rememberCall(id: string, text: string, compact?: boolean): FunctionCall {
+  return {
+    id, type: 'function',
+    function: {
+      name: 'extend',
+      arguments: JSON.stringify({
+        verb: 'remember', text, ...(compact !== undefined ? { compact } : {}),
+      }),
+    },
+  };
+}
+
 function calling(
   calls: readonly FunctionCall[],
   usage?: { readonly prompt: number; readonly completion: number },
@@ -183,12 +203,13 @@ function configWith(over: {
  * key — so the policy is built whole.
  */
 function byteConfig(over: {
-  policy?: Partial<SeedPolicy>; model?: string;
+  policy?: Partial<SeedPolicy>; model?: string; version?: number;
 } = {}): AgentConfig {
   const base = defaultAgentConfig();
   const { compactAfterTokens: _tokens, ...rest } = base.policy;
   return {
     ...base,
+    version: over.version ?? base.version,
     model: over.model ?? base.model,
     policy: { ...rest, ...over.policy } as SeedPolicy,
   };
@@ -200,15 +221,72 @@ async function adapterFor(fx: WorldFixture, transport: SerializedTransport): Pro
 
 async function runtimeFor(
   fx: WorldFixture, config: AgentConfig, transport: SerializedTransport,
-  extra: { readonly models?: readonly LlmModel[]; readonly diagnose?: (d: RuntimeDiagnostic) => void } = {},
+  extra: {
+    readonly models?: readonly LlmModel[];
+    readonly diagnose?: (d: RuntimeDiagnostic) => void;
+    readonly extend?: ExtendPort;
+  } = {},
 ): Promise<AgentRuntime> {
+  const extend = extra.extend;
   return createAgentRuntime({
     home: fx.home, uid: 'n1', world: fx.world, initialConfig: config,
     terminal: { env: DEFAULT_TERMINAL_ENV },
     adapter: await adapterFor(fx, transport),
     ...(extra.models !== undefined ? { models: extra.models } : {}),
     ...(extra.diagnose !== undefined ? { diagnose: extra.diagnose } : {}),
+    ...(extend !== undefined ? { extend: () => extend } : {}),
   });
+}
+
+/**
+ * The real extend port the runtime completes with its memory seam (the
+ * loop-self precedent): the ready phase scans the store, so the port is real;
+ * no Run is ever started and no terminal/web is wired.
+ */
+async function memoryExtendPort(fx: WorldFixture): Promise<ExtendPort> {
+  const store = await createPackageStore({
+    home: fx.home, uid: 'n1', worldDir: fx.world.path, scratchDir: join(fx.home, 'tmp', 'n1'),
+  });
+  const supervisor = createRunSupervisor({
+    home: fx.home, uid: 'n1', sandbox: false,
+    shellTimeoutMs: 5_000, killGraceMs: 200, maxShellCaptureBytes: 1024 * 1024,
+    now: () => 0,
+    schedule: (ms, callback) => {
+      const timer = setTimeout(callback, ms);
+      return () => clearTimeout(timer);
+    },
+    terminal: null, web: null, webAllowance: { search: false, fetch: false },
+    events: { effect: () => {}, error: () => {}, service: () => {} },
+    bootstrapPath: fileURLToPath(new URL('../packages/run-bootstrap.ts', import.meta.url)),
+  });
+  return { store, supervisor, sandbox: false };
+}
+
+/** The journaled compaction summaries, in order. */
+async function summariesOf(fx: WorldFixture): Promise<Array<{
+  id: string; message: { role: string; content: string }; replacement?: string;
+  sources: unknown[]; replacementBytes: number;
+}>> {
+  return (await eventsOf(fx))
+    .filter((event) => event.type === 'compaction/summary')
+    .map((event) => event.data as unknown as {
+      id: string; message: { role: string; content: string }; replacement?: string;
+      sources: unknown[]; replacementBytes: number;
+    });
+}
+
+/** The turn number of each compaction/start, from the journal's own order. */
+async function compactionTurns(fx: WorldFixture): Promise<number[]> {
+  const events = await eventsOf(fx);
+  let turn = -1;
+  const out: number[] = [];
+  for (const event of events) {
+    if (event.type === 'turn/start') {
+      turn = (event.data as unknown as { turn: number }).turn;
+    }
+    if (event.type === 'compaction/start') out.push(turn);
+  }
+  return out;
 }
 
 function openRuntime(fx: WorldFixture, runtime: AgentRuntime): Promise<NodeDriver> {
@@ -843,5 +921,208 @@ describe('the overflow answer (the separable slice)', () => {
     // The second failure's own code is `http`; the original window refusal is
     // what the turn records.
     expect(end.data).toMatchObject({ outcome: 'error', error: 'context-exceeded 400' });
+  });
+});
+
+// ==================================================================================
+// The remember verb (A5): the pending authored survival, the early flag, the
+// typed outcomes and the gate — driven through the real runtime.
+// ==================================================================================
+
+describe('the remember verb: the pending authored survival', () => {
+  const GATE_ON = { remember: true, messages: false };
+  /** A wide byte threshold: nothing compacts while the payload is authored. */
+  const wide = (policy: Partial<SeedPolicy> = {}): Partial<SeedPolicy> => ({
+    compactAfterBytes: 1_000_000, keepRecentGroups: 0, memory: GATE_ON, ...policy,
+  });
+  /** The next config version: the byte trigger fires, consuming the slot. */
+  const compacting = (version = 2): AgentConfig =>
+    byteConfig({ version, policy: wide({ compactAfterBytes: 1, memory: GATE_ON }) });
+
+  it('pins the turn-distance expiry constant', () => {
+    // The slot's age is a TURN DISTANCE (A5's committed pin), not wall time.
+    expect(REMEMBER_PENDING_TURNS).toBe(4);
+  });
+
+  it('maps every non-applied early outcome to its own typed diagnostic (never silent)', () => {
+    // 'applied' journals the transaction; both misses are typed, including the
+    // ABORTED case (stale/orphan) that the branch previously swallowed.
+    expect(earlyTriggerMiss('applied')).toBeNull();
+    expect(earlyTriggerMiss('skipped')).toEqual({ kind: 'early-compact-nothing-selectable' });
+    expect(earlyTriggerMiss('aborted')).toEqual({ kind: 'early-compact-aborted' });
+  });
+
+  it('records at turn N and lands at a later turn M: the frame, the sources, the typed outcome', async () => {
+    const fx = fixture();
+    const config = byteConfig({ policy: wide() });
+    const transport = new ScriptedTransport([
+      calling([waitCall('w1')]),                                    // turn 0
+      calling([rememberCall('r1', 'the direction is north')]),      // turn 1, step 0
+      reply('idle'),                                                // turn 1, step 1
+      reply('idle'),                                                // turn 2 (compacts)
+      reply('idle'),                                                // turn 3 (reads the frame)
+    ]);
+    const runtime = await runtimeFor(fx, config, transport, { extend: await memoryExtendPort(fx) });
+    await runTurn(fx, runtime); // turn 0: one committed dialogue group
+    await runTurn(fx, runtime); // turn 1: the verb records the pending payload
+    // The verb is never a verb-time transaction: nothing has compacted yet.
+    expect(await summariesOf(fx)).toHaveLength(0);
+    runtime.scheduleConfig(compacting());
+    await runTurn(fx, runtime); // turn 2: the plan site consumes the slot
+    const summaries = await summariesOf(fx);
+    expect(summaries).toHaveLength(1);
+    const message = `${AUTHORED_FRAME}the direction is north`;
+    expect(summaries[0]!.replacement).toBe('authored-applied');
+    expect(summaries[0]!.message.content).toBe(message);
+    // The removed span's sources are still cited.
+    expect(summaries[0]!.sources.length).toBeGreaterThan(0);
+    expect(summaries[0]!.replacementBytes).toBeGreaterThan(message.length);
+    // The frame is in the NEXT plan's history as an ordinary user message.
+    await runTurn(fx, runtime); // turn 3
+    const [turn0] = await turns(fx);
+    const plan = await planAt(fx, turn0! + 3, []);
+    const users = plan.history.filter((entry) => entry.role === 'user')
+      .map((entry) => entry.content);
+    expect(users).toContain(message);
+  });
+
+  it('a second remember replaces the pending payload outright', async () => {
+    const fx = fixture();
+    const config = byteConfig({ policy: wide() });
+    const transport = new ScriptedTransport([
+      calling([waitCall('w1')]),                                     // turn 0
+      calling([rememberCall('r1', 'the first text must not survive')]), // turn 1, step 0
+      calling([rememberCall('r2', 'the second text survives')]),     // turn 1, step 1
+      reply('idle'),                                                 // turn 1, step 2
+      reply('idle'),                                                 // turn 2 (compacts)
+    ]);
+    const runtime = await runtimeFor(fx, config, transport, { extend: await memoryExtendPort(fx) });
+    await runTurn(fx, runtime);
+    await runTurn(fx, runtime);
+    runtime.scheduleConfig(compacting());
+    await runTurn(fx, runtime);
+    const summaries = await summariesOf(fx);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.message.content).toContain('the second text survives');
+    expect(summaries[0]!.message.content).not.toContain('the first text');
+  });
+
+  it('is lost on restart: a fresh runtime compacts with the fixed notice (the node re-authors)', async () => {
+    const fx = fixture();
+    const transport1 = new ScriptedTransport([
+      calling([waitCall('w1')]),                              // turn 0
+      calling([rememberCall('r1', 'the runtime-only text')]), // turn 1, step 0
+      reply('idle'),                                          // turn 1, step 1
+    ]);
+    const runtime1 = await runtimeFor(
+      fx, byteConfig({ policy: wide() }), transport1, { extend: await memoryExtendPort(fx) });
+    await runTurn(fx, runtime1);
+    await runTurn(fx, runtime1);
+    expect(await summariesOf(fx)).toHaveLength(0);
+
+    // A RESTART is a fresh runtime: the slot is host state, never journaled.
+    const runtime2 = await runtimeFor(fx, byteConfig({ policy: wide() }), new ScriptedTransport([
+      reply('idle'), // turn 2 (compacts)
+    ]), { extend: await memoryExtendPort(fx) });
+    runtime2.scheduleConfig(compacting());
+    await runTurn(fx, runtime2);
+    const summaries = await summariesOf(fx);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.replacement).toBe('no-pending-notice');
+    expect(summaries[0]!.message.content).toBe(COMPACTION_NOTICE);
+  });
+
+  it('the strict-smaller rule at apply time falls back to the notice when the text is too large', async () => {
+    const fx = fixture();
+    const config = byteConfig({ policy: wide() });
+    const transport = new ScriptedTransport([
+      calling([waitCall('w1')]),                               // turn 0
+      calling([rememberCall('r1', 'x'.repeat(5_000))]),        // turn 1, step 0
+      reply('idle'),                                           // turn 1, step 1
+      reply('idle'),                                           // turn 2 (compacts)
+    ]);
+    const runtime = await runtimeFor(fx, config, transport, { extend: await memoryExtendPort(fx) });
+    await runTurn(fx, runtime);
+    await runTurn(fx, runtime);
+    // Retain the newest groups — the dialogue that carries the 5,000-byte
+    // arguments and the perception beside it — so the eligible span is the
+    // older, smaller surface the authored text cannot fit.
+    runtime.scheduleConfig(byteConfig({
+      version: 2, policy: wide({ compactAfterBytes: 1, keepRecentGroups: 2, memory: GATE_ON }),
+    }));
+    await runTurn(fx, runtime);
+    const summaries = await summariesOf(fx);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.replacement).toBe('authored-too-large-fallback-notice');
+    expect(summaries[0]!.message.content).toBe(COMPACTION_NOTICE);
+  });
+
+  it('the turn-distance expiry drops a stale payload instead of filling a later slot', async () => {
+    const fx = fixture();
+    const transport = new ScriptedTransport([
+      calling([waitCall('w1')]),                              // turn 0: a committed span
+      calling([rememberCall('r1', 'stale text must not land')]), // turn 1
+      reply('idle'),                                          // turn 1, step 1
+      reply('idle'),                                          // turn 2
+      reply('idle'),                                          // turn 3
+      reply('idle'),                                          // turn 4
+      reply('idle'),                                          // turn 5 (compacts)
+    ]);
+    const runtime = await runtimeFor(
+      fx, byteConfig({ policy: wide() }), transport, { extend: await memoryExtendPort(fx) });
+    await runTurn(fx, runtime); // turn 0
+    await runTurn(fx, runtime); // turn 1: recorded
+    for (let turn = 2; turn <= 4; turn += 1) await runTurn(fx, runtime);
+    expect(REMEMBER_PENDING_TURNS).toBe(4); // distance 4 at turn 5: expired
+    runtime.scheduleConfig(compacting());
+    await runTurn(fx, runtime); // turn 5: the distance is reached, the payload is dropped
+    const summaries = await summariesOf(fx);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.replacement).toBe('no-pending-notice');
+    expect(summaries[0]!.message.content).toBe(COMPACTION_NOTICE);
+  });
+
+  it('the early flag is consumed at the NEXT plan site, never at verb time', async () => {
+    const fx = fixture();
+    const transport = new ScriptedTransport([
+      calling([waitCall('w1')]),                                     // turn 0: group 1
+      calling([waitCall('w2')]),                                     // turn 1: group 2
+      calling([rememberCall('r1', 'early text survives', true), waitCall('w3')]), // turn 2
+      reply('idle'),                                                 // turn 3 (forces)
+      reply('idle'),                                                 // turn 4 (no second fire)
+    ]);
+    const runtime = await runtimeFor(
+      fx, byteConfig({ policy: wide() }), transport, { extend: await memoryExtendPort(fx) });
+    await runTurn(fx, runtime); // turn 0
+    await runTurn(fx, runtime); // turn 1
+    await runTurn(fx, runtime); // turn 2: records the payload + the flag
+    // Never a verb-time transaction: turn 2 itself compacted nothing.
+    expect((await summariesOf(fx))).toHaveLength(0);
+    await runTurn(fx, runtime); // turn 3: the flag fires one forced compaction
+    await runTurn(fx, runtime); // turn 4: the flag is gone; the threshold is still wide
+    const summaries = await summariesOf(fx);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]!.replacement).toBe('authored-applied');
+    expect(summaries[0]!.message.content).toContain('early text survives');
+    // Exactly one compaction, and it happened at turn 3 — the next plan site.
+    expect(await compactionTurns(fx)).toEqual([3]);
+  });
+
+  it('the early trigger with nothing selectable is typed, never a silent no-op', async () => {
+    const fx = fixture();
+    const diagnostics: RuntimeDiagnostic[] = [];
+    const transport = new ScriptedTransport([
+      // The same turn: the remember dispatch is followed by the next plan site,
+      // where the open turn is not on the committed surface yet.
+      calling([rememberCall('r1', 'nothing to compact yet', true)]),
+      reply('idle'),
+    ]);
+    const runtime = await runtimeFor(
+      fx, byteConfig({ policy: wide() }), transport,
+      { extend: await memoryExtendPort(fx), diagnose: (diagnostic) => diagnostics.push(diagnostic) });
+    await runTurn(fx, runtime);
+    expect(diagnostics).toContainEqual({ kind: 'early-compact-nothing-selectable' });
+    expect((await eventsOf(fx)).filter((event) => event.type === 'compaction/start'))
+      .toHaveLength(0);
   });
 });

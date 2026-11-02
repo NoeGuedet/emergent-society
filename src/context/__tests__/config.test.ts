@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { defaultAgentConfig, validateAgentConfig } from '../config.js';
+import {
+  DEFAULT_CHARTER_AUTHORED, composeMemoryOffering, defaultAgentConfig, validateAgentConfig,
+} from '../config.js';
 import { validateProviderParameters } from '../parameters.js';
 import type { SeedPolicy } from '../contracts.js';
 
@@ -315,5 +317,87 @@ describe('provider parameters: the config boundary', () => {
     expect(validateProviderParameters({ temperature: 0 })).toEqual({ temperature: 0 });
     expect(() => validateProviderParameters([])).toThrow();
     expect(() => validateProviderParameters(null)).toThrow();
+  });
+});
+
+describe('the memory gate policy (A5)', () => {
+  it('accepts the object only whole, with two independent booleans', () => {
+    // The factory base carries no memory key: absent = both OFF.
+    expect('memory' in base().policy).toBe(false);
+    expect(validateAgentConfig(withPolicy({
+      memory: { remember: true, messages: false },
+    })).policy.memory).toEqual({ remember: true, messages: false });
+    // The reserved history arm is accepted independently — its behavior is a
+    // later brick, the shape is this one's.
+    expect(validateAgentConfig(withPolicy({
+      memory: { remember: false, messages: true },
+    })).policy.memory).toEqual({ remember: false, messages: true });
+    // Absent stays absent: the optional-key precedent, never a rewrite.
+    const cfg = base();
+    const policy: Record<string, unknown> = { ...cfg.policy };
+    expect('memory' in validateAgentConfig({ ...cfg, policy }).policy).toBe(false);
+    for (const bad of [
+      { remember: true }, { messages: false }, {}, 7, null, [],
+      { remember: true, messages: false, extra: 1 },
+      { remember: 'yes', messages: false },
+      { remember: true, messages: 0 },
+    ]) {
+      expect(() => validateAgentConfig(withPolicy({ memory: bad } as never)))
+        .toThrow(/policy\.memory/);
+    }
+  });
+
+  it('composes the gated offering: thirteen verbs, the remember clause, the compact argument', () => {
+    const gated = validateAgentConfig(withPolicy({
+      memory: { remember: true, messages: false },
+    }));
+    const composed = composeMemoryOffering(gated);
+    const extendTool = composed.tools.find((tool) => tool.name === 'extend');
+    if (extendTool === undefined) throw new Error('expected the extend tool');
+    const parameters = extendTool.parameters as unknown as {
+      properties: { verb: { enum: string[] }; compact?: { type: string } };
+    };
+    expect(parameters.properties.verb.enum).toHaveLength(13);
+    expect(parameters.properties.verb.enum[12]).toBe('remember');
+    expect(parameters.properties.compact).toEqual({ type: 'boolean' });
+    expect(extendTool.description).toContain('Thirteen verbs:');
+    expect(extendTool.description).toContain('remember (author what survives the next compaction');
+    expect(extendTool.description).toContain(
+      'the pending slot is runtime state only — a restart drops it and never re-forms it');
+    // Idempotent: composing the composed config changes nothing (the description
+    // is rebuilt from the canonical text, never appended twice).
+    expect(composeMemoryOffering(composed)).toEqual(composed);
+  });
+
+  it('leaves the OFF arm byte-identical to the twelve-verb factory base', () => {
+    const plain = base();
+    // The composed path returns the very same object when the gate is OFF.
+    expect(composeMemoryOffering(plain)).toBe(plain);
+    const extendTool = plain.tools.find((tool) => tool.name === 'extend');
+    if (extendTool === undefined) throw new Error('expected the extend tool');
+    const parameters = extendTool.parameters as unknown as {
+      properties: { verb: { enum: string[] }; compact?: unknown };
+    };
+    expect(parameters.properties.verb.enum).toHaveLength(12);
+    expect(parameters.properties.verb.enum).not.toContain('remember');
+    expect('compact' in parameters.properties).toBe(false);
+    expect(extendTool.description).toContain('Twelve verbs:');
+    expect(extendTool.description).not.toContain('remember');
+    // The two independent booleans: remember OFF keeps the twelve-verb arm even
+    // when the reserved messages arm is on.
+    const messagesOnly = validateAgentConfig(withPolicy({
+      memory: { remember: false, messages: true },
+    }));
+    expect(composeMemoryOffering(messagesOnly)).toBe(messagesOnly);
+  });
+
+  it('the gated default charter names the authored slot honestly', () => {
+    // The factory arm's sentence stands where it is true; the gated arm replaces
+    // the base with the amended sentence (the treatment change the Lead recorded).
+    expect(base().charter).toContain('whatever you have not put outside it is lost.');
+    expect(base().charter).not.toContain('compaction slot');
+    expect(DEFAULT_CHARTER_AUTHORED).toContain('whatever you have not put outside it is lost');
+    expect(DEFAULT_CHARTER_AUTHORED).toContain('runtime-only reprieve, never a durable record');
+    expect(DEFAULT_CHARTER_AUTHORED).toContain('The heading is the boot seed');
   });
 });

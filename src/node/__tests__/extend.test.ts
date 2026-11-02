@@ -10,12 +10,16 @@ import { canonicalizeJson } from '../../journal/index.js';
 import { sha256HexOf } from '../../journal/index.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
 import type { VerifiedEvents } from '../../context/loader.js';
-import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
+import {
+  composeMemoryOffering, defaultAgentConfig, validateAgentConfig,
+} from '../../context/config.js';
 import { ContextFold } from '../../context/fold.js';
 import { MAX_CAPTURE_BYTES, createBoundaryGate } from '../gate.js';
 import type { BoundaryGate, GateCallbacks, GateScope } from '../gate.js';
 import { dispatchCalls } from '../tools/dispatch.js';
-import { executeExtend, type ConversationPort, type DepartPort } from '../tools/extend.js';
+import {
+  executeExtend, type ConversationPort, type DepartPort, type MemoryPort,
+} from '../tools/extend.js';
 import { createPackageStore } from '../packages/store.js';
 import type { PackageStore } from '../packages/store.js';
 import { createRunSupervisor } from '../packages/supervisor.js';
@@ -155,6 +159,7 @@ async function extendCall(
   s: Session, args: JsonValue, over: Partial<AgentConfig> = {},
   portSandbox = false, models?: readonly LlmModel[], self?: SelfPort,
   depart?: DepartPort, conversation?: ConversationPort, history?: HistoryPort,
+  memory?: MemoryPort,
 ): Promise<Dispatched> {
   const gate = s.gate('turn', 0);
   s.packageGate(gate);
@@ -170,6 +175,7 @@ async function extendCall(
         ...(depart !== undefined ? { depart } : {}),
         ...(conversation !== undefined ? { conversation } : {}),
         ...(history !== undefined ? { history } : {}),
+        ...(memory !== undefined ? { memory } : {}),
       },
     );
   } finally {
@@ -2092,5 +2098,86 @@ describe('extend: the node\'s own history', () => {
     expect(parameters.properties.verb.enum[11]).toBe('history');
     expect(extendTool.description).toContain('Twelve verbs:');
     expect(extendTool.description).toContain('history (read your own records —');
+  });
+});
+
+describe('the memory gate (A5): the gated remember verb', () => {
+  /** The gate ON, with both booleans journaled explicitly (the shape). */
+  const gatedOver = (): Partial<AgentConfig> => ({
+    policy: {
+      ...defaultAgentConfig().policy,
+      memory: { remember: true, messages: false },
+    },
+  });
+
+  /** The gated composed config: the same offering a start would journal. */
+  const gatedConfig = (): AgentConfig => validateAgentConfig({
+    ...defaultAgentConfig(), ...gatedOver(),
+  });
+
+  function memoryPort(calls: Array<{ text: string; compact: boolean; turn: number }>): MemoryPort {
+    return { remember: (text, compact, turn) => { calls.push({ text, compact, turn }); } };
+  }
+
+  it('advertises thirteen verbs in the gated composed cell', () => {
+    const composed = composeMemoryOffering(gatedConfig());
+    const extendTool = composed.tools.find((tool) => tool.name === 'extend');
+    if (extendTool === undefined) throw new Error('expected the extend tool');
+    const parameters = extendTool.parameters as unknown as {
+      properties: { verb: { enum: string[] } };
+    };
+    expect(parameters.properties.verb.enum).toHaveLength(13);
+    expect(parameters.properties.verb.enum[12]).toBe('remember');
+    expect(extendTool.description).toContain('Thirteen verbs:');
+    expect(extendTool.description).toContain('remember (author what survives the next compaction');
+  });
+
+  it('records the pending survival on the memory port and answers numberless/runtime-only', async () => {
+    const s = await openSession();
+    try {
+      const calls: Array<{ text: string; compact: boolean; turn: number }> = [];
+      const { results } = await extendCall(
+        s, { verb: 'remember', text: 'the direction is north', compact: true },
+        gatedOver(), false, undefined, undefined, undefined, undefined, undefined,
+        memoryPort(calls));
+      expect(results[0]!.isError).toBe(false);
+      expect(calls).toEqual([{ text: 'the direction is north', compact: true, turn: 0 }]);
+      expect(results[0]!.content).toContain('pending for the next compaction');
+      expect(results[0]!.content).toContain('runtime-only');
+      expect(/[0-9]/.test(results[0]!.content)).toBe(false);
+    } finally {
+      await s.shutdown();
+    }
+  });
+
+  it('answers the honest port-less denial when the gate is ON but no memory port was composed', async () => {
+    const s = await openSession();
+    try {
+      const { results } = await extendCall(
+        s, { verb: 'remember', text: 'x' }, gatedOver());
+      expect(results[0]!.isError).toBe(true);
+      expect(results[0]!.content).toBe('denied: this cell was composed without a memory port');
+    } finally {
+      await s.shutdown();
+    }
+  });
+
+  it('lists the survival section in inspect only when the journaled gate is ON', async () => {
+    const s = await openSession();
+    try {
+      const off = await extendCall(s, { verb: 'inspect' });
+      expect(off.results[0]!.isError).toBe(false);
+      expect(off.results[0]!.content).not.toContain('== your survival ==');
+      expect(off.results[0]!.content).not.toContain('remember: author what survives');
+
+      const on = await extendCall(s, { verb: 'inspect' }, gatedOver());
+      expect(on.results[0]!.isError).toBe(false);
+      expect(on.results[0]!.content).toContain('== your survival ==');
+      expect(on.results[0]!.content).toContain('remember: author what survives the next compaction');
+      expect(on.results[0]!.content)
+        .toContain('The pending slot is runtime-only host state: a restart drops it');
+    } finally {
+      await s.shutdown();
+    }
   });
 });

@@ -12,6 +12,9 @@ import { defaultAgentConfig } from '../../context/config.js';
 import { createBoundaryGate } from '../gate.js';
 import type { BoundaryGate, GateCallbacks, GateScope } from '../gate.js';
 import { dispatchCalls } from '../tools/dispatch.js';
+import type { ExtendPort } from '../tools/extend.js';
+import type { PackageStore } from '../packages/store.js';
+import type { RunSupervisor } from '../packages/supervisor.js';
 import { DEFAULT_TERMINAL_ENV, PtyTerminalRuntime } from '../tools/terminal.js';
 import type { CommandLimits, CommandOutcome, TerminalPort } from '../tools/terminal.js';
 import type { WebOutcome, WebTools } from '../tools/web.js';
@@ -1333,6 +1336,14 @@ describe('dispatchCalls: the history verb', () => {
     ['history addressed to a peer', '{"verb":"history","uid":"node-1"}',
       'history reads only your own records — there is no parameter to ask for a peer\'s'
       + ' history'],
+    // The gated memory verb's argument shapes (A5): the key set, the text's
+    // non-blank rule — the cap has its own row with a bounded policy below.
+    ['remember without text', '{"verb":"remember"}',
+      'text must be a non-blank string'],
+    ['remember with a blank text', '{"verb":"remember","text":"  "}',
+      'text must be a non-blank string'],
+    ['remember with an unknown key', '{"verb":"remember","text":"x","x":1}',
+      'remember takes verb, text and optionally compact'],
   ];
 
   it.each(REFUSED)('refuses %s', async (_name, args, want) => {
@@ -1350,16 +1361,119 @@ describe('dispatchCalls: the history verb', () => {
     }
   }, 15000);
 
-  it('appends history last in the recognition refusal', async () => {
+  it('appends the gated verb last in the recognition refusal', async () => {
     const { home } = world();
     const s = await openSession(home);
     try {
       await dispatchCalls(projection([call('u1', 'extend', '{"verb":"make"}')]),
         ID, s.gate('turn', 0), config(), neverTerminal);
       const data = await firstResult(home);
+      // The vocabulary grows only by addition: the history suffix is intact and
+      // the gated remember is the LAST member (the published teaching text).
       expect(data.message.content).toContain(
         'verb must be one of inspect, define, run, call, stop, undefine, spawn,'
-        + ' update_self, request_death, send_message, get_messages, history');
+        + ' update_self, request_death, send_message, get_messages, history, remember');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('refuses an authored text over the tool-argument cap, naming the cap', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      const small = config({
+        policy: { ...defaultAgentConfig().policy, maxToolArgumentBytes: 8 },
+      });
+      await dispatchCalls(
+        projection([call('u1', 'extend', '{"verb":"remember","text":"123456789"}')]),
+        ID, s.gate('turn', 0), small, neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'invalid-tool', status: null });
+      expect(data.message.content).toContain('text must be at most 8 bytes');
+      expect(data.message.content).toContain('the tool-argument cap');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('refuses a non-boolean compact with the bare frozen failure', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(
+        projection([call('u1', 'extend', '{"verb":"remember","text":"x","compact":"yes"}')]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'invalid-tool', status: null });
+      expect(data.message.content).toBe('error: invalid-tool');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  /** A memory port that records what the executor hands it. */
+  function memoryPort(calls: Array<{ text: string; compact: boolean; turn: number }>): ExtendPort {
+    const untouched = new Proxy({}, {
+      get(): never { throw new Error('the remember branch must touch only the memory port'); },
+    });
+    return {
+      store: untouched as unknown as PackageStore,
+      supervisor: untouched as unknown as RunSupervisor,
+      sandbox: false,
+      memory: { remember: (text, compact, turn) => { calls.push({ text, compact, turn }); } },
+    };
+  }
+
+  it('records the gated remember on the port and answers numberless and runtime-only', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      const calls: Array<{ text: string; compact: boolean; turn: number }> = [];
+      const gated = config({
+        policy: {
+          ...defaultAgentConfig().policy,
+          memory: { remember: true, messages: false },
+        },
+      });
+      await dispatchCalls(
+        projection([call('u1', 'extend',
+          '{"verb":"remember","text":"the direction is north","compact":true}')]),
+        ID, s.gate('turn', 0), gated, neverTerminal, undefined, memoryPort(calls));
+      const data = await firstResult(home);
+      expect(data.isError).toBe(false);
+      expect(calls).toEqual([{ text: 'the direction is north', compact: true, turn: 0 }]);
+      // The result is NUMBERLESS and says the slot is runtime-only: the node is
+      // never told the survival is set.
+      expect(data.message.content).toContain('runtime-only');
+      expect(data.message.content).toContain('pending for the next compaction');
+      expect(/[0-9]/.test(data.message.content)).toBe(false);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('refuses the gated remember in a cell whose gate is OFF (the drift pin)', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      const calls: Array<{ text: string; compact: boolean; turn: number }> = [];
+      // The factory config carries no memory gate: a node that guesses the verb
+      // gets the EXECUTOR's denial, and the memory port is never reached.
+      await dispatchCalls(
+        projection([call('u1', 'extend', '{"verb":"remember","text":"x"}')]),
+        ID, s.gate('turn', 0), config(), neverTerminal, undefined, memoryPort(calls));
+      const data = await firstResult(home);
+      // The executor's denial is an ordinary error result (the appendResult
+      // shape every executor denial uses); the point is that it refused, not
+      // that it executed, and the memory port was never reached.
+      expect(data.isError).toBe(true);
+      expect(data.failure).toBeNull();
+      expect(data.message.content).toContain('the journaled memory gate is OFF');
+      expect(data.message.content).toContain('nothing was recorded');
+      expect(calls).toEqual([]);
     } finally {
       await s.shutdown();
     }

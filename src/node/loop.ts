@@ -175,6 +175,35 @@ export const UNCOMPACTABLE_OVER_WINDOW = 'over the window but uncompactable: sen
 export const AFTER_COMPACTION_OVER_WINDOW =
   'still over the window after the forced compaction: sent anyway';
 
+/**
+ * The early trigger's typed miss (A5): the `remember {compact:true}` flag was
+ * consumed at the plan site and no transaction could reduce the surface, so it
+ * is the uncompactable escape's shape — a stated outcome, never a silent
+ * no-op. The pending authored payload, when there is one, stays pending (it
+ * may still fill a later slot inside its turn-distance expiry).
+ */
+export const EARLY_COMPACT_NOTHING_SELECTABLE =
+  'the early compaction found nothing selectable: no transaction ran';
+
+/**
+ * The early trigger's second typed miss (A5): the forced transaction was
+ * ABORTED (an orphan recovered at the plan site, or a stale candidate raced by
+ * a concurrent change), so no replacement applied. Like the nothing-selectable
+ * case it is a stated outcome, never a silent flag consumption.
+ */
+export const EARLY_COMPACT_ABORTED =
+  'the early compaction was aborted (stale or orphan): no replacement applied';
+
+/**
+ * The pending authored survival's turn-distance expiry (A5), part of this
+ * brick's committed pins. The payload recorded at turn N is eligible at the
+ * plan site while `turn − N < REMEMBER_PENDING_TURNS` and is dropped once that
+ * distance is reached; its later slots are never filled by a stale text. The
+ * slot is RUNTIME state, not a journal fact: a restart drops it outright (the
+ * node re-authors — residual A8(n)), independent of the turn distance.
+ */
+export const REMEMBER_PENDING_TURNS = 4;
+
 /** One bounded runtime diagnostic: host state, never a journal fact. */
 export type RuntimeDiagnostic =
   | { readonly kind: 'token-trigger-fallback' }
@@ -185,7 +214,25 @@ export type RuntimeDiagnostic =
   | {
       readonly kind: 'over-window-after-compaction';
       readonly estimate: number; readonly threshold: number;
-    };
+    }
+  | { readonly kind: 'early-compact-nothing-selectable' }
+  | { readonly kind: 'early-compact-aborted' };
+
+/**
+ * The typed outcome of one early-trigger attempt (A5): `applied` is the one
+ * non-miss (the transaction journals its own summary); every other outcome is
+ * a stated miss — `skipped` (nothing selectable) or `aborted` (stale/orphan) —
+ * so the flag's consumption is never silent. Pure; the host maps each miss to
+ * its own bounded log line.
+ */
+export function earlyTriggerMiss(
+  outcome: 'applied' | 'skipped' | 'aborted',
+): RuntimeDiagnostic | null {
+  if (outcome === 'applied') return null;
+  return outcome === 'skipped'
+    ? { kind: 'early-compact-nothing-selectable' }
+    : { kind: 'early-compact-aborted' };
+}
 
 /** The resolved token rule of one request: the declared window, `O`, and the journaled rule. */
 type TokenRule = {
@@ -254,6 +301,21 @@ class Runtime implements AgentRuntime {
    * re-forms it, so a restart re-anchors exactly from the journal.
    */
   private anchor: AssistantAccounting | null = null;
+  /**
+   * The pending authored survival (A5), beside the conversation notice: host
+   * state, never journaled. The `remember` verb records it (a second call
+   * replaces it outright), the next applied compaction consumes it, and the
+   * turn-distance expiry drops a stale one. A restart starts empty — the node
+   * re-authors; the verb's result text says the slot is runtime-only.
+   */
+  private pendingAuthored: { readonly text: string; readonly turn: number } | null = null;
+  /**
+   * The remember verb's early-trigger FLAG (A5): consumed at the NEXT plan
+   * site, never a verb-time transaction — the committed surface excludes the
+   * open turn, so "compact now" pre-compacts the next request. A second
+   * remember replaces the whole act (payload and flag alike).
+   */
+  private earlyCompact = false;
   /** The windowless fallback is diagnosed once per boot (the stated bound). */
   private fallbackDiagnosed = false;
   /** Set by the driver's stop: a late run can never respawn a session. */
@@ -379,6 +441,18 @@ class Runtime implements AgentRuntime {
         history: {
           events: () => this.fold.verifiedEvents(),
           commitPaths: (hash) => readCommitPaths(this.options.world, hash),
+        },
+        // The memory seam (A5, the SelfPort/HistoryPort precedent): the pending
+        // authored survival and the early-trigger flag are runtime state, so
+        // only this module can hold them; the executor reads the journaled
+        // `memory.remember` gate FIRST and reaches this port only when it is ON.
+        // The turn is carried explicitly: the payload's expiry is a distance
+        // from the turn that authored it, not from wall time.
+        memory: {
+          remember: (text, compact, turn) => {
+            this.pendingAuthored = { text, turn };
+            this.earlyCompact = compact;
+          },
         },
       };
   }
@@ -656,6 +730,23 @@ class Runtime implements AgentRuntime {
   }
 
   /**
+   * The pending authored survival for this turn, after the turn-distance
+   * expiry (A5): a payload whose distance has reached REMEMBER_PENDING_TURNS is
+   * dropped here — it is never applied to a slot authored long after the text.
+   * The expiry shares the restart-loss rule's honest shape: the slot is runtime
+   * state, so neither the payload nor its age is journaled.
+   */
+  private pendingAuthoredFor(turn: number): string | undefined {
+    const pending = this.pendingAuthored;
+    if (pending === null) return undefined;
+    if (turn - pending.turn >= REMEMBER_PENDING_TURNS) {
+      this.pendingAuthored = null;
+      return undefined;
+    }
+    return pending.text;
+  }
+
+  /**
    * One priced request at the plan site: the full wire price, the anchor's
    * adoption (A2(ii)), the threshold and its published effective percent, and
    * the domain verdict. Pure — no journal, no send, no model.
@@ -722,11 +813,47 @@ class Runtime implements AgentRuntime {
           output: outputReservation(live.parameters, window.maxOutputTokens),
           policy: live.policy.compactAfterTokens as TokenTriggerPolicy,
         };
+      // The pending authored survival (A5), resolved ONCE per logical request
+      // after the turn-distance expiry. Every transaction this request runs
+      // uses it as the effective replacement until one APPLIES — the slot is
+      // then consumed (authored text or the notice fallback alike).
+      let authored = this.pendingAuthoredFor(ctx.turn);
+      let compacted = false;
+      // The remember verb's early trigger: the FLAG is consumed HERE, at the
+      // next plan site, never as a verb-time transaction. The committed surface
+      // excludes the open turn, so this pre-compacts the next request.
+      if (this.earlyCompact) {
+        this.earlyCompact = false;
+        const early = await runCompaction(this.fold, ctx.gate, {
+          force: true, ...(authored !== undefined ? { authored } : {}),
+        });
+        if (early === 'applied') {
+          this.anchor = null;
+          compacted = true;
+          authored = undefined;
+          this.pendingAuthored = null;
+        } else {
+          // The escape's shape: every non-applied outcome is typed, never a
+          // silent flag consumption. A pending payload stays pending — it may
+          // still fill a later slot inside its expiry.
+          const miss = earlyTriggerMiss(early);
+          if (miss !== null) this.diagnose(miss);
+        }
+      }
       if (rule === null) {
         // The byte trigger (the pre-wave cells' forever path, and the windowless
         // fallback): an applied replacement rewrites the sampled surface, so the
-        // anchor resets.
-        if (await runCompaction(this.fold, ctx.gate) === 'applied') this.anchor = null;
+        // anchor resets. An applied early trigger above is this request's one
+        // compaction, so the routine byte transaction must not erase twice.
+        if (!compacted) {
+          const outcome = await runCompaction(this.fold, ctx.gate,
+            authored !== undefined ? { authored } : {});
+          if (outcome === 'applied') {
+            this.anchor = null;
+            authored = undefined;
+            this.pendingAuthored = null;
+          }
+        }
       }
       const id: RequestId = { turn: ctx.turn, ordinal };
       // Host state, not journaled state: the notice rides the volatile queue,
@@ -762,47 +889,60 @@ class Runtime implements AgentRuntime {
           };
         }
         if (meterFires(decision.total, decision.threshold)) {
-          const meter: MeterRecord = {
-            window: rule.window,
-            output: rule.output,
-            headroom: decision.headroom,
-            threshold: decision.threshold,
-            percent: decision.percent,
-            estimate: decision.total,
-            anchor: decision.kind,
-            outcome: 'compact',
-          };
-          const outcome = await runCompaction(this.fold, ctx.gate, { force: true, meter });
-          // The reset on compaction: an APPLIED replacement rewrites the sampled
-          // surface, so the anchor's delta can no longer describe it — the
-          // estimate stands wholesale from here. A skipped transaction changes
-          // nothing, so the anchor survives it.
-          if (outcome === 'applied') {
-            this.anchor = null;
-            // ONE re-assemble and ONE re-price (the bound): the re-assembled plan
-            // is what is sent, and a price still over the threshold is sent
-            // anyway — a second compaction would be a second erasure for one
-            // logical request. The re-price is not journaled (the transaction's
-            // start record is the accounting home); when it is still over, the
-            // bounded host diagnostic carries the fact to the operator.
-            plan = assemblePlan();
-            const repriced = this.tokenDecision(plan, rule);
-            if (meterFires(repriced.total, repriced.threshold)) {
-              this.diagnose({
-                kind: 'over-window-after-compaction',
-                estimate: repriced.total, threshold: repriced.threshold,
-              });
-            }
-          } else {
-            // The uncompactable escape (A4): nothing eligible, an unbalanced
-            // first group, an empty span, a notice not smaller — or a stale
-            // abort. The request is sent anyway under the typed policy, its only
-            // accounting the bounded host diagnostic (this branch journals
-            // nothing).
+          if (compacted) {
+            // The applied early compaction is this request's one erasure: the
+            // re-price reports the residual instead of firing a second one.
             this.diagnose({
-              kind: 'uncompactable-over-window',
+              kind: 'over-window-after-compaction',
               estimate: decision.total, threshold: decision.threshold,
             });
+          } else {
+            const meter: MeterRecord = {
+              window: rule.window,
+              output: rule.output,
+              headroom: decision.headroom,
+              threshold: decision.threshold,
+              percent: decision.percent,
+              estimate: decision.total,
+              anchor: decision.kind,
+              outcome: 'compact',
+            };
+            const outcome = await runCompaction(this.fold, ctx.gate, {
+              force: true, meter, ...(authored !== undefined ? { authored } : {}),
+            });
+            // The reset on compaction: an APPLIED replacement rewrites the sampled
+            // surface, so the anchor's delta can no longer describe it — the
+            // estimate stands wholesale from here. A skipped transaction changes
+            // nothing, so the anchor survives it.
+            if (outcome === 'applied') {
+              this.anchor = null;
+              authored = undefined;
+              this.pendingAuthored = null;
+              // ONE re-assemble and ONE re-price (the bound): the re-assembled plan
+              // is what is sent, and a price still over the threshold is sent
+              // anyway — a second compaction would be a second erasure for one
+              // logical request. The re-price is not journaled (the transaction's
+              // start record is the accounting home); when it is still over, the
+              // bounded host diagnostic carries the fact to the operator.
+              plan = assemblePlan();
+              const repriced = this.tokenDecision(plan, rule);
+              if (meterFires(repriced.total, repriced.threshold)) {
+                this.diagnose({
+                  kind: 'over-window-after-compaction',
+                  estimate: repriced.total, threshold: repriced.threshold,
+                });
+              }
+            } else {
+              // The uncompactable escape (A4): nothing eligible, an unbalanced
+              // first group, an empty span, a notice not smaller — or a stale
+              // abort. The request is sent anyway under the typed policy, its only
+              // accounting the bounded host diagnostic (this branch journals
+              // nothing).
+              this.diagnose({
+                kind: 'uncompactable-over-window',
+                estimate: decision.total, threshold: decision.threshold,
+              });
+            }
           }
         }
       }
@@ -814,9 +954,14 @@ class Runtime implements AgentRuntime {
         // frontier group. A second failure — or a reduction no transaction can
         // make — passes the ORIGINAL error through.
         const reduced = await runCompaction(
-          this.fold, ctx.gate, { force: true, retainGroups: 0 });
+          this.fold, ctx.gate, {
+            force: true, retainGroups: 0,
+            ...(authored !== undefined ? { authored } : {}),
+          });
         if (reduced === 'applied') {
           this.anchor = null;
+          authored = undefined;
+          this.pendingAuthored = null;
           plan = assemblePlan();
           const resent = await this.options.adapter.send(plan, ctx.gate, sendOptions);
           if (resent.kind === 'response') {

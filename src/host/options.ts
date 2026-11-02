@@ -23,7 +23,7 @@ import { UsageError } from './errors.js';
  * the host gate's decision (also exit `2`, but after a real fold), not argv
  * parsing's.
  *
- * `USAGE` names the seven commands, the exit codes, and the eight §3.9
+ * `USAGE` names the seven commands, the exit codes, and the §3.9
  * disclosures, so `--help` is honest about what a stop, a resume, a pause, a
  * status, the interactive chat session and the human's two `direct` acts
  * actually guarantee.
@@ -52,6 +52,12 @@ export type HostCliCommand =
       readonly model?: string; readonly heading?: string; readonly noSandbox: boolean;
       readonly charterFile?: string; readonly nodesFile?: string;
       readonly gatewayCharter?: string; readonly gatewayModel?: string;
+      /**
+       * The memory gate (A5), start-only: `--memory-remember` declares the
+       * authored-survival arm for every node of this boot. A resume has no
+       * such flag (the journaled config wins), so the parser refuses it there.
+       */
+      readonly memoryRemember?: boolean;
     }
   | {
       readonly command: 'resume'; readonly home: string; readonly uid: string;
@@ -79,8 +85,8 @@ export type HostCliCommand =
  */
 export const USAGE = `Usage:
   node dist/host/main.js init   --home <abs-dir>
-  node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--no-sandbox]
-  node dist/host/main.js start  --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--no-sandbox]
+  node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--memory-remember] [--no-sandbox]
+  node dist/host/main.js start  --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--memory-remember] [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> [--uid node-0] [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]
   node dist/host/main.js pause  --home <abs-dir>
@@ -114,6 +120,12 @@ pair is already persisted); resume takes the persisted configuration — the fla
 there (the persisted configuration wins). The charter is read up to the capture bound, but the
 assembled request is bounded by the overlay policy (2 MiB) and refused at send: an oversize
 charter starts and then fails every cycle.
+--memory-remember is the memory gate, start-only and home-level: it journals
+policy.memory {remember: true, messages: false} into every node this start composes and the
+composed extend offering advertises the remember verb (the node authors what replaces the fixed
+compaction notice; the slot is runtime-only, bounded by the tool-argument cap and the strict-smaller
+rule at apply time). A start without it is the factory notice-only arm; resume refuses the flag —
+the journaled config wins.
 chat is the interactive human↔overlay session (the CLI's first interactive command): it renders
 the recent chat log first (both sides' records, the newest --tail records, default 20), then reads
 one message per line from stdin — each non-blank line of at most 8192 bytes is saved as a human
@@ -214,6 +226,7 @@ function parseStart(args: readonly string[]): HostCliCommand {
     'nodes-file': { type: 'string' },
     'gateway-charter': { type: 'string' },
     'gateway-model': { type: 'string' },
+    'memory-remember': { type: 'boolean' },
     uid: { type: 'string' },
     'no-sandbox': { type: 'boolean' },
   });
@@ -266,6 +279,8 @@ function parseStart(args: readonly string[]): HostCliCommand {
       nodesFile,
       ...(gatewayCharter !== undefined ? { gatewayCharter } : {}),
       ...(gatewayModel !== undefined ? { gatewayModel } : {}),
+      // Home-level: the gate applies to every node the file declares.
+      ...(values['memory-remember'] === true ? { memoryRemember: true } : {}),
     };
   }
   return {
@@ -278,6 +293,7 @@ function parseStart(args: readonly string[]): HostCliCommand {
     ...(charterFile !== undefined ? { charterFile } : {}),
     ...(gatewayCharter !== undefined ? { gatewayCharter } : {}),
     ...(gatewayModel !== undefined ? { gatewayModel } : {}),
+    ...(values['memory-remember'] === true ? { memoryRemember: true } : {}),
   };
 }
 

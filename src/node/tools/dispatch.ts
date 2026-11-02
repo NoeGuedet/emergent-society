@@ -217,21 +217,21 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
     return { kind: 'execute', cmd };
   }
 
-  // `extend`: the twelve verbs, each with its exact key set (the funnel's
+  // `extend`: the verbs, each with its exact key set (the funnel's
   // argument shapes are validated here — the one-decision-point rule). The two
-  // conversation verbs and the history read are APPENDED LAST so the published
-  // recognition refusal keeps its existing prefix — the teaching text a model
-  // may already have seen, and the string the dispatch pin asserts — and the
-  // vocabulary grows only by addition.
+  // conversation verbs, the history read and the gated memory verb are
+  // APPENDED LAST so the published recognition refusal keeps its existing
+  // prefix — the teaching text a model may already have seen, and the string
+  // the dispatch pin asserts — and the vocabulary grows only by addition.
   const verbs = [
     'inspect', 'define', 'run', 'call', 'stop', 'undefine', 'spawn', 'update_self',
-    'request_death', 'send_message', 'get_messages', 'history',
+    'request_death', 'send_message', 'get_messages', 'history', 'remember',
   ];
   const verb = parsed['verb'];
   if (typeof verb !== 'string' || !verbs.includes(verb)) {
     return invalidDetail(
       'verb must be one of inspect, define, run, call, stop, undefine, spawn,'
-      + ' update_self, request_death, send_message, get_messages, history',
+      + ' update_self, request_death, send_message, get_messages, history, remember',
     );
   }
   const keys = Object.keys(parsed);
@@ -313,6 +313,29 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
       return { kind: 'extend', verb: 'history', n };
     }
     return { kind: 'extend', verb: 'history' };
+  }
+  if (verb === 'remember') {
+    // The authored survival (A5): one non-blank text, bounded by the same
+    // tool-argument cap the wire enforces (the cap is the practical bound — the
+    // JSON encoding must itself fit), and an optional `compact` flag asking
+    // the kernel to compact at the NEXT request (never at verb time: the
+    // committed surface excludes the open turn). The gate is NOT decided here:
+    // recognition is the static vocabulary, and the executor refuses an OFF
+    // cell — the drift pin gets the executor's denial, not an unknown verb.
+    if (!only('verb', 'text', 'compact')) {
+      return invalidDetail('remember takes verb, text and optionally compact');
+    }
+    const text = parsed['text'];
+    if (typeof text !== 'string' || text.trim() === '') {
+      return invalidDetail('text must be a non-blank string');
+    }
+    if (Buffer.byteLength(text, 'utf8') > config.policy.maxToolArgumentBytes) {
+      return invalidDetail(`text must be at most ${config.policy.maxToolArgumentBytes} bytes`
+        + ' (the tool-argument cap)');
+    }
+    const compact = parsed['compact'];
+    if (compact !== undefined && typeof compact !== 'boolean') return INVALID;
+    return { kind: 'extend', verb: 'remember', text, compact: compact === true };
   }
   if (verb === 'spawn') {
     // The kernel capability: the child inherits the requester's tools and

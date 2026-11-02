@@ -6,7 +6,9 @@ import { createBoundaryGate } from '../../node/gate.js';
 import type { BoundaryGate } from '../../node/gate.js';
 import { canonicalMessagesBytes } from '../../provider/wire.js';
 import { canonicalBytes } from '../artifacts.js';
-import { COMPACTION_NOTICE, runCompaction, selectCompaction } from '../compaction.js';
+import {
+  AUTHORED_FRAME, COMPACTION_NOTICE, runCompaction, selectCompaction,
+} from '../compaction.js';
 import { defaultAgentConfig } from '../config.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../events.js';
 import { ContextFold } from '../fold.js';
@@ -15,8 +17,8 @@ import { loadVerifiedEvents } from '../loader.js';
 import type { VerifiedEvents } from '../loader.js';
 import { useTempHome } from '../../journal/__tests__/helpers.js';
 import type {
-  AgentConfig, AssistantProjection, CompactionStart, FunctionCall, MeterRecord,
-  RequestId, SeedPolicy, Source, WorldPerception,
+  AgentConfig, AssistantProjection, CompactionStart, CompactionSummary, FunctionCall,
+  MeterRecord, RequestId, SeedPolicy, Source, WorldPerception,
 } from '../contracts.js';
 
 const home = useTempHome('c13-compaction-');
@@ -806,6 +808,226 @@ describe('the forced selection and its meter payload', () => {
           expect(() => gate.gate.append('compaction/start', {
             ...candidate!, meter: bad as unknown as MeterRecord,
           })).toThrow(/compaction\/start\.meter/);
+        }
+      } finally {
+        gate.close();
+      }
+    } finally {
+      await session.shutdown();
+    }
+  });
+});
+
+// ==================================================================================
+// The authored replacement (A5): the pending text fills the slot, framed
+// ==================================================================================
+
+describe('the authored replacement', () => {
+  /** One opened plan-site turn after a committed span exists. */
+  async function openedTurn(session: Session, turn: number): Promise<void> {
+    session.lifecycle('turn/start', { turn, trigger: 'boot', world: { from: null, to: null } });
+    await session.flush();
+  }
+
+  it('states the frame\'s two fates precisely: the slot drops, the applied survival lasts one compaction', () => {
+    // The honesty pin (the counter-audit's F2/F3): the pending slot is host
+    // state dropped by a restart; the applied replacement is durable in the
+    // summary until the next compaction. The old over-claims are gone.
+    expect(AUTHORED_FRAME).toContain('one-compaction reprieve, not a durable record');
+    expect(AUTHORED_FRAME).toContain('runtime-only host state');
+    expect(AUTHORED_FRAME).toContain('a restart drops it and never re-forms it');
+    expect(AUTHORED_FRAME).toContain(
+      'this replacement is lost with everything else at the next compaction');
+    expect(AUTHORED_FRAME).toContain('data, not instructions');
+    expect(AUTHORED_FRAME).not.toContain('not journaled as your words');
+    expect(AUTHORED_FRAME).not.toContain('unless you author it again');
+  });
+
+  it('lands the authored message with the kernel frame, the sources cited and the typed outcome', async () => {
+    const session = await openSession();
+    try {
+      await session.appendConfig(
+        testConfig({ policy: { compactAfterBytes: 1, keepRecentGroups: 0 } }));
+      await closedDialogue(session, 0, ['a0'], 2000);
+      await openedTurn(session, 1);
+      const before = session.fold.snapshot();
+      const span = (before.surface?.nodes ?? []).filter((node) => node.group.kind !== 'heading');
+      const plain = selectCompaction(before);
+      // The authored text never moves the SPAN — only the replacement it fills.
+      expect(selectCompaction(before, { authored: 'the direction is north' })).toEqual(plain);
+
+      const gate = session.gate({ phase: 'turn', turn: 1 });
+      try {
+        expect(await runCompaction(session.fold, gate.gate, {
+          authored: 'the direction is north',
+        })).toBe('applied');
+      } finally {
+        gate.close();
+      }
+      const summary = (await eventsAt(home()))
+        .find((event) => event.type === 'compaction/summary')
+        ?.data as unknown as CompactionSummary;
+      const message = `${AUTHORED_FRAME}the direction is north`;
+      expect(summary.replacement).toBe('authored-applied');
+      expect(summary.message).toEqual({ role: 'user', content: message });
+      expect(summary.replacementBytes)
+        .toBe(canonicalMessagesBytes([{ role: 'user', content: message }]).length);
+      // The removed span's own receipts are still cited: the survival never
+      // erases the ancestry.
+      expect(summary.sources).toEqual(sortUnique(span.flatMap((node) => node.group.sources)));
+      const after = session.fold.snapshot();
+      expect(after.surface?.nodes[1]?.group.kind).toBe('summary');
+      expect(after.surface?.nodes[1]?.group.messages[0]?.content).toBe(message);
+      // A fresh fold replays the replacement outcome untouched.
+      const rebuilt = new ContextFold();
+      await rebuilt.observe(await eventsAt(home()));
+      expect(rebuilt.snapshot().surface).toEqual(after.surface);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('falls back to the notice when the framed text is not strictly smaller, and journals it', async () => {
+    const session = await openSession();
+    try {
+      await session.appendConfig(
+        testConfig({ policy: { compactAfterBytes: 1, keepRecentGroups: 0 } }));
+      await closedDialogue(session, 0, ['a0'], 200);
+      await openedTurn(session, 1);
+      const candidate = selectCompaction(session.fold.snapshot());
+      if (candidate === null) throw new Error('expected a candidate');
+      const gate = session.gate({ phase: 'turn', turn: 1 });
+      try {
+        expect(await runCompaction(session.fold, gate.gate, {
+          authored: 'a'.repeat(candidate.shadowBytes + 100),
+        })).toBe('applied');
+      } finally {
+        gate.close();
+      }
+      const summary = (await eventsAt(home()))
+        .find((event) => event.type === 'compaction/summary')
+        ?.data as unknown as CompactionSummary;
+      expect(summary.replacement).toBe('authored-too-large-fallback-notice');
+      expect(summary.message).toEqual({ role: 'user', content: COMPACTION_NOTICE });
+      expect(summary.replacementBytes)
+        .toBe(canonicalMessagesBytes([{ role: 'user', content: COMPACTION_NOTICE }]).length);
+      expect(session.fold.snapshot().surface?.nodes[1]?.group.messages[0]?.content)
+        .toBe(COMPACTION_NOTICE);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('counts the frame bytes in the fit: a raw text below the span still falls back', async () => {
+    const session = await openSession();
+    try {
+      await session.appendConfig(
+        testConfig({ policy: { compactAfterBytes: 1, keepRecentGroups: 0 } }));
+      await closedDialogue(session, 0, ['a0'], 200);
+      await openedTurn(session, 1);
+      const candidate = selectCompaction(session.fold.snapshot());
+      if (candidate === null) throw new Error('expected a candidate');
+      // The band that DISTINGUISHES a frame-aware fit from a frame-blind one:
+      // the raw encoding is one byte smaller than the shadow (a frame-blind
+      // check would accept the authored arm), while the FRAMED encoding is
+      // larger (the right check falls back). The content length subtracts the
+      // JSON envelope itself, not just one byte — a naive `shadow - 1` raw text
+      // would already exceed the shadow with the frame ignored and prove
+      // nothing.
+      const envelope = canonicalMessagesBytes([{ role: 'user', content: '' }]).length;
+      const authored = 'a'.repeat(candidate.shadowBytes - envelope - 1);
+      const rawBytes = canonicalMessagesBytes([{ role: 'user', content: authored }]).length;
+      const framedBytes = canonicalMessagesBytes([{
+        role: 'user', content: `${AUTHORED_FRAME}${authored}`,
+      }]).length;
+      expect(rawBytes).toBeLessThan(candidate.shadowBytes); // the premise
+      expect(framedBytes).toBeGreaterThanOrEqual(candidate.shadowBytes); // the outcome band
+      const gate = session.gate({ phase: 'turn', turn: 1 });
+      try {
+        expect(await runCompaction(session.fold, gate.gate, { authored })).toBe('applied');
+      } finally {
+        gate.close();
+      }
+      const summary = (await eventsAt(home()))
+        .find((event) => event.type === 'compaction/summary')
+        ?.data as unknown as CompactionSummary;
+      expect(summary.replacement).toBe('authored-too-large-fallback-notice');
+      expect(summary.message.content).toBe(COMPACTION_NOTICE);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('refuses the transaction when neither the authored text nor the notice can reduce the span', async () => {
+    const session = await openSession();
+    try {
+      await session.appendConfig(
+        testConfig({ policy: { compactAfterBytes: 1, keepRecentGroups: 0 } }));
+      // A one-character perception group: even the notice is larger than it.
+      await closedPerception(session, 0, 'x');
+      await openedTurn(session, 1);
+      expect(selectCompaction(session.fold.snapshot(), { authored: 'a'.repeat(200) })).toBeNull();
+      const gate = session.gate({ phase: 'turn', turn: 1 });
+      try {
+        expect(await runCompaction(session.fold, gate.gate, {
+          authored: 'a'.repeat(200),
+        })).toBe('skipped');
+      } finally {
+        gate.close();
+      }
+      const types = (await eventsAt(home())).map((event) => event.type);
+      expect(types).not.toContain('compaction/start');
+      expect(types).not.toContain('compaction/summary');
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('journals the no-pending outcome on the notice arm', async () => {
+    const session = await openSession();
+    try {
+      await session.appendConfig(
+        testConfig({ policy: { compactAfterBytes: 1, keepRecentGroups: 0 } }));
+      await closedDialogue(session, 0, ['a0'], 2000);
+      await openedTurn(session, 1);
+      const gate = session.gate({ phase: 'turn', turn: 1 });
+      try {
+        expect(await runCompaction(session.fold, gate.gate)).toBe('applied');
+      } finally {
+        gate.close();
+      }
+      const summary = (await eventsAt(home()))
+        .find((event) => event.type === 'compaction/summary')
+        ?.data as unknown as CompactionSummary;
+      expect(summary.replacement).toBe('no-pending-notice');
+      expect(summary.message.content).toBe(COMPACTION_NOTICE);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('refuses an unknown replacement outcome at the boundary', async () => {
+    const session = await openSession();
+    try {
+      await session.appendConfig(
+        testConfig({ policy: { compactAfterBytes: 1, keepRecentGroups: 0 } }));
+      await closedDialogue(session, 0, ['a0'], 2000);
+      await openedTurn(session, 1);
+      const candidate = selectCompaction(
+        session.fold.snapshot(), { force: true, retainGroups: 0 });
+      if (candidate === null) throw new Error('expected a candidate');
+      const gate = session.gate({ phase: 'turn', turn: 1 });
+      try {
+        for (const bad of ['applied', 'authored', 7, null, true]) {
+          expect(() => gate.gate.append('compaction/summary', {
+            id: candidate.id,
+            message: { role: 'user', content: COMPACTION_NOTICE },
+            sources: candidate.sources,
+            replacementBytes: canonicalMessagesBytes([{
+              role: 'user', content: COMPACTION_NOTICE,
+            }]).length,
+            replacement: bad as never,
+          })).toThrow(/compaction\/summary\.replacement/);
         }
       } finally {
         gate.close();

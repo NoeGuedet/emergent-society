@@ -13,8 +13,8 @@ import { createBoundaryRegistry } from './events.js';
 import { SAME, sortUnique } from './groups.js';
 import type {
   AgentConfig, ArtifactRef, AssistantAccounting, AssistantProjection, ChatMessage,
-  CompactionStart, CompactionSummary, FunctionCall, OpenTurn, ProjectionState, RecoveryGroup,
-  RequestId, Source, Stored, SurfaceGroup, WorldPerception,
+  CompactionReplacement, CompactionStart, CompactionSummary, FunctionCall, OpenTurn,
+  ProjectionState, RecoveryGroup, RequestId, Source, Stored, SurfaceGroup, WorldPerception,
 } from './contracts.js';
 import type { VerifiedEvent, VerifiedEvents } from './loader.js';
 import { ArtifactMismatchError, sourceOf } from './loader.js';
@@ -888,12 +888,27 @@ export class ContextFold {
       invariant('compaction/summary.message.content is not a string');
     }
     const message: CompactionSummary['message'] = { role: 'user', content };
+    // The typed replacement outcome (A5): optional for a pre-wave summary, but
+    // present-and-unknown is an invariant failure, never folded as the notice.
+    // Preserving it keeps the durable summary byte-identical to the producer's
+    // (the applier compares them canonically before replacing anything).
+    const rawReplacement = raw['replacement'];
+    let replacement: CompactionReplacement | undefined;
+    if (rawReplacement !== undefined) {
+      if (rawReplacement !== 'authored-applied'
+        && rawReplacement !== 'authored-too-large-fallback-notice'
+        && rawReplacement !== 'no-pending-notice') {
+        invariant('compaction/summary.replacement is not a typed outcome');
+      }
+      replacement = rawReplacement;
+    }
     const data: CompactionSummary = {
       id,
       message,
       sources: dataArray(raw['sources'], 'compaction/summary.sources')
         .map((entry, i) => dataSource(entry, `compaction/summary.sources[${i}]`)),
       replacementBytes: dataInt(raw['replacementBytes'], 'compaction/summary.replacementBytes'),
+      ...(replacement !== undefined ? { replacement } : {}),
     };
     const source = sourceOf(event);
     // A summary completes exactly one open start and is recorded once: validate
