@@ -43,3 +43,17 @@ export type {
 export {
   createAgentRuntime, type AgentRuntime, type RuntimeOptions,
 } from './loop.js';
+// The conversation interface's public surface: the stream's writer/reader, its
+// watcher and the pending notice. The node verbs reach the log through the
+// host-composed port; the overlay (G1) subscribes to the same watcher.
+export {
+  CONVERSATION_FILE, CONVERSATION_FRAMING, CONVERSATION_LOCK_FILE, DEFAULT_THREAD_READ,
+  MAX_SPEAK_BYTES, ConversationLog, ConversationRefusedError, ConversationWriteError,
+  openConversationLog, readConversationThread, renderConversationNotice,
+  renderConversationThread,
+  type ConversationRecord, type ConversationSent, type ConversationThread,
+} from './conversation.js';
+export {
+  ConversationWatcher,
+  type ConversationNotice, type ConversationNoticeSource, type ConversationSource,
+} from './conversation-watcher.js';

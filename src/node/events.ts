@@ -12,7 +12,14 @@ import type { WorldRange } from './world.js';
  * `turn/end` carries (§5.2).
  */
 
-export type TurnTrigger = 'boot' | 'chain' | 'wakeup' | 'timer';
+/**
+ * What caused a turn to open. `'conversation'` is the interface's arrival: a
+ * pending conversation notice ended the park (the cause rides a fired flag,
+ * exactly like `'timer'`, so a conversation wake is never silently recorded as
+ * `'wakeup'`). The value joins the type only; the local event set is unchanged,
+ * and the fold ignores the trigger, so an older reader skips it.
+ */
+export type TurnTrigger = 'boot' | 'chain' | 'wakeup' | 'timer' | 'conversation';
 export type TurnEndOutcome = 'chained' | 'waiting' | 'error' | 'interrupted';
 export type ShutdownReason =
   | 'stop-requested' | 'handler-error' | 'maintenance-error' | 'driver-error'

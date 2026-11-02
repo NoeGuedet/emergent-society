@@ -1190,3 +1190,102 @@ describe('dispatchCalls: request_death recognition', () => {
     }
   }, 15000);
 });
+
+describe('dispatchCalls: the conversation verbs', () => {
+  // Accepted shapes reach the executor. With no extend port threaded, the
+  // honest denial is the proof of recognition — never unknown-tool.
+  const ACCEPTED: ReadonlyArray<readonly [string, JsonValue]> = [
+    ['send_message with the default addressee', { verb: 'send_message', text: 'hello' }],
+    ['send_message addressed to the gateway',
+      { verb: 'send_message', to: 'gateway', text: 'hello' }],
+    ['get_messages with no window', { verb: 'get_messages' }],
+    ['get_messages with a window', { verb: 'get_messages', n: 4 }],
+  ];
+
+  it.each(ACCEPTED)('accepts %s and reaches the executor', async (_name, args) => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([call('u1', 'extend', JSON.stringify(args))]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'denied', status: null });
+      expect(data.message.content).toBe('error: denied\nthis cell was composed without an extend port');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  const REFUSED: ReadonlyArray<readonly [string, string, string]> = [
+    ['send_message without text', '{"verb":"send_message"}',
+      'text must be a non-blank string'],
+    ['send_message with a blank text', '{"verb":"send_message","text":"  "}',
+      'text must be a non-blank string'],
+    ['send_message with an unknown key', '{"verb":"send_message","text":"x","charter":"y"}',
+      'send_message takes verb, text and optionally to'],
+    ['send_message to a peer', '{"verb":"send_message","to":"node-2","text":"hi"}',
+      'send_message can address only the gateway (or no to at all)'],
+    ['send_message to a peer with the wrong type', '{"verb":"send_message","to":3,"text":"hi"}',
+      ''],
+    ['get_messages with a zero window', '{"verb":"get_messages","n":0}',
+      'n must be a positive integer'],
+    ['get_messages with a non-integer window', '{"verb":"get_messages","n":1.5}',
+      'n must be a positive integer'],
+    ['get_messages with an unknown key', '{"verb":"get_messages","x":1}',
+      'get_messages takes verb and optionally n'],
+  ];
+
+  it.each(REFUSED)('refuses %s', async (_name, args, want) => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([call('u1', 'extend', args)]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'invalid-tool', status: null });
+      if (want === '') expect(data.message.content).toBe('error: invalid-tool');
+      else expect(data.message.content).toContain(want);
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  it('refuses a text above the conversation record ceiling', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([call('u1', 'extend', JSON.stringify({
+        verb: 'send_message', text: 'x'.repeat(8193),
+      }))]), ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.failure).toEqual({ code: 'invalid-tool', status: null });
+      expect(data.message.content).toContain('text must be at most 8192 bytes');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+
+  // The speak removal's stated consequence: the node offering no longer knows
+  // the verb (and an existing cell's journaled description lingers — journaled
+  // configs win — but dispatch executes the frozen vocabulary, so the old text
+  // teaches a verb that is gone). The generic recognition refusal is the
+  // answer, never a channel-specific denial.
+  it('answers an old cell\'s speak call with the generic recognition refusal', async () => {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      await dispatchCalls(projection([call('s1', 'extend', '{"verb":"speak","text":"hello"}')]),
+        ID, s.gate('turn', 0), config(), neverTerminal);
+      const data = await firstResult(home);
+      expect(data.isError).toBe(true);
+      expect(data.failure).toEqual({ code: 'invalid-tool', status: null });
+      expect(data.message.content).toContain('error: invalid-tool\n');
+      expect(data.message.content).toContain('verb must be one of');
+      expect(data.message.content).not.toContain('speak');
+    } finally {
+      await s.shutdown();
+    }
+  }, 15000);
+});

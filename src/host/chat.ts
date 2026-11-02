@@ -2,21 +2,22 @@ import { open, truncate } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  JournalClosedError, assertNodeUid, isErrno, readFileOrNull, syncPath,
+  JournalClosedError, assertConversationActor, isErrno, readFileOrNull, syncPath,
 } from '../journal/index.js';
-import { MAX_SPEAK_BYTES } from '../node/tools/extend.js';
+import { MAX_SPEAK_BYTES } from '../node/conversation.js';
 
 /**
- * The agent-zero chat log: the human channel's delivery surface, outside the
- * world.
+ * The human channel's chat log (`chat.v0.jsonl`): the human↔overlay
+ * conversation, outside the world.
  *
- * The channel is the one sanctioned exception to "communication is a file"
- * (the human has no file to read). It is a projection of the frontier, not a
- * third record: `speak` is an ordinary kernel-mediated tool call, so the
- * message's exact bytes are already durable in the frontier response body
- * before the effect; this file is the human-facing rendering of those calls
- * (one line per message), owned by the kernel, mode 0600, append-only, and
- * rebuildable from the frontier. A torn tail from a crash inside one append is
+ * The channel is the conversation's human-side surface — one of the sanctioned
+ * interface exceptions to "communication is a file" (the human has no file to
+ * read). The log is kernel-owned, mode 0600 and append-only, with one
+ * `{v, at, uid, text}` line per record; `uid` follows the conversation actor
+ * rule (a node uid, the reserved `human`, or the reserved `gateway`). The node
+ * offering carries no `speak` verb: its successor, the overlay's native chat
+ * (the human's typed records and the cycle's response records in this file),
+ * is specified, not implemented. A torn tail from a crash inside one append is
  * dropped at open, exactly like the attribution sidecar's.
  */
 
@@ -57,10 +58,10 @@ export class ChatLog {
   /** Appends one message and makes it durable before returning. */
   async append(uid: string, text: string, at: number): Promise<void> {
     if (this.closed) throw new JournalClosedError();
-    const actor = assertNodeUid(uid);
-    if (text.trim() === '') throw new Error('a spoken message cannot be blank');
+    const actor = assertConversationActor(uid);
+    if (text.trim() === '') throw new Error('a chat message cannot be blank');
     if (Buffer.byteLength(text, 'utf8') > MAX_SPEAK_BYTES) {
-      throw new Error(`a spoken message cannot exceed ${MAX_SPEAK_BYTES} bytes`);
+      throw new Error(`a chat message cannot exceed ${MAX_SPEAK_BYTES} bytes`);
     }
     const handle = await this.file();
     const line = JSON.stringify({ v: 0, at, uid: actor, text }) + '\n';
@@ -122,7 +123,11 @@ export async function readChat(home: string): Promise<ChatMessage[]> {
       || typeof record['uid'] !== 'string' || typeof record['text'] !== 'string') {
       throw new Error(`chat record ${index + 1} has an invalid shape`);
     }
-    return { v: 0, at: record['at'], uid: record['uid'], text: record['text'] };
+    // Both logs' readers validate the same actor rule (the writer does too):
+    // a node uid, the reserved human, or the reserved gateway.
+    return {
+      v: 0, at: record['at'], uid: assertConversationActor(record['uid']), text: record['text'],
+    };
   });
 }
 

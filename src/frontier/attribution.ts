@@ -2,7 +2,7 @@ import { open, stat, truncate } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  CorruptionError, JournalClosedError, assertNodeUid, frontierLayout, isErrno,
+  CorruptionError, JournalClosedError, assertConversationActor, frontierLayout, isErrno,
   readFileOrNull, syncPath,
 } from '../journal/index.js';
 import type { Frontier } from './journal.js';
@@ -148,7 +148,7 @@ export class AttributionLog implements AttributionSink {
 export function attributeFrontier(
   frontier: Frontier, uid: string, sink: AttributionSink,
 ): Frontier {
-  const actor = assertNodeUid(uid);
+  const actor = assertConversationActor(uid);
   return {
     begin: async (input) => {
       const call = await frontier.begin(input);
@@ -200,7 +200,7 @@ function parseRecord(line: string, index: number): AttributionRecord {
   if (typeof record['uid'] !== 'string') {
     throw new AttributionCorruptionError(`attribution record ${index + 1} has an invalid uid`);
   }
-  return { v: RECORD_VERSION, call, uid: assertNodeUid(record['uid']) };
+  return { v: RECORD_VERSION, call, uid: assertConversationActor(record['uid']) };
 }
 
 async function pathExists(path: string): Promise<boolean> {

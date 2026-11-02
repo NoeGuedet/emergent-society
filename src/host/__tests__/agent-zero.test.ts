@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -13,12 +13,15 @@ import { initHome } from '../layout.js';
 import { createHostLog } from '../observe.js';
 
 /**
- * Agent zero (A4): the human channel and the ratified direction.
+ * Agent zero and the conversation interface.
  *
- * `speak` delivers a message outside the world and is granted to the root
- * only; the direction is the world's `DIRECTION.md` at its latest
- * human-authored commit, so a node's draft commit never moves the pin. Both
- * run through the real host lifetime against a scripted provider.
+ * The direction is the world's `DIRECTION.md` at its latest human-authored
+ * commit, so a node's draft commit never moves the pin. The conversation is
+ * the interface: every node holds `send_message`/`get_messages`, the record is
+ * kernel-stamped into `<home>/conversation.v0.jsonl` (outside the world), and
+ * the removed `speak` verb answers with the generic recognition refusal — the
+ * human channel's successor is specified, not implemented. Both run through
+ * the real host lifetime against a scripted provider.
  */
 
 const dirs: string[] = [];
@@ -74,10 +77,10 @@ async function providers(home: string, url: string): Promise<void> {
 }
 
 function start(home: string, lines: string[]) {
-  // A one-entry nodes file with the declared grant: the human channel is the
-  // root's, and the spawn capability is declared, never implicit (a solo flag
-  // boot grants nobody). The journaled config is composed exactly as a solo
-  // start's would be.
+  // A one-entry nodes file with the declared grant: the spawn capability is
+  // declared, never implicit (a solo flag boot grants nobody), and the
+  // conversation belongs to every node. The journaled config is composed
+  // exactly as a solo start's would be.
   const nodesFile = join(home, 'nodes.json');
   return writeFile(nodesFile, JSON.stringify([
     { uid: 'node-0', model: 'first-light-test', heading: 'Seed heading.', spawn: true },
@@ -139,7 +142,7 @@ it('pins the human-ratified DIRECTION.md, never a node draft', async () => {
   expect(await handle.done).toBe(0);
 }, 40_000);
 
-it('delivers speak outside the world to the root and denies it to a child', async () => {
+it('carries every node\'s message into the conversation and refuses the removed speak', async () => {
   const { home, world } = await fixture();
   await commitAs(world, 'human', { 'seed.txt': 'seed\n' }, 'seed');
   const counts = new Map<string, number>();
@@ -155,12 +158,22 @@ it('delivers speak outside the world to the root and denies it to a child', asyn
         return respond({ tool: { name: 'extend', args: { verb: 'spawn', heading: 'Worker.' } } });
       }
       if (count === 1) {
+        // The removed verb: an old cell's call is the generic recognition
+        // refusal, never a channel-specific denial.
         return respond({ tool: { name: 'extend', args: { verb: 'speak', text: 'hello human' } } });
+      }
+      if (count === 2) {
+        return respond({
+          tool: { name: 'extend', args: { verb: 'send_message', text: 'root to gateway' } },
+        });
       }
       return respond({ content: 'idle' });
     }
     if (count === 0) {
-      return respond({ tool: { name: 'extend', args: { verb: 'speak', text: 'child speaks' } } });
+      // A child holds the same interface: no root-only channel exists.
+      return respond({
+        tool: { name: 'extend', args: { verb: 'send_message', text: 'child to gateway' } },
+      });
     }
     return respond({ content: 'idle' });
   });
@@ -168,23 +181,34 @@ it('delivers speak outside the world to the root and denies it to a child', asyn
   await providers(home, server.url);
   const lines: string[] = [];
   const handle = await start(home, lines);
+  const conversation = (): Promise<Record<string, unknown>[]> =>
+    readFile(join(home, 'conversation.v0.jsonl'), 'utf8').then((text) =>
+      text.split('\n').filter((line) => line !== '')
+        .map((line) => JSON.parse(line) as Record<string, unknown>));
   await vi.waitFor(async () => {
-    const events = await loadVerifiedEvents(home, 'node-1', C13_EVENT_TYPES);
-    expect(events.filter((event) => event.type === 'turn/end').length).toBeGreaterThan(0);
+    const records = await conversation().catch(() => []);
+    expect(records).toHaveLength(2);
   }, { timeout: 30_000 });
   handle.stop();
   expect(await handle.done).toBe(0);
 
-  const chat = await readChat(home);
-  expect(chat).toHaveLength(1);
-  expect(chat[0]).toMatchObject({ uid: 'node-0', text: 'hello human' });
-  const child = await loadVerifiedEvents(home, 'node-1', C13_EVENT_TYPES);
-  expect(child.some((event) => event.type === 'tool/result'
+  const records = await conversation();
+  expect(records).toHaveLength(2);
+  const root = records.find((record) => record['text'] === 'root to gateway');
+  const child = records.find((record) => record['text'] === 'child to gateway');
+  expect(root).toMatchObject({ v: 0, from: 'node-0', to: 'gateway' });
+  expect(child).toMatchObject({ v: 0, from: 'node-1', to: 'gateway' });
+  const rootEvents = await loadVerifiedEvents(home, 'node-0', C13_EVENT_TYPES);
+  const refusals = rootEvents.filter((event) => event.type === 'tool/result'
     && (event.data as { readonly message?: { readonly content?: string } })
-      .message?.content?.includes('denied: this node was not granted the human channel')))
-    .toBe(true);
-  // The world never carries the chat: it is delivered outside it.
+      .message?.content?.includes('error: invalid-tool'));
+  expect(refusals.length).toBe(1);
+  // The human channel's successor is specified, not implemented: no node verb
+  // writes the chat log any more.
+  expect(await readChat(home)).toEqual([]);
+  // The world never carries either record: both are kernel-owned and outside it.
   expect(await world.headHash()).not.toBeNull();
   const worldFiles = await import('node:fs/promises').then((fs) => fs.readdir(world.path));
   expect(worldFiles).not.toContain('chat.v0.jsonl');
+  expect(worldFiles).not.toContain('conversation.v0.jsonl');
 }, 40_000);

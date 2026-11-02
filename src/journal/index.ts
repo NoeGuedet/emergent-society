@@ -70,9 +70,16 @@ export {
 
 // Layout, for callers that need to address a journal directly.
 export {
-  HEAD_FILE, HUMAN_AUTHOR, LOG_FILE, LOCK_FILE, NODE_UID_RE, OWNER_FILE,
+  GATEWAY_ADDRESSEE, HEAD_FILE, HUMAN_AUTHOR, LOG_FILE, LOCK_FILE, NODE_UID_RE, OWNER_FILE,
   assertLayoutNames, assertNodeUid, frontierLayout, nodeDir, nodeLayout,
 } from './layout.js';
+
+// The conversation actor rule: the three kernel-owned records that name a
+// participant (the attribution sidecar, the chat log, the conversation stream)
+// share it, so no write point writes its own version.
+export {
+  assertConversationActor, assertConversationAddressee,
+} from './actors.js';
 
 // The typed error family.
 export {

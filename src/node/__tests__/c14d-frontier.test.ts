@@ -445,10 +445,12 @@ describe('proof 1: one mediated path (a regression guard on kernel sources)', ()
       }
     }
 
-    // Exactly four legitimate kernel sites (the supervisor's plain spawn is
-    // the fourth, C1.5 design §5.2); a fifth fails the proof.
+    // Exactly five legitimate kernel sites (the supervisor's plain spawn is
+    // the fourth, C1.5 design §5.2; the conversation stream's flock writer
+    // helper is the fifth — Node has no flock binding, so the append runs a
+    // short-lived child under `flock -F`); a sixth fails the proof.
     expect(containing(sources, 'child' + '_process')).toEqual([
-      'journal/lock.ts', 'node/packages/supervisor.ts',
+      'journal/lock.ts', 'node/conversation.ts', 'node/packages/supervisor.ts',
       'node/tools/sandbox.ts', 'node/world-git.ts',
     ]);
   });

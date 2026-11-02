@@ -39,6 +39,14 @@ export type AssembleInput = {
    * state alone). Absent means no catalog: no block, today's plan.
    */
   readonly models?: readonly string[];
+  /**
+   * The kernel's pending conversation notice, rendered as a SYSTEM message in
+   * the VOLATILE queue — after the breakpoint, never before it. It is host
+   * state, not journaled state: it enters no source list and never
+   * `stateHash`, so the cached prefix is byte-identical whether a notice is
+   * pending or not. Absent means no pending notice.
+   */
+  readonly notice?: string;
 };
 
 /**
@@ -120,6 +128,11 @@ export function assemble(input: AssembleInput): RequestPlan {
     }
     history.push(...open.messages);
     historySources.push(...open.sources);
+  }
+  // The conversation notice rides the open-turn queue: post-breakpoint and
+  // volatile, so a new message never invalidates the cached prefix.
+  if (input.notice !== undefined) {
+    queue.push({ role: 'system', content: input.notice });
   }
 
   const headingText = input.direction?.text ?? surface.heading.text;

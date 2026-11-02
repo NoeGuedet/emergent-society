@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { assertNodeUid, nodeDir } from '../layout.js';
+import { GATEWAY_ADDRESSEE, HUMAN_AUTHOR, assertNodeUid, nodeDir } from '../layout.js';
+import { assertConversationActor, assertConversationAddressee } from '../actors.js';
 import { InvalidNodeUidError, JournalError } from '../errors.js';
 import { JournalWriter } from '../writer.js';
 import { JournalReader, repair } from '../reader.js';
@@ -73,5 +74,31 @@ describe('uid validation happens before any filesystem effect', () => {
     const seqs: number[] = [];
     for await (const e of r.events()) seqs.push(e.seq);
     expect(seqs).toEqual([0]);
+  });
+});
+
+describe('the reserved conversation actors', () => {
+  it('reserves the gateway addressee exactly like the human ratifier', () => {
+    expect(() => assertNodeUid(GATEWAY_ADDRESSEE)).toThrow(InvalidNodeUidError);
+    expect(() => assertNodeUid(HUMAN_AUTHOR)).toThrow(InvalidNodeUidError);
+    expect(GATEWAY_ADDRESSEE).toBe('gateway');
+  });
+
+  it('accepts the actor rule: node uids plus the two reserved names', () => {
+    for (const actor of ['n1', 'node-0', HUMAN_AUTHOR, GATEWAY_ADDRESSEE]) {
+      expect(assertConversationActor(actor)).toBe(actor);
+    }
+    for (const actor of ['', 'a b', 'a/b', 'peer!', 'x'.repeat(129)]) {
+      expect(() => assertConversationActor(actor), JSON.stringify(actor))
+        .toThrow(InvalidNodeUidError);
+    }
+  });
+
+  it('accepts the addressee rule: a node uid or the gateway, never the human', () => {
+    expect(assertConversationAddressee('node-2')).toBe('node-2');
+    expect(assertConversationAddressee(GATEWAY_ADDRESSEE)).toBe(GATEWAY_ADDRESSEE);
+    // The human's words live in the chat log, not in the conversation stream.
+    expect(() => assertConversationAddressee(HUMAN_AUTHOR)).toThrow(InvalidNodeUidError);
+    expect(() => assertConversationAddressee('a/b')).toThrow(InvalidNodeUidError);
   });
 });

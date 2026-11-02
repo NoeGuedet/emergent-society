@@ -47,9 +47,13 @@ import {
 import type { BootHygiene, CellCgroup } from './cgroups.js';
 import { createFencePort } from './fence.js';
 import {
-  SpeakRefusedError, SpawnRefusedError,
-  type DepartPort, type SpeakPort, type SpawnCaps, type SpawnPort, type SpawnRequest,
+  SpawnRefusedError,
+  type DepartPort, type SpawnCaps, type SpawnPort, type SpawnRequest,
 } from '../node/tools/extend.js';
+import {
+  ConversationLog, openConversationLog,
+} from '../node/conversation.js';
+import { ConversationWatcher } from '../node/conversation-watcher.js';
 import { ChatLog } from './chat.js';
 import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
 import { MAX_NODES, readNodesFile, type NodeSpec } from './nodes.js';
@@ -145,8 +149,6 @@ export type CellOptions = {
    * over the pool, whose check-and-mark refuses the last live node.
    */
   readonly depart?: DepartPort;
-  /** The human channel, granted to agent zero (the first booted node) only. */
-  readonly speak?: SpeakPort;
   readonly pollMs?: number; readonly log: HostLog;
 };
 
@@ -210,8 +212,6 @@ export type CellSetOptions = {
   readonly fence?: FencePort;
   readonly storage?: StorageConfig;
   readonly doctorRunner?: CellOptions['doctorRunner'];
-  /** The human channel, granted to agent zero (the first booted node) only. */
-  readonly speak?: SpeakPort;
   readonly pollMs?: number; readonly log: HostLog;
 };
 
@@ -233,6 +233,8 @@ type SharedCell = {
   readonly doctor: DoctorReport | undefined;
   readonly storage: StorageConfig;
   readonly storageState: StorageFact;
+  /** The home's conversation stream: stateless, shared by every node's port. */
+  readonly conversation: ConversationLog;
 };
 
 /**
@@ -267,7 +269,11 @@ async function openCellShared(options: CellOptions): Promise<SharedCell> {
   const frontier = await openFrontierJournal(home, {
     worldHead: () => world.headHash(), now: Date.now, storage,
   });
-  return { world, frontier, doctor, storage, storageState };
+  // The conversation stream's stateless writer/reader, shared by every node of
+  // the home; the boot repair is the host's own act (startHost), not a
+  // composition side effect.
+  const conversation = ConversationLog.for(home);
+  return { world, frontier, doctor, storage, storageState, conversation };
 }
 
 /**
@@ -281,7 +287,11 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
   // renders it as the plan's substrate block and the extend port lists it.
   // Absent stays absent — no block, no line, no validation.
   const models = credential.models;
-  const { world, doctor, storage, storageState } = shared;
+  const { world, doctor, storage, storageState, conversation } = shared;
+  // The conversation stream's watcher: one per home, process-lifetime, the
+  // second subscription every driver's park takes beside the HEAD one. Its
+  // notices are the interface's notification — host state, in memory.
+  const conversationWatcher = ConversationWatcher.for(home, pollMs);
   const paths = cellPaths(home, uid);
   // Every mediator this node owns — the model adapter and the web tools —
   // crosses the frontier through the node's attribution view, so each begun
@@ -323,6 +333,10 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
     terminal: { env: DEFAULT_TERMINAL_ENV, sandbox: shellSandbox },
     ...(webTools !== undefined ? { webTools } : {}),
     ...(models !== undefined ? { models } : {}),
+    notice: {
+      current: () => conversationWatcher.noticeFor(uid),
+      consume: (version) => { conversationWatcher.consume(uid, version); },
+    },
     extend: (events, ports) => ({
       store,
       supervisor: createRunSupervisor({
@@ -367,13 +381,24 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
       sandbox: sandbox !== false,
       ...(options.spawn !== undefined ? { spawn: options.spawn } : {}),
       ...(options.depart !== undefined ? { depart: options.depart } : {}),
-      ...(options.speak !== undefined ? { speak: options.speak } : {}),
       ...(models !== undefined ? { models } : {}),
+      // The conversation interface, bound to this node: `from` is stamped from
+      // the runtime's own uid, and the port pokes the watcher so an in-process
+      // arrival wakes a parked recipient without the interval's latency.
+      conversation: {
+        send: async (to, text) => {
+          const sent = await conversation.append(uid, to, text);
+          conversationWatcher.poke();
+          return sent;
+        },
+        thread: (n) => conversation.thread(uid, n),
+      },
     }),
   });
   const driver = await NodeDriver.open(home, uid, wrapHandler(runtime.handler, log), world, {
     knownTypes: C13_EVENT_TYPES,
     hooks: runtime.hooks,
+    conversation: conversationWatcher,
     ...(pollMs !== undefined ? { worldPollMs: pollMs } : {}),
     ...(fencePort !== undefined ? { fence: fencePort } : {}),
     ...(doctor !== undefined ? { doctor } : {}),
@@ -468,11 +493,8 @@ export async function composeCellSet(options: CellSetOptions): Promise<CellSet> 
   const shared = await openCellShared(nodeOptionsOf(options, first));
   const nodes: NodeCell[] = [];
   try {
-    for (const [index, spec] of options.nodes.entries()) {
-      nodes.push(await composeNode(
-        nodeOptionsOf(options, spec, spec.spawn, index === 0 ? options.speak : undefined),
-        shared,
-      ));
+    for (const spec of options.nodes) {
+      nodes.push(await composeNode(nodeOptionsOf(options, spec, spec.spawn), shared));
     }
   } catch (err) {
     for (const node of nodes) await node.close().catch(() => {});
@@ -504,7 +526,7 @@ function nodeOptionsOf(
     readonly uid: string; readonly config: AgentConfig;
     readonly spawn?: SpawnPort; readonly depart?: DepartPort;
   },
-  spawn?: SpawnPort, speak?: SpeakPort,
+  spawn?: SpawnPort,
 ): CellOptions {
   return {
     home: options.home, uid: spec.uid, config: spec.config,
@@ -512,7 +534,6 @@ function nodeOptionsOf(
     sandbox: options.sandbox, log: options.log,
     ...(spawn !== undefined ? { spawn } : {}),
     ...(spec.depart !== undefined ? { depart: spec.depart } : {}),
-    ...(speak !== undefined ? { speak } : {}),
     ...(options.fence !== undefined ? { fence: options.fence } : {}),
     ...(options.storage !== undefined ? { storage: options.storage } : {}),
     ...(options.doctorRunner !== undefined ? { doctorRunner: options.doctorRunner } : {}),
@@ -1030,6 +1051,17 @@ class NodePool {
   }
 
   /**
+   * Whether `uid` names a node this pool admits as a conversation recipient:
+   * a registered live node OR one whose spawn has claimed a uid and not yet
+   * registered. The reservation counts because `spawn` composes the child
+   * (and the child's boot notice arms) BEFORE it registers the cell, so a
+   * record already waiting for the minted uid must arm during composition.
+   */
+  admitsRecipient(uid: string): boolean {
+    return this.nodes.has(uid) || this.reservations.has(uid);
+  }
+
+  /**
    * The host lifetime's one anchor: a fresh waiter per call, resolving when no
    * live node remains and rejecting with the first booted run's rejection. It
    * is never re-armed: the pool cannot empty while a spawn is in flight (the
@@ -1478,6 +1510,12 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       // world, kernel-owned, and independent of composition. A failed open is a
       // refused boot (a kernel-owned record that cannot be read is not reset).
       chat = await ChatLog.open(home);
+      // The conversation stream's boot repair — HOST-ONLY: one TAIL read under
+      // the stream's own flock, truncating at most one incomplete trailing
+      // fragment. A missing stream is a new cell and creates nothing; a failed
+      // repair is a refused boot (a kernel-owned record that cannot be read is
+      // never silently reset).
+      await openConversationLog(home);
       // The boot's node set: one solo spec from the flags, or the operator's
       // nodes file. It is read before the owner record (a malformed file is an
       // exit-2 refusal that never writes one) and validated entry by entry.
@@ -1597,18 +1635,6 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         beginDepart: () => (pool === null ? false : pool.beginDepart(uid)),
         depart: () => { pool?.depart(uid); },
       });
-      // The human channel, granted to the root only (agent zero). Delivery is
-      // the chat log; the frontier already holds the exact call bytes.
-      const rootSpeak: SpeakPort = {
-        speak: async (text) => {
-          if (chat === null) throw new SpeakRefusedError('the human channel is not open');
-          try {
-            await chat.append(primaryUid, text, Date.now());
-          } catch {
-            throw new SpeakRefusedError('the human channel could not be written');
-          }
-        },
-      };
       // The composition seams are the solo cell's or the set's; both receive
       // the same validated providers/credential and the one attached sandbox.
       const sharedOptions = {
@@ -1623,7 +1649,6 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
           ...sharedOptions, uid: spec.uid, config: configs[0]!,
           depart: departPortFor(spec.uid),
           ...(spec.spawn === true ? { spawn: spawnPortFor(spec.uid) } : {}),
-          speak: rootSpeak,
         });
         composed = {
           nodes: [cell], world: cell.world, frontier: cell.frontier,
@@ -1631,7 +1656,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         };
       } else {
         composed = await (deps.composeSet ?? composeCellSet)({
-          ...sharedOptions, speak: rootSpeak,
+          ...sharedOptions,
           nodes: specs.map((spec, index) => ({
             uid: spec.uid, config: configs[index]!,
             depart: departPortFor(spec.uid),
@@ -1647,10 +1672,19 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         shared: {
           world: composed.world, frontier: composed.frontier,
           doctor: undefined, storage, storageState,
+          conversation: ConversationLog.for(home),
         },
         providers, credential, sandbox: cellSandbox, storage, log, maxNodes: MAX_NODES,
         ...(deps.composeChild !== undefined ? { composeChild: deps.composeChild } : {}),
       });
+      // The conversation's live recipients: a record addressed to a uid no live
+      // (or reserved) node bears accumulates in the stream with NO notice (the
+      // absent-recipient rule). The pool's reservations count, because a
+      // spawned child's boot notice arms during composition, before its cell
+      // is registered.
+      ConversationWatcher.for(home).setRecipientFilter(
+        (uid) => pool !== null && pool.admitsRecipient(uid),
+      );
       for (const [index, node] of composed.nodes.entries()) {
         pool.addBooted(node, specs[index]?.spawn === true);
       }

@@ -4,12 +4,14 @@ import type {
 import { isRecord } from '../../util.js';
 import type { BoundaryGate } from '../gate.js';
 import { Buffer } from 'node:buffer';
+import { GATEWAY_ADDRESSEE } from '../../journal/index.js';
 import { sanitizePtyText } from './sanitize.js';
 import type { CommandOutcome, TerminalPort } from './terminal.js';
 import { boundToolText, decodeToolText } from './text.js';
 import { renderExtract, renderSearch } from './web.js';
 import type { WebOutcome, WebTools } from './web.js';
-import { MAX_SPEAK_BYTES, executeExtend, type ExtendDecision, type ExtendPort } from './extend.js';
+import { executeExtend, type ExtendDecision, type ExtendPort } from './extend.js';
+import { MAX_SPEAK_BYTES } from '../conversation.js';
 
 /**
  * Tool dispatch (T7, kernel.md §4).
@@ -214,17 +216,21 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
     return { kind: 'execute', cmd };
   }
 
-  // `extend`: the ten verbs, each with its exact key set (the funnel's
-  // argument shapes are validated here — the one-decision-point rule).
+  // `extend`: the eleven verbs, each with its exact key set (the funnel's
+  // argument shapes are validated here — the one-decision-point rule). The two
+  // conversation verbs are APPENDED LAST so the published recognition refusal
+  // keeps its existing prefix — the teaching text a model may already have
+  // seen, and the string the dispatch pin asserts — and the vocabulary grows
+  // only by addition.
   const verbs = [
-    'inspect', 'define', 'run', 'call', 'stop', 'undefine', 'spawn', 'speak', 'update_self',
-    'request_death',
+    'inspect', 'define', 'run', 'call', 'stop', 'undefine', 'spawn', 'update_self',
+    'request_death', 'send_message', 'get_messages',
   ];
   const verb = parsed['verb'];
   if (typeof verb !== 'string' || !verbs.includes(verb)) {
     return invalidDetail(
-      'verb must be one of inspect, define, run, call, stop, undefine, spawn, speak,'
-      + ' update_self, request_death',
+      'verb must be one of inspect, define, run, call, stop, undefine, spawn,'
+      + ' update_self, request_death, send_message, get_messages',
     );
   }
   const keys = Object.keys(parsed);
@@ -243,10 +249,16 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
       ? { kind: 'extend', verb: 'inspect' }
       : invalidDetail('inspect takes only verb');
   }
-  if (verb === 'speak') {
-    // The human channel: exactly one non-blank message, bounded like the
-    // kernel's chat line. The delivery is the host's; dispatch only shapes it.
-    if (!only('verb', 'text')) return invalidDetail('speak takes verb and text');
+  if (verb === 'send_message') {
+    // The conversation interface's send: one non-blank message at most the
+    // conversation record's bytes, addressed with ROLE-CONSTRAINED addressing.
+    // `to` absent is the reserved gateway (a node's default addressee); a
+    // present `to` must be exactly the gateway — anything else is the teaching
+    // refusal, because the kernel is not a node↔node transport. The sender is
+    // never an argument: the kernel stamps it.
+    if (!only('verb', 'to', 'text')) {
+      return invalidDetail('send_message takes verb, text and optionally to');
+    }
     const text = parsed['text'];
     if (typeof text !== 'string' || text.trim() === '') {
       return invalidDetail('text must be a non-blank string');
@@ -254,7 +266,29 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
     if (Buffer.byteLength(text, 'utf8') > MAX_SPEAK_BYTES) {
       return invalidDetail(`text must be at most ${MAX_SPEAK_BYTES} bytes`);
     }
-    return { kind: 'extend', verb: 'speak', text };
+    const to = parsed['to'];
+    if (to !== undefined) {
+      if (typeof to !== 'string') return INVALID;
+      if (to !== GATEWAY_ADDRESSEE) {
+        return invalidDetail('send_message can address only the gateway (or no to at all) —'
+          + ' the kernel is not a node-to-node transport');
+      }
+      return { kind: 'extend', verb: 'send_message', to, text };
+    }
+    return { kind: 'extend', verb: 'send_message', text };
+  }
+  if (verb === 'get_messages') {
+    // The read side is stateless: the last n records of the caller's own
+    // thread, default 16. No cursor, no reference to a peer's thread.
+    if (!only('verb', 'n')) return invalidDetail('get_messages takes verb and optionally n');
+    const n = parsed['n'];
+    if (n !== undefined) {
+      if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 1) {
+        return invalidDetail('n must be a positive integer');
+      }
+      return { kind: 'extend', verb: 'get_messages', n };
+    }
+    return { kind: 'extend', verb: 'get_messages' };
   }
   if (verb === 'spawn') {
     // The kernel capability: the child inherits the requester's tools and

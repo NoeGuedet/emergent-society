@@ -19,9 +19,11 @@ import {
  *   before any visible effect; a refusal lands nothing, and a collision
  *   inside the declaration is caught before the first tool moves.
  * - **Collision-checked against every reserved vocabulary** — the base five,
- *   the extend verbs, the kernel-owned `spawn`/`speak` (a package tool named
- *   `spawn` would corrupt the honesty catalogue), already-registered names,
- *   and duplicates within the declaration.
+ *   the extend verbs, the kernel-owned `spawn`/`speak` and the conversation's
+ *   `send_message`/`get_messages` (a package tool bearing one of those names
+ *   would corrupt the honesty catalogue, and the reserved verb names are never
+ *   released), already-registered names, and duplicates within the
+ *   declaration.
  * - **The declaration bounds** — at most `MAX_TOOLS_PER_RUN` tools, each
  *   schema at most `MAX_TOOL_SCHEMA_BYTES`, the whole surface (names +
  *   descriptions + schemas) at most `MAX_DECLARED_SURFACE_BYTES` so the
@@ -81,7 +83,9 @@ const VERB_VOCABULARY: ReadonlySet<string> = new Set([
   'request_death',
 ]);
 
-const KERNEL_OWNED: ReadonlySet<string> = new Set(['spawn', 'speak']);
+const KERNEL_OWNED: ReadonlySet<string> = new Set([
+  'spawn', 'speak', 'send_message', 'get_messages',
+]);
 
 const SCALAR_TYPES: ReadonlySet<string> = new Set([
   'object', 'array', 'string', 'number', 'integer', 'boolean',

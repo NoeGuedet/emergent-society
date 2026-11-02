@@ -12,6 +12,8 @@ import { ContextFold } from '../context/fold.js';
 import { loadVerifiedEvents } from '../context/loader.js';
 import { writeSnapshot } from '../context/snapshots.js';
 import { dispatchCalls } from './tools/dispatch.js';
+import { renderConversationNotice } from './conversation.js';
+import type { ConversationNoticeSource } from './conversation-watcher.js';
 import { createSelfPort } from './self.js';
 import type { ExtendPort } from './tools/extend.js';
 import type { RunSupervisorEvents } from './packages/supervisor.js';
@@ -116,6 +118,12 @@ export type RuntimeOptions = {
     events: RunSupervisorEvents,
     ports: { readonly terminal: TerminalPort | null; readonly web: WebTools | null },
   ) => ExtendPort;
+  /**
+   * The pending conversation notice (the interface's notification, host state):
+   * the runtime reads it before each assembled request and clears it only after
+   * a request the kernel actually sent. Absent means no conversation physics.
+   */
+  readonly notice?: ConversationNoticeSource;
 };
 
 export interface AgentRuntime {
@@ -548,10 +556,14 @@ class Runtime implements AgentRuntime {
     for (let step = 0; step < config.policy.stepsPerTurn; step += 1) {
       await runCompaction(this.fold, ctx.gate);
       const id: RequestId = { turn: ctx.turn, ordinal };
+      // Host state, not journaled state: the notice rides the volatile queue,
+      // so a new arrival never invalidates the cached prefix.
+      const notice = this.options.notice?.current() ?? null;
       const plan = assemble({
         id, state: this.fold.snapshot(),
         ...(ctx.direction !== undefined ? { direction: ctx.direction } : {}),
         ...(this.options.models !== undefined ? { models: this.options.models } : {}),
+        ...(notice !== null ? { notice: renderConversationNotice(notice) } : {}),
       });
       const bytes = canonicalBytes(plan).length;
       if (bytes >= MAX_CAPTURE_BYTES) {
@@ -572,6 +584,10 @@ class Runtime implements AgentRuntime {
         if (sent.failure.code === 'cancelled') return { outcome: 'waiting', toolCalls: accepted > 0 };
         return { outcome: 'error', toolCalls: accepted > 0, error: sent.failure };
       }
+      // The CLEAR rule: the notice is consumed only by a request the kernel
+      // actually sent (the exchange is journaled and answered). A failed
+      // request leaves it pending and the next attempt re-renders it.
+      if (notice !== null) this.options.notice?.consume(notice.version);
       const calls = sent.projection.message.tool_calls;
       this.packageGateHolder.gate = ctx.gate;
       this.flushPackageFacts(ctx.gate);

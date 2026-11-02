@@ -13,7 +13,10 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const dist = join(root, 'dist');
 const scriptPath = fileURLToPath(import.meta.url);
 const launcherRel = join('native', 'es-landlock', 'es-landlock');
-const required = ['journal/lock.js', 'journal/lock-guard.mjs', 'node/tools/sandbox.js', 'host/main.js'];
+const required = [
+  'journal/lock.js', 'journal/lock-guard.mjs', 'node/conversation.js',
+  'node/conversation-append.mjs', 'node/tools/sandbox.js', 'host/main.js',
+];
 
 const toPosix = (path) => path.split(sep).join('/');
 
@@ -43,9 +46,16 @@ async function walk(dir, prefix = '') {
 }
 
 export async function copyRuntimeAssets(root, out = join(root, 'dist')) {
-  const destination = join(out, 'journal', 'lock-guard.mjs');
-  await mkdir(dirname(destination), { recursive: true });
-  await copyFile(join(root, 'src', 'journal', 'lock-guard.mjs'), destination);
+  // The two runtime assets tsc does not emit: the journal's ownership guard and
+  // the conversation stream's flock writer helper (both are plain .mjs children).
+  for (const rel of [
+    ['journal', 'lock-guard.mjs'],
+    ['node', 'conversation-append.mjs'],
+  ]) {
+    const destination = join(out, rel[0], rel[1]);
+    await mkdir(dirname(destination), { recursive: true });
+    await copyFile(join(root, 'src', rel[0], rel[1]), destination);
+  }
 }
 
 export async function ensureNative(root) {

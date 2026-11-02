@@ -421,3 +421,27 @@ describe('verifyPerceptions: a divergence is explicit, never a promise of equali
       /recorded Git version .* differs from the host's/);
   });
 });
+
+describe('assemble: the conversation notice', () => {
+  const NOTICE = '1 message arrived, the newest from gateway; consult get_messages';
+
+  it('rides the volatile queue and never moves the cached prefix', () => {
+    const state = makeState();
+    const plain = assemble({ id: ID, state });
+    const noticed = assemble({ id: ID, state, notice: NOTICE });
+    // Host state, not journaled state: the plan hash is unchanged.
+    expect(noticed.stateHash).toBe(plain.stateHash);
+    expect(noticed.history).toEqual(plain.history);
+    expect(noticed.queue).toEqual([{ role: 'system', content: NOTICE }]);
+    expect(plain.queue).toEqual([]);
+    // The wire's whole prefix (tools, charter, heading, history) is identical;
+    // the notice is the last message and the section is post-breakpoint.
+    const plainWire = parse(serializeWire(plain))['messages'] as Array<Record<string, unknown>>;
+    const noticedWire = parse(serializeWire(noticed))['messages'] as Array<Record<string, unknown>>;
+    expect(noticedWire.slice(0, -1)).toEqual(plainWire);
+    expect(noticedWire[noticedWire.length - 1]).toEqual({ role: 'system', content: NOTICE });
+    expect(noticed.sections.map((section) => section.name))
+      .toEqual(['tools', 'charter', 'heading', 'history', 'queue']);
+    expect(noticed.sections[noticed.sections.length - 1]!.cache).toBe('volatile');
+  });
+});

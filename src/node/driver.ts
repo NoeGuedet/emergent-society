@@ -24,6 +24,7 @@ import {
 import type { SafeFailure, Source } from '../context/contracts.js';
 import type { VerifiedEvent } from '../context/loader.js';
 import { HeadWatcher } from './watcher.js';
+import type { ConversationSource } from './conversation-watcher.js';
 import { readRatifiedDirection, type DirectionPin } from './direction.js';
 import { DEFAULT_WAKE_BUDGET_PER_HOUR } from '../context/config.js';
 import type { WorldRange, WorldRepo } from './world.js';
@@ -211,6 +212,14 @@ export interface NodeDriverOptions extends JournalWriterOptions {
    * retry is deterministic. The wait only ever ends early on `stop()`.
    */
   storageRetryMs?: number;
+  /**
+   * The conversation stream's notice source (the interface). Present means the
+   * driver takes a second subscription beside the HEAD one inside every park,
+   * arms the boot notice from the thread's bounded tail, and reports the
+   * `'conversation'` turn trigger when a pending notice is what ended the
+   * wait. Absent is the conversation-less driver of the node suites.
+   */
+  conversation?: ConversationSource;
 }
 
 /** The bounded self-retry delays: three attempts, then the cell stays parked. */
@@ -304,6 +313,18 @@ export class NodeDriver {
   private stopReason: ShutdownReason = 'stop-requested';
   private readonly latch = new WakeLatch();
   private readonly watcher: HeadWatcher;
+  /** The conversation stream's notice source, when this driver has one. */
+  private readonly conversation: ConversationSource | null;
+  /** Whether the last park ended on a pending conversation notice. */
+  private conversationFired = false;
+  /**
+   * The newest notice version this driver already woke for. A notice that a
+   * FAILED request did not consume is still pending at the next park; without
+   * this guard the park would re-wake at once and a provider outage would spin
+   * turns. The version only moves when a new record arrives, so a new arrival
+   * always wakes.
+   */
+  private lastWokenNotice = -1;
   /**
    * The injected `now`, or the shared `systemClock` in `util.ts` — the same
    * clock the journal writer defaults to. Resolved once here, so every turn
@@ -376,6 +397,7 @@ export class NodeDriver {
     this.wakeBudgetPerHour = opts.wakeBudgetPerHour ?? DEFAULT_WAKE_BUDGET_PER_HOUR;
     this.readDirection = opts.readDirection ?? readRatifiedDirection;
     this.watcher = HeadWatcher.for(world, opts.worldPollMs);
+    this.conversation = opts.conversation ?? null;
     this.home = home;
     this.hooks = opts.hooks;
     this.schedule = opts.schedule ?? defaultSchedule;
@@ -456,6 +478,21 @@ export class NodeDriver {
           try { opts.onError?.(err instanceof Error ? err : new Error('world/doctor write failed')); }
           catch { /* the diagnostic is not the boot */ }
         }
+      }
+    }
+    if (opts.conversation !== undefined) {
+      // The boot rule: a node booting with unread mail is notified on its first
+      // evaluation, from the thread's bounded tail — never the whole history,
+      // and at the cost of one possibly-redundant consult. A read failure is a
+      // bounded diagnostic, never a refused boot (the stream is not the node's
+      // journal).
+      try {
+        await opts.conversation.armBoot(uid);
+      } catch (err) {
+        try {
+          opts.onError?.(err instanceof Error
+            ? err : new Error('conversation boot notice failed'));
+        } catch { /* the diagnostic is not the boot */ }
       }
     }
     return driver;
@@ -674,7 +711,11 @@ export class NodeDriver {
           await this.park();
           if (this.stopRequested) break;
           this.nodeState = 'active';
-          trigger = this.timerFired ? 'timer' : 'wakeup';
+          // The cause flag, not a boolean wake: a conversation wake that
+          // recorded 'wakeup' would silently lose the interface's arrival.
+          trigger = this.conversationFired ? 'conversation'
+            : this.timerFired ? 'timer' : 'wakeup';
+          this.conversationFired = false;
           this.timerFired = false;
           this.turn += 1;
         } finally {
@@ -987,11 +1028,18 @@ export class NodeDriver {
     this.parkEpoch += 1;
     const epoch = this.parkEpoch;
     const unsubscribe = this.watcher.subscribe(() => { void this.armIfAwake(epoch); });
+    // The second subscription rides the same park epoch: the conversation's
+    // own watcher is never a detour of the HEAD-conditioned path.
+    const unsubscribeConversation = this.conversation?.subscribe(() => {
+      this.armConversationIfDue(epoch);
+    });
     try {
       await this.armIfAwake(epoch);
+      this.armConversationIfDue(epoch);
       await this.latch.wait();
     } finally {
       unsubscribe();
+      unsubscribeConversation?.();
       // The park is over: a pending self-retry must not wake the park that
       // follows (the refusal that armed it is this park's, and the next turn
       // either re-arms it or a successful commit clears it). The wake timer is
@@ -1020,6 +1068,23 @@ export class NodeDriver {
    */
   private async armIfAwake(epoch: number): Promise<void> {
     if ((await this.wakeDue()) && epoch === this.parkEpoch) this.latch.request();
+  }
+
+  /**
+   * Arms the latch when a conversation notice for this node is pending and was
+   * not already woken for. One message wakes ONE recipient: the watcher's
+   * notification reaches every parked driver, but only the addressed node has
+   * a pending notice, so the others' check is a cheap no-op and they re-park.
+   * The epoch check forbids a stale evaluation from arming the next park.
+   */
+  private armConversationIfDue(epoch: number): void {
+    const source = this.conversation;
+    if (source === null || epoch !== this.parkEpoch) return;
+    const notice = source.noticeFor(this.uid);
+    if (notice === null || notice.version <= this.lastWokenNotice) return;
+    this.lastWokenNotice = notice.version;
+    this.conversationFired = true;
+    this.latch.request();
   }
 
   /**

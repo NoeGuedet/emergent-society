@@ -45,11 +45,20 @@ export const NODE_UID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 export const HUMAN_AUTHOR = 'human';
 
 /**
+ * The reserved addressee of the conversation stream — the overlay (the gateway
+ * between the far west and the human). It is never a node uid: a node bearing
+ * the name could read the messages addressed to the gateway through the
+ * `get_messages` thread filter, so `assertNodeUid` refuses it. The kernel
+ * stamps it as the resolved default `to` of a node's message.
+ */
+export const GATEWAY_ADDRESSEE = 'gateway';
+
+/**
  * Validates a node uid, returning it unchanged.
  *
  * @throws InvalidNodeUidError when it is empty, too long, carries a character
- * that is not safe in a path segment and a git identity, or claims the
- * reserved human ratifier name.
+ * that is not safe in a path segment and a git identity, or claims one of the
+ * reserved names (`human`, `gateway`).
  */
 export function assertNodeUid(uid: string): string {
   if (typeof uid !== 'string' || !NODE_UID_RE.test(uid)) {
@@ -57,6 +66,11 @@ export function assertNodeUid(uid: string): string {
   }
   if (uid === HUMAN_AUTHOR) {
     throw new InvalidNodeUidError(uid, 'is reserved for the human ratifier and can never be a node uid');
+  }
+  if (uid === GATEWAY_ADDRESSEE) {
+    throw new InvalidNodeUidError(
+      uid, 'is reserved for the conversation gateway and can never be a node uid',
+    );
   }
   return uid;
 }

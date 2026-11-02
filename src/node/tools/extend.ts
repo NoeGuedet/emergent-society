@@ -1,10 +1,15 @@
 import type { BoundaryGate } from '../gate.js';
 import { MAX_CAPTURE_BYTES } from '../gate.js';
+import {
+  DEFAULT_THREAD_READ, MAX_SPEAK_BYTES, renderConversationThread,
+  type ConversationSent, type ConversationThread,
+} from '../conversation.js';
 import type { RequestId } from '../../context/contracts.js';
 import type { AgentConfig } from '../../context/contracts.js';
 import { canonicalizeJson } from '../../journal/index.js';
 import { boundToolText } from './text.js';
 import { modelRefusal } from './providers.js';
+import { Buffer } from 'node:buffer';
 import { singleLine } from '../../text.js';
 import { PackageError } from '../packages/errors.js';
 import { SelfRefusedError, type SelfPort } from '../self.js';
@@ -13,10 +18,12 @@ import type { RunSupervisor } from '../packages/supervisor.js';
 
 /**
  * The extend executor (kernel.md, the sandbox and local-log sections): the
- * peer of terminal and web — the ten verbs, the append home of the four
- * verb facts (define, run, stop, undefine; the registry's effect facts and
- * the supervisor's error/service facts ride the injected event port), the
- * funnel's kernel-side schema validation, and the honest inspect catalogue.
+ * peer of terminal and web — the eleven verbs, including the conversation's
+ * two (send_message, get_messages; the node `speak` verb is removed), the
+ * append home of the four verb facts (define, run, stop, undefine; the
+ * registry's effect facts and the supervisor's error/service facts ride the
+ * injected event port), the funnel's kernel-side schema validation, and the
+ * honest inspect catalogue.
  *
  * Invariants this module owns:
  * - **Recognition never lives here** — decide() validated the verb and its
@@ -51,10 +58,11 @@ export type ExtendPort = {
    */
   readonly spawn?: SpawnPort;
   /**
-   * The human channel (A4), when this node is agent zero (the cell's root).
-   * Delivery is outside the world; the frontier already holds the call.
+   * The conversation interface (A3), bound to THIS node's uid by the runtime:
+   * every node holds it. Absent is the port-less composition, which renders the
+   * honest denial (the speak pattern, without the channel that owned speak).
    */
-  readonly speak?: SpeakPort;
+  readonly conversation?: ConversationPort;
   /**
    * The operator-declared served-model catalog (providers.json `llm.models`),
    * when the store declares one. inspect lists it honestly; it is the one
@@ -124,21 +132,13 @@ export type DepartPort = {
   depart(): void;
 };
 
-/** The human-channel message ceiling: a message, not a document. */
-export const MAX_SPEAK_BYTES = 8192;
-
-/** The human channel's kernel seam: deliver one message, or refuse bounded. */
-export type SpeakPort = {
-  speak(text: string): Promise<void>;
+/** The conversation interface's kernel seam, bound to the caller's uid. */
+export type ConversationPort = {
+  /** Append one record; `to` absent resolves to the reserved gateway. */
+  send(to: string | undefined, text: string): Promise<ConversationSent>;
+  /** The caller's own thread: the last n records, oldest-first at render. */
+  thread(n: number): Promise<ConversationThread>;
 };
-
-/** A bounded, path-free channel refusal the executor renders as denied. */
-export class SpeakRefusedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'SpeakRefusedError';
-  }
-}
 
 /**
  * How a verb addresses a Package (the friction pass): by name — the ergonomic standard
@@ -177,8 +177,12 @@ export type ExtendDecision =
     readonly kind: 'extend'; readonly verb: 'update_self';
     readonly heading?: string; readonly path?: string; readonly model?: string;
   }
-  | { readonly kind: 'extend'; readonly verb: 'speak'; readonly text: string }
-  | { readonly kind: 'extend'; readonly verb: 'request_death' };
+  | { readonly kind: 'extend'; readonly verb: 'request_death' }
+  | {
+    readonly kind: 'extend'; readonly verb: 'send_message';
+    readonly to?: string; readonly text: string;
+  }
+  | { readonly kind: 'extend'; readonly verb: 'get_messages'; readonly n?: number };
 
 /** A schema violation the funnel refuses with, naming the field. */
 function schemaViolation(args: unknown, schema: unknown, where: string): string | null {
@@ -346,8 +350,8 @@ const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true });
  * Renders the honest inspect catalogue (kernel.md, the sandbox and
  * local-log sections): base tools, package tools with their schemas, the
  * stored packages with the caps and their meaning, the operator-declared
- * served models when the store declares a catalog, the kernel-owned
- * `spawn`/`speak` and the `request_death` rule, and the runtime honesty — the
+ * served models when the store declares a catalog, the conversation interface,
+ * the kernel-owned `spawn` and the `request_death` rule, and the runtime honesty — the
  * sandbox mode with its
  * spelled-out meaning, the fail-closed contract, the withheld capabilities,
  * the caps, the no-rlimit residual, the egress-open residual, the
@@ -413,6 +417,23 @@ function renderInspect(
     }
   }
   lines.push('');
+  lines.push('== the conversation (the interface) ==');
+  if (port.conversation !== undefined) {
+    lines.push('- send_message: send one message into the conversation —'
+      + ' extend {verb:"send_message", to?, text}; `to` is absent (the reserved'
+      + ` gateway addressee) or "gateway" — the kernel is not a node-to-node`
+      + ' transport. The kernel stamps the sender and'
+      + ` the addressee; the message is at most ${MAX_SPEAK_BYTES} bytes, non-blank.`);
+    lines.push('- get_messages: read your own conversation thread —'
+      + ' extend {verb:"get_messages", n?}; the last n records (default'
+      + ` ${DEFAULT_THREAD_READ}) that involve this node, oldest-first, with an`
+      + ' "older records exist" line when the thread is longer. There is no'
+      + ' cursor: re-reading is always possible.');
+  } else {
+    lines.push('- send_message / get_messages: the conversation interface —'
+      + ' not available in this composition (no conversation port was composed).');
+  }
+  lines.push('');
   lines.push('== kernel-owned, visible but never mounted ==');
   if (port.spawn !== undefined) {
     const caps = port.spawn.caps();
@@ -425,14 +446,6 @@ function renderInspect(
       : '- spawn: creating new nodes — not granted to this node.');
   } else {
     lines.push('- spawn: creating new nodes — not granted to this node.');
-  }
-  if (port.speak !== undefined) {
-    lines.push('- speak: the human channel — available to this node:'
-      + ' extend {verb:"speak", text}; one non-blank message of at most'
-      + ` ${MAX_SPEAK_BYTES} bytes, delivered to the human outside the world (the frontier`
-      + ' already holds the exact call bytes).');
-  } else {
-    lines.push('- speak: the human channel — not granted to this node (agent zero alone).');
   }
   // Static rule text, never a live query: the departure decision is a
   // check-and-MARK, so a read must not call `beginDepart` (it would leave a
@@ -561,24 +574,47 @@ export async function executeExtend(opts: {
     return;
   }
 
-  if (decision.verb === 'speak') {
-    if (port.speak === undefined) {
+  if (decision.verb === 'send_message') {
+    const conversation = port.conversation;
+    if (conversation === undefined) {
       await appendResult(gate, id, callId,
-        'denied: this node was not granted the human channel', true, max);
+        'denied: this cell was composed without a conversation port', true, max);
       return;
     }
     try {
-      await port.speak.speak(decision.text);
+      // The runtime's port stamps `from` with this node's uid and resolves the
+      // addressee; the executor only carries the validated message.
+      const sent = await conversation.send(decision.to, decision.text);
       await appendResult(gate, id, callId,
-        `spoken to the human (${Buffer.byteLength(decision.text, 'utf8')} bytes)`,
-        false, max);
+        `sent to ${sent.to} (${Buffer.byteLength(decision.text, 'utf8')} bytes);`
+        + ' the kernel wrote the record', false, max);
     } catch (err) {
-      if (err instanceof SpeakRefusedError) {
-        await appendResult(gate, id, callId,
-          `denied: ${singleLine(err.message, 200)}`, true, max);
-        return;
-      }
-      throw err;
+      await appendResult(gate, id, callId,
+        `error: conversation/failed\n${singleLine(
+          err instanceof Error ? err.message : 'the conversation stream could not be written',
+          200)}`, true, max);
+    }
+    return;
+  }
+
+  if (decision.verb === 'get_messages') {
+    const conversation = port.conversation;
+    if (conversation === undefined) {
+      await appendResult(gate, id, callId,
+        'denied: this cell was composed without a conversation port', true, max);
+      return;
+    }
+    try {
+      const thread = await conversation.thread(decision.n ?? DEFAULT_THREAD_READ);
+      // SELF-BOUNDED: the renderer drops the oldest records itself; the generic
+      // `boundToolText` would silently cut a record in half.
+      const content = renderConversationThread(thread, max);
+      await appendResult(gate, id, callId, content, false, max);
+    } catch (err) {
+      await appendResult(gate, id, callId,
+        `error: conversation/failed\n${singleLine(
+          err instanceof Error ? err.message : 'the conversation thread could not be read',
+          200)}`, true, max);
     }
     return;
   }
