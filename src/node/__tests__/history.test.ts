@@ -436,6 +436,87 @@ describe('history: the perception entry', () => {
 
 // --- the window contract ----------------------------------------------------------
 
+describe('history: the stored attribution notice', () => {
+  it('renders the notice the perception recorded when it carries one', async () => {
+    // The notice is emitted by the perception renderer only when omittedOwn is
+    // non-empty; the history renderer never claims it otherwise. This row
+    // journals the notice in the stored text (as the kernel did) and checks it
+    // is rendered verbatim as part of that record.
+    const notice = 'attribution: commit author names the closer;'
+      + ' omitted own commits may contain peer in-flight writes';
+    const own = 'a'.repeat(40);
+    const peer = 'b'.repeat(40);
+    const events: VerifiedEvents = [
+      ev(0, 'node/boot', { reason: 'start' }),
+      ev(1, 'system/message', configData(1, config())),
+      ev(2, 'turn/start', { turn: 1, trigger: 'wakeup', world: { from: null, to: null } }),
+      ev(3, 'world/perception', perceptionData(1, perception({
+        commits: [{ hash: peer, author: 'n2' }, { hash: own, author: 'n1' }],
+        included: [peer],
+        omittedOwn: [own],
+        text: `${notice}\ncommit ${peer}\nauthor n2\n@@ a patch @@\n`,
+      }))),
+      ev(4, 'turn/end', { turn: 1, outcome: 'waiting' }),
+    ];
+    const content = await renderHistory(fakePort(events), 16, 65536);
+    expect(content).toContain('commits 2, included 1, own omitted 1');
+    expect(content).toContain(notice);
+    expect(content).toContain('own commits (omitted from the patches):');
+    expect(content).toContain(`  - ${own}`);
+  });
+});
+
+describe('history: the sub-factory-cap bands', () => {
+  function largePerception(): VerifiedEvents {
+    return [
+      ev(0, 'node/boot', { reason: 'start' }),
+      ev(1, 'system/message', configData(1, config())),
+      ev(2, 'turn/start', { turn: 1, trigger: 'wakeup', world: { from: null, to: null } }),
+      ev(3, 'world/perception', perceptionData(1, perception({
+        commits: Array.from({ length: 4096 }, (_unused, index) => ({
+          hash: `${index}`.padStart(40, '0'), author: 'n2',
+        })),
+        text: 'the world patch as stored\n'.repeat(20_000),
+      }))),
+      ev(4, 'turn/end', { turn: 1, outcome: 'waiting' }),
+    ];
+  }
+
+  it('keeps the newest entry clamped at small caps, and the framing alone below its head', async () => {
+    const events = largePerception();
+    // Below the entry's own head (framing + title + text label): the framing
+    // alone is the documented band — never a partial entry passed off as a
+    // record, never a broken framing.
+    expect(await renderHistory(fakePort(events), 16, 400)).toBe(HISTORY_FRAMING);
+    for (const cap of [512, 1024, 2048]) {
+      const content = await renderHistory(fakePort(events), 16, cap);
+      expect(bytes(content), `cap ${cap}`).toBeLessThanOrEqual(cap);
+      expect(content.startsWith(HISTORY_FRAMING)).toBe(true);
+      // A3's keep rule: the entry survives a small cap, its lists and text
+      // clamped to the room.
+      expect(content).toContain('perception, turn 1');
+      expect(content).toContain('commits 4096');
+      expect(content).toContain('text:');
+    }
+    // 512: the entry fits, the footer does not — the entry is kept, the footer
+    // is dropped (documented).
+    const at512 = await renderHistory(fakePort(events), 16, 512);
+    expect(at512).not.toContain('older records exist');
+    // 1024/2048: entry and footer both fit; the list window is clamped.
+    for (const cap of [1024, 2048]) {
+      const content = await renderHistory(fakePort(events), 16, cap);
+      expect(content).toContain(
+        'older records exist — this window shows the newest 1 of 4 entries');
+      expect(content).toMatch(/\(\+\d+ more\)/);
+    }
+    // The factory band is unchanged: the full first-K window and the long text.
+    const wide = await renderHistory(fakePort(events), 16, 65536);
+    expect(bytes(wide)).toBeLessThanOrEqual(65536);
+    expect(wide).toContain('(+4032 more)');
+    expect(wide).toContain('the world patch as stored');
+  });
+});
+
 describe('history: the n contract and the stateless re-read', () => {
   function manyEvents(count: number): VerifiedEvents {
     const list: VerifiedEvent[] = [ev(0, 'node/boot', { reason: 'start' })];
@@ -843,9 +924,11 @@ async function openFoldSession(home: string): Promise<FoldSession> {
 const cell = useWorld('history-cell-');
 const twoNodeHome = useTempHome('history-two-nodes-');
 
-function projection(calls: FunctionCall[]): AssistantProjection {
+function projection(
+  calls: FunctionCall[], content: string | null = null,
+): AssistantProjection {
   return {
-    message: { role: 'assistant', content: null, tool_calls: calls },
+    message: { role: 'assistant', content, tool_calls: calls },
     contentTruncated: false, frontierCall: 'call-1',
   };
 }
@@ -861,6 +944,8 @@ async function livingTurn(
     readonly perception?: WorldPerception;
     readonly commit?: string;
     readonly outcome?: 'chained' | 'waiting';
+    /** A non-null assistant content for the erased-text (A4) pin. */
+    readonly assistantContent?: string;
     readonly beforeClose?: (gate: BoundaryGate) => Promise<void>;
   },
 ): Promise<void> {
@@ -876,7 +961,9 @@ async function livingTurn(
     });
     const id: RequestId = { turn: opts.turn, ordinal: 0 };
     const call = toolCall(`c${opts.turn}`);
-    gate.append('assistant/message', { id, value: await gate.store(projection([call])) });
+    gate.append('assistant/message', {
+      id, value: await gate.store(projection([call], opts.assistantContent ?? null)),
+    });
     gate.append('tool/call', { turn: opts.turn, request: id, call });
     gate.append('tool/result', {
       turn: opts.turn, request: id, callId: call.id,
@@ -1083,6 +1170,45 @@ function historyExtendPort(history: HistoryPort): ExtendPort {
     history,
   };
 }
+
+describe('history: the erased in-context texts stay erased', () => {
+  it('never renders an assistant message text, which the journal does carry', async () => {
+    const { home } = cell();
+    const session = await openFoldSession(home);
+    try {
+      session.raw('node/boot', { reason: 'start' });
+      const ready = session.gate('ready', null);
+      try {
+        ready.gate.append('system/message', {
+          version: 1, value: await ready.gate.store(config()),
+        });
+        await ready.gate.flush();
+      } finally {
+        ready.close();
+      }
+      await livingTurn(session, {
+        turn: 1, trigger: 'boot', world: { from: null, to: null },
+        // The fixture otherwise journals content: null; this row proves the
+        // A4 boundary with a real non-null text.
+        assistantContent: 'ERASED-ASSISTANT-TEXT-A4',
+      });
+      const port: HistoryPort = {
+        events: () => session.fold.verifiedEvents(),
+        commitPaths: async () => ({ kind: 'paths', paths: [], omitted: 0 }),
+      };
+      const content = await renderHistory(port, 64, 65536);
+      expect(content).not.toContain('ERASED-ASSISTANT-TEXT-A4');
+      // The text IS journaled and in-context: the exclusion is the
+      // projection's (the erased kind), not a missing record.
+      expect(JSON.stringify(session.fold.snapshot().surface))
+        .toContain('ERASED-ASSISTANT-TEXT-A4');
+      // The turn remains a record; only its message text is withheld.
+      expect(content).toContain('turn 1 (trigger: boot)');
+    } finally {
+      await session.close();
+    }
+  }, 20_000);
+});
 
 async function listFiles(root: string): Promise<string[]> {
   const out: string[] = [];

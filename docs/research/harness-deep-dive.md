@@ -84,6 +84,7 @@ pattern — a harness that journals its own failure modes — is the point.
 Everything above describes DeepSeek Harness's design, not this project's. This repo keeps
 the storage pattern — framed, append-only journals under `src/journal/` — but locates
 truth in a frontier journal at the kernel-mediated HTTP boundary; the per-node stream is
-a cold-start artifact that observers never read. dsh's session-event vocabulary
+a cold-start artifact that no outside observer reads (the node's own `history` read is its
+own act, not an observation surface). dsh's session-event vocabulary
 (`assistant/attempt`, `request/header`, `request/context`)
 is not part of this project's vocabulary.

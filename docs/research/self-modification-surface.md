@@ -25,7 +25,7 @@ claim derived from documented Linux semantics rather than execution is daemon su
 | Sandbox mode (confined / off) | none | **impossible** | `src/host/host.ts:126-155`; `src/node/loop.ts:407-421`; `src/host/options.ts:142` |
 | World files (shared) | write / rewrite / delete anything under `world/` | **possible** | `src/node/tools/sandbox.ts:284`; `native/es-landlock/es-landlock.c:98,182-200` |
 | Private scratch | read/write `<home>/tmp/<uid>` | **possible** | `src/node/tools/sandbox.ts:285,335` |
-| Own config / journal (read) | none beyond the prompt and tool text | **read-only (structural)** | `src/host/host.ts:311-332,433`; `src/journal/layout.ts:84-100`; `src/provider/wire.ts:79-89` |
+| Own config / journal (read) | the node's own identity versions as facts (model, heading, charter bytes + SHA-256 — never the past text) and its journal-derived timeline (turns with the paths their commits changed, perceptions as stored, lifecycle, compaction markers, pins) via `extend {verb:"history", n?}`; no raw journal file, no fold, no foreign uid | **read-only (structural)** | `src/node/history.ts`; `src/node/world-paths.ts`; `src/node/loop.ts` (the runtime-composed port); `src/host/host.ts:311-332,433`; `src/journal/layout.ts:84-100`; `src/provider/wire.ts:79-89` |
 | Another node's config (read) | none | **impossible** | `src/node/tools/sandbox.ts:284-311`; `src/node/driver.ts:839,852` |
 
 ---
@@ -325,7 +325,7 @@ No, through any existing capability:
 - The only file-reading tool is `execute`'s shell; its read set excludes `<home>` entirely
   (**`src/node/tools/sandbox.ts:284-311`**; `nodes/<uid>` is explicitly asserted EACCES by
   `sandbox-confinement.test.ts:24-30,265-292`).
-- No tool exposes the journal, the fold, or `readCellConfig`; `dispatch` gives tools no gate (**§1.1**).
+- `extend {verb:"history"}` exposes a kernel projection over the fold's verified events — the node's own identity versions as facts, its timeline, its perceived world patches at the recorded bounds — never the journal file, the fold object, `readCellConfig`, or a foreign uid's record; the journal files and the fold stay unreachable, and `dispatch` gives tools no gate (**§1.1**).
 - The world contains no node config (charters live only in the journal, `src/context/events.ts:31`).
 - A second node cannot even run concurrently against the same home (frontier writer lock,
   `src/frontier/journal.ts:240-270`).
@@ -335,9 +335,12 @@ file. Nothing prevents a node from writing its own charter, caps, or the tool te
 
 ### 4.4 Self-knowledge available
 
-`extend {verb:"inspect"}` is the only introspection verb: base tools as given, live tools with schemas, stored
+`extend {verb:"inspect"}` renders live kernel state: base tools as given, live tools with schemas, stored
 packages with sizes and caps, the sandbox mode and the honesty block (**`src/node/tools/extend.ts:207-295`**).
-It is a rendering of live kernel state, not of the journal.
+`extend {verb:"history", n?}` is the second introspection verb: it renders a kernel projection over the node's
+own fold events — its identity versions as facts (model, heading, charter bytes + SHA-256, never the past text),
+its timeline and its perceived world patches — never the in-context assistant texts (the erased kind) and never
+the journal file or the fold object itself (**`src/node/history.ts`**, **`src/node/world-paths.ts`**).
 
 ---
 

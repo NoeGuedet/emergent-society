@@ -356,13 +356,18 @@ function rangeText(range: WorldRange): string {
 
 type PathReader = (hash: string) => Promise<CommitPathsRead>;
 
-function renderList(title: string, items: readonly string[]): string[] {
-  if (items.length === 0) return [];
+/**
+ * One perception list, windowed to `limit` items. The window is adaptive: the
+ * renderer lowers it until the entry's fixed head leaves room for the text
+ * marker, so a small cell cap still shows the ENTRY (A3's keep rule) with its
+ * lists clamped to the room rather than dropping the whole record.
+ */
+function renderList(title: string, items: readonly string[], limit: number): string[] {
+  if (items.length === 0 || limit <= 0) return [];
+  const shown = Math.min(limit, items.length);
   const lines = [`  ${title}:`];
-  for (const item of items.slice(0, MAX_PERCEPTION_LIST)) lines.push(`  - ${item}`);
-  if (items.length > MAX_PERCEPTION_LIST) {
-    lines.push(`  (+${items.length - MAX_PERCEPTION_LIST} more)`);
-  }
+  for (let index = 0; index < shown; index += 1) lines.push(`  - ${items[index]!}`);
+  if (items.length > shown) lines.push(`  (+${items.length - shown} more)`);
   return lines;
 }
 
@@ -438,26 +443,43 @@ function renderPerception(
     return `${head}: payload is an artifact, ${payload.bytes} bytes`;
   }
   const perception = payload.perception;
-  const lines = [
-    `${head}: commits ${perception.commits.length},`
-      + ` included ${perception.included.length},`
-      + ` own omitted ${perception.omittedOwn.length}`,
-    ...renderList('commits', perception.commits.map((commit) =>
-      `${commit.hash} ${commit.author}`)),
-    ...renderList('included patches', perception.included),
-    ...renderList('own commits (omitted from the patches)', perception.omittedOwn),
-  ];
-  if (perception.listTruncated) {
-    lines.push('  the commit list was truncated at the perception\'s own bound');
-  }
-  lines.push('  text:');
-  const fixed = `${lines.join('\n')}\n`;
+  const title = `${head}: commits ${perception.commits.length},`
+    + ` included ${perception.included.length},`
+    + ` own omitted ${perception.omittedOwn.length}`;
+  const commitLines = perception.commits.map((commit) => `${commit.hash} ${commit.author}`);
+  const linesFor = (limit: number): string[] => {
+    const lines = [
+      title,
+      ...renderList('commits', commitLines, limit),
+      ...renderList('included patches', perception.included, limit),
+      ...renderList('own commits (omitted from the patches)', perception.omittedOwn, limit),
+    ];
+    if (perception.listTruncated) {
+      lines.push('  the commit list was truncated at the perception\'s own bound');
+    }
+    lines.push('  text:');
+    return lines;
+  };
   const marker = ' [text truncated at the result cap]';
-  const room = budget - byteLength(fixed) - byteLength(marker);
-  const text = byteLength(perception.text) <= room
-    ? perception.text
-    : `${utf8Prefix(perception.text, Math.max(0, room)).text}${marker}`;
-  return fixed + text;
+  const compose = (lines: readonly string[]): string => {
+    const fixed = `${lines.join('\n')}\n`;
+    const room = budget - byteLength(fixed) - byteLength(marker);
+    const text = byteLength(perception.text) <= room
+      ? perception.text
+      : `${utf8Prefix(perception.text, Math.max(0, room)).text}${marker}`;
+    return fixed + text;
+  };
+  // The first-K window clamps down until the entry's fixed head leaves the
+  // marker room: the entry survives at a small cap instead of the framing line
+  // replacing the record (A3's literal keep behaviour). A cap below even the
+  // bare head is the caller's floor band (framing alone), never a partial
+  // entry passed off as a record.
+  for (let limit = MAX_PERCEPTION_LIST; limit >= 1; limit -= 1) {
+    if (byteLength(`${linesFor(limit).join('\n')}\n`) + byteLength(marker) <= budget) {
+      return compose(linesFor(limit));
+    }
+  }
+  return compose(linesFor(0));
 }
 
 async function renderEntry(
@@ -485,11 +507,14 @@ function compose(
 /**
  * Renders the last `n` entries, oldest-first, self-bounded under `maxBytes`
  * (the cell's `maxToolResultBytes`). The bound is the per-entry one — the
- * clamped paths, the first-K lists, the perception text bounded to the room
- * left — never the generic tool-text truncation: when the window does not fit,
- * the OLDEST entries are dropped whole (the get_messages precedent) and the
- * footer says how many entries the timeline still holds; a cap too small even
- * for the footer keeps the framing line alone rather than breaking it.
+ * clamped paths, the adaptive list windows, the perception text bounded to the
+ * room left — never the generic tool-text truncation: when the window does not
+ * fit, the OLDEST entries are dropped whole (the get_messages precedent); the
+ * footer says how many entries the timeline still holds whenever the cap can
+ * carry it, and the NEWEST entry is kept (its lists and text clamped to the
+ * room) whenever the cap can carry its own head. A cap below that band keeps
+ * the framing line alone rather than breaking it or passing a partial entry
+ * off as a record.
  *
  * `n` is clamped here as well as in dispatch: a positive safe integer, 1..64,
  * default 16 — so a direct call can never widen the window. Below the framing
@@ -542,7 +567,7 @@ export async function renderHistory(
     if (byteLength(content) <= cap) return content;
   }
 
-  // The newest entry alone is over the cap: keep it and bound its own text to
+  // The newest entry alone is over the cap: keep it and bound its entries to
   // the room left (the get_messages oversized-record shape), never drop it.
   const newest = window[window.length - 1]!;
   const footer = entries.length > 1
@@ -552,9 +577,16 @@ export async function renderHistory(
   const tight = await renderEntry(newest, Math.max(0, cap - fixed), paths);
   const content = `${HISTORY_FRAMING}\n\n${tight}${footer}`;
   if (byteLength(content) <= cap) return content;
-  // Even the newest entry cannot fit with the footer: the framing line is the
-  // floor, so the footer (or the entry) is dropped rather than the framing.
-  const withoutFooter = `${HISTORY_FRAMING}\n\n${tight}`;
+  // The entry and the footer cannot both fit: the newest entry is kept (A3's
+  // keep rule) and the footer is dropped, with the entry re-bounded to the
+  // larger room the footer's absence frees.
+  const resized = await renderEntry(
+    newest, Math.max(0, cap - byteLength(HISTORY_FRAMING) - 2), paths,
+  );
+  const withoutFooter = `${HISTORY_FRAMING}\n\n${resized}`;
   if (byteLength(withoutFooter) <= cap) return withoutFooter;
+  // Below even the entry's own head: the framing line is the floor, so the
+  // entry is dropped rather than the framing being broken or a partial entry
+  // being passed off as a record (the sub-entry band, documented in kernel.md).
   return HISTORY_FRAMING;
 }

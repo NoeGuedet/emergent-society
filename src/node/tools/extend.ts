@@ -12,7 +12,9 @@ import { modelRefusal } from './providers.js';
 import { Buffer } from 'node:buffer';
 import { singleLine } from '../../text.js';
 import { PackageError } from '../packages/errors.js';
-import { DEFAULT_HISTORY_ENTRIES, renderHistory, type HistoryPort } from '../history.js';
+import {
+  DEFAULT_HISTORY_ENTRIES, MAX_HISTORY_ENTRIES, renderHistory, type HistoryPort,
+} from '../history.js';
 import { SelfRefusedError, type SelfPort } from '../self.js';
 import type { PackageDefinition, PackageStore } from '../packages/store.js';
 import type { RunSupervisor } from '../packages/supervisor.js';
@@ -448,7 +450,8 @@ function renderInspect(
   if (port.history !== undefined) {
     lines.push('- history: read your own records —'
       + ' extend {verb:"history", n?}; the last n entries of your own timeline'
-      + ` (default ${DEFAULT_HISTORY_ENTRIES}, at most 64), oldest-first, with an`
+      + ` (default ${DEFAULT_HISTORY_ENTRIES}, at most ${MAX_HISTORY_ENTRIES}),`
+      + ' oldest-first, with an'
       + ' "older records exist" line when the timeline is longer. The entries are the'
       + ' kernel\'s record of your identity versions (charter bytes and digest, never'
       + ' the text), your turns with the paths their commits changed, your perceptions'
