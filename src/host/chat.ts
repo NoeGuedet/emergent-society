@@ -624,9 +624,13 @@ export async function runChatSession(options: ChatSessionOptions): Promise<ChatS
 
   const history = await readChatHistory(options.home, tail);
   const degraded = history.degraded > 0;
-  const conversation = options.conversation === true
-    ? (await readConversationStream(options.home, tail)).records
-    : null;
+  // The raw stream's bounded tail: the SAME reader, `--tail` bound and renderer
+  // at open and before every prompt. A record that lands mid-session (the
+  // overlay's relay to a node) is therefore visible in the raw view without a
+  // restart, and the view never grows past the open render's bounds.
+  const conversationWindow = async (): Promise<readonly ConversationRecord[]> =>
+    (await readConversationStream(options.home, tail)).records;
+  const conversation = options.conversation === true ? await conversationWindow() : null;
 
   if (options.json === true) {
     out(`${JSON.stringify({ records: history.records, conversation })}\n`);
@@ -634,7 +638,13 @@ export async function runChatSession(options: ChatSessionOptions): Promise<ChatS
   }
 
   out(`${renderChatHistory(history)}\n`);
-  if (conversation !== null) out(`${renderConversationHistory(conversation)}\n`);
+  // What the raw view currently shows. The open render already reflects the
+  // state at the first prompt, so the loop re-renders only when the stream
+  // actually changed — never a duplicated unchanged block, never a stale view.
+  let shownConversation = conversation === null
+    ? null
+    : renderConversationHistory(conversation);
+  if (shownConversation !== null) out(`${shownConversation}\n`);
 
   // A pipe/EOF stdin is the scripted read: render and leave. It never blocks.
   let code = degraded ? 1 : 0;
@@ -643,6 +653,16 @@ export async function runChatSession(options: ChatSessionOptions): Promise<ChatS
   const writer = ChatWriter.for(options.home);
   let responses = 0;
   for (;;) {
+    // Before each prompt, after the previous response rendered: re-read the
+    // newest tail and re-render it when it moved (still the open render's
+    // bounds), so an arrival during the wait is never invisible until restart.
+    if (shownConversation !== null) {
+      const refreshed = renderConversationHistory(await conversationWindow());
+      if (refreshed !== shownConversation) {
+        out(`${refreshed}\n`);
+        shownConversation = refreshed;
+      }
+    }
     out('> ');
     const line = await options.stdin.readLine();
     if (line === null) {

@@ -79,9 +79,14 @@ function sink(): { readonly write: (text: string) => void; readonly text: () => 
   return { write: (text: string) => { buffer += text; }, text: () => buffer };
 }
 
-/** One scripted overlay service: the real cycle + watchers, a scripted model. */
+/**
+ * One scripted overlay service: the real cycle + watchers, a scripted model.
+ * `onSend` runs inside a cycle's send (0-based cycle order), the seam a test
+ * uses to make a side effect land while the gateway is generating its reply.
+ */
 function overlayService(
   home: string, chat: ChatLog, replies: readonly string[],
+  onSend?: (sendIndex: number) => Promise<void>,
 ): { readonly service: OverlayService; readonly plans: SendPlan[] } {
   const plans: SendPlan[] = [];
   let index = 0;
@@ -93,8 +98,10 @@ function overlayService(
     world: { path: join(home, 'world'), gitBaseArgs: () => [] },
     send: async (plan: SendPlan): Promise<SendResult> => {
       plans.push(plan);
-      const text = replies[Math.min(index, replies.length - 1)]!;
+      const sendIndex = index;
       index += 1;
+      await onSend?.(sendIndex);
+      const text = replies[Math.min(sendIndex, replies.length - 1)]!;
       const message: AssistantProjection['message'] = {
         role: 'assistant', content: text, tool_calls: [],
       };
@@ -413,6 +420,50 @@ describe('the interactive session', () => {
     expect(JSON.stringify(plans[1]!.history)).toContain('hello gateway');
     // The prompt loop returned to the prompt: it read the line, then EOF.
     expect(stdin.reads()).toBe(2);
+  });
+
+  it('re-renders the raw conversation stream before each prompt: a mid-session relay appears', async () => {
+    const dir = await home();
+    await configured(dir);
+    const chat = await ChatLog.open(dir);
+    chats.push(chat);
+    const conversation = ConversationLog.for(dir);
+    // The stream already holds a node's question when the session opens, so the
+    // OPEN render shows the raw view; nothing else is there yet.
+    await conversation.append('n1', GATEWAY_ADDRESSEE, 'a question from the node', 1);
+    const { service } = overlayService(dir, chat, ['ready.', 'hello there.'], async (sendIndex) => {
+      // The human-triggered cycle (index 1): the overlay relays to the node
+      // while it generates the reply. The record lands after the open render
+      // and before the next prompt's refresh.
+      if (sendIndex !== 1) return;
+      await conversation.append(GATEWAY_ADDRESSEE, 'n1', 'relayed mid-session', 3);
+    });
+    services.push(service);
+    service.start();
+    await service.idle();
+
+    const out = sink();
+    const stdin = scriptedStdin(['hello gateway']);
+    const result = await runChatSession({
+      home: dir, stdin, stdout: out.write, stderr: sink().write,
+      conversation: true,
+      waitTimeoutMs: 10_000, waitPollMs: 20, waitNoteMs: 1_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.responses).toBe(1);
+    const text = out.text();
+    // Two renders, same renderer and bounds: the open one and the refresh at
+    // the second prompt. The relay is absent from the first and present in the
+    // second, which lands after the first prompt's response render.
+    const blocks = text.split('conversation stream (nodes ↔ overlay), oldest first:');
+    expect(blocks).toHaveLength(3);
+    expect(blocks[1]).toContain('a question from the node');
+    expect(blocks[1]).not.toContain('relayed mid-session');
+    expect(blocks[2]).toContain('a question from the node');
+    expect(blocks[2]).toContain('relayed mid-session');
+    const relayAt = text.indexOf('relayed mid-session');
+    expect(relayAt).toBeGreaterThan(text.indexOf('hello there.'));
+    expect(relayAt).toBeLessThan(text.lastIndexOf('> '));
   });
 
   it('returns to the prompt after the bounded wait: the timeout notice, the message saved', async () => {
