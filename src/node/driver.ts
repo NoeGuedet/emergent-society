@@ -648,6 +648,11 @@ export class NodeDriver {
         // before the turn's opening is durable: the event it writes cites the
         // pinned block, and a failed read pins the journaled seed instead.
         const direction = await this.currentDirection();
+        // A stop that lands while the direction read is in flight has no active
+        // controller to abort (the previous turn already closed it). Re-check
+        // IMMEDIATELY before the opening becomes durable: no post-stop
+        // `turn/start`, fresh controller or handler turn may exist.
+        if (this.stopRequested) break;
         const start = this.writeEvent('turn/start', {
           turn: this.turn, trigger, world: { from: world.from, to: world.to },
         });

@@ -621,6 +621,72 @@ describe('commit-retry priority and ownership', () => {
       await running;
     }
   }, 20_000);
+
+  it('a legitimate retry fired BEFORE park is one pending latch, an ordinary wakeup, then a fresh grid', async () => {
+    const { home, world } = fixture();
+    const blocked = await blockGitAdd(world);
+    const manual = manualSchedule();
+    const seen: TurnTrigger[] = [];
+    let holdMaintenance = true;
+    let releaseMaintenance!: () => void;
+    const heldMaintenance = new Promise<void>((resolve) => { releaseMaintenance = resolve; });
+    let enteredMaintenance!: () => void;
+    const reachedMaintenance = new Promise<void>((resolve) => { enteredMaintenance = resolve; });
+    const d = await openTestDriver(home, 'n1', async (ctx) => {
+      seen.push(ctx.trigger);
+      if (ctx.turn === 2) await writeWorldFile(world, 'n1/ok.md', 'ok');
+      return wait();
+    }, world, {
+      worldPollMs: 0, now: () => NOW, schedule: manual.schedule, wakePolicy: modern(5),
+      onMaintenance: async () => {
+        if (holdMaintenance) {
+          holdMaintenance = false;
+          enteredMaintenance();
+          await heldMaintenance;
+        }
+      },
+    });
+    const running = d.run();
+    try {
+      // The refusal armed the 1000 ms retry BEFORE park; the turn is still
+      // closing in maintenance. Firing it here must set EXACTLY one pending
+      // latch (no turn starts while maintenance is held).
+      await reachedMaintenance;
+      await vi.waitFor(() => expect(manual.timers.map((timer) => timer.ms)).toEqual([1000]));
+      manual.timers[0]!.fire();
+      expect(loose(d).latch.requested).toBe(true);
+      expect(seen).toEqual(['boot']);
+      expect(manual.timers.filter((timer) => timer.ms === 1000)).toHaveLength(1);
+
+      releaseMaintenance();
+      await vi.waitFor(() => expect(seen).toEqual(['boot', 'wakeup']));
+      // The pending pre-park latch opened one ordinary wakeup, never a cadence
+      // label. Any cadence arm made after the retry was consumed was cancelled
+      // before it could fire; the next refusal's retry is 4000 ms.
+      await parked(d, world);
+      await vi.waitFor(() => {
+        expect(manual.timers.map((timer) => timer.ms).filter((ms) => ms === 1000 || ms === 4000))
+          .toEqual([1000, 4000]);
+      });
+      expect(seen).toEqual(['boot', 'wakeup']);
+
+      await unblock(blocked);
+      manual.timers.find((timer) => timer.ms === 4000)!.fire();
+      await vi.waitFor(() => expect(seen).toEqual(['boot', 'wakeup', 'wakeup']));
+      await parked(d, world);
+      // The successful turn settles the retry; the next park derives a FRESH
+      // grid (one live cadence timer at the expected future delay).
+      const due = nextCadenceDueMs('n1', 5, NOW)!;
+      await vi.waitFor(() => expect(
+        manual.timers.filter((timer) => timer.ms === due - NOW && !timer.cancelled),
+      ).toHaveLength(1));
+    } finally {
+      releaseMaintenance();
+      await unblock(blocked);
+      d.stop();
+      await running;
+    }
+  }, 20_000);
 });
 
 describe('the one owned timer: epoch + generation guards', () => {

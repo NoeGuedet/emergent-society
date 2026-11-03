@@ -22,7 +22,9 @@ Four mechanisms carry the design:
    node's uid.
 3. **Wake-on-change, time and conversation** — the kernel watches the world's git HEAD; a
    node wakes when HEAD carries a commit it did not author, when a conversation notice is
-   pending, or when its one selected timer/cadence fires. A static world spends no tokens.
+   pending, or when its one selected timer/cadence fires. Change notifications alone do not
+   spend model tokens on a static world; explicit timers or an enabled cadence can still open
+   a quiet turn.
 4. **The conversation interface is the exception** — one kernel-owned stream carries the
    nodes' messages to a host-side gateway overlay and the overlay's answers back; the chat
    log carries the human↔overlay conversation. The overlay is never a node (no cell, no

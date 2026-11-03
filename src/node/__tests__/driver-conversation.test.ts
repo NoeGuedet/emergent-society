@@ -163,16 +163,19 @@ describe('the conversation wake', () => {
     const { home, world } = fixture();
     const fake = new FakeConversationSource();
     const seen: Seen[] = [];
+    const noticeChecks = vi.spyOn(fake, 'noticeFor');
     const d = await openTestDriver(home, 'n1', (ctx: TurnContext) => {
       seen.push({ uid: 'n1', trigger: ctx.trigger });
       return { outcome: 'waiting', toolCalls: false };
     }, world, { worldPollMs: 0, conversation: fake });
     const run = d.run();
     running.push(async () => { d.stop(); await run; });
-    // Park 1: the fake holds the first listener.
+    // Park 1: the fake holds the first listener and its own initial notice
+    // check has completed before any notice exists.
     await vi.waitFor(() => {
       expect(d.state).toBe('waiting');
       expect(fake.subscriberCount).toBe(1);
+      expect(noticeChecks).toHaveBeenCalledTimes(1);
     });
     // A foreign commit ends park 1 and opens its wakeup turn; park 2 takes its
     // own subscription, and park 1's listener is removed.
@@ -183,15 +186,29 @@ describe('the conversation wake', () => {
     await vi.waitFor(() => {
       expect(d.state).toBe('waiting');
       expect(fake.subscriberCount).toBe(1);
+      // Readiness gate: park 2's own initial `armConversationIfDue` check has
+      // finished (its second noticeFor) BEFORE a notice is armed. Without this,
+      // the initial check could see the armed notice and mask a broken epoch
+      // guard by waking for the wrong reason.
+      expect(noticeChecks).toHaveBeenCalledTimes(2);
     });
     // A notice arms while park 2 is parked. Replaying park 1's (stale)
     // evaluation must not arm park 2's latch; its own listener must.
+    const checksBeforeStale = noticeChecks.mock.calls.length;
     fake.arm({ count: 1, newestFrom: 'gateway', version: 1 });
     fake.emitStale();
+    // Synchronous, timing-free distinguishing assertion: the stale epoch must
+    // return before consulting the source at all (removing the epoch guard
+    // makes this call happen here).
+    expect(noticeChecks).toHaveBeenCalledTimes(checksBeforeStale);
     await new Promise((resolve) => { setTimeout(resolve, 50); });
     expect(seen).toHaveLength(2);
     expect(d.state).toBe('waiting');
     fake.emitCurrent();
+    // The current park's listener did consult the source synchronously for this
+    // wake; a later park's own initial check may add one more, so assert the
+    // immediate transition only.
+    expect(noticeChecks).toHaveBeenCalledTimes(checksBeforeStale + 1);
     await vi.waitFor(() => expect(seen).toHaveLength(3), { timeout: 10_000 });
     expect(seen[2]).toEqual({ uid: 'n1', trigger: 'conversation' });
     d.stop();
