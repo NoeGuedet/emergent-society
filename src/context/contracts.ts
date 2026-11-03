@@ -166,6 +166,24 @@ export type MemoryGate = {
   readonly messages: boolean;
 };
 
+/**
+ * The wake policy (wake v1): per-node wall-clock cadence, in seconds.
+ *
+ * Its PRESENCE in a journaled policy is the modern marker: a modern cell uses
+ * no timer count/cost quota and accepts the relative wait form; an absent key is
+ * a legacy cell and keeps the exact `wakeBudgetPerHour` behavior forever. A
+ * fresh composition emits it even at `0` (cadence off, modern quota-free
+ * self-wakes on); `1..604800` is the cadence period (seven days is the existing
+ * bounded platform-delay discipline). The phase is derived from the uid, never
+ * journaled; this object is the only new policy shape.
+ */
+export type WakePolicy = {
+  readonly heartbeatSeconds: number;
+};
+
+/** The cadence domain's upper bound: one week, in seconds. */
+export const MAX_HEARTBEAT_SECONDS = 604800;
+
 /** The recorded runtime policy; every numeric limit is the effective one, expanded before journaling. */
 export type SeedPolicy = {
   readonly stepsPerTurn: number; readonly compactAfterBytes: number;
@@ -199,6 +217,13 @@ export type SeedPolicy = {
    * `messages` is accepted for the reserved second arm and behaves not at all.
    */
   readonly memory?: MemoryGate;
+  /**
+   * The wake policy (wake v1). Optional: its presence is the modern marker
+   * (no timer count quota, cadence derived from the uid); absent is the legacy
+   * cell and keeps `wakeBudgetPerHour` exact. Presence takes precedence over the
+   * old cost key even if an externally supplied config carries both.
+   */
+  readonly wake?: WakePolicy;
 };
 
 export type AgentConfig = {

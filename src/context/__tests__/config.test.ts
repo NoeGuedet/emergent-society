@@ -144,6 +144,49 @@ describe('validateAgentConfig', () => {
     expect(() => validateAgentConfig(withPolicy({ wakeBudgetPerHour: 1.5 }))).toThrow();
   });
 
+  it('accepts an optional wake policy, validates its one key, and keeps the old budget', () => {
+    // Absent stays absent: a pre-wake cell is legacy forever, never rewritten.
+    expect('wake' in validateAgentConfig(base()).policy).toBe(false);
+    for (const heartbeatSeconds of [0, 1, 3600, 604800]) {
+      expect(validateAgentConfig(withPolicy({
+        wake: { heartbeatSeconds },
+      })).policy.wake).toEqual({ heartbeatSeconds });
+    }
+    // Both keys are accepted; the modern marker's precedence is a driver/
+    // dispatch reading, not a validator rewrite. The old key stays exact.
+    expect(validateAgentConfig(withPolicy({
+      wake: { heartbeatSeconds: 0 }, wakeBudgetPerHour: 3,
+    })).policy).toMatchObject({
+      wake: { heartbeatSeconds: 0 }, wakeBudgetPerHour: 3,
+    });
+    // The wake VALUE itself must be a plain object: a scalar/null/array is
+    // refused at the outer record, never silently read as absent or as a wake
+    // policy. (Objects go on to the key-domain rows below.)
+    for (const outer of [
+      0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '0', null, [],
+    ] as unknown[]) {
+      expect(() => validateAgentConfig(withPolicy({ wake: outer } as never)))
+        .toThrow(/policy\.wake/);
+    }
+    // The one required key's DOMAIN is actually reached and refused — not just
+    // the outer record. Every case below names policy.wake.heartbeatSeconds.
+    for (const heartbeatSeconds of [
+      -1, 604801, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '1', null, {},
+      undefined,
+    ]) {
+      expect(() => validateAgentConfig(withPolicy({
+        wake: { heartbeatSeconds },
+      } as never))).toThrow(/policy\.wake\.heartbeatSeconds/);
+    }
+    // A missing key is an explicit missing refusal, not a defaulted 0.
+    expect(() => validateAgentConfig(withPolicy({ wake: {} } as never)))
+      .toThrow(/policy\.wake\.heartbeatSeconds: missing/);
+    // An extra key inside the policy object is a shape refusal.
+    expect(() => validateAgentConfig(withPolicy({
+      wake: { heartbeatSeconds: 1, extra: true },
+    } as never))).toThrow(/policy\.wake: unexpected key "extra"/);
+  });
+
   it('accepts a pre-wave policy (no compactAfterTokens) and validates one when present', () => {
     const cfg = base();
     const policy: Record<string, unknown> = { ...cfg.policy };

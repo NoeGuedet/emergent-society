@@ -1073,6 +1073,12 @@ describe('history: the fixture cell that lived', () => {
       compactedReceipts = (summary.data as unknown as CompactionSummary).sources.length;
       expect(compactedReceipts).toBeGreaterThan(0);
 
+      // Turn 7 (cadence): the modern phase-grid fire, rendered by the same
+      // trigger field as every earlier cause.
+      await livingTurn(session, {
+        turn: 7, trigger: 'cadence', world: { from: commit, to: commit },
+      });
+
       // Pause, then the resume boot.
       session.raw('node/shutdown', { reason: 'stop-requested' });
       session.raw('node/boot', { reason: 'resume' });
@@ -1091,8 +1097,8 @@ describe('history: the fixture cell that lived', () => {
         expect(entries[index]!.seq).toBeGreaterThan(entries[index - 1]!.seq);
       }
 
-      // All five triggers.
-      for (const trigger of ['boot', 'chain', 'timer', 'wakeup', 'conversation']) {
+      // All six triggers, every old case retained.
+      for (const trigger of ['boot', 'chain', 'timer', 'wakeup', 'conversation', 'cadence']) {
         expect(content).toContain(`(trigger: ${trigger})`);
       }
 

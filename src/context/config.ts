@@ -3,8 +3,9 @@ import { canonicalBytes, toJson } from './artifacts.js';
 import { DEFAULT_TOKEN_TRIGGER } from './meter.js';
 import { validateProviderParameters } from './parameters.js';
 import { createValidator } from './validate.js';
-import type {
-  AgentConfig, MemoryGate, SeedPolicy, TokenTriggerPolicy, ToolSchema,
+import {
+  MAX_HEARTBEAT_SECONDS, type AgentConfig, type MemoryGate, type SeedPolicy,
+  type TokenTriggerPolicy, type ToolSchema, type WakePolicy,
 } from './contracts.js';
 
 /**
@@ -179,17 +180,18 @@ const POLICY_KEYS = [
   'requestTimeoutMs', 'shellTimeoutMs', 'killGraceMs', 'maxCaptureBytes', 'maxRequestBytes',
   'maxShellCaptureBytes', 'maxDiffBytes', 'maxCommits', 'maxAssistantBytes',
   'maxToolResultBytes', 'maxToolArgumentBytes', 'maxCallsPerResponse', 'wakeBudgetPerHour',
-  'compactAfterTokens', 'memory',
+  'compactAfterTokens', 'memory', 'wake',
 ] as const;
 
 /**
  * The policy keys a journaled config may legitimately omit: the timer's budget
- * (a pre-timer cell), the token trigger (a pre-token cell) and the memory gate
- * (a pre-memory cell). Every absent key reads as its documented default, never
- * as a rewrite; for `memory` the absent object means BOTH booleans OFF.
+ * (a pre-timer cell), the token trigger (a pre-token cell), the memory gate
+ * (a pre-memory cell) and the wake policy (a pre-wake cell, hence legacy). Every
+ * absent key reads as its documented default, never as a rewrite; for `memory`
+ * the absent object means BOTH booleans OFF.
  */
 const OPTIONAL_POLICY_KEYS: ReadonlySet<string> = new Set([
-  'wakeBudgetPerHour', 'compactAfterTokens', 'memory',
+  'wakeBudgetPerHour', 'compactAfterTokens', 'memory', 'wake',
 ]);
 
 /**
@@ -239,6 +241,26 @@ function memoryGate(value: unknown, where: string): MemoryGate {
   };
 }
 
+/**
+ * The wake policy's journaled shape (wake v1): exactly one required key,
+ * `heartbeatSeconds`, an integer in `0..604800` seconds (0 disables cadence,
+ * positive sets the period). The object's presence is the modern marker; an
+ * absent object stays absent (a legacy cell), never a synthesized default.
+ * `wakeBudgetPerHour` keeps its own validator and remains accepted forever: a
+ * config carrying both is still valid, and the modern marker takes precedence
+ * at the driver/dispatch reading.
+ */
+function wakePolicy(value: unknown, where: string): WakePolicy {
+  const o = record(value, where);
+  onlyKeys(o, ['heartbeatSeconds'], where);
+  const heartbeatSeconds = o['heartbeatSeconds'];
+  if (heartbeatSeconds === undefined) fail(`${where}.heartbeatSeconds: missing`);
+  return {
+    heartbeatSeconds:
+      safeInt(heartbeatSeconds, `${where}.heartbeatSeconds`, 0, MAX_HEARTBEAT_SECONDS),
+  };
+}
+
 export function validateSeedPolicy(value: unknown, where = 'policy'): SeedPolicy {
   const o = record(value, where);
   onlyKeys(o, POLICY_KEYS, where);
@@ -274,6 +296,9 @@ export function validateSeedPolicy(value: unknown, where = 'policy'): SeedPolicy
       : {}),
     ...(o['memory'] !== undefined
       ? { memory: memoryGate(o['memory'], 'policy.memory') }
+      : {}),
+    ...(o['wake'] !== undefined
+      ? { wake: wakePolicy(o['wake'], 'policy.wake') }
       : {}),
   };
 }

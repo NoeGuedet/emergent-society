@@ -13,6 +13,20 @@ export abstract class NodeError extends KernelError {
 /** The node's state contract was violated (a `run()` out of order, or a second one). */
 export class NodeStateError extends NodeError {}
 
+/**
+ * The modern cadence could not be computed safely: a non-finite/negative/unsafe
+ * park instant, an invalid period, or an overflow at the rest boundary or the
+ * computed due. The driver arms NO cadence timer and emits this one fixed label
+ * through its bounded diagnostic channel for that park; the park's reactive
+ * subscriptions stay live, so a foreign commit still wakes the node. It is a
+ * diagnostic, never a thrown failure and never a silent fallback.
+ */
+export class WakeClockUnavailableError extends NodeError {
+  constructor() {
+    super('cadence clock unavailable: no cadence wake armed');
+  }
+}
+
 /** The configured world directory is `$HOME` or a broad root (kernel.md §7). */
 export class UnsafeWorldPathError extends NodeError {
   constructor(public readonly path: string) {

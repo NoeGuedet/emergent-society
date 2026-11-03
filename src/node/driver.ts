@@ -8,7 +8,8 @@ import { DEFAULT_STORAGE } from './storage-probe.js';
 import { systemClock } from '../util.js';
 import { NODE_EVENT_TYPES, type ShutdownReason, type TurnTrigger } from './events.js';
 import {
-  GitCommandError, InvalidDoctorReportError, NodeStateError, WorldReconciliationError,
+  GitCommandError, InvalidDoctorReportError, NodeStateError, WakeClockUnavailableError,
+  WorldReconciliationError,
 } from './errors.js';
 import { WakeLatch } from './latch.js';
 import {
@@ -21,12 +22,13 @@ import {
   type BoundaryGate, type BoundaryRegistry, type DurableWatermark, type DriverHooks,
   type GateCallbacks, type GateScope, type WorldAcknowledgement,
 } from './gate.js';
-import type { SafeFailure, Source } from '../context/contracts.js';
+import type { SafeFailure, Source, WakePolicy } from '../context/contracts.js';
 import type { VerifiedEvent } from '../context/loader.js';
 import { HeadWatcher } from './watcher.js';
 import type { ConversationSource } from './conversation-watcher.js';
 import { readRatifiedDirection, type DirectionPin } from './direction.js';
 import { DEFAULT_WAKE_BUDGET_PER_HOUR } from '../context/config.js';
+import { nextCadenceDueMs } from './cadence.js';
 import type { WorldRange, WorldRepo } from './world.js';
 
 export type NodeState = 'booting' | 'active' | 'waiting' | 'stopping' | 'stopped';
@@ -72,10 +74,34 @@ export type { TurnTrigger } from './events.js';
 export type TurnResult =
   | {
       readonly outcome: 'chained' | 'waiting'; readonly toolCalls: boolean;
-      /** The instant the handler asked to be woken at, when `wait` carried one. */
+      /**
+       * The instant the handler asked to be woken at, when a wait carried an
+       * absolute timer. Mutually exclusive with `wakeAfterMs`.
+       */
       readonly wakeAt?: number;
+      /**
+       * A relative wait's duration in milliseconds, anchored at the ACTUAL park
+       * (after the turn's commit and maintenance), never at model-call time.
+       * Positive; mutually exclusive with `wakeAt`. A trusted result carrying
+       * both is a bounded `NodeStateError`, never an arbitrary precedence.
+       */
+      readonly wakeAfterMs?: number;
     }
   | { readonly outcome: 'error'; readonly toolCalls: boolean; readonly error: SafeFailure };
+
+/**
+ * The modern-only opening receipt's physical facts (wake v1). `openedAt` is the
+ * actual `turn/start` envelope's recorded time, not a fresh clock read at send;
+ * `sinceLastRecordedEndMs` is derived from the preceding RECORDED `turn/end`
+ * envelope time (a synthetic resume closer counts), and is unavailable (null)
+ * for the first turn or a backwards/non-finite/unsafe delta — never a false
+ * measured zero. The wire formatter and its first-ordinal queue presence are the
+ * host/model surface brick; the driver only supplies the facts here.
+ */
+export type TurnOpening = {
+  readonly openedAt: number;
+  readonly sinceLastRecordedEndMs: number | null;
+};
 
 /** The handler's whole world: no writer, no commit — the clock is the injected `now`. */
 export interface TurnContext {
@@ -99,6 +125,12 @@ export interface TurnContext {
    * when no human-authored `DIRECTION.md` exists (the seed stays authoritative).
    */
   readonly direction?: { readonly text: string; readonly source: Source };
+  /**
+   * The modern-only physical opening receipt facts (wake v1). Present only when
+   * the effective journaled policy carries `policy.wake`; a legacy turn's
+   * context is byte-identical to before.
+   */
+  readonly opening?: TurnOpening;
   now(): number;
 }
 
@@ -183,6 +215,16 @@ export interface NodeDriverOptions extends JournalWriterOptions {
    * a cap on observation.
    */
   wakeBudgetPerHour?: number;
+  /**
+   * The modern wake-policy seam (wake v1): a TRUSTED late read of the effective
+   * journaled `policy.wake`, sampled after `onReady` folded the journal state —
+   * never the incoming seed or constructor config. `null`/absent means legacy
+   * (the exact `wakeBudgetPerHour` path, no cadence); a returned object marks
+   * modern semantics even at `heartbeatSeconds: 0` (no count quota, no cadence).
+   * The host binds it to the runtime snapshot in the host-activation brick; the
+   * core driver is complete and testable through this seam.
+   */
+  wakePolicy?: () => WakePolicy | null;
   /**
    * The ratified-direction seam (A4): production reads the latest
    * human-authored `DIRECTION.md` from the world's history. A failure is the
@@ -272,6 +314,12 @@ type DriverCommitAttempt = {
   readonly refusal: CommitRefusal | null;
 };
 
+/** The one owned park timer: explicit self-timer or cadence. */
+type ArmedWake = {
+  readonly cancel: () => void;
+  readonly generation: number;
+};
+
 /** The production schedule seam; the one place this module spells `setTimeout`. */
 function defaultSchedule(ms: number, callback: () => void): () => void {
   const timer = setTimeout(callback, ms);
@@ -339,13 +387,48 @@ export class NodeDriver {
   private retryAttempt = 0;
   /** The pending retry wake's cancel, or null; cleared on park, stop and success. */
   private retryTimer: (() => void) | null = null;
-  /** The armed timer wake, if any; cancelled whenever the park ends. */
-  private wakeTimer: (() => void) | null = null;
+  /**
+   * The retry timer's OWNERSHIP generation (never the park epoch): bumped on
+   * every clear/re-arm and on a legitimate fire. A canceled callback invoked
+   * during an active turn or a later park fails this guard before it can null
+   * the current retry handle or request the latch.
+   */
+  private retryGeneration = 0;
+  /**
+   * The one owned self/cadence timer, or null. It is armed inside the park after
+   * the epoch and subscriptions exist and before the first await, and cancelled
+   * whenever the park ends. `generation` is the timer's OWNERSHIP generation
+   * (bumped on every arm/clear/consume), so a stale callback cannot discard the
+   * current timer's handle.
+   */
+  private wakeTimer: ArmedWake | null = null;
+  private wakeTimerGeneration = 0;
   /** Whether the last park ended on a timer, so the next turn says 'timer'. */
   private timerFired = false;
+  /** Whether the last park ended on a cadence fire, so the next turn says 'cadence'. */
+  private cadenceFired = false;
+  /**
+   * Whether the last park ended on an ordinary visible-world wake. It only has
+   * to outrank a coincident cadence flag (conversation > timer > wakeup >
+   * cadence); without cadence the final fallback is 'wakeup' as before.
+   */
+  private worldFired = false;
   /** The timer fires inside the sliding hour; per process, reset by a restart. */
   private timerWakes: number[] = [];
   private readonly wakeBudgetPerHour: number;
+  /**
+   * The trusted late effective-policy seam: absent/null is legacy forever. It is
+   * sampled at turn opening (modern-only receipt facts) and at park (timer
+   * selection), never from the constructor's incoming seed.
+   */
+  private readonly wakePolicy: () => WakePolicy | null;
+  /**
+   * The latest RECORDED `turn/end` envelope time, maintained in O(1) on normal
+   * appends and during the existing one-pass replay (both readers). It is the
+   * only source of the modern opening receipt's elapsed delta; null before the
+   * first recorded end.
+   */
+  private lastRecordedEndMs: number | null = null;
   private readonly readDirection: (world: WorldRepo) => Promise<DirectionPin | null>;
   /** The storage circuit breaker shared by the local writer and the turn start. */
   private readonly storage: StorageConfig;
@@ -395,6 +478,7 @@ export class NodeDriver {
   ) {
     this.now = opts.now ?? systemClock;
     this.wakeBudgetPerHour = opts.wakeBudgetPerHour ?? DEFAULT_WAKE_BUDGET_PER_HOUR;
+    this.wakePolicy = opts.wakePolicy ?? (() => null);
     this.readDirection = opts.readDirection ?? readRatifiedDirection;
     this.watcher = HeadWatcher.for(world, opts.worldPollMs);
     this.conversation = opts.conversation ?? null;
@@ -564,9 +648,18 @@ export class NodeDriver {
         // before the turn's opening is durable: the event it writes cites the
         // pinned block, and a failed read pins the journaled seed instead.
         const direction = await this.currentDirection();
-        this.writeEvent('turn/start', {
+        const start = this.writeEvent('turn/start', {
           turn: this.turn, trigger, world: { from: world.from, to: world.to },
         });
+        // The modern-only physical opening facts come from the ACTUAL turn/start
+        // envelope time and the preceding RECORDED turn/end time. The policy is
+        // sampled here, after `open` finished the ready phase that folds the
+        // journal, never from the incoming seed. A legacy turn gets no key.
+        const effectiveWake = this.effectiveWakePolicy();
+        const opening: TurnOpening | undefined = effectiveWake === null ? undefined : {
+          openedAt: start.time,
+          sinceLastRecordedEndMs: this.sinceLastRecordedEnd(start.time),
+        };
         let pinned: TurnContext['direction'];
         if (direction !== null) {
           const receipt = this.writeEvent('direction/pinned', {
@@ -583,6 +676,7 @@ export class NodeDriver {
           turn: this.turn, trigger, world, now: () => this.now(),
           gate: created.gate, signal: controller.signal,
           ...(pinned !== undefined ? { direction: pinned } : {}),
+          ...(opening !== undefined ? { opening } : {}),
         };
         try {
           // Barrier: the turn's opening is durable and observed before the handler
@@ -707,16 +801,24 @@ export class NodeDriver {
             throw err;
           }
           if (this.stopRequested) break;
-          this.armWakeTimer(result);
-          await this.park();
+          await this.park(result);
           if (this.stopRequested) break;
           this.nodeState = 'active';
-          // The cause flag, not a boolean wake: a conversation wake that
-          // recorded 'wakeup' would silently lose the interface's arrival.
+          // The selected cause flags, not a boolean wake: conversation > timer >
+          // ordinary visible-world wake > cadence. A conversation or timer wake
+          // that recorded 'wakeup' would silently lose the stronger cause; a
+          // cadence fire with an already-visible foreign commit is recorded as
+          // the ordinary 'wakeup'. This is the selected physical cause, never an
+          // exhaustive causality claim: commits/notices arriving after the
+          // asynchronous check are still in the perception.
           trigger = this.conversationFired ? 'conversation'
-            : this.timerFired ? 'timer' : 'wakeup';
+            : this.timerFired ? 'timer'
+              : this.worldFired ? 'wakeup'
+                : this.cadenceFired ? 'cadence' : 'wakeup';
           this.conversationFired = false;
           this.timerFired = false;
+          this.worldFired = false;
+          this.cadenceFired = false;
           this.turn += 1;
         } finally {
           // Every exit from the turn — the barrier, a handler failure, a commit
@@ -788,8 +890,35 @@ export class NodeDriver {
     type: T, data: EventDataFor<T>, opts: { ignorable?: boolean } = {},
   ): EventEnvelope {
     const receipt = this.writer.append(type, data, opts);
+    // The O(1) clock fact: a recorded closer's envelope time is the last end a
+    // later modern opening receipt may measure from. A synthetic resume closer
+    // flows through this same append and therefore counts.
+    if (type === 'turn/end') this.lastRecordedEndMs = receipt.time;
     this.record(receipt, data as unknown as JsonValue);
     return receipt;
+  }
+
+  /**
+   * The trusted late effective wake policy: absent/null is legacy. This is the
+   * ONLY read of the seam; it is sampled after the ready phase and at each park,
+   * never cached from the constructor's incoming seed.
+   */
+  private effectiveWakePolicy(): WakePolicy | null {
+    return this.wakePolicy() ?? null;
+  }
+
+  /**
+   * The modern opening receipt's elapsed delta from the latest RECORDED
+   * `turn/end`: null for the first turn or a backwards/non-finite/unsafe delta,
+   * never a false measured zero. O(1); no fold scan.
+   */
+  private sinceLastRecordedEnd(openedAt: number): number | null {
+    const last = this.lastRecordedEndMs;
+    if (last === null) return null;
+    if (!Number.isSafeInteger(openedAt) || !Number.isSafeInteger(last)) return null;
+    const elapsed = openedAt - last;
+    if (!Number.isSafeInteger(elapsed) || elapsed < 0) return null;
+    return elapsed;
   }
 
   /**
@@ -1012,19 +1141,24 @@ export class NodeDriver {
   }
 
   /**
-   * Parks until the world moves with a commit this node did not author, or until
-   * `stop()`.
+   * Parks until the world moves with a commit this node did not author, until a
+   * conversation notice arrives, until the one owned self/cadence timer fires,
+   * or until `stop()`.
    *
-   * The subscription is taken *before* the predicate is checked, so a commit
-   * landing between the two cannot be lost: the watcher arms the latch and the
-   * wait returns at once instead of parking on a wake that already happened.
+   * The subscriptions and the arm point are ordered deliberately: the park epoch
+   * is bumped, both subscriptions are registered, then the ONE owned timer is
+   * armed INSIDE the same try/finally and BEFORE the first await. So `parkNow` is
+   * sampled at the real park point (after commit/maintenance) and a due cannot
+   * become past while an earlier world read is in flight.
    *
    * Each park is an epoch. An evaluation started under one park can resolve
    * after it ended — it read the predicate's input before its git call, so its
    * verdict is stale — and would then arm the *next* park's latch: a `wakeup`
-   * turn on an unmoved world. The epoch is what forbids it.
+   * turn on an unmoved world. The epoch is what forbids it; the timer's own
+   * ownership generation forbids a canceled callback from discarding a newer
+   * handle.
    */
-  private async park(): Promise<void> {
+  private async park(result: TurnResult): Promise<void> {
     this.parkEpoch += 1;
     const epoch = this.parkEpoch;
     const unsubscribe = this.watcher.subscribe(() => { void this.armIfAwake(epoch); });
@@ -1034,6 +1168,7 @@ export class NodeDriver {
       this.armConversationIfDue(epoch);
     });
     try {
+      this.armParkTimer(result, epoch);
       await this.armIfAwake(epoch);
       this.armConversationIfDue(epoch);
       await this.latch.wait();
@@ -1054,6 +1189,122 @@ export class NodeDriver {
   }
 
   /**
+   * Selects and arms this park's ONE owned timer, synchronously, after the
+   * epoch/subscriptions exist and before the park's first await.
+   *
+   * Order (wake v1): an explicit absolute `wakeAt` or relative `wakeAfterMs`
+   * results in exactly one `timer`; a trusted result carrying both timer forms
+   * is a bounded `NodeStateError`; otherwise a modern positive-cadence policy
+   * with no pending commit-retry timer arms the phase grid as `cadence` (after
+   * a recoverable error too). A pending commit-retry timer takes priority; once
+   * it settles, the next park derives a fresh future grid. Cadence 0 and legacy
+   * cells arm nothing. An unsafe cadence clock arms nothing and emits ONE fixed
+   * `WakeClockUnavailableError`; the reactive subscriptions are already live.
+   */
+  private armParkTimer(result: TurnResult, epoch: number): void {
+    if (result.outcome === 'waiting') {
+      if (result.wakeAt !== undefined && result.wakeAfterMs !== undefined) {
+        throw new NodeStateError('wait result carries both wakeAt and wakeAfterMs');
+      }
+      if (result.wakeAt !== undefined) {
+        const delay = Math.max(0, result.wakeAt - this.now());
+        this.armOwnedWake(delay, 'timer', epoch, this.effectiveWakePolicy() !== null);
+        return;
+      }
+      if (result.wakeAfterMs !== undefined) {
+        if (!Number.isSafeInteger(result.wakeAfterMs) || result.wakeAfterMs <= 0) {
+          throw new NodeStateError('wait result wakeAfterMs is not a positive safe integer');
+        }
+        this.armOwnedWake(
+          result.wakeAfterMs, 'timer', epoch, this.effectiveWakePolicy() !== null);
+        return;
+      }
+    }
+    // The bounded commitment recovery owns the next wake; cadence never competes
+    // with a pending refusal retry. It re-arms on the next park after recovery.
+    if (this.retryTimer !== null) return;
+    const policy = this.effectiveWakePolicy();
+    if (policy === null || policy.heartbeatSeconds === 0) return;
+    const parkNow = this.now();
+    const due = nextCadenceDueMs(this.uid, policy.heartbeatSeconds, parkNow);
+    if (due === null) {
+      try { this.opts.onError?.(new WakeClockUnavailableError()); }
+      catch { /* the label is not the arming */ }
+      return;
+    }
+    this.armOwnedWake(due - parkNow, 'cadence', epoch, true);
+  }
+
+  /**
+   * Arms the one owned wake timer under the current park epoch. The generation
+   * is this timer's identity: a canceled callback holds an older generation and
+   * must not touch the current handle, flags or latch.
+   */
+  private armOwnedWake(
+    delay: number, cause: 'timer' | 'cadence', epoch: number, modern: boolean,
+  ): void {
+    this.clearWakeTimer();
+    this.wakeTimerGeneration += 1;
+    const generation = this.wakeTimerGeneration;
+    const cancel = this.schedule(Math.max(0, delay), () => {
+      void this.onOwnedWake(generation, epoch, cause, modern);
+    });
+    this.wakeTimer = { cancel, generation };
+  }
+
+  /**
+   * The owned timer callback. Guards BEFORE touching the handle/flags/latch,
+   * re-checks after the asynchronous cadence predicate, and consumes its
+   * generation so a duplicate invocation cannot fire twice.
+   *
+   * A cadence fire first asks the existing `wakeDue()` path: an already-visible
+   * foreign commit selects the ordinary `wakeup` cause instead of `cadence`, and
+   * a failed read (which `wakeDue` turns into one bounded diagnostic and false)
+   * does NOT delete the healthy cadence opportunity — it records `cadence`.
+   */
+  private async onOwnedWake(
+    generation: number, epoch: number, cause: 'timer' | 'cadence', modern: boolean,
+  ): Promise<void> {
+    if (!this.ownsWake(generation, epoch)) return;
+    if (cause === 'cadence') {
+      const visible = await this.wakeDue();
+      if (!this.ownsWake(generation, epoch)) return;
+      this.consumeWakeTimer();
+      if (visible) {
+        this.worldFired = true;
+        this.latch.request();
+      } else {
+        this.cadenceFired = true;
+        this.latch.request();
+      }
+      return;
+    }
+    this.consumeWakeTimer();
+    if (modern) {
+      // Modern explicit timers bypass the legacy count entirely: the old
+      // `wakeBudgetPerHour` is an inert honored-for-old-cells key, never a
+      // reinterpreted cost gate. No push to `timerWakes` happens here.
+      this.timerFired = true;
+      this.latch.request();
+    } else {
+      this.fireTimerWake();
+    }
+  }
+
+  /** Whether this callback's generation and park are still the current ones. */
+  private ownsWake(generation: number, epoch: number): boolean {
+    return generation === this.wakeTimerGeneration
+      && epoch === this.parkEpoch
+      && !this.stopRequested;
+  }
+
+  /** Consumes the current handle after the guard has proved ownership. */
+  private consumeWakeTimer(): void {
+    this.wakeTimer = null;
+    this.wakeTimerGeneration += 1;
+  }
+
+  /**
    * Arms the latch when the world has moved with a commit this node did not
    * author. Both wake paths — the check a park opens with, and the watcher's
    * notification — come through here, so they cannot drift into two policies.
@@ -1067,7 +1318,10 @@ export class NodeDriver {
    * @param epoch the park this evaluation belongs to.
    */
   private async armIfAwake(epoch: number): Promise<void> {
-    if ((await this.wakeDue()) && epoch === this.parkEpoch) this.latch.request();
+    if ((await this.wakeDue()) && epoch === this.parkEpoch) {
+      this.worldFired = true;
+      this.latch.request();
+    }
   }
 
   /**
@@ -1264,6 +1518,12 @@ export class NodeDriver {
    * Arms the next bounded self-retry (1 s/4 s/16 s), never while a stop is
    * requested. The timer only requests the latch: the next turn is an ordinary
    * `wakeup`, so the retry takes the same path as a foreign commit.
+   *
+   * This timer has its OWN ownership generation, separate from the park epoch: a
+   * callback canceled by a later successful commit, a park exit or stop() must
+   * never null the current retry handle or request a latch, while a legitimate
+   * fire before the park (which only requests the latch, never arms a turn) must
+   * still work.
    */
   private scheduleRetry(): void {
     if (this.stopRequested) return;
@@ -1271,13 +1531,15 @@ export class NodeDriver {
     const delay = RETRY_DELAYS_MS[this.retryAttempt]!;
     this.retryAttempt += 1;
     this.clearRetryTimer();
+    const generation = this.retryGeneration;
     this.retryTimer = this.schedule(delay, () => {
+      if (generation !== this.retryGeneration || this.stopRequested) return;
+      this.retryGeneration += 1;
       this.retryTimer = null;
-      if (!this.stopRequested) this.latch.request();
+      this.latch.request();
     });
   }
 
-  /** Cancels a pending retry wake; idempotent. */
   /**
    * The ratified direction, with the wake path's failure policy: a failed read
    * is one bounded diagnostic and a null pin (the journaled seed stays the
@@ -1294,24 +1556,10 @@ export class NodeDriver {
   }
 
   /**
-   * Arms the wake the turn asked for. A commit wake ends the park first and
-   * cancels this timer in `park`'s exit, so the two wake paths coalesce onto
-   * the one latch instead of racing.
-   */
-  private armWakeTimer(result: TurnResult): void {
-    this.clearWakeTimer();
-    if (result.outcome !== 'waiting' || result.wakeAt === undefined) return;
-    const delay = Math.max(0, result.wakeAt - this.now());
-    this.wakeTimer = this.schedule(delay, () => {
-      this.wakeTimer = null;
-      this.fireTimerWake();
-    });
-  }
-
-  /**
-   * One timer fire: the sliding-hour budget is checked first, then the latch is
-   * requested. An exhausted budget refuses the proactive wake and reports one
-   * bounded label; the node stays parked and any foreign commit still wakes it.
+   * One LEGACY timer fire: the sliding-hour budget is checked first, then the
+   * latch is requested. An exhausted budget refuses the proactive wake and
+   * reports one bounded label; the node stays parked and any foreign commit still
+   * wakes it. Modern explicit timers never reach here (they bypass the count).
    */
   private fireTimerWake(): void {
     const at = this.now();
@@ -1325,15 +1573,23 @@ export class NodeDriver {
     this.latch.request();
   }
 
+  /**
+   * Cancels the owned wake timer and invalidates its generation. A callback the
+   * manual scheduler invokes after this returns is stale: it fails the ownership
+   * guard before touching any handle, flag or latch.
+   */
   private clearWakeTimer(): void {
-    const cancel = this.wakeTimer;
+    const timer = this.wakeTimer;
     this.wakeTimer = null;
-    cancel?.();
+    this.wakeTimerGeneration += 1;
+    timer?.cancel();
   }
 
+  /** Cancels the pending retry wake and invalidates its separate generation. */
   private clearRetryTimer(): void {
     const cancel = this.retryTimer;
     this.retryTimer = null;
+    this.retryGeneration += 1;
     if (cancel !== null) cancel();
   }
 
@@ -1409,8 +1665,10 @@ export class NodeDriver {
   private async shutdown(prior: unknown): Promise<unknown> {
     let failure: unknown = null;
     this.clearRetryTimer();
-    // The loop has already left any storage wait; the cancel is defensive so a
-    // shutdown can never be held by a timer.
+    // The loop has already left any storage wait or park; these cancels are
+    // defensive so a shutdown can never be held by a timer or leave a stale
+    // callback able to latch a stopped node.
+    this.clearWakeTimer();
     this.storageWait?.();
     this.nodeState = 'stopping';
     try {
@@ -1461,7 +1719,7 @@ export class NodeDriver {
     let sawAny = false;
     let openTurn: number | null = null;
     let openRangeTo: string | null = null;
-    const applyLifecycle = (type: string, data: unknown): void => {
+    const applyLifecycle = (type: string, data: unknown, time: number): void => {
       if (type === 'turn/start') {
         const d = data as { turn: number; world: WorldRange };
         openTurn = d.turn;
@@ -1475,6 +1733,9 @@ export class NodeDriver {
         if (this.hooks === undefined) this.watermark = d.world.to;
       } else if (type === 'turn/end') {
         openTurn = null;
+        // The O(1) replay clock fact, for BOTH readers. A synthetic closer later
+        // in this same resume flows through `writeEvent` and updates it again.
+        this.lastRecordedEndMs = time;
       }
     };
     if (this.hooks !== undefined) {
@@ -1483,7 +1744,7 @@ export class NodeDriver {
         sawAny = true;
         this.receipts.set(`${event.raw.seq}:${event.raw.hash}`, event.raw);
         this.observations.push(event);
-        applyLifecycle(event.type, event.data);
+        applyLifecycle(event.type, event.data, event.raw.time);
       }
       await this.flushBooting();
       // Only after the whole history is delivered can the handler prove the last
@@ -1498,7 +1759,7 @@ export class NodeDriver {
       });
       for await (const e of reader.events()) {
         sawAny = true;
-        applyLifecycle(e.type, e.data);
+        applyLifecycle(e.type, e.data, e.time);
       }
     }
     if (openTurn !== null) {

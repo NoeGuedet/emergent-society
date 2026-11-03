@@ -20,6 +20,7 @@ export {
   type NodeState,
   type TurnContext,
   type TurnHandler,
+  type TurnOpening,
   type TurnResult,
 } from './driver.js';
 export {
@@ -28,7 +29,7 @@ export {
 } from './world.js';
 export {
   GitCommandError, InvalidDoctorReportError, NodeError, NodeStateError, UnsafeWorldPathError,
-  WorldHeadError, WorldNotARepoError, WorldReconciliationError,
+  WakeClockUnavailableError, WorldHeadError, WorldNotARepoError, WorldReconciliationError,
 } from './errors.js';
 export {
   NODE_EVENT_TYPES, type ShutdownReason, type TurnEndOutcome, type TurnTrigger,
