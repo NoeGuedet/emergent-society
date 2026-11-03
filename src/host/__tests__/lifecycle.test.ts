@@ -525,6 +525,8 @@ type HostOnceSetup = {
   readonly expectRefusal?: boolean;
   /** The start-only memory gate (A5): `--memory-remember` on a start. */
   readonly memoryRemember?: boolean;
+  /** The start-only wake cadence (wake v1): `--heartbeat-seconds`. */
+  readonly heartbeatSeconds?: number;
 };
 
 /**
@@ -544,6 +546,8 @@ async function runHostOnce(command: 'start' | 'resume', setup: HostOnceSetup = {
         ...(setup.heading !== undefined ? { heading: setup.heading } : {}),
         ...(setup.charterFile !== undefined ? { charterFile: setup.charterFile } : {}),
         ...(setup.memoryRemember === true ? { memoryRemember: true } : {}),
+        ...(setup.heartbeatSeconds !== undefined
+          ? { heartbeatSeconds: setup.heartbeatSeconds } : {}),
       }
     : (() => {
         const { model, heading, ...resumeOpts } = opts;
@@ -930,7 +934,14 @@ it('renders no substrate block when the store declares no catalog', async () => 
   const body = JSON.parse(first!.body.toString('utf8')) as {
     messages: Array<{ role: string; content: string }>;
   };
-  expect(body.messages.filter((message) => message.role === 'system')).toHaveLength(2);
+  // No substrate block: the two kernel prefix blocks are the charter and the
+  // heading. The modern ordinal-0 turn receipt is the one added volatile system
+  // line (wake v1) — a host fact, not a substrate declaration.
+  const systems = body.messages.filter((message) => message.role === 'system');
+  expect(systems).toHaveLength(3);
+  expect(systems[0]!.content).toContain('You are node-0.');
+  expect(systems[1]).toEqual({ role: 'system', content: 'First light.' });
+  expect(systems[2]!.content).toMatch(/^Kernel turn receipt: opened_at=/);
   expect(JSON.stringify(body)).not.toContain('The substrate this kernel serves');
 }, 20_000);
 
@@ -1705,5 +1716,163 @@ describe('the memory gate at START composition (A5)', () => {
       expect(enumOf(config)).toHaveLength(13);
       expect(enumOf(config)[12]).toBe('remember');
     }
+  }, 30_000);
+});
+
+describe('the wake policy at host activation (wake v1)', () => {
+  const waitOf = (config: AgentConfig) => {
+    const tool = config.tools.find((candidate) => candidate.name === 'wait');
+    if (tool === undefined) throw new Error('expected the wait tool');
+    return tool;
+  };
+
+  type WireTool = {
+    readonly type: string;
+    readonly function: {
+      readonly name: string; readonly description: string;
+      readonly parameters: { readonly properties: Record<string, unknown> };
+    };
+  };
+  const wireWait = (body: string): WireTool => {
+    const parsed = JSON.parse(body) as { tools: WireTool[] };
+    const tool = parsed.tools.find((candidate) => candidate.function.name === 'wait');
+    if (tool === undefined) throw new Error('expected the wire wait tool');
+    return tool;
+  };
+
+  it('an absent --heartbeat-seconds composes wake 0, drops the old key, and advertises the modern surface', async () => {
+    const srv = await serve();
+    expect(await runHostOnce('start', {})).toBe(0);
+    const config = firstConfig(await readC13(home, 'node-0'));
+    expect(config.policy.wake).toEqual({ heartbeatSeconds: 0 });
+    expect('wakeBudgetPerHour' in config.policy).toBe(false);
+    // Every other policy field survives the fresh composition.
+    const { wakeBudgetPerHour: _old, ...expectedPolicy } = defaultAgentConfig().policy;
+    expect(config.policy).toEqual({ ...expectedPolicy, wake: { heartbeatSeconds: 0 } });
+    // The offering: exactly the two modern timer forms and the wake-0
+    // description (cadence disabled, no implied floor timer).
+    expect(Object.keys((waitOf(config).parameters as unknown as {
+      properties: Record<string, unknown>;
+    }).properties).sort()).toEqual(['after_seconds', 'until']);
+    expect(waitOf(config).description).toContain('Host cadence is disabled.');
+    expect(waitOf(config).description).not.toContain('floor timer');
+    expect(waitOf(config).description).toContain('There is no timer count or cost quota.');
+    // The WIRE carries that same modern offering and the ordinal-0 receipt.
+    const first = srv.requests[0];
+    expect(first).toBeDefined();
+    const wire = wireWait(first!.body.toString('utf8'));
+    expect(wire.function.description).toBe(waitOf(config).description);
+    expect(Object.keys(wire.function.parameters.properties).sort())
+      .toEqual(['after_seconds', 'until']);
+    expect(first!.body.toString('utf8')).toContain('Kernel turn receipt: opened_at=');
+  }, 20_000);
+
+  it('--heartbeat-seconds 3600 is journaled home-level for solo and nodes-file starts', async () => {
+    await serve();
+    expect(await runHostOnce('start', { heartbeatSeconds: 3600 })).toBe(0);
+    const solo = firstConfig(await readC13(home, 'node-0'));
+    expect(solo.policy.wake).toEqual({ heartbeatSeconds: 3600 });
+    expect('wakeBudgetPerHour' in solo.policy).toBe(false);
+    expect(waitOf(solo).description)
+      .toContain('Host cadence is enabled; a bare park can wake on it.');
+    expect(waitOf(solo).description)
+      .toContain('A selected self-timer excludes the cadence floor timer for that park');
+
+    await resetHome();
+    const nodesFile = join(home, 'nodes.json');
+    await writeFile(nodesFile, JSON.stringify([
+      { uid: 'node-0', model: 'served-a', heading: 'Lead.' },
+      { uid: 'node-1', model: 'served-b', heading: 'Worker.' },
+    ]));
+    const handle = track(startHost({
+      ...opts, nodesFile, heartbeatSeconds: 3600,
+    }, hostDeps));
+    await vi.waitFor(async () => {
+      for (const uid of ['node-0', 'node-1']) {
+        const events = await readC13(home, uid).catch(() => []);
+        expect(events.some((event) => event.type === 'system/message')).toBe(true);
+      }
+    }, { timeout: 20_000 });
+    handle.stop();
+    expect(await handle.done).toBe(0);
+    for (const uid of ['node-0', 'node-1']) {
+      const config = firstConfig(await readC13(home, uid));
+      expect(config.policy.wake).toEqual({ heartbeatSeconds: 3600 });
+      expect('wakeBudgetPerHour' in config.policy).toBe(false);
+    }
+  }, 40_000);
+
+  it('refuses every out-of-domain programmatic start value before any effect', async () => {
+    const bad = [-1, 1.5, 604801, Number.NaN, Number.MAX_SAFE_INTEGER + 1, '1', null];
+    for (const value of bad) {
+      const handle = track(startHost({
+        ...opts, heartbeatSeconds: value as unknown as number,
+      }, hostDeps));
+      expect(await handle.done).toBe(2);
+      // The gate ran FIRST: no owner record, no chat log, no node log, no turn.
+      expect((await readOwner(home)).kind).toBe('absent');
+      await expect(lstat(join(home, 'chat.v0.jsonl'))).rejects.toThrow();
+      const layout = nodeLayout(home, 'node-0');
+      await expect(lstat(join(layout.dir, layout.logFile))).rejects.toThrow();
+    }
+  }, 20_000);
+
+  it('refuses a supplied resume value (exit 2) before any owner/chat/config/turn effect', async () => {
+    await seedConfig(existingConfig);
+    const { model: _model, heading: _heading, ...resumeOpts } = opts;
+    const handle = track(startHost({
+      ...resumeOpts, command: 'resume', heartbeatSeconds: 1,
+    }, hostDeps));
+    expect(await handle.done).toBe(2);
+    expect((await readOwner(home)).kind).toBe('absent');
+    await expect(lstat(join(home, 'chat.v0.jsonl'))).rejects.toThrow();
+    const events = await readC13(home, 'node-0');
+    expect(events.filter((event) => event.type === 'system/message')).toHaveLength(1);
+    expect(events.some((event) => event.type === 'turn/start')).toBe(false);
+  }, 20_000);
+
+  it('a resume uses the FOLDED legacy policy over a conflicting modern programmatic seed', async () => {
+    // The journal holds a legacy config; the injected initial-config seam hands
+    // the host a modern one. The driver's late wake seam must sample the folded
+    // journal state, never the incoming seed: no receipt, legacy wait form and
+    // receipt, no after_seconds offering.
+    await seedConfig(existingConfig);
+    const modernSeed = validateAgentConfig({
+      ...defaultAgentConfig(), model: 'first-light-test', heading: 'First light.',
+      policy: {
+        ...defaultAgentConfig().policy,
+        wake: { heartbeatSeconds: 1 },
+      },
+    });
+    const waitReply: ReplyBody = {
+      body: JSON.stringify({ choices: [{ message: {
+        role: 'assistant', content: null,
+        tool_calls: [{
+          id: 'w0', type: 'function', function: { name: 'wait', arguments: '{}' },
+        }],
+      } }] }),
+    };
+    const srv = await serve(() => waitReply);
+    const { model: _model, heading: _heading, ...resumeOpts } = opts;
+    const resumed = track(startHost({ ...resumeOpts, command: 'resume' }, {
+      ...hostDeps,
+      readInitialConfig: async () => modernSeed,
+    }));
+    await waitForLog(log, 'host/parked');
+    resumed.stop();
+    expect(await resumed.done).toBe(0);
+    const request = srv.requests[0];
+    expect(request).toBeDefined();
+    const body = request!.body.toString('utf8');
+    expect(body).not.toContain('Kernel turn receipt:');
+    const wire = wireWait(body);
+    expect(Object.keys(wire.function.parameters.properties)).toEqual(['until']);
+    expect(wire.function.description).toContain('The sliding-hour timer budget');
+    const results = (await readC13(home, 'node-0'))
+      .filter((event) => event.type === 'tool/result')
+      .map((event) => (event.data as unknown as {
+        message: { content: string };
+      }).message.content);
+    expect(results).toEqual(['Waiting until a foreign world commit']);
   }, 30_000);
 });

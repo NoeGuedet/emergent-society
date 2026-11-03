@@ -46,6 +46,8 @@ A reply is saved even when no overlay is running (the session says so; the next 
 
 No measurement of sycophancy at first; no gates or approvals in the chat; no imposed cadence or revision heartbeat; no direct human ↔ working-node channel. Current state: the thread filter makes the last one true — a node reads only its own thread with the gateway, and the human's words live in the kernel-owned chat log, outside the conversation.
 
+"No revision heartbeat" scopes the DIRECTION co-negotiation only: nothing periodically rewrites the heading, proposes a revision, or polls the gateway/direction. The node's own physical wake cadence (the start-only `--heartbeat-seconds`, the modern `wait` timer/cadence) is kernel park physics, not a direction-revision heartbeat and not an automatic heading proposal; a node still speaks or revises the direction only through its ordinary authored acts.
+
 ## 6. Consequences for the bootstrap ([seed.md](seed.md))
 
 Agent zero alone holds the human channel; the seed's framing names "the person speaking to you" as agent zero, not the human, and no node has a direct human channel. The native chat replaces the retired `speak` verb: the overlay converses in its own cycle's prose, and the human writes through `chat` or `direct`. The provisional v0 direction and its pinning stay as specified, and the first negotiation that retires v0 takes place between the human and agent zero; the human's act is `direct --path DIRECTION.md`.

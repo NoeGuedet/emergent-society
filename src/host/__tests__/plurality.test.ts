@@ -2,8 +2,10 @@ import { existsSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, expect, it, vi } from 'vitest';
-import { defaultAgentConfig, validateAgentConfig } from '../../context/config.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  composeWakeOffering, defaultAgentConfig, validateAgentConfig,
+} from '../../context/config.js';
 import type { AgentConfig, LlmModel } from '../../context/contracts.js';
 import { C13_EVENT_TYPES } from '../../context/events.js';
 import { ContextFold } from '../../context/fold.js';
@@ -135,6 +137,7 @@ function boot(home: string, opts: {
   readonly lines: string[];
   readonly nodesFile?: string;
   readonly charterFile?: string;
+  readonly heartbeatSeconds?: number;
   readonly deps?: HostDeps;
 }): HostHandle {
   const options: HostOptions = {
@@ -143,6 +146,8 @@ function boot(home: string, opts: {
       ? { nodesFile: opts.nodesFile }
       : { model: 'first-light-test', heading: 'Lead.' }),
     ...(opts.charterFile !== undefined ? { charterFile: opts.charterFile } : {}),
+    ...(opts.heartbeatSeconds !== undefined
+      ? { heartbeatSeconds: opts.heartbeatSeconds } : {}),
     log: createHostLog((line) => opts.lines.push(line)),
   };
   return startHost(options, {
@@ -960,3 +965,111 @@ it('boots a declared node set through the host lifetime and stops it cleanly', a
     expect(local.filter((event) => event.type === 'node/boot')).toHaveLength(1);
   }
 }, 40_000);
+
+describe('spawn inherits the wake policy across the mode line', () => {
+  /** One parent that spawns exactly one child, then parks; the child parks. */
+  async function spawnOne(opts: {
+    readonly heartbeatSeconds?: number; readonly initialConfig?: AgentConfig;
+  }): Promise<{ child: AgentConfig | null; home: string }> {
+    const { home } = await initFixture();
+    const counts = new Map<string, number>();
+    const server = await serveJson((request) => {
+      const body = request.body.toString('utf8');
+      const uid = body.includes('You are node-1, composed by node-0.') ? 'node-1' : 'node-0';
+      const count = counts.get(uid) ?? 0;
+      counts.set(uid, count + 1);
+      return count > 0
+        ? respond({ content: 'idle' })
+        : uid === 'node-0'
+          ? respond({ tool: { name: 'extend', args: { verb: 'spawn', heading: 'Worker.' } } })
+          : respond({ content: 'idle' });
+    });
+    servers.push(server);
+    await providers(home, server.url);
+    const nodesFile = await writeNodes(home, [
+      { uid: 'node-0', model: 'first-light-test', heading: 'Lead.', spawn: true },
+    ]);
+    const lines: string[] = [];
+    const handle = boot(home, {
+      nodesFile,
+      lines,
+      ...(opts.heartbeatSeconds !== undefined
+        ? { heartbeatSeconds: opts.heartbeatSeconds } : {}),
+      ...(opts.initialConfig !== undefined
+        ? { deps: { readInitialConfig: async () => opts.initialConfig! } }
+        : {}),
+    });
+    await vi.waitFor(() => {
+      expect(hostEvents(lines).filter((event) => event.event === 'host/spawned')).toHaveLength(1);
+    }, { timeout: 30_000 });
+    await vi.waitFor(async () => {
+      expect(await foldedConfig(home, 'node-1')).not.toBeNull();
+    }, { timeout: 30_000 });
+    const child = await foldedConfig(home, 'node-1');
+    handle.stop();
+    expect(await handle.done).toBe(0);
+    return { child, home };
+  }
+
+  /** A legacy factory config, with the old key explicitly present or absent. */
+  function legacyConfig(wakeBudgetPerHour?: number): AgentConfig {
+    const base = defaultAgentConfig();
+    const { wakeBudgetPerHour: _absent, ...policy } = base.policy;
+    return validateAgentConfig({
+      ...base, model: 'first-light-test', heading: 'Lead.',
+      policy: wakeBudgetPerHour === undefined
+        ? policy
+        : { ...policy, wakeBudgetPerHour },
+    });
+  }
+
+  it('a modern parent copies wake 0 and 3600 verbatim, adding no old key', async () => {
+    for (const heartbeatSeconds of [0, 3600]) {
+      const { child } = await spawnOne({ heartbeatSeconds });
+      expect(child?.policy.wake).toEqual({ heartbeatSeconds });
+      expect(child !== null && 'wakeBudgetPerHour' in child.policy).toBe(false);
+    }
+  }, 120_000);
+
+  it('a modern parent carrying BOTH keys copies policy and wait offering verbatim', async () => {
+    const factory = defaultAgentConfig();
+    // A modern offering composed first, then an inert old key added externally:
+    // the exact compatibility shape the plan names.
+    const modernOffering = composeWakeOffering(validateAgentConfig({
+      ...factory, model: 'first-light-test', heading: 'Lead.',
+      policy: { ...factory.policy, wake: { heartbeatSeconds: 0 } },
+    }), { heartbeatSeconds: 0 });
+    const both = validateAgentConfig({
+      ...modernOffering,
+      policy: { ...modernOffering.policy, wakeBudgetPerHour: 3 },
+    });
+    const { child } = await spawnOne({ initialConfig: both });
+    // VERBATIM: wake stays, the inert old key stays exactly 3 (not dropped, not
+    // synthesized to 12), and no normalization occurs on the child.
+    expect(child?.policy).toEqual(both.policy);
+    expect(child?.policy.wake).toEqual({ heartbeatSeconds: 0 });
+    expect(child?.policy.wakeBudgetPerHour).toBe(3);
+    // The child also keeps the MODERN wait offering (description + schema).
+    const wait = child?.tools.find((tool) => tool.name === 'wait');
+    expect(wait?.description).toContain('Host cadence is disabled.');
+    expect(wait?.description).toContain('There is no timer count or cost quota.');
+    expect(wait?.description).not.toContain('The sliding-hour timer budget');
+    const parameters = wait?.parameters as unknown as {
+      properties: Record<string, unknown>; maxProperties?: number;
+    };
+    expect(Object.keys(parameters.properties).sort()).toEqual(['after_seconds', 'until']);
+    expect(parameters.maxProperties).toBe(1);
+  }, 120_000);
+
+  it('a legacy parent keeps the old synthesis: absent reads 12, explicit stays', async () => {
+    for (const [input, expected] of [[undefined, 12], [3, 3]] as const) {
+      const { child } = await spawnOne({ initialConfig: legacyConfig(input) });
+      expect(child?.policy.wake).toBeUndefined();
+      expect(child?.policy.wakeBudgetPerHour).toBe(expected);
+      // The legacy parent's child also keeps the legacy wait offering.
+      const wait = child?.tools.find((tool) => tool.name === 'wait');
+      expect(wait?.description).toContain('The sliding-hour timer budget');
+      expect(wait?.description).not.toContain('There is no timer count or cost quota.');
+    }
+  }, 120_000);
+});

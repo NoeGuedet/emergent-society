@@ -15,6 +15,7 @@ import {
 } from '../context/meter.js';
 import { writeSnapshot } from '../context/snapshots.js';
 import { dispatchCalls } from './tools/dispatch.js';
+import { renderOpeningReceipt } from './receipt.js';
 import { renderConversationNotice } from './conversation.js';
 import type { ConversationNoticeSource } from './conversation-watcher.js';
 import { createSelfPort } from './self.js';
@@ -797,6 +798,14 @@ class Runtime implements AgentRuntime {
     const slot = this.fold.snapshot().config;
     if (slot === null) throw new Error('runtime: handler reached without a configuration');
     const config = slot.value;
+    // The modern opening receipt is rendered ONCE at run entry from the driver's
+    // captured physical facts (never Date.now) and reused for every assembly of
+    // this turn's logical request ordinal 0 — compaction, reassembly, adapter
+    // retry and the overflow resend included. It is never retained as local
+    // history and never regenerated for later ordinals.
+    const openingReceipt = ctx.opening === undefined
+      ? undefined
+      : renderOpeningReceipt(ctx.opening, ctx.trigger);
     let accepted = 0;
     let ordinal = 0;
     for (let step = 0; step < config.policy.stepsPerTurn; step += 1) {
@@ -863,6 +872,7 @@ class Runtime implements AgentRuntime {
         id, state: this.fold.snapshot(),
         ...(ctx.direction !== undefined ? { direction: ctx.direction } : {}),
         ...(this.options.models !== undefined ? { models: this.options.models } : {}),
+        ...(ordinal === 0 && openingReceipt !== undefined ? { opening: openingReceipt } : {}),
         ...(notice !== null ? { notice: renderConversationNotice(notice) } : {}),
       });
       let plan = assemblePlan();
@@ -999,7 +1009,9 @@ class Runtime implements AgentRuntime {
       const calls = sent.projection.message.tool_calls;
       this.packageGateHolder.gate = ctx.gate;
       this.flushPackageFacts(ctx.gate);
-      let dispatched: { waited: boolean; called: number; wakeAt?: number };
+      let dispatched: {
+        waited: boolean; called: number; wakeAt?: number; wakeAfterMs?: number;
+      };
       try {
         dispatched = await dispatchCalls(
           sent.projection, id, ctx.gate, config, this.terminalPort,
@@ -1018,6 +1030,10 @@ class Runtime implements AgentRuntime {
         return {
           outcome: 'waiting', toolCalls: accepted > 0,
           ...(dispatched.wakeAt !== undefined ? { wakeAt: dispatched.wakeAt } : {}),
+          // A relative wait is carried as a DURATION; the driver anchors it at
+          // the actual park, never at this model-call/assembly point.
+          ...(dispatched.wakeAfterMs !== undefined
+            ? { wakeAfterMs: dispatched.wakeAfterMs } : {}),
         };
       }
     }

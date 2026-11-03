@@ -1740,3 +1740,42 @@ describe('ProviderAdapter: assistant content bounding', () => {
     }
   });
 });
+
+describe('the modern opening receipt counts in the request-band guard', () => {
+  const RECEIPT =
+    'Kernel turn receipt: opened_at=2026-11-03T15:00:00.000Z; trigger=boot;'
+    + ' since_last_recorded_end_ms=unavailable.';
+
+  it('a band between the plain and receipt plans refuses the receipt plan before any send', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult(validBody())]);
+    try {
+      const plain = plan();
+      const opened = plan({ queue: [{ role: 'system', content: RECEIPT }] });
+      const plainBytes = serializeWire(plain).length;
+      const openedBytes = serializeWire(opened).length;
+      // The distinguishing band: the plain plan is exactly at the cap (allowed),
+      // the receipt plan is over it (refused). No fictitious queue cap and no
+      // 32 MiB fixture: the receipt's own bytes are what moves the wire.
+      expect(openedBytes).toBeGreaterThan(plainBytes);
+      const banded = seedPolicy({ maxRequestBytes: plainBytes });
+      const adapter = await adapterWith(transport);
+      const allowed = await adapter.send(
+        { ...plain, policy: banded }, session.gate('turn', 0));
+      expect(allowed.kind).toBe('response');
+      expect(transport.sends).toBe(1);
+      const refused = await adapter.send(
+        { ...opened, policy: banded }, session.gate('turn', 0));
+      expect(refused).toEqual({
+        kind: 'failure', failure: { code: 'request-limit', status: null },
+      });
+      // The refusal precedes any begin/send: the frontier has only the allowed
+      // exchange, and the transport was never called for the receipt plan.
+      expect(transport.sends).toBe(1);
+      const { requests } = await frontierRecords();
+      expect(requests).toHaveLength(1);
+    } finally {
+      await session.shutdown();
+    }
+  });
+});

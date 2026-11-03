@@ -66,9 +66,9 @@ The minimum is not zero. The minimum is the set of constraints whose ablation ma
 
 *What it costs.* The society is reactive. A node cannot choose to act on a schedule, to think when nothing changes, or to maintain itself. With no peers, the human is the clock. "Perpetual" becomes "suspended" whenever the world is still. The founder panel named this directly: a perpetual system without a timer is a photograph, not a loop ([research/founder-panel.md](research/founder-panel.md)).
 
-*Alternative.* A timer or heartbeat, with a budget. The wake predicate becomes a disjunction: a foreign commit, a schedule, or an internal goal. The timer is physics, not organization: it gives time to the system without giving it a task queue or a scheduler.
+*Alternative.* A timer or heartbeat. The wake predicate becomes a disjunction: a foreign commit, a conversation notice, a schedule, or (still future) an internal goal. The timer is physics, not organization: it gives time to the system without giving it a task queue or a scheduler. The implemented modern policy takes a cadence (per-node wall-clock grid, missed slots skipped, never replayed) and a self-timer whose relative duration starts at the actual park; it installs no count, token-tank or cost quota, so it does not claim that proactive work is financially bounded. A legacy cell's sliding-hour `wakeBudgetPerHour` counter is retained for old journals, not carried into fresh compositions.
 
-*Verdict.* The current choice is insufficient for the vision. Add a timer, bound it with a budget, and treat "reactive versus proactive" as a variable.
+*Verdict.* The reactive-only choice is insufficient for the vision. Time and cadence are now implemented and reachable end-to-end (start-only `--heartbeat-seconds`, `wait {after_seconds}`, `trigger: 'cadence'`); treat "reactive versus proactive" as a variable. A budget is not required for the feature and must not be confused with one: operators may set a deployment ceiling, and the kernel enforces operational deadlines and storage, not spending.
 
 ### 4.4 The pinned heading
 
@@ -113,12 +113,12 @@ A proposal, not a mandate:
 - **World.** A shared, read-only history of published state.
 - **Workspace.** A private, writable draft per node.
 - **Publish.** A kernel-mediated integration at the turn boundary; conflicts are detected and recorded; attribution is per publication.
-- **Time.** A timer plus wake-on-change. A node may act on a schedule, on a foreign change, or on an internal goal; a budget bounds the cost.
+- **Time.** A timer plus wake-on-change. A node may act on a schedule, on a foreign change, on a conversation notice, or on an internal goal; no kernel budget bounds the cost (a deployment may set an upstream ceiling).
 - **Direction.** A versioned heading and letter; ratification is a dated event; the pinned heading is the metronome; the invariants are separate.
 - **Memory.** Token-calibrated compaction; a durable, visible transaction; externalization is the agent's work.
 - **Plurality.** N nodes, per-node workspaces, a shared world, a shared frontier with attribution.
 - **Observation.** Frontier plus world; node identity; a read-only event log for the agents; metrics outside the world.
-- **Safety.** The existing confinement and cgroups; a kill switch; the delegated launch as the default; an egress policy.
+- **Safety.** The existing confinement and cgroups; a kill switch; the delegated launch as the default; an egress policy. Spending is a deployment concern (an optional upstream key limit), never a kernel-installed quota; operational storage and child deadlines remain.
 
 ## 6. What stays
 
@@ -129,7 +129,7 @@ The journal's durability discipline; the commit plumbing; the refusal taxonomy; 
 Each increment has a proof and a control. No increment without a falsifiable claim.
 
 1. **Plurality.** N drivers, per-node logs, a commit queue, cgroup leaves. *Proof:* two concurrent nodes commit with distinct authors; the frontier remains one chain; no commit is lost. *Control:* one node.
-2. **Time.** A timer and a budget. *Proof:* a node wakes on schedule with no foreign commit and produces a turn. *Control:* wake-on-change only.
+2. **Time.** A timer/cadence without a count or cost quota. *Proof:* a node wakes on schedule with no foreign commit and produces a turn; a self-timer's relative delay is anchored at the actual park. *Control:* wake-on-change only (cadence 0).
 3. **World model.** Private workspace plus publish. *Proof:* two nodes edit the same file; the integration produces a conflict event; both publications are attributable. *Control:* the shared mutable worktree.
 4. **Direction.** A versioned heading plus ratification. *Proof:* a ratified change appears in every node's next request; the old version is archived. *Control:* a static heading.
 5. **Hole.** Token-calibrated compaction. *Proof:* compaction fires at the threshold; the agent externalizes; the transaction is durable. *Control:* a large context with no compaction.

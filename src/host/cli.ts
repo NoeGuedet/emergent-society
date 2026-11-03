@@ -134,6 +134,8 @@ async function runHost(command: HostRun, deps: CliDeps, err: Sink): Promise<numb
           ...(command.gatewayCharter !== undefined
             ? { gatewayCharter: command.gatewayCharter } : {}),
           ...(command.gatewayModel !== undefined ? { gatewayModel: command.gatewayModel } : {}),
+          ...(command.heartbeatSeconds !== undefined
+            ? { heartbeatSeconds: command.heartbeatSeconds } : {}),
           ...(command.memoryRemember === true ? { memoryRemember: true } : {}),
         }
       : {}),

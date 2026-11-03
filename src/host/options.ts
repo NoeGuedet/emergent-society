@@ -1,5 +1,6 @@
 import { isAbsolute } from 'node:path';
 import { parseArgs, type ParseArgsOptionsConfig } from 'node:util';
+import { MAX_HEARTBEAT_SECONDS } from '../context/contracts.js';
 import { assertNodeUid } from '../journal/index.js';
 import { validateTreePath } from '../overlay/world-read.js';
 import { UsageError } from './errors.js';
@@ -58,6 +59,13 @@ export type HostCliCommand =
        * such flag (the journaled config wins), so the parser refuses it there.
        */
       readonly memoryRemember?: boolean;
+      /**
+       * The wake cadence (wake v1), start-only and home-level: an integer in
+       * `0..604800` seconds. Absent means 0 (no cadence; modern quota-free
+       * self-wakes stay on). A resume has no such flag — the journaled policy
+       * wins — so the parser refuses it there.
+       */
+      readonly heartbeatSeconds?: number;
     }
   | {
       readonly command: 'resume'; readonly home: string; readonly uid: string;
@@ -85,8 +93,8 @@ export type HostCliCommand =
  */
 export const USAGE = `Usage:
   node dist/host/main.js init   --home <abs-dir>
-  node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--memory-remember] [--no-sandbox]
-  node dist/host/main.js start  --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--memory-remember] [--no-sandbox]
+  node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--heartbeat-seconds N] [--memory-remember] [--no-sandbox]
+  node dist/host/main.js start  --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--heartbeat-seconds N] [--memory-remember] [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> [--uid node-0] [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]
   node dist/host/main.js pause  --home <abs-dir>
@@ -120,6 +128,17 @@ pair is already persisted); resume takes the persisted configuration — the fla
 there (the persisted configuration wins). The charter is read up to the capture bound, but the
 assembled request is bounded by the overlay policy (2 MiB) and refused at send: an oversize
 charter starts and then fails every cycle.
+--heartbeat-seconds is the wake cadence, start-only and home-level: a strict decimal integer
+from 0 to 604800 seconds, absent 0. It journals policy.wake {heartbeatSeconds} into every node
+this start composes, so a fresh cell gets no timer count or cost quota and a parked node wakes
+on its per-uid wall-clock grid when the value is positive (missed slots are skipped, never
+replayed). A positive value is a treatment dose, not optimality (3600 is one hour). Resume
+refuses the flag — the journaled config wins — and a spawn inherits the effective policy
+exactly: a modern parent's child stays modern (including wake 0), an old parent's child keeps
+the legacy sliding-hour wakeBudgetPerHour forever, with no migration. A cell journaled
+without policy.wake keeps its legacy wait form ({until} only, after_seconds refused) and its
+exact budget behavior; the old key remains accepted for those cells and is never re-emitted
+by a fresh composition.
 --memory-remember is the memory gate, start-only and home-level: it journals
 policy.memory {remember: true, messages: false} into every node this start composes and the
 composed extend offering advertises the remember verb (the node authors what replaces the fixed
@@ -226,6 +245,7 @@ function parseStart(args: readonly string[]): HostCliCommand {
     'nodes-file': { type: 'string' },
     'gateway-charter': { type: 'string' },
     'gateway-model': { type: 'string' },
+    'heartbeat-seconds': { type: 'string' },
     'memory-remember': { type: 'boolean' },
     uid: { type: 'string' },
     'no-sandbox': { type: 'boolean' },
@@ -265,6 +285,7 @@ function parseStart(args: readonly string[]): HostCliCommand {
     }
   }
   const home = homeOf(values, 'start');
+  const heartbeatSeconds = heartbeatSecondsOf(values);
   const nodesFile = nodesFileOf(values);
   if (nodesFile !== undefined) {
     // The file carries every node's config: a solo flag beside it would be
@@ -279,7 +300,8 @@ function parseStart(args: readonly string[]): HostCliCommand {
       nodesFile,
       ...(gatewayCharter !== undefined ? { gatewayCharter } : {}),
       ...(gatewayModel !== undefined ? { gatewayModel } : {}),
-      // Home-level: the gate applies to every node the file declares.
+      // Home-level: both gates apply to every node the file declares.
+      ...(heartbeatSeconds !== undefined ? { heartbeatSeconds } : {}),
       ...(values['memory-remember'] === true ? { memoryRemember: true } : {}),
     };
   }
@@ -293,8 +315,28 @@ function parseStart(args: readonly string[]): HostCliCommand {
     ...(charterFile !== undefined ? { charterFile } : {}),
     ...(gatewayCharter !== undefined ? { gatewayCharter } : {}),
     ...(gatewayModel !== undefined ? { gatewayModel } : {}),
+    ...(heartbeatSeconds !== undefined ? { heartbeatSeconds } : {}),
     ...(values['memory-remember'] === true ? { memoryRemember: true } : {}),
   };
+}
+
+/**
+ * `--heartbeat-seconds`: a strict decimal integer in the cadence domain. No
+ * sign, fraction, whitespace, junk, unsafe magnitude or missing value; a value
+ * over the seven-day ceiling is refused here (the parser never calls the host).
+ * An absent flag stays absent (the host composes wake 0).
+ */
+function heartbeatSecondsOf(values: OptionValues): number | undefined {
+  const raw = values['heartbeat-seconds'];
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || !/^[0-9]+$/.test(raw)) {
+    throw new UsageError('--heartbeat-seconds takes a decimal integer from 0 to 604800');
+  }
+  const seconds = Number(raw);
+  if (!Number.isSafeInteger(seconds) || seconds > MAX_HEARTBEAT_SECONDS) {
+    throw new UsageError('--heartbeat-seconds takes a decimal integer from 0 to 604800');
+  }
+  return seconds;
 }
 
 /** `--nodes-file`, optional and absolute like the other operator paths. */

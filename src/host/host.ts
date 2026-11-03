@@ -3,9 +3,9 @@ import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   DEFAULT_CHARTER_AUTHORED, DEFAULT_WAKE_BUDGET_PER_HOUR, composeMemoryOffering,
-  defaultAgentConfig, validateAgentConfig,
+  composeWakeOffering, defaultAgentConfig, validateAgentConfig,
 } from '../context/config.js';
-import type { AgentConfig, LlmModel } from '../context/contracts.js';
+import { MAX_HEARTBEAT_SECONDS, type AgentConfig, type LlmModel } from '../context/contracts.js';
 import { C13_EVENT_TYPES } from '../context/events.js';
 import { ContextFold } from '../context/fold.js';
 import { loadVerifiedEvents } from '../context/loader.js';
@@ -455,6 +455,12 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
     ...(doctor !== undefined ? { doctor } : {}),
     storage,
     wakeBudgetPerHour: config.policy.wakeBudgetPerHour ?? DEFAULT_WAKE_BUDGET_PER_HOUR,
+    // The modern wake seam binds to the runtime's EFFECTIVE folded config, not
+    // the incoming seed/config argument: the ready phase folds the journal
+    // during `open`, so a resume (or a conflicting programmatic seed) reads the
+    // journaled policy. Absent/null is legacy. The closure is sampled by the
+    // driver at turn opening and each park.
+    wakePolicy: () => runtime.snapshot().config?.value.policy.wake ?? null,
     onError: (err) => log.emit('driver/error', { error: err.name }),
     onMaintenance: () => log.emit('host/parked'),
     schedule: (ms, callback) => {
@@ -698,6 +704,14 @@ export type HostOptions = {
    */
   readonly memoryRemember?: boolean;
   /**
+   * The wake cadence (wake v1), start-only and home-level: an integer in
+   * `0..604800` seconds journaled as `policy.wake {heartbeatSeconds}` into every
+   * node this start composes (absent = 0). It is validated at the TOP of the
+   * host body, before any home/chat/owner/config effect; a resume carrying it
+   * (or an out-of-domain programmatic value) is a `HostConfigError` (exit 2).
+   */
+  readonly heartbeatSeconds?: number;
+  /**
    * A JSON nodes file declaring the whole boot: its uids (and, on a start, each
    * model, heading and optional absolute charter file) replace the solo flags.
    * The parser refuses `--nodes-file` together with `--uid`/`--model`/`--heading`/
@@ -878,6 +892,7 @@ async function readCellConfig(home: string, uid: string): Promise<CellConfigStat
  */
 async function resolveNodeConfig(
   home: string, command: HostCommand, spec: NodeSpec, memoryRemember = false,
+  heartbeatSeconds = 0,
 ): Promise<AgentConfig> {
   const { uid, model, heading, charterFile } = spec;
   const state = await readCellConfig(home, uid);
@@ -918,7 +933,11 @@ async function resolveNodeConfig(
         ? { policy: { ...factory.policy, memory: { remember: true, messages: false } } }
         : {}),
     });
-    return composeMemoryOffering(composed);
+    // FRESH composition only: the memory offering (when gated) and then the
+    // modern wake offering. The composer omits the legacy cost key and journals
+    // `policy.wake {heartbeatSeconds}` even at 0, replaces only the wait tool,
+    // and preserves every other policy field. A resume never reaches here.
+    return composeWakeOffering(composeMemoryOffering(composed), { heartbeatSeconds });
   }
   if (model !== undefined || heading !== undefined) {
     throw new HostConfigError('resume takes no --model or --heading; the journaled config wins');
@@ -1436,10 +1455,16 @@ function composedChildConfig(
     charter: `${authored}${identitySentence(uid, requesterUid)}`,
     // Attenuation: a child can hold only what the requester holds.
     allowedTools: [...base.allowedTools],
-    policy: {
-      ...base.policy,
-      wakeBudgetPerHour: base.policy.wakeBudgetPerHour ?? DEFAULT_WAKE_BUDGET_PER_HOUR,
-    },
+    // The wake policy is inherited, never synthesized across the mode line:
+    // a MODERN parent copies its policy verbatim (no old cost key is added,
+    // and an externally carried inert old key rides along untouched), while a
+    // LEGACY parent keeps the exact old synthesis/absent-as-12 behavior.
+    policy: base.policy.wake !== undefined
+      ? { ...base.policy }
+      : {
+          ...base.policy,
+          wakeBudgetPerHour: base.policy.wakeBudgetPerHour ?? DEFAULT_WAKE_BUDGET_PER_HOUR,
+        },
   });
 }
 
@@ -1464,6 +1489,31 @@ function singleNodeSpec(options: HostOptions): NodeSpec {
     ...(options.heading !== undefined ? { heading: options.heading } : {}),
     ...(options.charterFile !== undefined ? { charterFile: options.charterFile } : {}),
   };
+}
+
+/**
+ * The wake option's one programmatic validator, called at the top of the host
+ * body. The CLI parser already enforces the same domain for argv; a direct
+ * `HostOptions` caller (a test, an embedder) must not bypass it. Resume never
+ * takes the option: the journaled policy wins, so any supplied value — even a
+ * valid one — is a configuration refusal (exit 2).
+ */
+function readHeartbeatSeconds(options: HostOptions): number {
+  const value = options.heartbeatSeconds;
+  if (options.command !== 'start') {
+    if (value !== undefined) {
+      throw new HostConfigError(
+        'resume takes no --heartbeat-seconds; the journaled config wins');
+    }
+    return 0;
+  }
+  if (value === undefined) return 0;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)
+    || value < 0 || value > MAX_HEARTBEAT_SECONDS) {
+    throw new HostConfigError(
+      '--heartbeat-seconds takes a decimal integer from 0 to 604800');
+  }
+  return value;
 }
 
 /** The bounded error label: a name, never a message and never a payload. */
@@ -1552,6 +1602,13 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
   const done = (async (): Promise<number> => {
     let code = 0;
     try {
+      // The wake option's programmatic gate is the FIRST body step: before the
+      // home/world checks, the chat open, the conversation repair, the owner
+      // record and the config fold. A supplied value on resume and any
+      // out-of-domain start value are configuration refusals (exit 2) that
+      // leave no owner, chat, config or turn behind; the synchronously
+      // installed signal handlers and keepalive are still cleared in `finally`.
+      const heartbeatSeconds = readHeartbeatSeconds(options);
       await assertHomeOutsideCheckout(home);
       await assertHomePermissions(home);
       await assertCellLayout(home);
@@ -1589,7 +1646,8 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       const memoryRemember = options.memoryRemember === true;
       const composeConfig = deps.readInitialConfig
         ?? ((nodeHome: string, nodeCommand: HostCommand, nodeSpec: NodeSpec) =>
-          resolveNodeConfig(nodeHome, nodeCommand, nodeSpec, memoryRemember));
+          resolveNodeConfig(
+            nodeHome, nodeCommand, nodeSpec, memoryRemember, heartbeatSeconds));
       const configs = await Promise.all(specs.map(
         (spec) => composeConfig(home, command, spec),
       ));

@@ -9,6 +9,7 @@ import { resolveArtifact } from '../artifacts.js';
 import { assemble } from '../assembler.js';
 import { presentWorld } from '../diff.js';
 import { serializeWire } from '../../provider/wire.js';
+import { priceWire } from '../meter.js';
 import { useWorld } from '../../node/__tests__/helpers.js';
 import { verifyPerceptions } from './verify-perceptions.js';
 import type {
@@ -443,5 +444,62 @@ describe('assemble: the conversation notice', () => {
     expect(noticed.sections.map((section) => section.name))
       .toEqual(['tools', 'charter', 'heading', 'history', 'queue']);
     expect(noticed.sections[noticed.sections.length - 1]!.cache).toBe('volatile');
+  });
+});
+
+describe('assemble: the modern opening receipt', () => {
+  const RECEIPT =
+    'Kernel turn receipt: opened_at=2026-11-03T15:00:00.000Z; trigger=cadence;'
+    + ' since_last_recorded_end_ms=1234.';
+  const NOTICE = '1 message arrived, the newest from gateway; consult get_messages';
+
+  function perceptionGroup(): SurfaceGroup {
+    return {
+      id: src(10), kind: 'perception', turn: 0,
+      messages: [{ role: 'user', content: 'evidence' }], sources: [src(10)],
+    };
+  }
+
+  it('rides the volatile queue after first-use perception and before the notice', () => {
+    const open: OpenTurn = {
+      start: src(9), turn: 0, world: { from: null, to: null },
+      perception: perceptionGroup(), perceptionConsumed: false, messages: [], sources: [],
+    };
+    const plan = assemble({
+      id: ID, state: makeState({ open }), opening: RECEIPT, notice: NOTICE,
+    });
+    expect(plan.queue).toEqual([
+      { role: 'user', content: 'evidence' },
+      { role: 'system', content: RECEIPT },
+      { role: 'system', content: NOTICE },
+    ]);
+    // Not journaled state: no source, no stateHash move, no history retention,
+    // and the section's citation stays the perception's own.
+    expect(plan.sections[4]?.sources).toEqual([src(10)]);
+    expect(plan.history).toEqual([]);
+    const plain = assemble({ id: ID, state: makeState({ open }) });
+    expect(plan.stateHash).toBe(plain.stateHash);
+    expect(plan.sections.map((section) => section.sources))
+      .toEqual(plain.sections.map((section) => section.sources));
+  });
+
+  it('counts in the priced wire but not the state hash, and is byte-bounded', () => {
+    const state = makeState();
+    const plain = assemble({ id: ID, state });
+    const opened = assemble({ id: ID, state, opening: RECEIPT });
+    // The added queue system line is priced like any wire text (it is not a
+    // fictitious queue cap or an out-of-band envelope), while the journaled
+    // state hash is byte-identical.
+    expect(opened.stateHash).toBe(plain.stateHash);
+    expect(serializeWire(opened).length).toBeGreaterThan(serializeWire(plain).length);
+    expect(priceWire(opened)).toBeGreaterThan(priceWire(plain));
+    expect(Buffer.from(serializeWire(opened)).toString('utf8')).toContain(RECEIPT);
+    expect(Buffer.byteLength(RECEIPT, 'utf8')).toBeLessThanOrEqual(256);
+    // The stable prefix is byte-identical: the receipt is the last (volatile)
+    // message, never inside tools/charter/heading/substrate/history.
+    const plainMessages = parse(serializeWire(plain))['messages'] as unknown[];
+    const openedMessages = parse(serializeWire(opened))['messages'] as unknown[];
+    expect(openedMessages.slice(0, -1)).toEqual(plainMessages);
+    expect(openedMessages.at(-1)).toEqual({ role: 'system', content: RECEIPT });
   });
 });

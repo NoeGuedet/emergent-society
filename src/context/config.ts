@@ -439,3 +439,83 @@ export function composeMemoryOffering(config: AgentConfig): AgentConfig {
   });
   return toJson({ ...config, tools }) as unknown as AgentConfig;
 }
+
+/**
+ * The modern wait description (wake v1): the park's three causes (a foreign
+ * commit, a conversation notice, the chosen timer), the cadence clause
+ * conditioned on the ACTUAL policy (a wake-0 cell must not imply a floor timer
+ * exists), the request facts the plan requires (no count/cost quota, the
+ * relative delay starts after parking, the last accepted wait selects the arm,
+ * infrastructure recovery may wake earlier), and the positive-cadence-only
+ * exclusion rule. It states request facts at this call, never a claim that the
+ * arm remains selected or that the timer caused a later turn.
+ */
+function modernWaitDescription(wake: WakePolicy): string {
+  const cadence = wake.heartbeatSeconds > 0
+    ? 'Host cadence is enabled; a bare park can wake on it.'
+    : 'Host cadence is disabled.';
+  const floor = wake.heartbeatSeconds > 0
+    ? ' A selected self-timer excludes the cadence floor timer for that park; cadence is an'
+      + ' opportunity, not a deadline.'
+    : '';
+  return 'End the turn and park until a foreign world commit lands (a commit you did not'
+    + ' author; your own commits never wake you), a conversation notice arrives, or a chosen'
+    + ` timer fires. Costs no tokens while parked. ${cadence}`
+    + ' Call it as {} to park with no self-timer, or with exactly one of until (an ISO-8601'
+    + ' instant, for example 2026-11-01T09:00:00Z) or after_seconds (an integer from 1 to'
+    + ' 604800): a relative delay starts after parking, not at this call. Nothing is queued:'
+    + ' the timer is physics, not a task. There is no timer count or cost quota. The last'
+    + ' accepted wait selects this park: a later accepted wait'
+    + ' replaces an earlier one, a bare wait clears it, and an invalid call does not replace'
+    + ' it. Existing infrastructure recovery can wake you earlier.'
+    + floor
+    + ' The next turn opens with a bounded patch view of the foreign commits since your last'
+    + ' wake — read that first.';
+}
+
+/** The modern wait schema: exactly the two timer forms; the parser enforces one. */
+function modernWaitParameters(): JsonValue {
+  return toJson({
+    type: 'object',
+    properties: {
+      until: { type: 'string', minLength: 1 },
+      after_seconds: { type: 'integer', minimum: 1, maximum: MAX_HEARTBEAT_SECONDS },
+    },
+    // Bare {} has zero properties; both timer keys are refused by the wire
+    // schema exactly as the parser refuses them.
+    maxProperties: 1,
+    additionalProperties: false,
+  });
+}
+
+/**
+ * Composes the modern wake offering (wake v1) at START composition: the wait
+ * tool advertises the modern contract (bare `{}`, an ISO `until`, or a relative
+ * `after_seconds`), the policy journals `wake` and no longer carries the legacy
+ * `wakeBudgetPerHour`, and every other policy field (memory gate, token
+ * trigger, budgets) is retained. Pure and idempotent: the wait tool's
+ * description/schema are replaced wholesale, so composing twice is the same as
+ * composing once, and the caller's config is never mutated (the validator
+ * returns a frozen canonical copy).
+ *
+ * This is the FRESH-composition only. A resume never recomposes (the journaled
+ * config wins), and an old parent's spawn keeps its legacy synthesis; a modern
+ * parent's child copies the effective policy verbatim (see the host's
+ * `composedChildConfig`). The old cost key stays accepted forever for cells
+ * that journaled it, and is never re-emitted here.
+ */
+export function composeWakeOffering(config: AgentConfig, wake: WakePolicy): AgentConfig {
+  const tools = config.tools.map((tool) => (tool.name === 'wait'
+    ? {
+        name: tool.name,
+        description: modernWaitDescription(wake),
+        parameters: modernWaitParameters(),
+      }
+    : tool));
+  const { wakeBudgetPerHour: _legacyBudget, ...policy } = config.policy;
+  return validateAgentConfig({
+    ...config,
+    tools,
+    policy: { ...policy, wake },
+  });
+}

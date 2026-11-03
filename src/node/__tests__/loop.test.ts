@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer';
 import { access, chmod, copyFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { NodeDriver, type TurnHandler } from '../driver.js';
+import { NodeDriver, type NodeDriverOptions, type TurnHandler } from '../driver.js';
 import { HeadWatcher } from '../watcher.js';
 import { WorldRepo, type WorldRange } from '../world.js';
 import { BlobStore } from '../../journal/index.js';
@@ -131,6 +131,16 @@ function statusResponse(status: number): TransportResult {
   return { status, headers: {}, complete: true, failure: null, body: new Uint8Array() };
 }
 
+/** The provider's structured context-window refusal (the overflow path). */
+function contextExceeded(): TransportResult {
+  return {
+    status: 400, headers: {}, complete: true, failure: null,
+    body: Buffer.from(JSON.stringify({
+      error: { code: 'context_length_exceeded', message: 'over the window' },
+    })),
+  };
+}
+
 function execute(id: string, cmd: string): FunctionCall {
   return { id, type: 'function', function: { name: 'execute', arguments: JSON.stringify({ cmd }) } };
 }
@@ -169,9 +179,12 @@ async function runtimeFor(
   });
 }
 
-function openRuntime(fx: WorldFixture, runtime: AgentRuntime): Promise<NodeDriver> {
+function openRuntime(
+  fx: WorldFixture, runtime: AgentRuntime, opts: NodeDriverOptions = {},
+): Promise<NodeDriver> {
   return openTestDriver(fx.home, 'n1', runtime.handler, fx.world, {
     knownTypes: C13_EVENT_TYPES, hooks: runtime.hooks, worldPollMs: 0, batchWindowMs: 10000,
+    ...opts,
   });
 }
 
@@ -1151,5 +1164,203 @@ describe('shell confinement wiring (C1.4c)', () => {
     expect(e2.isError).toBe(true);
     expect(e2.failure).toEqual({ code: 'spawn', status: null });
     expect(e2.content).toContain('spawn-failed');
+  }, 30000);
+});
+
+describe('the modern opening receipt and relative wait on the real loop', () => {
+  /** A modern config with the optional heartbeat and its old-cost-key control. */
+  function modernConfig(over: Partial<SeedPolicy> = {}): AgentConfig {
+    return configWith({
+      policy: { retryDelayMs: 1, wake: { heartbeatSeconds: 0 }, ...over },
+    });
+  }
+
+  const modernSeam = (): (() => { heartbeatSeconds: number }) => () => ({ heartbeatSeconds: 0 });
+
+  const waitAfter = (id: string, seconds: number): FunctionCall => ({
+    id, type: 'function',
+    function: { name: 'wait', arguments: JSON.stringify({ after_seconds: seconds }) },
+  });
+
+  function wire(body: Uint8Array): {
+    messages: Array<{ role: string; content: string | null }>;
+  } {
+    return JSON.parse(Buffer.from(body).toString('utf8')) as {
+      messages: Array<{ role: string; content: string | null }>;
+    };
+  }
+
+  it('renders one receipt on logical ordinal 0 only and never retains it as history', async () => {
+    const fx = fixture();
+    // Two logical requests in one turn: an execute group, then a no-call park.
+    const transport = new ScriptedTransport([
+      calling([execute('e1', 'true')]),
+      noCalls('done'),
+    ]);
+    const runtime = await runtimeFor(
+      fx, modernConfig({ stepsPerTurn: 2 }), transport,
+    );
+    const driver = await openRuntime(fx, runtime, { wakePolicy: modernSeam() });
+    const running = driver.run();
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'), { timeout: 15000 });
+    driver.stop();
+    await running;
+
+    expect(transport.sends).toHaveLength(2);
+    const first = wire(transport.sends[0]!);
+    const second = wire(transport.sends[1]!);
+    const receiptOf = (body: ReturnType<typeof wire>): string[] => body.messages
+      .filter((message) => message.role === 'system'
+        && typeof message.content === 'string'
+        && message.content.startsWith('Kernel turn receipt: '))
+      .map((message) => message.content as string);
+    const receipts = receiptOf(first);
+    expect(receipts).toHaveLength(1);
+    const start = (await eventsOf(fx)).find((event) => event.type === 'turn/start')!;
+    const started = start.data as unknown as { trigger: string };
+    expect(receipts[0]).toBe(
+      `Kernel turn receipt: opened_at=${new Date(start.time).toISOString()};`
+      + ` trigger=${started.trigger}; since_last_recorded_end_ms=unavailable.`);
+    // Ordinal 1 gets none, and the ordinal-0 line never entered history.
+    expect(receiptOf(second)).toEqual([]);
+    expect(JSON.stringify(second)).not.toContain('Kernel turn receipt:');
+  }, 30000);
+
+  it('renders a fresh receipt per turn, measuring from the preceding recorded end', async () => {
+    const fx = fixture();
+    const transport = new ScriptedTransport([noCalls('first'), noCalls('second')]);
+    const runtime = await runtimeFor(fx, modernConfig(), transport);
+    const driver = await openRuntime(fx, runtime, { wakePolicy: modernSeam() });
+    const running = driver.run();
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'), { timeout: 15000 });
+    // A foreign commit opens the second turn while parked.
+    await commitAs(fx.world, 'n2', { 'n2/hi.md': 'hi' });
+    await HeadWatcher.for(fx.world, 0).check();
+    await vi.waitFor(() => expect(transport.sends).toHaveLength(2), { timeout: 15000 });
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    driver.stop();
+    await running;
+
+    const events = await eventsOf(fx);
+    const turns = events.filter((event) => event.type === 'turn/start');
+    const closes = events.filter((event) => event.type === 'turn/end');
+    expect(turns).toHaveLength(2);
+    expect(closes).toHaveLength(2);
+    const receiptIn = (body: Uint8Array): string => {
+      const messages = wire(body).messages;
+      const found = messages.filter((message) => message.role === 'system'
+        && typeof message.content === 'string'
+        && message.content.startsWith('Kernel turn receipt: '));
+      expect(found).toHaveLength(1);
+      return found[0]!.content as string;
+    };
+    // The second turn's receipt is its own, not a cached copy of the first:
+    // opened_at is turn 1's envelope time and the elapsed is the recorded gap.
+    expect(receiptIn(transport.sends[1]!)).toBe(
+      `Kernel turn receipt: opened_at=${new Date(turns[1]!.time).toISOString()};`
+      + ` trigger=wakeup; since_last_recorded_end_ms=${turns[1]!.time - closes[0]!.time}.`);
+  }, 30000);
+
+  it('reuses the identical ordinal-0 receipt through a forced overflow resend', async () => {
+    const fx = fixture();
+    // Turn 0: one execute group. Turn 1 opens with the provider's structured
+    // context-window refusal; the overflow answer forces one maximal reduction
+    // and one resend of the SAME logical request.
+    const transport = new ScriptedTransport([
+      calling([execute('e1', 'true')]),
+      noCalls('done'),
+      contextExceeded(),
+      noCalls('after overflow'),
+    ]);
+    const runtime = await runtimeFor(fx, modernConfig(), transport);
+    const driver = await openRuntime(fx, runtime, { wakePolicy: modernSeam() });
+    const running = driver.run();
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'), { timeout: 15000 });
+    await commitAs(fx.world, 'n2', { 'n2/hi.md': 'hi' });
+    await HeadWatcher.for(fx.world, 0).check();
+    await vi.waitFor(() => expect(transport.sends).toHaveLength(4), { timeout: 15000 });
+    await vi.waitFor(() => expect(driver.state).toBe('waiting'));
+    driver.stop();
+    await running;
+
+    const receiptIn = (body: Uint8Array): string[] => wire(body).messages
+      .filter((message) => message.role === 'system'
+        && typeof message.content === 'string'
+        && message.content.startsWith('Kernel turn receipt: '))
+      .map((message) => message.content as string);
+    const firstTurn = receiptIn(transport.sends[2]!);
+    const resend = receiptIn(transport.sends[3]!);
+    expect(firstTurn).toHaveLength(1);
+    // One receipt per wire, the identical ordinal-0 receipt across the
+    // reassembly/resend; it never entered the compacted history.
+    expect(resend).toEqual(firstTurn);
+    expect(new Set([...firstTurn, ...resend]).size).toBe(1);
+    const events = await eventsOf(fx);
+    expect(events.filter((event) => event.type === 'turn/start')).toHaveLength(2);
+    // The overflow answer really reduced and resent: the second turn has two
+    // provider attempts and no error closer.
+    expect((events.filter((event) => event.type === 'turn/end').at(-1)?.data as
+      { outcome: string }).outcome).toBe('waiting');
+  }, 30000);
+
+  it('reuses the identical ordinal-0 receipt across an adapter retry and still carries the relative timer', async () => {
+    const fx = fixture();
+    const transport = new ScriptedTransport([
+      statusResponse(500),
+      calling([waitAfter('w1', 3)]),
+    ]);
+    const runtime = await runtimeFor(
+      fx, modernConfig({ maxAttempts: 2 }), transport,
+    );
+    const delays: number[] = [];
+    const driver = await openRuntime(fx, runtime, {
+      wakePolicy: modernSeam(),
+      schedule: (ms) => { delays.push(ms); return () => {}; },
+    });
+    const running = driver.run();
+    await vi.waitFor(() => expect(delays).toContain(3000), { timeout: 15000 });
+    driver.stop();
+    await running;
+
+    // One logical request, one serialized body reused byte-for-byte by the
+    // retry; the receipt is rendered once at run entry, not per attempt.
+    expect(transport.sends).toHaveLength(2);
+    expect(Buffer.from(transport.sends[0]!).equals(Buffer.from(transport.sends[1]!))).toBe(true);
+    const body = Buffer.from(transport.sends[1]!).toString('utf8');
+    expect(body.match(/Kernel turn receipt: /g)).toHaveLength(1);
+    // The RETRY + explicit timer succeeds; the relative duration reached the
+    // driver's actual park as exactly 3000 ms (not an absolute dispatch value).
+    const result = (await eventsOf(fx))
+      .filter((event) => event.type === 'tool/result')
+      .map((event) => (event.data as unknown as {
+        message: { content: string };
+      }).message.content);
+    expect(result[0]).toContain('Park requested: self-timer 3s after parking.');
+    expect(result[0]).toContain('Configured cadence: off.');
+    expect(delays).toContain(3000);
+  }, 30000);
+
+  it('carries a relative wait through a deliberately slow dispatch, still 3000 ms at park', async () => {
+    const fx = fixture();
+    const transport = new ScriptedTransport([
+      calling([
+        execute('e1', 'sleep 0.4'),
+        waitAfter('w1', 3),
+      ]),
+    ]);
+    const runtime = await runtimeFor(fx, modernConfig(), transport);
+    const delays: number[] = [];
+    const driver = await openRuntime(fx, runtime, {
+      wakePolicy: modernSeam(),
+      schedule: (ms) => { delays.push(ms); return () => {}; },
+    });
+    const running = driver.run();
+    await vi.waitFor(() => expect(delays).toContain(3000), { timeout: 20000 });
+    driver.stop();
+    await running;
+    // A timer anchored at dispatch would be ~2600 ms after the 0.4 s tool; the
+    // actual park anchor keeps the positive duration exactly.
+    expect(delays.filter((ms) => ms === 3000)).toHaveLength(1);
+    expect(delays.some((ms) => ms > 0 && ms < 3000)).toBe(false);
   }, 30000);
 });

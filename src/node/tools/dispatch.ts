@@ -49,18 +49,45 @@ export type DispatchResult = {
   readonly waited: boolean; readonly called: number;
   /** The requested timer wake, epoch ms, when `wait` carried an `until`. */
   readonly wakeAt?: number;
+  /**
+   * The requested RELATIVE timer duration in ms, when a modern `wait` carried
+   * `after_seconds`. It is carried as a duration, never precomputed into an
+   * absolute instant here: the driver anchors it at the ACTUAL park after the
+   * turn's commit and maintenance.
+   */
+  readonly wakeAfterMs?: number;
 };
 
 /** The furthest a `until` may reach: longer than this is not a turn, and the
  * driver's timer must stay inside the platform's delay range. */
 const MAX_WAIT_MS = 7 * 24 * 60 * 60 * 1000;
 
+/** The modern relative wait's domain, in whole seconds (the cadence domain). */
+const MAX_WAIT_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * The exact modern request receipts (wake v1): a per-call REQUEST fact — the
+ * timer this call asked for and the configured cadence — never a claim that
+ * the arm stays selected, that a turn will happen, or that a deadline will be
+ * met. The common suffix is ASCII and the whole line is bounded well below the
+ * plan's 256-byte receipt ceiling. The cadence clause is selected from the
+ * effective policy: `on` iff `heartbeatSeconds > 0`, `off` for wake 0.
+ */
+const WAIT_RECEIPT_SUFFIX = (cadenceOn: boolean): string =>
+  ` Configured cadence: ${cadenceOn ? 'on' : 'off'}.`
+  + ' Foreign commits or conversation notices can wake you.'
+  + ' Last accepted wait selects this park; resume supersedes volatile timers.';
+
 /** An ISO-8601 instant: a date-time with seconds and an explicit zone. */
 const ISO_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 
 type Decision =
   | { readonly kind: 'execute'; readonly cmd: string }
-  | { readonly kind: 'wait'; readonly until?: number }
+  | {
+      readonly kind: 'wait'; readonly until?: number;
+      /** A modern relative wait's whole-second duration, anchored at park. */
+      readonly afterSeconds?: number;
+    }
   | { readonly kind: 'web_search'; readonly query: string;
       readonly maxResults: number | undefined }
   | { readonly kind: 'web_fetch'; readonly url: string }
@@ -144,14 +171,36 @@ function decide(call: FunctionCall, config: AgentConfig, now: () => number): Dec
   }
 
   if (name === 'wait') {
-    // `{}` parks until a foreign commit; `{until}` also arms a timer. The
-    // instant is strict ISO-8601, at least one second ahead (an immediate
-    // re-wake would spin) and at most seven days out (the timer is not a
-    // calendar and must not overflow the platform delay).
-    const keys = Object.keys(parsed);
-    if (keys.length === 0) return { kind: 'wait' };
-    if (keys.length !== 1 || keys[0] !== 'until') {
-      return invalidDetail('wait takes {} or {until} — call it as {} to end the turn');
+    // The modern branch is selected by the effective journaled policy's
+    // PRESENCE (same marker as the driver/composition), even at heartbeat 0 and
+    // even when an externally supplied config also carries the old cost key.
+    // Legacy keeps its exact schema/parser/refusal forever.
+    if (config.policy.wake !== undefined) {
+      const keys = Object.keys(parsed);
+      if (keys.length === 0) return { kind: 'wait' };
+      if (keys.length !== 1
+        || (keys[0] !== 'until' && keys[0] !== 'after_seconds')) {
+        return invalidDetail(
+          'wait takes {} or exactly one of until and after_seconds'
+          + ' — call it as {} to end the turn with no self-timer');
+      }
+      if (keys[0] === 'after_seconds') {
+        const after = parsed['after_seconds'];
+        if (typeof after !== 'number' || !Number.isSafeInteger(after)
+          || after < 1 || after > MAX_WAIT_SECONDS) {
+          return invalidDetail(`after_seconds must be an integer from 1 to ${MAX_WAIT_SECONDS}`);
+        }
+        return { kind: 'wait', afterSeconds: after };
+      }
+    } else {
+      // Legacy: `{}` parks until a foreign commit; `{until}` also arms a timer.
+      // The exact frozen shape — after_seconds is refused, and the teaching
+      // sentence keeps its published prefix.
+      const keys = Object.keys(parsed);
+      if (keys.length === 0) return { kind: 'wait' };
+      if (keys.length !== 1 || keys[0] !== 'until') {
+        return invalidDetail('wait takes {} or {until} — call it as {} to end the turn');
+      }
     }
     const until = parsed['until'];
     if (typeof until !== 'string' || !ISO_INSTANT_RE.test(until)) {
@@ -492,15 +541,37 @@ function appendErrorResult(
   });
 }
 
-function appendWaitResult(gate: BoundaryGate, id: RequestId, callId: string): void {
+function appendWaitResult(
+  gate: BoundaryGate, id: RequestId, callId: string, content: string,
+): void {
   gate.append('tool/result', {
     turn: id.turn, request: id, callId,
     message: {
-      role: 'tool', content: 'Waiting until a foreign world commit', tool_call_id: callId,
+      role: 'tool', content, tool_call_id: callId,
     },
     isError: false, raw: null, failure: null, synthetic: false,
     frontierCall: null,
   });
+}
+
+/** The legacy wait receipt, byte-frozen. */
+const LEGACY_WAIT_RESULT = 'Waiting until a foreign world commit';
+
+/**
+ * The exact modern request receipt for one accepted wait call: the form this
+ * call asked for, normalized from validated values only, plus the cadence
+ * fact. It is a request fact (the timer this call selected), not a future
+ * success/arm/deadline claim; a later accepted wait can replace the arm.
+ */
+function modernWaitReceipt(
+  decision: Extract<Decision, { kind: 'wait' }>, cadenceOn: boolean,
+): string {
+  const prefix = decision.until !== undefined
+    ? `Park requested: self-timer at ${new Date(decision.until).toISOString()}.`
+    : decision.afterSeconds !== undefined
+      ? `Park requested: self-timer ${decision.afterSeconds}s after parking.`
+      : 'Park requested: no self-timer.';
+  return `${prefix}${WAIT_RECEIPT_SUFFIX(cadenceOn)}`;
 }
 
 /**
@@ -639,6 +710,12 @@ export async function dispatchCalls(
   let called = 0;
   let waited = false;
   let wakeAt: number | undefined;
+  let wakeAfterMs: number | undefined;
+  // The modern marker is the effective journaled policy's presence (same marker
+  // as the driver/composition). Cadence `on` is a positive heartbeat; wake 0 is
+  // modern but cadence-off, and the receipt says so.
+  const modern = config.policy.wake !== undefined;
+  const cadenceOn = modern && (config.policy.wake?.heartbeatSeconds ?? 0) > 0;
 
   for (let i = 0; i < calls.length; i++) {
     const call = calls[i]!;
@@ -702,8 +779,28 @@ export async function dispatchCalls(
     }
     if (decision.kind === 'wait') {
       waited = true;
-      if (decision.until !== undefined) wakeAt = decision.until;
-      appendWaitResult(gate, id, call.id);
+      if (modern) {
+        // ONE selected arm, the LAST accepted wait in this response: a bare wait
+        // clears an earlier arm; until clears the relative field and
+        // after_seconds clears the absolute field. An invalid later call never
+        // reaches this branch, so it never replaces the selection.
+        if (decision.until !== undefined) {
+          wakeAt = decision.until;
+          wakeAfterMs = undefined;
+        } else if (decision.afterSeconds !== undefined) {
+          wakeAfterMs = decision.afterSeconds * 1000;
+          wakeAt = undefined;
+        } else {
+          wakeAt = undefined;
+          wakeAfterMs = undefined;
+        }
+        appendWaitResult(gate, id, call.id, modernWaitReceipt(decision, cadenceOn));
+      } else {
+        // Legacy: the last accepted until wins, and a bare wait does NOT clear
+        // an earlier until (the frozen behavior).
+        if (decision.until !== undefined) wakeAt = decision.until;
+        appendWaitResult(gate, id, call.id, LEGACY_WAIT_RESULT);
+      }
       await gate.flush();
       continue;
     }
@@ -737,5 +834,9 @@ export async function dispatchCalls(
     await gate.flush();
   }
 
-  return { waited, called, ...(wakeAt !== undefined ? { wakeAt } : {}) };
+  return {
+    waited, called,
+    ...(wakeAt !== undefined ? { wakeAt } : {}),
+    ...(wakeAfterMs !== undefined ? { wakeAfterMs } : {}),
+  };
 }

@@ -1479,3 +1479,169 @@ describe('dispatchCalls: the history verb', () => {
     }
   }, 15000);
 });
+
+describe('dispatchCalls: modern wait (wake v1)', () => {
+  /** A factory config with the modern marker present (and optionally the old key). */
+  function modernConfig(heartbeatSeconds: number, wakeBudgetPerHour?: number): AgentConfig {
+    const b = defaultAgentConfig();
+    return {
+      ...b,
+      policy: {
+        ...b.policy,
+        wake: { heartbeatSeconds },
+        ...(wakeBudgetPerHour !== undefined ? { wakeBudgetPerHour } : {}),
+      },
+    } as AgentConfig;
+  }
+
+  const suffix = (on: boolean): string =>
+    ` Configured cadence: ${on ? 'on' : 'off'}.`
+    + ' Foreign commits or conversation notices can wake you.'
+    + ' Last accepted wait selects this park; resume supersedes volatile timers.';
+
+  const NOW = 1_800_000_000_000;
+
+  async function runWait(
+    argsList: readonly unknown[], config: AgentConfig, now = (): number => NOW,
+  ): Promise<{ result: Awaited<ReturnType<typeof dispatchCalls>>; results: ResultData[] }> {
+    const { home } = world();
+    const s = await openSession(home);
+    try {
+      const calls = argsList.map((args, index) =>
+        call(`w${index}`, 'wait', JSON.stringify(args)));
+      const result = await dispatchCalls(
+        projection(calls), ID, s.gate('turn', 0), config, neverTerminal,
+        undefined, undefined, now,
+      );
+      const durable = await events(home);
+      const all = ofType(durable, 'tool/result').map((e) => e.data as unknown as ResultData);
+      // The session's home/log is shared across calls in one test: return only
+      // this dispatch's results (one per advertised call).
+      return { result, results: all.slice(-calls.length) };
+    } finally {
+      await s.shutdown();
+    }
+  }
+
+  it.each([
+    [0, {}, 'Park requested: no self-timer.', false],
+    [0, { after_seconds: 3 }, 'Park requested: self-timer 3s after parking.', false],
+    [0, { until: new Date(NOW + 60_000).toISOString() },
+      `Park requested: self-timer at ${new Date(NOW + 60_000).toISOString()}.`, false],
+    [1, {}, 'Park requested: no self-timer.', true],
+    [1, { after_seconds: 3 }, 'Park requested: self-timer 3s after parking.', true],
+    [1, { until: new Date(NOW + 60_000).toISOString() },
+      `Park requested: self-timer at ${new Date(NOW + 60_000).toISOString()}.`, true],
+  ] as const)(
+    'wake %i cadence: %j gets the exact request receipt (six mode/form cases)',
+    async (heartbeatSeconds, args, prefix, on) => {
+      const config = modernConfig(heartbeatSeconds);
+      const { result, results } = await runWait([args], config);
+      expect(result).toMatchObject({ waited: true, called: 1 });
+      if ('after_seconds' in args) expect(result.wakeAfterMs).toBe(3000);
+      if ('until' in args) expect(result.wakeAt).toBe(NOW + 60_000);
+      if (!('after_seconds' in args) && !('until' in args)) {
+        expect('wakeAt' in result).toBe(false);
+        expect('wakeAfterMs' in result).toBe(false);
+      }
+      const content = results[0]!.message.content;
+      expect(content).toBe(prefix + suffix(on));
+      // ASCII and the plan's 256-byte ceiling.
+      expect(/^[\x20-\x7e]+$/.test(content)).toBe(true);
+      expect(Buffer.byteLength(content, 'utf8')).toBeLessThanOrEqual(256);
+    },
+  );
+
+  it.each([
+    [1, 1000],
+    [604800, 604800000],
+  ] as const)('accepts the after_seconds boundary %i s and carries %i ms', async (seconds, ms) => {
+    const { result, results } = await runWait([{ after_seconds: seconds }], modernConfig(1));
+    expect(result).toEqual({ waited: true, called: 1, wakeAfterMs: ms });
+    expect(results[0]!.message.content)
+      .toBe(`Park requested: self-timer ${seconds}s after parking.${suffix(true)}`);
+  });
+
+  it('the LAST accepted wait selects one arm; until and after_seconds clear each other', async () => {
+    const config = modernConfig(1);
+    const iso = new Date(NOW + 60_000).toISOString();
+    const relativeThenAbsolute = await runWait(
+      [{ after_seconds: 3 }, { until: iso }], config);
+    expect(relativeThenAbsolute.result).toEqual({ waited: true, called: 2, wakeAt: NOW + 60_000 });
+    expect(relativeThenAbsolute.results.map((r) => r.message.content)).toEqual([
+      `Park requested: self-timer 3s after parking.${suffix(true)}`,
+      `Park requested: self-timer at ${iso}.${suffix(true)}`,
+    ]);
+    const absoluteThenRelative = await runWait(
+      [{ until: iso }, { after_seconds: 4 }], config);
+    expect(absoluteThenRelative.result).toEqual({ waited: true, called: 2, wakeAfterMs: 4000 });
+  });
+
+  it('a bare last wait clears the modern arm', async () => {
+    const cleared = await runWait([{ after_seconds: 3 }, {}], modernConfig(0));
+    expect(cleared.result).toEqual({ waited: true, called: 2 });
+    expect(cleared.results[1]!.message.content)
+      .toBe(`Park requested: no self-timer.${suffix(false)}`);
+  });
+
+  it('legacy bare wait preserves an earlier until (the frozen last-until rule)', async () => {
+    // The legacy arm is byte-frozen: bare does NOT clear an earlier until.
+    const legacy = await runWait(
+      [{ until: new Date(NOW + 60_000).toISOString() }, {}], config());
+    expect(legacy.result).toEqual({ waited: true, called: 2, wakeAt: NOW + 60_000 });
+    expect(legacy.results.map((r) => r.message.content))
+      .toEqual(['Waiting until a foreign world commit', 'Waiting until a foreign world commit']);
+  });
+
+  it('an invalid later wait does not replace the selected arm, and teaches', async () => {
+    const config = modernConfig(1);
+    const { result, results } = await runWait(
+      [{ after_seconds: 3 }, { after_seconds: 0 }], config);
+    expect(result).toEqual({ waited: true, called: 2, wakeAfterMs: 3000 });
+    expect(results[0]!.message.content)
+      .toBe(`Park requested: self-timer 3s after parking.${suffix(true)}`);
+    expect(results[1]!.isError).toBe(true);
+    expect(results[1]!.failure).toEqual({ code: 'invalid-tool', status: null });
+    expect(results[1]!.message.content)
+      .toContain('after_seconds must be an integer from 1 to 604800');
+  });
+
+  it('refuses both timer keys, unknown keys, and the whole after_seconds domain', async () => {
+    const config = modernConfig(0);
+    const cases: Array<[unknown, string]> = [
+      [{ until: new Date(NOW + 60_000).toISOString(), after_seconds: 3 },
+        'wait takes {} or exactly one of until and after_seconds'],
+      [{ ms: 1 }, 'wait takes {} or exactly one of until and after_seconds'],
+      [{ after_seconds: 0 }, 'after_seconds must be an integer from 1 to 604800'],
+      [{ after_seconds: 604801 }, 'after_seconds must be an integer from 1 to 604800'],
+      [{ after_seconds: 1.5 }, 'after_seconds must be an integer from 1 to 604800'],
+      [{ after_seconds: '3' }, 'after_seconds must be an integer from 1 to 604800'],
+      [{ after_seconds: null }, 'after_seconds must be an integer from 1 to 604800'],
+    ];
+    for (const [args, want] of cases) {
+      const { result, results } = await runWait([args], config);
+      // An invalid wait call is a refused tool call, not an accepted park.
+      expect(result).toEqual({ waited: false, called: 1 });
+      expect(results[0]!.isError).toBe(true);
+      expect(results[0]!.failure).toEqual({ code: 'invalid-tool', status: null });
+      expect(results[0]!.message.content).toContain(want);
+    }
+  });
+
+  it('legacy still refuses after_seconds and keeps its exact receipt', async () => {
+    const { result, results } = await runWait([{ after_seconds: 3 }], config());
+    expect(result).toEqual({ waited: false, called: 1 });
+    expect(results[0]!.isError).toBe(true);
+    expect(results[0]!.message.content).toContain('wait takes {} or {until}');
+  });
+
+  it('a modern config carrying both policy keys has modern semantics (no old-quota gate)', async () => {
+    // The old key is present and zero: a modern after_seconds wait is accepted,
+    // the receipt says cadence-off for wake 0, and no legacy refusal appears.
+    const { result, results } = await runWait([{ after_seconds: 3 }],
+      modernConfig(0, 0));
+    expect(result).toEqual({ waited: true, called: 1, wakeAfterMs: 3000 });
+    expect(results[0]!.message.content)
+      .toBe(`Park requested: self-timer 3s after parking.${suffix(false)}`);
+  });
+});

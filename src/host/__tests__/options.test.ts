@@ -225,3 +225,45 @@ it('parses direct: the reply default, then the strict flag combinations', () => 
     expect(() => parseHostCommand(argv)).toThrow(UsageError);
   }
 });
+
+it('parses the start-only --heartbeat-seconds domain, solo and nodes-file', () => {
+  for (const seconds of [0, 1, 3600, 604800]) {
+    expect(parseHostCommand([
+      'start', '--home', '/x', '--model', 'm', '--heading', 'h',
+      '--heartbeat-seconds', String(seconds),
+    ])).toMatchObject({ command: 'start', heartbeatSeconds: seconds });
+  }
+  // Home-level: the nodes-file boot takes the same start-only value.
+  expect(parseHostCommand([
+    'start', '--home', '/x', '--nodes-file', '/tmp/nodes.json',
+    '--heartbeat-seconds', '3600',
+  ])).toEqual({
+    command: 'start', home: '/x', uid: 'node-0', noSandbox: false,
+    nodesFile: '/tmp/nodes.json', heartbeatSeconds: 3600,
+  });
+  // Absent stays absent at the parser (the host composes wake 0).
+  expect('heartbeatSeconds' in parseHostCommand([
+    'start', '--home', '/x', '--model', 'm', '--heading', 'h',
+  ])).toBe(false);
+  for (const argv of [
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--heartbeat-seconds'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--heartbeat-seconds='],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--heartbeat-seconds', '-1'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--heartbeat-seconds', '1.5'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--heartbeat-seconds', 'abc'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--heartbeat-seconds', '604801'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h',
+      '--heartbeat-seconds', '999999999999999999999999'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--heartbeat-seconds', ' 1'],
+    // The flag belongs to start only: the parser refuses it on every other
+    // command (resume included — the journaled policy wins).
+    ['resume', '--home', '/x', '--heartbeat-seconds', '1'],
+    ['pause', '--home', '/x', '--heartbeat-seconds', '1'],
+    ['status', '--home', '/x', '--heartbeat-seconds', '1'],
+    ['init', '--home', '/x', '--heartbeat-seconds', '1'],
+  ]) {
+    expect(() => parseHostCommand(argv)).toThrow(UsageError);
+  }
+  expect(USAGE).toContain('--heartbeat-seconds N');
+  expect(USAGE).toContain('start-only');
+});

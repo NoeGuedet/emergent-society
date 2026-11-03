@@ -28,7 +28,7 @@ Everything else is either the expected emergence (structure, roles, process) or 
 - **The frontier journal is the only truth.** Everything else — dashboards, metrics, agent memory, the per-node local log — is a disposable projection or a cold-start artifact; the world's git history is the second observation surface.
 - **Metrics are invisible to the agents** (anti-Goodhart). Instrumentation lives outside the graph.
 - **Fidelity is measured on acts, never on declarations.**
-- **Autonomy is not a kernel concept.** The implemented physics is the frontier journal and the filesystem-confinement boundary. The kill switch is specified, not implemented; the budget ceiling is an upstream property of the API key, not a kernel mechanism. Graduation, if it exists, emerges as a request from agent zero through the chat.
+- **Autonomy is not a kernel concept.** The implemented physics is the frontier journal and the filesystem-confinement boundary. The kill switch is specified, not implemented; an operator MAY set an upstream ceiling on an API key, but it is optional deployment policy, not a kernel mechanism or a prerequisite (a local GPU or sponsored credits needs none). Graduation, if it exists, emerges as a request from agent zero through the chat.
 - **Operating live is the concept.** The kernel exists for it; the mirror/fork/benchmark is a development methodology, not a law of the kernel.
 
 ## 4. What is measured: viability, not performance

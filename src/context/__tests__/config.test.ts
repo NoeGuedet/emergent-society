@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  DEFAULT_CHARTER_AUTHORED, composeMemoryOffering, defaultAgentConfig, validateAgentConfig,
+  DEFAULT_CHARTER_AUTHORED, composeMemoryOffering, composeWakeOffering, defaultAgentConfig,
+  validateAgentConfig,
 } from '../config.js';
 import { validateProviderParameters } from '../parameters.js';
 import type { SeedPolicy } from '../contracts.js';
@@ -442,5 +443,75 @@ describe('the memory gate policy (A5)', () => {
     expect(DEFAULT_CHARTER_AUTHORED).toContain('whatever you have not put outside it is lost');
     expect(DEFAULT_CHARTER_AUTHORED).toContain('runtime-only reprieve, never a durable record');
     expect(DEFAULT_CHARTER_AUTHORED).toContain('The heading is the boot seed');
+  });
+});
+
+describe('composeWakeOffering (wake v1 fresh composition)', () => {
+  const waitOf = (config: ReturnType<typeof defaultAgentConfig>) => {
+    const tool = config.tools.find((candidate) => candidate.name === 'wait');
+    if (tool === undefined) throw new Error('expected the wait tool');
+    return tool;
+  };
+  const waitProps = (config: ReturnType<typeof defaultAgentConfig>): string[] =>
+    Object.keys((waitOf(config).parameters as unknown as {
+      properties: Record<string, unknown>;
+    }).properties).sort();
+
+  it('adds wake, omits the old cost key, patches only wait, and keeps the rest', () => {
+    const factory = validateAgentConfig(withPolicy({
+      memory: { remember: true, messages: false },
+    }));
+    const before = JSON.stringify(factory);
+    const modern = composeWakeOffering(factory, { heartbeatSeconds: 0 });
+    // Nonmutating: the caller's config is untouched.
+    expect(JSON.stringify(factory)).toBe(before);
+    // The policy: the modern marker present even at 0, the old key gone, every
+    // other field — memory gate and token trigger included — retained.
+    expect(modern.policy.wake).toEqual({ heartbeatSeconds: 0 });
+    expect('wakeBudgetPerHour' in modern.policy).toBe(false);
+    const { wakeBudgetPerHour: _old, wake: _wake, ...rest } = factory.policy;
+    const { wake: _new, ...modernRest } = modern.policy;
+    expect(modernRest).toEqual(rest);
+    // Only the wait tool moved; the frozen extend description/enum and every
+    // other tool are byte-identical.
+    const other = (config: ReturnType<typeof defaultAgentConfig>) => config.tools
+      .filter((tool) => tool.name !== 'wait');
+    expect(other(modern)).toEqual(other(factory));
+    // The modern schema advertises after_seconds and until only, bare {} is
+    // admitted by the absent required list, and no other key is allowed.
+    expect(waitProps(modern)).toEqual(['after_seconds', 'until']);
+    const modernParameters = waitOf(modern).parameters as unknown as {
+      additionalProperties: boolean; required?: unknown; maxProperties?: number;
+      properties: { after_seconds: { maximum: number; minimum: number } };
+    };
+    expect(modernParameters.additionalProperties).toBe(false);
+    expect(modernParameters.required).toBeUndefined();
+    // Bare {} (0 properties) is admitted; both timer keys are not.
+    expect(modernParameters.maxProperties).toBe(1);
+    expect(modernParameters.properties.after_seconds.minimum).toBe(1);
+    expect(modernParameters.properties.after_seconds.maximum).toBe(604800);
+    // The description is policy-conditioned: wake 0 says cadence is disabled,
+    // states the quota-free request facts, and must NOT imply a floor timer.
+    expect(waitOf(modern).description).toContain('Host cadence is disabled.');
+    expect(waitOf(modern).description).not.toContain('cadence is enabled');
+    expect(waitOf(modern).description).not.toContain('floor timer');
+    expect(waitOf(modern).description).toContain('There is no timer count or cost quota.');
+    expect(waitOf(modern).description)
+      .toContain('a relative delay starts after parking, not at this call');
+    expect(waitOf(modern).description)
+      .toContain('The last accepted wait selects this park');
+    expect(waitOf(modern).description).toContain('recovery can wake you earlier');
+    // A positive cadence adds the exact enabled clause and the floor-exclusion
+    // rule, and is idempotent for the same policy.
+    const active = composeWakeOffering(factory, { heartbeatSeconds: 3600 });
+    expect(active.policy.wake).toEqual({ heartbeatSeconds: 3600 });
+    expect(waitOf(active).description)
+      .toContain('Host cadence is enabled; a bare park can wake on it.');
+    expect(waitOf(active).description)
+      .toContain('A selected self-timer excludes the cadence floor timer for that park');
+    expect(composeWakeOffering(active, { heartbeatSeconds: 3600 })).toEqual(active);
+    // The input was validated and frozen.
+    expect(Object.isFrozen(modern)).toBe(true);
+    expect(() => { (modern.policy as { wake?: unknown }).wake = null; }).toThrow();
   });
 });

@@ -15,7 +15,7 @@ machine default shell may be older, always select 24 via nvm first.
 
 - `init --home <abs-dir>` — create the cell home; prints the real `providers.json` path and a
   0600-mode hint, never writes the file.
-- `start --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--memory-remember] [--no-sandbox]` —
+- `start --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--heartbeat-seconds N] [--memory-remember] [--no-sandbox]` —
   boot and run a node; Landlock confinement is the default, `--no-sandbox` is the explicit
   opt-out; `--charter-file` is the base of the composed charter on a start into a cell with no
   journaled configuration (its content is journaled as configuration; the kernel appends the
@@ -34,7 +34,20 @@ machine default shell may be older, always select 24 via nvm first.
   extend offering; without it the factory notice-only arm stands, and `resume` refuses the flag
   (the journaled config wins). A node spawned by a gated parent inherits the journaled `memory`
   policy and the composed offering (attenuation inherits, never widens).
-- `start --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--memory-remember] [--no-sandbox]` — boot a declared
+  `--heartbeat-seconds N` is the start-only wake cadence (home-level; a `--nodes-file` boot
+  takes it for every entry): a strict decimal integer `0..604800` seconds, absent `0`. A fresh
+  start journals `policy.wake {heartbeatSeconds}` into every composed node, so the cell is
+  MODERN: the wait surface accepts `{}`, `{until}` or `{after_seconds}` (the relative delay
+  starts at the actual park), explicit timers carry no sliding-hour count or cost quota, and a
+  positive value wakes a parked node on its per-uid wall-clock grid (missed slots are skipped,
+  never replayed). Wake `0` disables only the cadence; modern quota-free self-wakes stay on. A
+  `resume` refuses the flag and recomposes nothing — the journaled policy wins — and a spawned
+  child inherits the parent's policy exactly (a modern child stays modern, including wake `0`;
+  an old parent's child keeps the legacy `wakeBudgetPerHour` synthesis). Cells journaled
+  without `policy.wake` remain legacy forever: their `{until}`-only wait form, optional
+  `wakeBudgetPerHour` (absent reads `12`) and fire-time refusal are retained, with no
+  migration. Fresh compositions never emit the old cost key.
+- `start --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--heartbeat-seconds N] [--memory-remember] [--no-sandbox]` — boot a declared
   node set on one home: a strict JSON array of at most 16 `{uid, model, heading,
   charterFile?, spawn?}` entries with unique uids, read at the config gate (exit 2
   on a malformed file). `spawn: true` declares the kernel's spawn capability for
@@ -44,8 +57,8 @@ machine default shell may be older, always select 24 via nvm first.
   journal. `--nodes-file` replaces `--uid`/`--model`/`--heading`/`--charter-file`.
 - `resume --home <abs-dir> [--uid node-0] [--no-sandbox]` — resume a parked node;
   `--model`/`--heading`/`--charter-file` are refused as unknown flags, and so are
-  `--gateway-charter`/`--gateway-model` and `--memory-remember` — the persisted configuration
-  wins.
+  `--gateway-charter`/`--gateway-model`, `--heartbeat-seconds` and `--memory-remember` — the
+  persisted configuration wins.
 - `resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]` — resume a
   declared node set; entries declare only `uid` and `spawn` (the journaled config
   wins for everything else).
@@ -181,6 +194,14 @@ real-system acceptance for the refusal, fence and delegated-reap mechanisms:
 2. `node scripts/w0-fence-smoke.mjs` — C2: the commit fence against a real cgroup tree.
 3. `node scripts/w0-reap-smoke.mjs` — W0-a2: the delegated launch reaps the cell cgroup,
    and a pause through the wrapper stops the host.
+
+The wake-policy acceptance is the fourth compiled smoke (no live key, no new dependency):
+`node scripts/wake-policy-smoke.mjs` boots the real built CLI and host with
+`--heartbeat-seconds 1` against a local scripted OpenAI-compatible loopback provider, then
+asserts a cadence turn on a quiet world, an explicit `after_seconds` timer anchored at the
+actual park (a slow tool cannot shorten it), clean pause/resume without a missed-slot burst,
+the journaled modern policy/offering, and the ordinal-0 opening receipt. It has no skip path
+and makes no phase, phase-upper-bound or live-inference claim.
 
 Prerequisites and skip semantics: the refusal smoke runs every host with `--no-sandbox`
 (no cgroup tree, no systemd) and needs node, git and util-linux `flock` (the journal

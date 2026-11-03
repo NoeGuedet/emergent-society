@@ -49,6 +49,16 @@ export type AssembleInput = {
    * pending or not. Absent means no pending notice.
    */
   readonly notice?: string;
+  /**
+   * The modern opening receipt, rendered ONCE at run entry (wake v1) and
+   * supplied only for the turn's logical request ordinal 0. It rides the
+   * VOLATILE queue after a first-use world perception and before the
+   * conversation notice, as a kernel-written system line. It is host state (a
+   * physical request fact), not journaled state: no source list entry, no
+   * stateHash change, no stable-prefix movement. Absent for ordinal 1+, legacy
+   * cells and the gateway overlay.
+   */
+  readonly opening?: string;
 };
 
 /**
@@ -130,6 +140,13 @@ export function assemble(input: AssembleInput): RequestPlan {
     }
     history.push(...open.messages);
     historySources.push(...open.sources);
+  }
+  // The opening receipt rides the open-turn queue AFTER a first-use world
+  // perception and BEFORE the conversation notice, so the model reads the
+  // physical facts and then the interface's notification. It is host state, not
+  // journaled state: no source, never in stateHash or the stable prefix.
+  if (input.opening !== undefined) {
+    queue.push({ role: 'system', content: input.opening });
   }
   // The conversation notice rides the open-turn queue: post-breakpoint and
   // volatile, so a new message never invalidates the cached prefix.

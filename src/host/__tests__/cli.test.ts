@@ -124,6 +124,32 @@ it('dispatches start with the resolved sandbox, no undefined optional fields, an
     .toEqual(['host/boot']);
 });
 
+it('dispatches --heartbeat-seconds on start only, never on resume', async () => {
+  const captured: HostOptions[] = [];
+  const d = {
+    ...deps,
+    startHost: (o: HostOptions) => {
+      captured.push(o);
+      return { stop() {}, done: Promise.resolve(0) };
+    },
+  };
+  expect(await runCli([
+    'start', '--home', '/x', '--model', 'm', '--heading', 'h', '--heartbeat-seconds', '3600',
+  ], d)).toBe(0);
+  expect(captured[0]!.heartbeatSeconds).toBe(3600);
+  // Absent stays absent (the host composes wake 0).
+  expect(await runCli(['start', '--home', '/x', '--model', 'm', '--heading', 'h'], d)).toBe(0);
+  expect('heartbeatSeconds' in captured[1]!).toBe(false);
+  expect(await runCli(['resume', '--home', '/x'], d)).toBe(0);
+  expect('heartbeatSeconds' in captured[2]!).toBe(false);
+  // The CLI parser never calls startHost for an invalid value.
+  const before = captured.length;
+  expect(await runCli([
+    'start', '--home', '/x', '--model', 'm', '--heading', 'h', '--heartbeat-seconds', '1.5',
+  ], d)).toBe(2);
+  expect(captured).toHaveLength(before);
+});
+
 it('dispatches resume without model/heading keys', async () => {
   const captured: HostOptions[] = [];
   const d = {
