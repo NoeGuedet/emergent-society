@@ -4,7 +4,14 @@ A research harness for observing the emergence of multi-agent LLM societies — 
 
 ## Current state
 
-Implementation phase; no product. The journal module, node driver, context and provider boundary, web tools, persistent terminal, Landlock confinement, and frontier journal are implemented and tested, with a host layer driving them (seven-command CLI, including the interactive `chat` session and the human's two `direct` acts — the batch chat reply and the world ratification; first-light smoke, live wrapper). The live path is verified (see the [Roadmap](ROADMAP.md)); live runs are gated by `ES_LIVE_LLM=1` via `scripts/first-light-live.mjs`. Progress and remaining checkpoints live in the [Roadmap](ROADMAP.md); the current-code map in [Architecture](docs/architecture.md).
+Implementation phase; no product. The engine (kernel, host, seven-command CLI, gateway
+overlay, Package layer) exists; status, checkpoints and limits live only in the
+[Roadmap](ROADMAP.md). A zero-context session starts with [docs/resuming.md](docs/resuming.md)
+— the procedural reading map, code ownership and a safe fresh-home run. The operator surface
+is the CLI and the kernel-owned logs; features that do not exist are listed in
+[AGENTS.md](AGENTS.md) and the [Roadmap](ROADMAP.md).
+`ES_LIVE_LLM=1` gates only [first-light-live.mjs](scripts/first-light-live.mjs); `npm start`,
+the compiled smokes and the fresh-home flow are not gated by it.
 
 ## Documents
 
@@ -19,13 +26,14 @@ Implementation phase; no product. The journal module, node driver, context and p
 | [Substrate](docs/substrate.md) | The substrate as a treatment (design challenge) |
 | [AGENTS.md](AGENTS.md) | Commands and conventions |
 | [Roadmap](ROADMAP.md) | Progress, checkpoints |
+| [Resuming](docs/resuming.md) | Zero-context reading map and safe fresh-home run |
 | [SOTA survey](docs/research/sota-autonomous-agents.md) | State of the art |
 | [Harness deep-dive](docs/research/harness-deep-dive.md) | DeepSeek Harness internals |
 | [Devil's advocate](docs/research/devils-advocate.md) | Counter-evidence |
 | [Value measurement](docs/research/value-measurement-long-horizon.md) | Long-horizon value metrology |
 | [Exploration/exploitation](docs/research/exploration-exploitation-metrics.md) | Metric catalogue |
 | [Value–adaptation coupling](docs/research/value-adaptation-coupling.md) | Adaptation vs drift |
-| [Monitoring architecture](docs/research/monitoring-architecture.md) | Observation pipeline |
+| [Monitoring architecture](docs/research/monitoring-architecture.md) | Observation pipeline (design) |
 | [Tool surface](docs/research/tool-surface.md) | Dynamic-tool arbitration + measurement gap |
 | [First light](docs/first-light.md) | Founding run record |
 

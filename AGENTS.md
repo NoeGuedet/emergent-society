@@ -11,6 +11,15 @@ two — `@lydell/node-pty` and
 `canonicalize` — check `package.json` before adding any. Node `>=24 <25` (see `.nvmrc`); the
 machine default shell may be older, always select 24 via nvm first.
 
+## Starting a session
+
+A new session needs no chat transcript. First orient in the checkout: `pwd`, `git status
+--short`, `git log --oneline -5`. This repository is the engine (kernel, host, CLI), not the
+DeepSeek Harness GUI checkout and not a cell home. Read [ROADMAP.md](ROADMAP.md) for the
+current position, validation checkpoint and next safe action, and
+[docs/resuming.md](docs/resuming.md) for the zero-context reading map and the safe fresh-home
+run. Status lives in ROADMAP only; never infer it from this file or from a doc date.
+
 ## CLI (seven commands plus help; `npm run build` then `npm start`)
 
 - `init --home <abs-dir>` — create the cell home; prints the real `providers.json` path and a
@@ -137,13 +146,33 @@ stopping.
 ## Conventions
 
 - Conventional Commits; one task = one atomic commit.
-- English only: code, commits, documentation, communication.
+- English only: code, commits, documentation and repository communication; the Lead-facing
+  chat is French.
 - One task at a time, sequential execution.
 - Sub-agent delegation: long-running or independent work (research, implementation, audit)
   is delegated to sub-agents with a self-contained prompt; the delegating agent verifies the
   deliverable against the repo and the invariants, applies corrections, and iterates until
   the result passes before it is committed.
 - `src/node/world.ts` is protected: never modify it without Lead approval.
+
+## Durable execution protocol
+
+- The orchestrating session plans, reviews and owns the required gates. Repo source
+  implementation is delegated to a DeepSeek Account `deepseek-flash` sub-agent at high
+  reasoning effort; verify the available routes each session and never silently change
+  provider. `opencode-go` is not an established route.
+- Before coding: produce the plan, then run four independent audits — doctrine, feasibility,
+  invariants and minimalism — until all four return READY (4/4).
+- Then implement sequential atomic bricks. Each brick gets an independent counter-audit,
+  fixes and mutation checks; the orchestrator runs the required gates and the four compiled
+  smokes **sequentially**; one atomic commit per brick.
+- After the final brick: cross-brick audit, fixes and revalidation, then the same
+  gates/smokes, push and report.
+- The existing invariants hold: tests are never deleted or weakened, `src/node/world.ts`
+  stays protected, and suites never run concurrently.
+- A documentation-only handoff does not authorize source implementation, an experiment
+  launch or a paid API call, and it does not change the existing commit/push gate rules. The
+  next safe action is recorded in [ROADMAP.md](ROADMAP.md).
 
 ## Invariants (non-negotiable)
 
@@ -183,7 +212,8 @@ stopping.
 5. `npm run test:first-light`
 6. `npm run test:first-light-packages`
 
-No push until every gate passes; there is no CI to catch a failure later.
+No push until every gate passes; there is no CI to catch a failure later. A prior checkpoint is
+not a current gate run; report explicitly which checks were rerun.
 
 ### Manual survival-core acceptance (per wave; not an npm script)
 
@@ -223,6 +253,27 @@ a kernel failure.
 - No lint/format tooling, no coverage tooling.
 - No `src/skills/`, no `src/cli/` — the skills system is target design only, specified in
   `docs/kernel.md`.
+- No cockpit frontend or dedicated cockpit server. The operator surface is the CLI (`status`,
+  `chat`, `direct`, `pause`), the kernel-owned logs and the world's git; the cockpit is
+  proposed in [ROADMAP.md](ROADMAP.md), not implemented.
+- No generic credential broker and no endpoint-bound placeholders. The `providers.json`
+  loader supports exactly `llm` and `tavily`; the agent environment must not carry real
+  secrets. Broker-side injection, per-node capability attenuation and mediated exchanges
+  journaled without credential values are target design — see [docs/kernel.md](docs/kernel.md)
+  §Credential store and broker and [docs/architecture.md](docs/architecture.md) §7. A hostile
+  provider can reflect a secret into a response body captured by the journal; that accepted
+  residual is not an absolute no-leak promise.
+- No research observation/analysis pipeline and no cockpit frontier viewer. Operational
+  projections exist (`status`, the context fold, the per-node `history` read); the raw
+  frontier journal and the world's git are the facts. The analysis pipeline — layers, honesty
+  model, sensors — is specified, not implemented; see
+  [docs/research/monitoring-architecture.md](docs/research/monitoring-architecture.md).
+- The full escalating kill switch is not implemented. `pause`, cooperative stop and the
+  delegated reaper exist; the first-signal graceful shutdown with its 5-second backstop and
+  the re-signal immediate exit are specified — see [docs/kernel.md](docs/kernel.md) §Kill
+  switch and budget.
+- Checkpoint status — C1's readable frontier projection, C2 and C3 — is
+  [ROADMAP.md](ROADMAP.md) only; implemented mechanics do not close a checkpoint.
 
 ## Documentation rule
 

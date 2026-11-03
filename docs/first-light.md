@@ -57,5 +57,6 @@ the kernel staged the mutating worktree at turn end: a `GitCommandError` killed
 the kernel, the orphaned test processes survived it, and the machine OOM'd into
 a hard reboot. One well-intentioned node, alone, empirically demonstrated the
 isolation wave's findings — the process tree outlives the kernel, nothing
-bounds it, and world content racing the commit can kill the turn. The isolation
-wave is the next priority before any further live runs.
+bounds it, and world content racing the commit can kill the turn. The incident
+remains the empirical basis for the isolation findings; current priority and
+followup are recorded only in the [Roadmap](../ROADMAP.md).

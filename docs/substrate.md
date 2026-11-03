@@ -2,6 +2,11 @@
 
 **Status.** Design proposal. Not implemented. Scope: the engine — the physics a node inhabits — not the operator's product surface.
 
+**Current-state authority.** This note is a design challenge, not a description of the tree:
+some of its claims predate the implemented host, wake, direction and attribution layers.
+Verify a proposal against [architecture.md](architecture.md) and the status in
+[ROADMAP.md](../ROADMAP.md); where they disagree, the code map and the roadmap win.
+
 The [vision](vision.md) is a proactive, perpetual society steered by a [direction](direction.md) that a human and an agent zero co-negotiate. The engine's substrate is not a neutral background for that society: it is a treatment. It enables some behaviours, suppresses others, and decides what can be observed. The current substrate — specified in [kernel.md](kernel.md), mapped in [architecture.md](architecture.md) — was designed for a single-node research prototype; it is coherent for that purpose. It is not yet the substrate of a society. This note names the choices, challenges them against the vision, and proposes a revised substrate with a migration path.
 
 The argument is not that the current choices are wrong. It is that they are *choices*, and that a research engine should know which of its constraints are conditions of the phenomenon and which are opinions disguised as gravity.
