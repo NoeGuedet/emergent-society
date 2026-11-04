@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { chmod, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises';
+import { chmod, access, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
 import { HUMAN_AUTHOR, ensureDurableDirectory, isErrno } from '../journal/index.js';
@@ -236,6 +236,18 @@ export function worldIoOf(repo: WorldRepo): WorldIo {
 export async function ratify(io: WorldIo, options: RatifyOptions): Promise<RatifyOutcome> {
   const home = dirname(io.gitDir);
   const esDir = join(home, '.es');
+  // The home itself must accept the ratification's operator-side artifacts
+  // (`.es`, the temp write and the shared-index staging). A pre-existing `.es`
+  // on a marker-bearing home would otherwise hide a home the running uid
+  // cannot write; the bounded RatifyIoError is the same refusal as the
+  // `.es`-creation failure below.
+  try {
+    await access(home, fsConstants.W_OK);
+  } catch (err) {
+    throw new RatifyIoError(
+      `the home is not writable (${codeOf(err)}); a ratification needs`
+      + ' a home owned by the running uid');
+  }
   try {
     await ensureDurableDirectory(esDir, home);
   } catch (err) {

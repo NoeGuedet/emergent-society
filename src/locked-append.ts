@@ -1,5 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { open } from 'node:fs/promises';
+import { constants, type Stats } from 'node:fs';
+import { chmod, lstat, open } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureDurableDirectory } from './journal/index.js';
@@ -33,6 +35,10 @@ import { ensureDurableDirectory } from './journal/index.js';
  * every caller maps the failure to its own bounded refusal. A caller that needs
  * a more specific message (an unavailable lock sidecar) distinguishes the
  * `ensureLockSidecar` call from the append/repair call.
+ *
+ * The same flock seam also serializes `init`: `holdExclusiveLock` keeps the
+ * helper (and so the descriptor) alive for the whole caller's critical section,
+ * because the host must classify and complete a home without racing a peer.
  */
 
 /** The kernel-owned sidecar directory every line log's flock lives in. */
@@ -125,6 +131,139 @@ export async function repairUnderLock(
     throw new LockedAppendError('the kernel-owned line log writer returned no result');
   }
   return { repaired, size };
+}
+
+/**
+ * A held exclusive lock: `release` ends the guard and waits for its exit.
+ * Releasing twice is harmless (the second close is a no-op).
+ */
+export interface HeldExclusiveLock {
+  release(): Promise<void>;
+}
+
+/** The helper's one readiness token, written only after the lock is held. */
+const HOLD_READY = 'locked';
+
+/**
+ * Ensures the lock sidecar is a regular file before anything opens it. A symlink
+ * or special file (a FIFO in particular) would otherwise be followed or block
+ * the `open` before the helper even starts; the non-blocking, no-follow open is
+ * the race guard, and the fstat proves the opened descriptor is regular.
+ */
+async function ensureRegularLockFile(lock: string): Promise<void> {
+  let pre: Stats | null = null;
+  try {
+    pre = await lstat(lock);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new LockedAppendError();
+  }
+  if (pre !== null) {
+    if (!pre.isFile() || pre.isSymbolicLink()) throw new LockedAppendError();
+    try {
+      await chmod(lock, 0o600);
+    } catch {
+      throw new LockedAppendError();
+    }
+  }
+  let handle: FileHandle | null = null;
+  try {
+    handle = await open(
+      lock,
+      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT
+        | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      0o600,
+    );
+    const info = await handle.stat();
+    if (!info.isFile()) throw new LockedAppendError();
+  } catch (error) {
+    if (error instanceof LockedAppendError) throw error;
+    throw new LockedAppendError();
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+  try {
+    await chmod(lock, 0o600);
+  } catch {
+    throw new LockedAppendError();
+  }
+}
+
+/**
+ * Takes one exclusive flock for an arbitrary async critical section, reusing
+ * this module's audited flock seam: `flock -F` execs the same helper under the
+ * lock, the helper writes one ready token, then waits for its stdin to close,
+ * so the caller's section runs with the descriptor held. A dead caller closes
+ * the pipe and the lock dies with its holder; a peer's wait is bounded by the
+ * fixed five-second limit and every failure is the fixed `LockedAppendError`.
+ *
+ * The sidecar is created 0600 explicitly: `flock` would otherwise apply the
+ * process umask, and a restrictive mask (an operator session, the umask test)
+ * would leave the file unreadable and break every later acquisition. An
+ * existing sidecar is re-moded to the same fixed mode, never replaced, so its
+ * inode identity stays stable across initializations. A symlink or FIFO at the
+ * sidecar path is refused before any open or helper spawn.
+ */
+export async function holdExclusiveLock(lock: string): Promise<HeldExclusiveLock> {
+  await ensureRegularLockFile(lock);
+  const args = [
+    '-F', '--exclusive', `--wait=${LOCK_WAIT_SECONDS}`, lock,
+    process.execPath, HELPER_PATH, 'hold',
+  ];
+  return await new Promise<HeldExclusiveLock>((resolve, reject) => {
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(FLOCK_PATH, args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        killSignal: 'SIGKILL',
+      });
+    } catch {
+      reject(new LockedAppendError());
+      return;
+    }
+    let settled = false;
+    let stdout = '';
+    const closed = new Promise<void>((resolveClose) => {
+      child.once('close', () => { resolveClose(); });
+    });
+    // The acquisition bound only: once the helper is ready the hold is the
+    // caller's section and has no deadline of its own.
+    const readiness = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      reject(new LockedAppendError());
+    }, HELPER_TIMEOUT_MS);
+    child.stdout.setEncoding('utf8');
+    // Drained but never read: the helper's raw diagnostic can carry the path.
+    child.stderr.on('data', () => { /* dropped on purpose */ });
+    // A refused wait leaves the pipe closed; the close is the outcome.
+    child.stdin.on('error', () => { /* the exit code is the outcome */ });
+    child.once('error', () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(readiness);
+      reject(new LockedAppendError());
+    });
+    child.stdout.on('data', (chunk: string) => {
+      if (settled) return;
+      stdout += chunk;
+      if (!stdout.includes(`${HOLD_READY}\n`)) return;
+      settled = true;
+      clearTimeout(readiness);
+      resolve({
+        release: async () => {
+          child.stdin.end();
+          await closed;
+        },
+      });
+    });
+    child.once('close', () => {
+      clearTimeout(readiness);
+      if (settled) return;
+      settled = true;
+      reject(new LockedAppendError());
+    });
+  });
 }
 
 /**

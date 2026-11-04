@@ -23,7 +23,11 @@ run. Status lives in ROADMAP only; never infer it from this file or from a doc d
 ## CLI (seven commands plus help; `npm run build` then `npm start`)
 
 - `init --home <abs-dir>` — create the cell home; prints the real `providers.json` path and a
-  0600-mode hint, never writes the file.
+  0600-mode hint, never writes the file. A fresh home records the immutable
+  `.es/execution.json` `landlock` backend before the world pair; an existing markerless
+  both-valid home is left unchanged (the exclusive `.es/init.lock` metadata is the only
+  effect), and a valid marker with a missing/one-sided world pair is refused without adopting
+  a history.
 - `start --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--heartbeat-seconds N] [--memory-remember] [--no-sandbox]` —
   boot and run a node; Landlock confinement is the default, `--no-sandbox` is the explicit
   opt-out; `--charter-file` is the base of the composed charter on a start into a cell with no
@@ -272,6 +276,12 @@ a kernel failure.
   delegated reaper exist; the first-signal graceful shutdown with its 5-second backstop and
   the re-signal immediate exit are specified — see [docs/kernel.md](docs/kernel.md) §Kill
   switch and budget.
+- No VM execution backend exists: no QEMU process, guest, VM image, volume or network setup.
+  `start`/`resume` read the immutable `.es/execution.json` marker before any world, journal,
+  chat, owner, config or runtime effect; a `vm-qemu` marker is recognized and refused as
+  unavailable, and a marker-less home carrying actual VM evidence is refused rather than run
+  as host Landlock. A `landlock` marker and a marker-less legacy home keep the existing
+  Landlock path; `--no-sandbox` remains the runtime opt-out on a Landlock home.
 - Checkpoint status — C1's readable frontier projection, C2 and C3 — is
   [ROADMAP.md](ROADMAP.md) only; implemented mechanics do not close a checkpoint.
 

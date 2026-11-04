@@ -81,6 +81,15 @@ it('rejects a relative home, a missing flag, an unknown flag and an invalid uid 
     ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--charter-file'],
     ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--charter-file='],
     ['init', '--home', '/x', '--uid', 'node-0'],
+    // B1 exposes no execution-backend flag; only the activation brick (B8) may
+    // add `--execution`/`--vm-image` to a command or the help text.
+    ['init', '--home', '/x', '--execution', 'vm'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--execution', 'vm'],
+    ['resume', '--home', '/x', '--execution', 'vm'],
+    ['init', '--home', '/x', '--vm-image', '/x/base.qcow2'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h',
+      '--vm-image', '/x/base.qcow2'],
+    ['resume', '--home', '/x', '--vm-image', '/x/base.qcow2'],
   ]) {
     expect(() => parseHostCommand(argv)).toThrow(UsageError);
   }
@@ -178,6 +187,10 @@ it('USAGE lists the seven commands, the exit codes and the disclosures', () => {
   expect(USAGE).toContain('providers.json is refused by path and inode');
   expect(USAGE).toContain('unchanged: no commit — the pin did not move');
   expect(USAGE).not.toContain('SECRET');
+  // B1 keeps the execution-backend activation flags out of the help surface:
+  // only B8 may introduce them.
+  expect(USAGE).not.toContain('--execution');
+  expect(USAGE).not.toContain('--vm-image');
 });
 
 it('parses direct: the reply default, then the strict flag combinations', () => {

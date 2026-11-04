@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
-import { lstat, open, stat } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { access, lstat, open, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   GATEWAY_ADDRESSEE, HUMAN_AUTHOR, JournalClosedError, assertConversationActor, isErrno,
@@ -205,6 +206,11 @@ async function appendChatRecord(
  */
 async function chatLock(home: string): Promise<string> {
   try {
+    // The chat log lives directly in the home, so a home without owner write
+    // permission cannot take the append even when the `.es` sidecar directory
+    // already exists (it always does on a fresh marker-bearing home). Fail at
+    // the lock step with the same bounded, path-free refusal.
+    await access(home, constants.W_OK);
     return await ensureLockSidecar(home, CHAT_LOCK_FILE);
   } catch {
     throw new ChatWriteError(

@@ -52,6 +52,12 @@ it('initHome creates the home 0700 even under a restrictive umask', async () => 
     init.mockRestore();
   }
   expect((await stat(target)).mode & 0o777).toBe(0o700);
+  // The `.es` directory, the marker and the init lock each carry an explicit
+  // chmod against the same mask; without it they would be created 0000 and
+  // the first marker read would refuse its own home.
+  expect((await stat(join(target, '.es'))).mode & 0o777).toBe(0o700);
+  expect((await stat(join(target, '.es', 'execution.json'))).mode & 0o777).toBe(0o600);
+  expect((await stat(join(target, '.es', 'init.lock'))).mode & 0o777).toBe(0o600);
 });
 
 it('assertCellLayout follows a symlinked world pair exactly as WorldRepo.open does', async () => {

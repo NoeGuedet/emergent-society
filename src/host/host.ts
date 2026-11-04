@@ -45,6 +45,7 @@ import { llmCredentialFrom, loadProviderStore } from './credentials.js';
 import {
   assertCellLayout, assertHomeOutsideCheckout, assertHomePermissions, cellPaths,
 } from './layout.js';
+import { assertExecutionStartable } from './execution.js';
 import { readCharterFile } from './charter-file.js';
 import type { HostLog } from './observe.js';
 import {
@@ -1611,6 +1612,12 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       const heartbeatSeconds = readHeartbeatSeconds(options);
       await assertHomeOutsideCheckout(home);
       await assertHomePermissions(home);
+      // The execution backend is selected from the immutable marker (or the
+      // absence evidence) BEFORE the world, the chat log, the owner record, the
+      // config fold or any runtime exists. A VM-marked or VM-evidenced home is
+      // refused as unavailable, never silently run as host Landlock; a legacy
+      // markerless home and a landlock marker keep the existing path.
+      await assertExecutionStartable(home, { noSandbox: sandbox === false });
       await assertCellLayout(home);
       // The human channel's delivery surface, opened once per host: outside the
       // world, kernel-owned, and independent of composition. A failed open is a

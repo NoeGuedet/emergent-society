@@ -20,18 +20,36 @@
 // followed by one fsync, and the home directory's entry made durable when this
 // helper created the file. `repair` is the host-only boot counterpart: a TAIL
 // read that truncates one incomplete trailing fragment, under the same lock.
+//
+// `hold` is the third command: it does no file work. `flock -F` execs this
+// helper in place, so the helper's inherited descriptor holds the lock; it
+// writes one ready token and waits for stdin EOF, which is the caller's
+// explicit release (or the caller's death). The parent (`holdExclusiveLock`)
+// uses it for `init`'s whole classification and completion section.
 import { open, stat } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 const MAX_LINE_BYTES = 64 * 1024;
 const TAIL_READ_BYTES = 64 * 1024;
 const NEWLINE = 0x0a;
+const HOLD_READY = 'locked\n';
 
 const [, , command, file, mode] = process.argv;
 
 function fail(message) {
   process.stderr.write(`conversation-append: ${message}\n`);
   process.exit(1);
+}
+
+/**
+ * Holds the inherited flock until stdin closes. The ready token is written
+ * only while this process is the lock's holder, so the parent never treats a
+ * refused wait (flock exited before exec'ing the helper) as an acquisition.
+ */
+async function hold() {
+  process.stdout.write(HOLD_READY);
+  // Drain until EOF: the parent keeps the pipe open for its critical section.
+  for await (const _chunk of process.stdin) { /* drained on purpose */ }
 }
 
 /** Reads stdin to EOF, bounded: the parent's line is a small JSON record. */
@@ -156,10 +174,12 @@ async function repair() {
   }
 }
 
-if (file === undefined) fail('usage: conversation-append <append|repair> <file> [truncate-whole]');
-
 try {
-  if (command === 'append') await append();
+  if (command === 'hold') {
+    await hold();
+  } else if (file === undefined) {
+    fail('usage: conversation-append <append|repair|hold> <file> [truncate-whole]');
+  } else if (command === 'append') await append();
   else if (command === 'repair') await repair();
   else fail(`unknown command ${JSON.stringify(command)}`);
 } catch (err) {
