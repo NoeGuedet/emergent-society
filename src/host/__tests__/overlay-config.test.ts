@@ -118,6 +118,6 @@ it('refuses a nodes-file entry named gateway, the reserved overlay identity', as
   await writeFile(nodesFile, JSON.stringify([
     { uid: 'gateway', model: 'node-model', heading: 'I am the overlay.' },
   ]), 'utf8');
-  await expect(readNodesFile(nodesFile, 'start')).rejects.toBeInstanceOf(HostConfigError);
-  await expect(readNodesFile(nodesFile, 'start')).rejects.toThrow(/gateway/);
+  await expect(readNodesFile(fx.home, nodesFile, 'start')).rejects.toBeInstanceOf(HostConfigError);
+  await expect(readNodesFile(fx.home, nodesFile, 'start')).rejects.toThrow(/gateway/);
 });

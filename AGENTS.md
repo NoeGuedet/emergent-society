@@ -32,7 +32,9 @@ run. Status lives in ROADMAP only; never infer it from this file or from a doc d
   boot and run a node; Landlock confinement is the default, `--no-sandbox` is the explicit
   opt-out; `--charter-file` is the base of the composed charter on a start into a cell with no
   journaled configuration (its content is journaled as configuration; the kernel appends the
-  node identity sentence). `--gateway-charter` / `--gateway-model` configure the gateway
+  node identity sentence). Operator charter files are read through the pinned all-ancestor
+  no-follow chain (a symlinked ancestor is refused; only the configured legacy world-root alias
+  is trusted), the same chain as `direct --file`. `--gateway-charter` / `--gateway-model` configure the gateway
   overlay — a host-side digest service, never a node: the charter is persisted as
   `<home>/gateway.charter.md` and the model beside it (validated against the provider store's
   declared catalog, defaulting to its first entry); a start without the charter runs a
@@ -63,8 +65,12 @@ run. Status lives in ROADMAP only; never infer it from this file or from a doc d
 - `start --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--heartbeat-seconds N] [--memory-remember] [--no-sandbox]` — boot a declared
   node set on one home: a strict JSON array of at most 16 `{uid, model, heading,
   charterFile?, spawn?}` entries with unique uids, read at the config gate (exit 2
-  on a malformed file). `spawn: true` declares the kernel's spawn capability for
-  that node — the grant is declared, never implicit, and a solo boot grants nobody;
+  on a malformed file). The declaration itself must be an EXTERNAL host file: one inside the
+  cell's `world` (or the canonical target of a legacy symlinked world) is refused (exit 2)
+  because host configuration must not be guest-writable, while entry `charterFile`s may stay
+  world-addressed; its 64 KiB byte bound and JSON contract are unchanged. `spawn: true`
+  declares the kernel's spawn capability for that node — the grant is declared, never
+  implicit, and a solo boot grants nobody;
   grant by booting a one-entry nodes file with `spawn: true`. Each node gets its own
   local log, scratch leaf and cgroup leaf; all share the home's world and frontier
   journal. `--nodes-file` replaces `--uid`/`--model`/`--heading`/`--charter-file`.
@@ -107,8 +113,10 @@ run. Status lives in ROADMAP only; never infer it from this file or from a doc d
   commit: the human's words are chat-private, readable by the society only if the overlay relays a
   direction.
   `direct --home <abs-dir> --path <world-relative> --file <abs-path>` is the ratification (the
-  `--path` act takes a file, never `--text`): the file's bytes — a regular, non-symlinked, UTF-8
-  file under the read bound, `providers.json` refused by path and inode — are committed authored
+  `--path` act takes a file, never `--text`): the file's bytes — read through the pinned
+  all-ancestor no-follow chain (only the configured legacy world-root alias is trusted; a
+  regular, non-symlinked leaf, UTF-8, under the read bound, `providers.json` refused by path and
+  inode) — are committed authored
   the reserved `human` from a fresh private index seeded at the current HEAD (a root commit on an
   unborn branch), the worktree copy is materialized, and the shared index is staged with that one
   entry only after the rename. A `--path` that is absolute, empty or carries `.`/`..` is refused.

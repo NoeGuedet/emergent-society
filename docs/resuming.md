@@ -54,6 +54,12 @@ file first and do not infer status from this checklist.
   does not record shell syscalls, direct shell/Run egress or individual intra-turn filesystem
   effects. The world's git observes committed changes at commit granularity: the author is the
   node whose turn closed the commit, not necessarily the writer of each file.
+- **Host path pin** — every operator file read (the reply/ratification `--file`, `--charter-file`,
+  `--gateway-charter`, the `--nodes-file` declaration and every entry charter) is fd-anchored
+  through `src/node/world-fs.ts`: all ancestors and the leaf are no-follow, with only the
+  configured legacy world-root alias trusted. The `--nodes-file` DECLARATION is external-only
+  (a world-addressed one is refused); entry charters may stay world-addressed. `src/node/world.ts`
+  stays protected and the world pair's historical symlink is still accepted.
 - **The gateway is not a node** — the overlay is a host-side digest service. It has no cell,
   turn, world write or `extend` capability.
 

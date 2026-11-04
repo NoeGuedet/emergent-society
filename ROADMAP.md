@@ -48,8 +48,12 @@ the VM volume/fresh-root checks exist behind internal seams only; no VM process,
 volume, mount or network setup and no `--execution`/`--vm-image` CLI flag exists. B1's ordered
 nine-check run is green under Node 24 (138 test files / 2,443 tests, no skips; typecheck,
 build, first-light A–E, packages F and the refusal, fence, reap and wake-policy smokes); that
-is development evidence for B1, not a checkpoint. B2 is the next preparatory brick; B3+ remain
-hard-gated on a real B0c KVM proof.
+is development evidence for B1, not a checkpoint. B2 is split: B2a (the host path pin — operator
+reads, ratification materialization, doctor IO) is implemented and validated: four fresh
+independent audits returned READY and its ordered nine-check run is green under Node 24 (140 test
+files / 2,477 tests, no skips; typecheck, build, first-light A–E, packages F and the refusal,
+fence, reap and wake-policy smokes). That is development evidence for B2a, not a checkpoint. B2b
+(the one commit lease) remains design-not-ready. B3+ remain hard-gated on a real B0c KVM proof.
 
 ## Validation checkpoint
 
@@ -129,9 +133,11 @@ A checkpoint is reached when its criterion is demonstrated on a running system, 
 
 A new session starts at [docs/resuming.md](docs/resuming.md), confirms the checkout and HEAD,
 and does not start source work from a status document. The active shared-VM wave has B1
-implemented; the next safe source action is B2 (one commit lease) only
-after its own plan and four READY audits, then the sequential per-brick gates. B3+ stay
-hard-gated on a real B0c KVM proof. The broker design remains a proposal, not the active wave.
+implemented and B2 split into B2a (the host path pin: operator reads, ratification
+materialization, doctor IO) and B2b (one commit lease). B2a is implemented, audited (four fresh
+READY) and gate-validated. B2b is next and follows only after its own frozen plan and four READY
+audits; it stays design-not-ready until then. B3+ stay hard-gated on a real B0c KVM proof. The
+broker design remains a proposal, not the active wave.
 
 ## Framing rules
 

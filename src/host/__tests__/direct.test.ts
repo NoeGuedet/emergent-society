@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import {
-  chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile,
+  chmod, link, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -73,6 +73,13 @@ async function run(argv: readonly string[]): Promise<Sinks> {
     stderr: (text) => { err += text; },
   });
   return { code, out, err };
+}
+
+/** A real POSIX FIFO, no root required (util-linux `mkfifo`). */
+function makeFifo(path: string): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    execFile('mkfifo', [path], (err) => { if (err !== null) reject(err); else resolvePromise(); });
+  });
 }
 
 /** Kills the flock helper AND the sleep it forked (they share the lock fd). */
@@ -593,6 +600,191 @@ describe('the ratification: the commit', () => {
     expect(await readFile(join(fx.home, 'world', 'notes/2026/plan.md'), 'utf8'))
       .toBe('a nested plan\n');
     expect(await gitIn(fx.world, ['show', 'HEAD:notes/2026/plan.md'])).toBe('a nested plan\n');
+  });
+});
+
+describe('the pinned operator source read', () => {
+  it('pins the source parent: a post-pin swap cannot redirect the committed bytes', async () => {
+    const fx = await cell();
+    const outside = join(fx.root, 'outside');
+    await mkdir(outside);
+    await writeFile(join(outside, 'msg.md'), 'canary bytes\n');
+    await mkdir(join(fx.home, 'world', 'sub', 'deep'), { recursive: true });
+    await writeFile(join(fx.home, 'world', 'sub', 'deep', 'msg.md'), 'world bytes\n');
+    let pins = 0;
+    const code = await runDirect({
+      home: fx.home,
+      path: 'notes/msg.md',
+      file: join(fx.home, 'world', 'sub', 'deep', 'msg.md'),
+      stdout: () => {},
+      stderr: () => {},
+      afterPinned: async ({ fd }) => {
+        pins += 1;
+        // The seam receives the FINAL parent fd, not the intermediate `sub`.
+        expect(await realpath(`/proc/self/fd/${String(fd)}`))
+          .toBe(join(fx.home, 'world', 'sub', 'deep'));
+        // After the final parent pin: the fd authority must survive the swap.
+        await rename(
+          join(fx.home, 'world', 'sub', 'deep'), join(fx.home, 'world', 'sub', 'deep.pinned'));
+        await symlink(outside, join(fx.home, 'world', 'sub', 'deep'));
+      },
+    });
+    expect(code).toBe(0);
+    expect(pins).toBe(1);
+    expect(await gitIn(fx.world, ['show', 'HEAD:notes/msg.md'])).toBe('world bytes\n');
+    expect(await readFile(join(outside, 'msg.md'), 'utf8')).toBe('canary bytes\n');
+  });
+
+  it('refuses a PRE-pin symlink parent; a post-pin swap saves the pinned world bytes', async () => {
+    const fx = await cell();
+    const outside = join(fx.root, 'outside');
+    await mkdir(outside);
+    await writeFile(join(outside, 'msg.txt'), 'canary reply\n');
+    // PRE-pin: the attacker's parent is already a symlink when the walk starts.
+    await symlink(outside, join(fx.home, 'world', 'bad'));
+    let preErr = '';
+    const refused = await runDirect({
+      home: fx.home,
+      file: join(fx.home, 'world', 'bad', 'msg.txt'),
+      stdout: () => {},
+      stderr: (text) => { preErr += text; },
+    });
+    expect(refused).toBe(2);
+    expect(preErr).toContain('unsafe parent component');
+    expect(await stat(join(fx.home, CHAT_FILE)).catch(() => null)).toBeNull();
+
+    // POST-pin: the reply saves the pinned world bytes, never the canary.
+    await mkdir(join(fx.home, 'world', 'good'));
+    await writeFile(join(fx.home, 'world', 'good', 'msg.md'), 'pinned reply\n');
+    let pins = 0;
+    const code = await runDirect({
+      home: fx.home,
+      file: join(fx.home, 'world', 'good', 'msg.md'),
+      stdout: () => {},
+      stderr: () => {},
+      afterPinned: async () => {
+        pins += 1;
+        await rename(join(fx.home, 'world', 'good'), join(fx.home, 'world', 'good.pinned'));
+        await symlink(outside, join(fx.home, 'world', 'good'));
+      },
+    });
+    expect(code).toBe(0);
+    expect(pins).toBe(1);
+    expect((await readChat(fx.home)).map((record) => record.text)).toEqual(['pinned reply']);
+    expect(await readFile(join(outside, 'msg.txt'), 'utf8')).toBe('canary reply\n');
+  });
+
+  it('refuses a real FIFO source promptly, never opening it (no hang)', { timeout: 5000 }, async () => {
+    const fx = await cell();
+    const fifo = join(fx.home, 'world', 'pipe.fifo');
+    await makeFifo(fifo);
+    let err = '';
+    const code = await runDirect({
+      home: fx.home,
+      file: fifo,
+      stdout: () => {},
+      stderr: (text) => { err += text; },
+    });
+    expect(code).toBe(2);
+    expect(err).toContain('is not a regular file');
+    expect(await stat(join(fx.home, CHAT_FILE)).catch(() => null)).toBeNull();
+  });
+
+  it('refuses an external alias that enters the world then leaves it (exit 2)', async () => {
+    const fx = await cell();
+    const outside = join(fx.root, 'outside');
+    await mkdir(outside);
+    await writeFile(join(outside, 'msg.txt'), 'canary bytes\n');
+    // The input is lexically external; the alias points back into the world.
+    const alias = join(fx.root, 'alias');
+    await symlink(join(fx.home, 'world'), alias);
+    await symlink(outside, join(fx.home, 'world', 'esc'));
+    let err = '';
+    const code = await runDirect({
+      home: fx.home,
+      file: join(alias, 'esc', 'msg.txt'),
+      stdout: () => {},
+      stderr: (text) => { err += text; },
+    });
+    expect(code).toBe(2);
+    expect(err).toContain('unsafe parent component');
+    expect(await stat(join(fx.home, CHAT_FILE)).catch(() => null)).toBeNull();
+    expect(await readFile(join(outside, 'msg.txt'), 'utf8')).toBe('canary bytes\n');
+  });
+
+  it('the reply still saves an EXTERNAL source on a home with no healthy world', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'es-direct-bare-'));
+    roots.push(root);
+    const home = join(root, 'home');
+    await mkdir(home, { mode: 0o700 });
+    await chmod(home, 0o700);
+    const message = join(root, 'msg.md');
+    await writeFile(message, 'still saved\n');
+    const code = await runDirect({
+      home, file: message, stdout: () => {}, stderr: () => {},
+    });
+    expect(code).toBe(0);
+    expect((await readChat(home)).map((record) => record.text)).toEqual(['still saved']);
+  });
+
+  it('a /proc-unavailable source read refuses the reply before the chat write (exit 2)', async () => {
+    const fx = await cell();
+    const message = await file(fx, 'msg.md', 'hello\n');
+    let err = '';
+    const code = await runDirect({
+      home: fx.home,
+      file: message,
+      procRoot: join(fx.root, 'no-proc'),
+      stdout: () => {},
+      stderr: (text) => { err += text; },
+    });
+    expect(code).toBe(2);
+    expect(err).toContain('pinned read is unavailable');
+    expect(await stat(join(fx.home, CHAT_FILE)).catch(() => null)).toBeNull();
+  });
+
+  it('the ratification gives procRoot only to the post-CAS materialize (exit 0, named warning)', async () => {
+    const fx = await cell();
+    const bytes = 'landed without a proc root\n';
+    const message = await file(fx, 'DIRECTION.md', bytes);
+    let out = '';
+    let err = '';
+    const code = await runDirect({
+      home: fx.home,
+      path: 'DIRECTION.md',
+      file: message,
+      procRoot: join(fx.root, 'no-proc'),
+      stdout: (text) => { out += text; },
+      stderr: (text) => { err += text; },
+    });
+    expect(code).toBe(0);
+    const head = (await fx.world.headHash()) ?? '';
+    expect(head).toMatch(/^[0-9a-f]{40,64}$/);
+    // The source read ran on the real /proc, so the CAS landed. Only the pinned
+    // worktree materialization saw the fake root and degraded to a warning.
+    expect(out).toContain(`committed ${head} (author: human) DIRECTION.md`);
+    expect(err).toContain('the worktree copy was not materialized');
+    expect(err).toContain('proc-unavailable');
+    expect(await gitIn(fx.world, ['show', 'HEAD:DIRECTION.md'])).toBe(bytes);
+    expect(await stat(join(fx.home, 'world', 'DIRECTION.md')).catch(() => null)).toBeNull();
+  });
+
+  it('the legacy symlinked world root still ratifies through the pinned canonical root', async () => {
+    const fx = await cell();
+    const real = join(fx.home, 'real-world');
+    await rename(join(fx.home, 'world'), real);
+    await symlink(real, join(fx.home, 'world'));
+    await writeFile(join(real, 'msg.md'), 'alias bytes\n');
+    const code = await runDirect({
+      home: fx.home,
+      path: 'DIRECTION.md',
+      file: join(fx.home, 'world', 'msg.md'),
+      stdout: () => {},
+      stderr: () => {},
+    });
+    expect(code).toBe(0);
+    expect(await gitIn(fx.world, ['show', 'HEAD:DIRECTION.md'])).toBe('alias bytes\n');
+    expect(await readFile(join(real, 'DIRECTION.md'), 'utf8')).toBe('alias bytes\n');
   });
 });
 

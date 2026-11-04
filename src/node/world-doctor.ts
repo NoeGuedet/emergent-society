@@ -1,6 +1,7 @@
-import { lstat, mkdir, rename, statfs } from 'node:fs/promises';
+import { statfs } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
-import { dirname, join } from 'node:path';
+import type { FileHandle } from 'node:fs/promises';
+import { join } from 'node:path';
 import { singleLine } from '../text.js';
 import {
   INDEX_STALE_MS,
@@ -21,6 +22,16 @@ import {
   type WorldLockState,
 } from './world-git.js';
 import type { WorldRepo } from './world.js';
+import {
+  lstatAt,
+  openPinnedDirAt,
+  openPinnedParent,
+  openPinnedRoot,
+  renameAt,
+  WorldFsMissingError,
+  WorldFsProcUnavailableError,
+  type PinnedOptions,
+} from './world-fs.js';
 
 /**
  * The world doctor: the one boot-time inspection of the repository the kernel
@@ -118,7 +129,27 @@ export type DoctorOptions = {
   readonly indexStaleMs?: number;
   readonly maxTrackedUnreadable?: number;
   readonly timeoutMs?: number;
+  /** Test-only: fires after the world root pin and before the sweep/quarantine. */
+  readonly afterRootPin?: (pin: { readonly fd: number; readonly rootPath: string }) => Promise<void>;
+  /** Test-only: fires after the quarantine source parent pin. */
+  readonly afterQuarantinePin?: (pin: {
+    readonly fd: number; readonly rootPath: string; readonly rel: string;
+  }) => Promise<void>;
+  /** Test-only: fires after the destination pin, before the unique-name lstat/rename. */
+  readonly afterQuarantineDestinationPin?: (pin: {
+    readonly fd: number; readonly rootPath: string; readonly rel: string;
+  }) => Promise<void>;
+  /** Test-only: the proc-filesystem root used by every pinned call. */
+  readonly procRoot?: string;
+  /** Test-only: an injected rename that can throw `EXDEV` (the cross-mount arm). */
+  readonly renameAt?: QuarantineRename;
 };
+
+/** The doctor's move primitive (the production one is `world-fs.renameAt`). */
+export type QuarantineRename = (
+  srcFd: number, srcName: string, dstFd: number, dstName: string,
+  options?: { readonly procRoot?: string },
+) => Promise<void>;
 
 /** The default git deadline for one doctor listing (the plumbing bound). */
 const DEFAULT_READ_TIMEOUT_MS = 10_000;
@@ -240,21 +271,6 @@ async function defaultFreeSpace(home: string): Promise<{ bytes: number; inodes: 
   }
 }
 
-/** A destination that does not overwrite a previous boot's quarantine entry. */
-async function uniqueQuarantinePath(dest: string): Promise<string | null> {
-  for (let n = 0; n < 100; n += 1) {
-    const candidate = n === 0 ? dest : `${dest}.${n}`;
-    try {
-      await lstat(candidate);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT' || code === 'ENOTDIR') return candidate;
-      return null;
-    }
-  }
-  return null;
-}
-
 /**
  * Runs the world doctor against an opened repository. Never throws for a world
  * fact: every section is bounded and catches its own failure into the report.
@@ -363,110 +379,101 @@ export async function runWorldDoctor(
     dirty = { ...dirty, known: false };
   }
 
-  // Tracked unreadable paths: the pre-add check. The commit has no per-path
-  // skip, so this is a REPORT — the commit itself succeeds or refuses typed.
-  // The lstat sweep is bounded by the doctor scan cap (a 300k-entry world must
-  // not turn one boot into 300k syscalls); when the cap is hit the report says
-  // `dirty.truncated`, never a silent partial list.
+  // Tracked unreadable paths and the quarantine both run through the pinned
+  // chain (`world-fs.ts`): the world root is opened ONCE, every component is
+  // `lstatAt`'d before its no-follow open, and the only world write is the
+  // both-ends-pinned quarantine `renameAt`. A symlink/non-directory parent (or
+  // an ELOOP/ENOTDIR open race) is `trackedUnreadable` — never followed, never
+  // a deletion; only ENOENT of the path or a parent is a deletion and is
+  // skipped. An unavailable `/proc` base skips the affected section with the
+  // existing `truncated` fact and never falls back to a path.
   const uid = process.getuid?.();
-  const unreadable: string[] = [];
-  let scanned = 0;
-  let scanTruncated = false;
-  for (const rel of trackedPaths) {
-    if (unreadable.length >= maxTracked) break;
-    if (scanned >= MAX_DOCTOR_SCAN_ENTRIES) {
-      scanTruncated = true;
-      break;
-    }
-    scanned += 1;
-    if (!safeRelative(rel)) continue;
-    const label = reportPath(rel);
-    if (label === null) continue;
-    try {
-      const entry = await lstat(join(world.path, rel));
-      if (!entry.isFile() && !entry.isDirectory()) continue;
-      if (unstageable(entry, uid)) unreadable.push(label);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      // A deleted tracked path is not unreadable; any other errno is.
-      if (code !== 'ENOENT' && code !== 'ENOTDIR') unreadable.push(label);
-    }
+  const pinOptions: PinnedOptions = opts.procRoot !== undefined
+    ? { procRoot: opts.procRoot } : {};
+  let worldRoot: FileHandle | null = null;
+  try {
+    worldRoot = await openPinnedRoot(world.path, pinOptions);
+  } catch {
+    // An unpinnable world root is a skipped sweep (and quarantine), never a
+    // refused boot and never a path fallback.
+    worldRoot = null;
   }
-  if (scanTruncated) dirty = { ...dirty, truncated: true };
-  trackedUnreadable = unreadable;
-
-  // --- free space and the untracked quarantine -----------------------------
-  const probe = opts.freeSpace ?? (() => defaultFreeSpace(home));
-  const free = await probe();
-  const freeSpace: DoctorFreeSpace = free === null
-    ? { state: 'unverifiable', bytes: null }
-    : { state: free.bytes >= MIN_FREE_BYTES ? 'ok' : 'low', bytes: free.bytes };
   let quarantine: DoctorQuarantine = {
     files: 0, bytes: 0, paths: [], truncated: false,
   };
-  // Quarantine is a move, so it only runs when the world lock probe is free and
-  // the disk has room for the bounded move: a held lock is a live writer's
-  // index, and an unverifiable probe or less room than the move could ever need
-  // is not a place to perform the boot's one mutation. The probe is a CHECK,
-  // not a held lock: a peer that acquires the flock after it can interleave a
-  // commit with the move (declared residual; the files it targets are the
-  // unstageable ones git cannot add). The 20 GiB storage floor is reported
-  // separately as `freeSpace.state` (a low disk is a fact, not a refusal to
-  // rename a file within the same filesystem).
-  const roomForMove = free !== null
-    && free.bytes >= Math.min(QUARANTINE_MAX_BYTES, maxQuarantineBytes)
-    && free.inodes >= Math.min(QUARANTINE_MAX_FILES, maxQuarantineFiles);
-  if (lock === 'free' && roomForMove) {
-    const moved: string[] = [];
-    let bytes = 0;
-    let truncated = false;
-    for (const rel of untracked) {
-      if (moved.length >= maxQuarantineFiles || bytes >= maxQuarantineBytes) {
-        truncated = true;
-        break;
+  let freeSpace: DoctorFreeSpace = { state: 'unverifiable', bytes: null };
+  try {
+    const unreadable: string[] = [];
+    let scanned = 0;
+    let scanTruncated = false;
+    let sweepSkipped = false;
+    if (worldRoot !== null) {
+      if (opts.afterRootPin !== undefined) {
+        await opts.afterRootPin({ fd: worldRoot.fd, rootPath: world.path });
       }
-      if (!safeRelative(rel)) continue;
-      // A name with no representable single-line label is left in place: the
-      // report must stay valid (a moved file absent from `paths` would break
-      // `files === paths.length`), and a diagnostic omission never justifies a
-      // mutation we cannot describe.
-      const label = reportPath(rel);
-      if (label === null) continue;
-      const abs = join(world.path, rel);
-      let entry;
-      try {
-        entry = await lstat(abs);
-      } catch {
-        // Gone between the listing and the stat, or opaque: nothing to move.
-        continue;
+      for (const rel of trackedPaths) {
+        if (unreadable.length >= maxTracked) break;
+        if (scanned >= MAX_DOCTOR_SCAN_ENTRIES) {
+          scanTruncated = true;
+          break;
+        }
+        scanned += 1;
+        if (!safeRelative(rel)) continue;
+        const label = reportPath(rel);
+        if (label === null) continue;
+        const state = await inspectTracked(worldRoot.fd, rel, uid, pinOptions);
+        if (state === 'unreadable') unreadable.push(label);
+        else if (state === 'proc-unavailable') {
+          sweepSkipped = true;
+          break;
+        }
       }
-      if (!unstageable(entry, uid)) continue;
-      const size = Number.isSafeInteger(entry.size) && entry.size > 0 ? entry.size : 0;
-      if (moved.length + 1 > maxQuarantineFiles || bytes + size > maxQuarantineBytes) {
-        truncated = true;
-        continue;
-      }
-      const dir = quarantineDir(home);
-      const dest = await uniqueQuarantinePath(join(dir, rel));
-      if (dest === null) {
-        truncated = true;
-        continue;
-      }
-      try {
-        await mkdir(dirname(dest), { recursive: true, mode: 0o700 });
-        await rename(abs, dest);
-      } catch {
-        // A move we cannot prove (a read-only home, a cross-filesystem home)
-        // leaves the entry where it is; the commit will refuse typed.
-        continue;
-      }
-      moved.push(label);
-      bytes += size;
+    } else if (trackedPaths.size > 0) {
+      sweepSkipped = true;
     }
-    quarantine = { files: moved.length, bytes, paths: moved, truncated };
-  } else if (untracked.length > 0) {
-    // No free-space proof: moving files aside is refused, never guessed at.
-    quarantine = { files: 0, bytes: 0, paths: [], truncated: true };
+    if (scanTruncated || sweepSkipped) dirty = { ...dirty, truncated: true };
+    trackedUnreadable = unreadable;
+
+    // --- free space and the untracked quarantine ---------------------------
+    const probe = opts.freeSpace ?? (() => defaultFreeSpace(home));
+    const free = await probe();
+    freeSpace = free === null
+      ? { state: 'unverifiable', bytes: null }
+      : { state: free.bytes >= MIN_FREE_BYTES ? 'ok' : 'low', bytes: free.bytes };
+    // Quarantine is a move, so it only runs when the world lock probe is free
+    // and the disk has room for the bounded move: a held lock is a live
+    // writer's index, and an unverifiable probe or less room than the move
+    // could ever need is not a place to perform the boot's one mutation. The
+    // probe is a CHECK, not a held lock: a peer that acquires the flock after
+    // it can interleave a commit with the move (declared residual; the files it
+    // targets are the unstageable ones git cannot add). The 20 GiB storage
+    // floor is reported separately as `freeSpace.state` (a low disk is a fact,
+    // not a refusal to rename a file within the same filesystem).
+    const roomForMove = free !== null
+      && free.bytes >= Math.min(QUARANTINE_MAX_BYTES, maxQuarantineBytes)
+      && free.inodes >= Math.min(QUARANTINE_MAX_FILES, maxQuarantineFiles);
+    if (lock === 'free' && roomForMove) {
+      quarantine = await quarantineUntracked({
+        worldPath: world.path,
+        home,
+        rootFd: worldRoot === null ? null : worldRoot.fd,
+        untracked,
+        uid,
+        maxFiles: maxQuarantineFiles,
+        maxBytes: maxQuarantineBytes,
+        pinOptions,
+        ...(opts.afterQuarantinePin !== undefined
+          ? { afterQuarantinePin: opts.afterQuarantinePin } : {}),
+        ...(opts.afterQuarantineDestinationPin !== undefined
+          ? { afterQuarantineDestinationPin: opts.afterQuarantineDestinationPin } : {}),
+        ...(opts.renameAt !== undefined ? { renameAt: opts.renameAt } : {}),
+      });
+    } else if (untracked.length > 0) {
+      // No free-space proof: moving files aside is refused, never guessed at.
+      quarantine = { files: 0, bytes: 0, paths: [], truncated: true };
+    }
+  } finally {
+    if (worldRoot !== null) await worldRoot.close().catch(() => {});
   }
 
   const report: DoctorReport = {
@@ -485,6 +492,217 @@ export async function runWorldDoctor(
     throw new Error('the world doctor produced a report its own validator rejects');
   }
   return report;
+}
+
+/** One tracked path's pinned verdict: unreadable, deleted, or a `/proc` skip. */
+async function inspectTracked(
+  rootFd: number, rel: string, uid: number | undefined, options: PinnedOptions,
+): Promise<'ok' | 'unreadable' | 'deleted' | 'proc-unavailable'> {
+  const parts = rel.split('/');
+  const base = parts.pop();
+  if (base === undefined || base === '') return 'deleted';
+  let parent: FileHandle;
+  try {
+    parent = await openPinnedParent(rootFd, parts, options);
+  } catch (err) {
+    if (err instanceof WorldFsMissingError) return 'deleted';
+    if (err instanceof WorldFsProcUnavailableError) return 'proc-unavailable';
+    return 'unreadable';
+  }
+  try {
+    let entry: Stats;
+    try {
+      entry = await lstatAt(parent.fd, base, options);
+    } catch (err) {
+      if (err instanceof WorldFsMissingError) return 'deleted';
+      if (err instanceof WorldFsProcUnavailableError) return 'proc-unavailable';
+      return 'unreadable';
+    }
+    // A symlink final entry is not followed and is not unreadable: the existing
+    // sweep skips non-file/non-directory entries.
+    if (entry.isSymbolicLink()) return 'ok';
+    if (!entry.isFile() && !entry.isDirectory()) return 'ok';
+    return unstageable(entry, uid) ? 'unreadable' : 'ok';
+  } finally {
+    await parent.close().catch(() => {});
+  }
+}
+
+/** The quarantine's pinned inputs; the run-level options are already reduced here. */
+type QuarantineContext = {
+  readonly worldPath: string;
+  readonly home: string;
+  readonly rootFd: number | null;
+  readonly untracked: readonly string[];
+  readonly uid: number | undefined;
+  readonly maxFiles: number;
+  readonly maxBytes: number;
+  readonly pinOptions: PinnedOptions;
+  readonly afterQuarantinePin?: (pin: {
+    readonly fd: number; readonly rootPath: string; readonly rel: string;
+  }) => Promise<void>;
+  readonly afterQuarantineDestinationPin?: (pin: {
+    readonly fd: number; readonly rootPath: string; readonly rel: string;
+  }) => Promise<void>;
+  readonly renameAt?: QuarantineRename;
+};
+
+/** A fresh destination name under a pinned parent; null when it cannot be proven. */
+async function uniquePinnedName(
+  destFd: number, base: string, options: PinnedOptions,
+): Promise<string | null> {
+  for (let n = 0; n < 100; n += 1) {
+    const candidate = n === 0 ? base : `${base}.${n}`;
+    try {
+      await lstatAt(destFd, candidate, options);
+    } catch (err) {
+      if (err instanceof WorldFsMissingError) return candidate;
+      if (err instanceof WorldFsProcUnavailableError) return null;
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Moves the bounded untracked-unstageable set into `.es/quarantine`, pinning
+ * BOTH ends: the world source parent is walked from the world root fd with
+ * `O_NOFOLLOW`, and the destination pins `home`, creates `.es` and
+ * `.es/quarantine` (0700, creation-only) only when the FIRST entry is actually
+ * being moved, creates the destination's nested parents with `mkdirAt` and
+ * addresses the unique-name `lstatAt` and the final `renameAt` through the
+ * pinned destination fd. Any rename failure (including `EXDEV`) leaves the
+ * source whole and unchanged, counts nothing and marks the quarantine
+ * `truncated`; there is no copy outside the quota and no path fallback. A
+ * run with no untracked entry opens/creates nothing.
+ */
+async function quarantineUntracked(ctx: QuarantineContext): Promise<DoctorQuarantine> {
+  const moved: string[] = [];
+  let bytes = 0;
+  let truncated = false;
+  if (ctx.rootFd === null) {
+    return { files: 0, bytes: 0, paths: [], truncated: ctx.untracked.length > 0 };
+  }
+  const sourceRoot = ctx.rootFd;
+  let homeRoot: FileHandle | null = null;
+  let esRoot: FileHandle | null = null;
+  let destRoot: FileHandle | null = null;
+  const closeDestination = async (): Promise<void> => {
+    for (const handle of [homeRoot, esRoot, destRoot]) {
+      if (handle !== null) await handle.close().catch(() => {});
+    }
+    homeRoot = null;
+    esRoot = null;
+    destRoot = null;
+  };
+  const ensureDestination = async (): Promise<FileHandle | null> => {
+    if (destRoot !== null) return destRoot;
+    try {
+      homeRoot = await openPinnedRoot(ctx.home, ctx.pinOptions);
+      esRoot = await openPinnedDirAt(homeRoot.fd, '.es', {
+        create: true, mode: 0o700, ...ctx.pinOptions,
+      });
+      destRoot = await openPinnedDirAt(esRoot.fd, 'quarantine', {
+        create: true, mode: 0o700, ...ctx.pinOptions,
+      });
+      return destRoot;
+    } catch {
+      await closeDestination();
+      return null;
+    }
+  };
+  try {
+    for (const rel of ctx.untracked) {
+      if (moved.length >= ctx.maxFiles || bytes >= ctx.maxBytes) {
+        truncated = true;
+        break;
+      }
+      if (!safeRelative(rel)) continue;
+      // A name with no representable single-line label is left in place: the
+      // report must stay valid (a moved file absent from `paths` would break
+      // `files === paths.length`), and a diagnostic omission never justifies a
+      // mutation we cannot describe.
+      const label = reportPath(rel);
+      if (label === null) continue;
+      const parts = rel.split('/');
+      const base = parts.pop();
+      if (base === undefined || base === '') continue;
+      let source: FileHandle;
+      try {
+        source = await openPinnedParent(sourceRoot, parts, ctx.pinOptions);
+      } catch (err) {
+        if (err instanceof WorldFsMissingError) continue;
+        truncated = true;
+        if (err instanceof WorldFsProcUnavailableError) break;
+        continue;
+      }
+      try {
+        if (ctx.afterQuarantinePin !== undefined) {
+          await ctx.afterQuarantinePin({ fd: source.fd, rootPath: ctx.worldPath, rel });
+        }
+        let entry: Stats;
+        try {
+          entry = await lstatAt(source.fd, base, ctx.pinOptions);
+        } catch (err) {
+          if (err instanceof WorldFsMissingError) continue;
+          truncated = true;
+          if (err instanceof WorldFsProcUnavailableError) break;
+          continue;
+        }
+        if (!unstageable(entry, ctx.uid)) continue;
+        const size = Number.isSafeInteger(entry.size) && entry.size > 0 ? entry.size : 0;
+        if (moved.length + 1 > ctx.maxFiles || bytes + size > ctx.maxBytes) {
+          truncated = true;
+          continue;
+        }
+        const destination = await ensureDestination();
+        if (destination === null) {
+          truncated = true;
+          break;
+        }
+        let destParent: FileHandle;
+        try {
+          destParent = await openPinnedParent(destination.fd, parts, {
+            create: true, mode: 0o700, ...ctx.pinOptions,
+          });
+        } catch {
+          truncated = true;
+          continue;
+        }
+        try {
+          if (ctx.afterQuarantineDestinationPin !== undefined) {
+            await ctx.afterQuarantineDestinationPin({
+              fd: destParent.fd, rootPath: quarantineDir(ctx.home), rel,
+            });
+          }
+          const chosen = await uniquePinnedName(destParent.fd, base, ctx.pinOptions);
+          if (chosen === null) {
+            truncated = true;
+            continue;
+          }
+          const move = ctx.renameAt ?? renameAt;
+          try {
+            await move(source.fd, base, destParent.fd, chosen, ctx.pinOptions);
+          } catch {
+            // Any failure (EXDEV included) preserves the source whole: no
+            // copy, no count, no host escape; the next commit refuses typed if
+            // the entry stays unstageable.
+            truncated = true;
+            continue;
+          }
+          moved.push(label);
+          bytes += size;
+        } finally {
+          await destParent.close().catch(() => {});
+        }
+      } finally {
+        await source.close().catch(() => {});
+      }
+    }
+  } finally {
+    await closeDestination();
+  }
+  return { files: moved.length, bytes, paths: moved, truncated };
 }
 
 // --- the report's replay validator ------------------------------------------

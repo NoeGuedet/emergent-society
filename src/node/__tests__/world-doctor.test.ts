@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { chmod, lstat, mkdir, readdir, rm, unlink, utimes, writeFile } from 'node:fs/promises';
+import {
+  chmod, lstat, mkdir, readdir, rename, rm, stat, symlink, unlink, utimes, writeFile,
+} from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -426,5 +428,185 @@ describe('the report validator', () => {
     })).toBeNull();
     expect(parseDoctorReport(null)).toBeNull();
     expect(parseDoctorReport([])).toBeNull();
+  });
+});
+
+describe('the pinned tracked sweep (lstatAt, never a path follow)', () => {
+  it('afterRootPin fires before the sweep; the sweep stays on the pinned root', async () => {
+    const { world, home } = fixture();
+    await commitAs(world, 'n1', { 'docs/a.txt': 'x\n', 'locked.txt': 'x\n' });
+    let calls = 0;
+    const report = await runWorldDoctor(world, {
+      home, freeSpace: plenty,
+      afterRootPin: async ({ rootPath }) => {
+        calls += 1;
+        // Rename the already-pinned root and put a PLAIN fake directory at its
+        // old name (never a symlink). The pinned root's locked.txt becomes
+        // unreadable; the fake root's is readable. Firing after the sweep would
+        // miss the pinned chmod, and a path-based sweep would report the fake
+        // docs/a.txt instead.
+        await rename(rootPath, `${rootPath}.pinned`);
+        await chmod(join(`${rootPath}.pinned`, 'locked.txt'), 0o000);
+        await mkdir(rootPath);
+        await mkdir(join(rootPath, 'docs'));
+        await writeFile(join(rootPath, 'docs', 'a.txt'), 'fake\n');
+        await chmod(join(rootPath, 'docs', 'a.txt'), 0o000);
+        await writeFile(join(rootPath, 'locked.txt'), 'fake\n');
+      },
+    });
+    expect(calls).toBe(1);
+    expect(report.trackedUnreadable).toEqual(['locked.txt']);
+    expect(report.dirty.known).toBe(true);
+    expect(((await lstat(join(`${world.path}.pinned`, 'docs', 'a.txt'))).mode & 0o400))
+      .not.toBe(0);
+    expect(((await lstat(join(world.path, 'docs', 'a.txt'))).mode & 0o777)).toBe(0o000);
+  });
+
+  it('a tracked path whose parent is a symlink is trackedUnreadable, never followed', async () => {
+    const { world, home } = fixture();
+    await commitAs(world, 'n1', { 'linked/a.txt': 'x\n' });
+    const outside = join(home, 'outside');
+    await mkdir(outside);
+    await writeFile(join(outside, 'a.txt'), 'canary\n');
+    await rm(join(world.path, 'linked'), { recursive: true, force: true });
+    await symlink(outside, join(world.path, 'linked'));
+    const report = await runWorldDoctor(world, { home, freeSpace: plenty });
+    expect(report.trackedUnreadable).toEqual(['linked/a.txt']);
+    expect((await lstat(join(outside, 'a.txt'))).isFile()).toBe(true);
+  });
+
+  it('a deleted tracked path, including a missing parent, is skipped, not unreadable', async () => {
+    const { world, home } = fixture();
+    await commitAs(world, 'n1', { 'gone/a.txt': 'x\n' });
+    await rm(join(world.path, 'gone'), { recursive: true, force: true });
+    const report = await runWorldDoctor(world, { home, freeSpace: plenty });
+    expect(report.trackedUnreadable).toEqual([]);
+  });
+});
+
+describe('the both-ends-pinned quarantine', () => {
+  it('afterQuarantinePin swaps the source parent; the in-world entry moves and the canary is untouched', async () => {
+    const { world, home } = fixture();
+    await mkdir(join(world.path, 'sub'));
+    const bad = join(world.path, 'sub', 'bad.txt');
+    await writeFile(bad, '');
+    await chmod(bad, 0o000);
+    const outside = join(home, 'outside');
+    await mkdir(outside);
+    await writeFile(join(outside, 'bad.txt'), 'canary\n', { mode: 0o644 });
+    let calls = 0;
+    const report = await runWorldDoctor(world, {
+      home, freeSpace: plenty,
+      afterQuarantinePin: async ({ rootPath }) => {
+        calls += 1;
+        await rename(join(rootPath, 'sub'), join(rootPath, 'sub.pinned'));
+        await symlink(outside, join(rootPath, 'sub'));
+      },
+    });
+    expect(calls).toBe(1);
+    expect(report.quarantine.files).toBe(1);
+    expect(report.quarantine.paths).toEqual(['sub/bad.txt']);
+    expect(await stat(join(home, '.es', 'quarantine', 'sub', 'bad.txt'))).toBeTruthy();
+    await expect(lstat(join(world.path, 'sub.pinned', 'bad.txt'))).rejects
+      .toMatchObject({ code: 'ENOENT' });
+    expect((await lstat(join(outside, 'bad.txt'))).isFile()).toBe(true);
+    expect(await readdir(outside)).toEqual(['bad.txt']);
+  });
+
+  it('a symlinked .es/quarantine skips with truncated and is never followed', async () => {
+    const { world, home } = fixture();
+    await mkdir(join(home, '.es'));
+    const outside = join(home, 'outside');
+    await mkdir(outside);
+    await symlink(outside, join(home, '.es', 'quarantine'));
+    const bad = join(world.path, 'bad.txt');
+    await writeFile(bad, 'still here\n');
+    await chmod(bad, 0o000);
+    const report = await runWorldDoctor(world, { home, freeSpace: plenty });
+    expect(report.quarantine).toMatchObject({
+      files: 0, bytes: 0, paths: [], truncated: true,
+    });
+    expect((await lstat(bad)).isFile()).toBe(true);
+    expect(await readdir(outside)).toEqual([]);
+  });
+
+  it('afterQuarantineDestinationPin swaps the destination; the move lands in the pinned dir', async () => {
+    const { world, home } = fixture();
+    const bad = join(world.path, 'bad.txt');
+    await writeFile(bad, '');
+    await chmod(bad, 0o000);
+    const outside = join(home, 'outside');
+    await mkdir(outside);
+    let calls = 0;
+    const report = await runWorldDoctor(world, {
+      home, freeSpace: plenty,
+      afterQuarantineDestinationPin: async () => {
+        calls += 1;
+        const dir = join(home, '.es', 'quarantine');
+        await rename(dir, `${dir}.pinned`);
+        await symlink(outside, dir);
+      },
+    });
+    expect(calls).toBe(1);
+    expect(report.quarantine.files).toBe(1);
+    expect(await stat(join(home, '.es', 'quarantine.pinned', 'bad.txt'))).toBeTruthy();
+    // The replacement symlink and its target are untouched.
+    expect((await lstat(join(home, '.es', 'quarantine'))).isSymbolicLink()).toBe(true);
+    expect(await readdir(outside)).toEqual([]);
+  });
+
+  it('creates .es/quarantine 0700 only on the first actual move; a clean run creates nothing', async () => {
+    const { world, home } = fixture();
+    const clean = await runWorldDoctor(world, { home, freeSpace: plenty });
+    expect(clean.quarantine).toMatchObject({ files: 0, truncated: false });
+    await expect(lstat(join(home, '.es'))).rejects.toMatchObject({ code: 'ENOENT' });
+    const bad = join(world.path, 'bad.txt');
+    await writeFile(bad, '');
+    await chmod(bad, 0o000);
+    const moved = await runWorldDoctor(world, { home, freeSpace: plenty });
+    expect(moved.quarantine.files).toBe(1);
+    expect(((await stat(join(home, '.es'))).mode & 0o777)).toBe(0o700);
+    expect(((await stat(join(home, '.es', 'quarantine'))).mode & 0o777)).toBe(0o700);
+  });
+
+  it('EXDEV preserves the source whole, copies nothing, counts nothing and truncates', async () => {
+    const { world, home } = fixture();
+    const bad = join(world.path, 'bad.txt');
+    await writeFile(bad, 'exdev source\n');
+    await chmod(bad, 0o000);
+    const report = await runWorldDoctor(world, {
+      home, freeSpace: plenty,
+      renameAt: async () => {
+        const err = new Error('EXDEV: cross-device link') as NodeJS.ErrnoException;
+        err.code = 'EXDEV';
+        throw err;
+      },
+    });
+    expect(report.quarantine).toMatchObject({
+      files: 0, bytes: 0, paths: [], truncated: true,
+    });
+    expect(await stat(bad)).toMatchObject({ size: 13 });
+    expect(await readdir(join(home, '.es', 'quarantine'))).toEqual([]);
+    // The next commit refuses typed while the entry stays unstageable.
+    const attempt = await commitAllRefused(() => world.commitAll('n1', 'turn 1'));
+    expect(attempt.commit).toBeNull();
+    expect(attempt.refusal).not.toBeNull();
+  });
+
+  it('a /proc-unavailable doctor skips the sweep/quarantine with truncated, never a deletion', async () => {
+    const { world, home } = fixture();
+    await commitAs(world, 'n1', { 'a.txt': 'x\n' });
+    const bad = join(world.path, 'bad.txt');
+    await writeFile(bad, '');
+    await chmod(bad, 0o000);
+    const report = await runWorldDoctor(world, {
+      home, freeSpace: plenty, procRoot: join(home, 'no-proc'),
+    });
+    expect(report.trackedUnreadable).toEqual([]);
+    expect(report.dirty.truncated).toBe(true);
+    expect(report.quarantine.files).toBe(0);
+    expect(report.quarantine.truncated).toBe(true);
+    expect((await lstat(bad)).isFile()).toBe(true);
+    await expect(lstat(join(home, '.es'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

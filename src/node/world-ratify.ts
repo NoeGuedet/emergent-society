@@ -1,14 +1,26 @@
 import { Buffer } from 'node:buffer';
 import { randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { chmod, access, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises';
+import { access, open } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, join, sep } from 'node:path';
-import { HUMAN_AUTHOR, ensureDurableDirectory, isErrno } from '../journal/index.js';
+import { basename, dirname, join, sep } from 'node:path';
+import { HUMAN_AUTHOR, ensureDurableDirectory } from '../journal/index.js';
 import { singleLine } from '../text.js';
 import { delay } from '../util.js';
 import { GitCommandError, WorldHeadError } from './errors.js';
 import { LOCK_CONTENTION } from './world-commit.js';
+import {
+  chmodFd,
+  lstatAt,
+  openLeafAt,
+  openPinnedParent,
+  openPinnedRoot,
+  realpathFd,
+  renameAt,
+  unlinkAt,
+  WorldFsError,
+  WorldFsMissingError,
+} from './world-fs.js';
 import {
   emptyTree, hashLength, readHead, runGit, runGitWithStdin, treeOf, type WorldIo,
 } from './world-git.js';
@@ -186,6 +198,22 @@ export type RatifyOptions = {
   readonly beforePublish?: (parent: string | null) => Promise<void>;
   /** Runs after a successful CAS and before the worktree rename (the scar seam). */
   readonly afterPublish?: (commit: string) => Promise<void>;
+  /**
+   * Test-only (`runDirect` never forwards it): fires exactly once after
+   * `openPinnedRoot(io.path)` and before any `openPinnedParent`/`mkdirAt`/parent
+   * traversal. The materialize mkdir canary.
+   */
+  readonly afterRootPin?: (pin: { readonly fd: number; readonly rootPath: string }) => Promise<void>;
+  /**
+   * Test-only: the distinct later seam for `readExisting`/exec-bit `chmodFd`/
+   * `renameAt`; fires exactly once after the final parent pin and before the
+   * leaf `lstatAt`/read, never after an intermediate directory pin.
+   */
+  readonly afterPinned?: (pin: {
+    readonly fd: number; readonly root: string; readonly rel: string;
+  }) => Promise<void>;
+  /** Test-only: the proc-filesystem root used by every pinned materialize call. */
+  readonly procRoot?: string;
 };
 
 /**
@@ -255,7 +283,8 @@ export async function ratify(io: WorldIo, options: RatifyOptions): Promise<Ratif
       `the home's .es directory could not be created (${codeOf(err)}); a ratification needs`
       + ' a home owned by the running uid');
   }
-  const temp = join(esDir, `direct-write.${randomHex()}.tmp`);
+  const tempName = `direct-write.${randomHex()}.tmp`;
+  const temp = join(esDir, tempName);
   try {
     await writeTemp(temp, options.bytes);
   } catch (err) {
@@ -281,6 +310,9 @@ export async function ratify(io: WorldIo, options: RatifyOptions): Promise<Ratif
           ...(options.beforePublish !== undefined
             ? { beforePublish: options.beforePublish } : {}),
           ...(options.afterPublish !== undefined ? { afterPublish: options.afterPublish } : {}),
+          ...(options.afterRootPin !== undefined ? { afterRootPin: options.afterRootPin } : {}),
+          ...(options.afterPinned !== undefined ? { afterPinned: options.afterPinned } : {}),
+          ...(options.procRoot !== undefined ? { procRoot: options.procRoot } : {}),
         });
       } catch (err) {
         if (!isContention(err) || attempt >= RATIFY_ATTEMPTS) throw err;
@@ -288,10 +320,12 @@ export async function ratify(io: WorldIo, options: RatifyOptions): Promise<Ratif
       }
     }
   } finally {
-    // The temp is gone when the rename moved it; the unlink is the unchanged
-    // path's and the failure path's cleanup, and a stale temp can never poison a
-    // later run (the name is unique per call).
-    await rm(temp, { force: true }).catch(() => {});
+    // The temp is gone when the rename moved it; the pinned unlink is the
+    // unchanged path's and the failure path's cleanup, and a stale temp can
+    // never poison a later run (the name is unique per call). A missing /proc
+    // leaves the bounded, uniquely named residue in `.es` rather than falling
+    // back to a path.
+    await unlinkPinned(esDir, tempName, options.procRoot);
   }
 }
 
@@ -305,6 +339,11 @@ type AttemptInput = {
   readonly esDir: string;
   readonly beforePublish?: (parent: string | null) => Promise<void>;
   readonly afterPublish?: (commit: string) => Promise<void>;
+  readonly afterRootPin?: (pin: { readonly fd: number; readonly rootPath: string }) => Promise<void>;
+  readonly afterPinned?: (pin: {
+    readonly fd: number; readonly root: string; readonly rel: string;
+  }) => Promise<void>;
+  readonly procRoot?: string;
 };
 
 /**
@@ -335,7 +374,11 @@ async function ratifyOnce(io: WorldIo, input: AttemptInput): Promise<RatifyOutco
       if (await readHead(io) !== parent) {
         throw new RatifyRetryError('the world moved while the ratification compared its tree');
       }
-      const worktree = await materialize(io, input.path, input.bytes, input.temp, mode);
+      const worktree = await materialize(io, input.path, input.bytes, input.temp, mode, {
+        ...(input.afterRootPin !== undefined ? { afterRootPin: input.afterRootPin } : {}),
+        ...(input.afterPinned !== undefined ? { afterPinned: input.afterPinned } : {}),
+        ...(input.procRoot !== undefined ? { procRoot: input.procRoot } : {}),
+      });
       const materialized = worktree.ok ? worktree.moved : false;
       return {
         kind: 'unchanged',
@@ -367,7 +410,11 @@ async function ratifyOnce(io: WorldIo, input: AttemptInput): Promise<RatifyOutco
     // once through the pinned chain; the shared index is staged only after a
     // successful rename (see the module header).
     const warnings: string[] = [];
-    const worktree = await materialize(io, input.path, input.bytes, input.temp, mode);
+    const worktree = await materialize(io, input.path, input.bytes, input.temp, mode, {
+      ...(input.afterRootPin !== undefined ? { afterRootPin: input.afterRootPin } : {}),
+      ...(input.afterPinned !== undefined ? { afterPinned: input.afterPinned } : {}),
+      ...(input.procRoot !== undefined ? { procRoot: input.procRoot } : {}),
+    });
     let staged = false;
     if (worktree.ok) {
       try {
@@ -393,9 +440,10 @@ async function ratifyOnce(io: WorldIo, input: AttemptInput): Promise<RatifyOutco
     };
   } finally {
     // The private index and its lock: a crashed run's stale file must never
-    // poison the next, and a retry seeds a NEW one.
-    await rm(index, { force: true }).catch(() => {});
-    await rm(`${index}.lock`, { force: true }).catch(() => {});
+    // poison the next, and a retry seeds a NEW one. The cleanup is pinned to
+    // `.es` so a /proc failure leaves only the bounded residue.
+    await unlinkPinned(input.esDir, basename(index), input.procRoot);
+    await unlinkPinned(input.esDir, `${basename(index)}.lock`, input.procRoot);
   }
 }
 
@@ -510,119 +558,138 @@ type Materialized =
   | { readonly ok: true; readonly moved: boolean }
   | { readonly ok: false; readonly reason: string };
 
+/** The materialize-only test seams (never set by the CLI or a production caller). */
+type MaterializeSeams = {
+  readonly afterRootPin?: (pin: { readonly fd: number; readonly rootPath: string }) => Promise<void>;
+  readonly afterPinned?: (pin: {
+    readonly fd: number; readonly root: string; readonly rel: string;
+  }) => Promise<void>;
+  readonly procRoot?: string;
+};
+
 /**
- * Renames the pre-written temp over the worktree path through the contained
+ * Renames the pre-written temp over the worktree path through the fd-anchored
  * chain, or reports that the worktree already holds the bytes.
  *
- * The chain: from the world's canonical root, every parent component is
- * `lstat`ed (a symlink is refused, never followed) and created when missing;
- * the parent directory is then opened `O_DIRECTORY | O_NOFOLLOW`, pinned as an
- * fd, and proven inside the world by `realpath('/proc/self/fd/N')` (the store's
- * fd-first precedent) and `fstat`. The rename's destination is the pinned fd's
- * own entry (`/proc/self/fd/N/<base>`), so a parent swapped after the open
- * cannot redirect the write: it lands in the directory the pin names.
+ * The chain (`src/node/world-fs.ts`): `openPinnedRoot(io.path)` is the ONLY
+ * root-path `realpath`; `afterRootPin` fires there, before any parent walk or
+ * `mkdirAt`. Every parent component is `lstatAt`'d and opened
+ * `O_DIRECTORY|O_NOFOLLOW` through the pinned parent fd, missing ones are
+ * created with `mkdirAt` (EEXIST success, reopen once), and the final
+ * `lstatAt`/comparison read/exec-bit `chmodFd`/`renameAt` address the pinned
+ * parent only. The containment proof is `realpathFd` compared against the
+ * pinned root's own fd (never a `realpath` of a selected parent path). The
+ * pre-CAS temp WRITE stays the host-owned path in `.es`; only its post-CAS
+ * chmod and cleanup are pinned.
  *
  * Failures are returned, never thrown: they happen after the CAS, and the
- * commit's landing decides the outcome (A6's post-CAS precedence). The
- * remaining race — a parent component replaced after its lstat and before the
- * pin — is bounded by the pin itself; the final-component race (the target
- * swapped) only ever replaces the final entry, never follows it.
+ * commit's landing decides the outcome (A6's post-CAS precedence). A `/proc`
+ * failure here is one named warning with the landed hash preserved, never a
+ * path fallback.
  */
 async function materialize(
   io: WorldIo, treePath: string, bytes: Uint8Array, temp: string, mode: string,
+  seams: MaterializeSeams = {},
 ): Promise<Materialized> {
   const segments = treePath.split('/');
   const base = segments.pop();
   if (base === undefined || base === '') {
-    return { ok: false, reason: 'the tree path has no file name' };
+    return failed('the tree path has no file name');
   }
-  let root: string;
+  const pinOptions = seams.procRoot !== undefined ? { procRoot: seams.procRoot } : {};
+  const esDir = dirname(temp);
+  const tempName = basename(temp);
+  let root: FileHandle;
   try {
-    root = await realpath(io.path);
+    root = await openPinnedRoot(io.path, pinOptions);
   } catch (err) {
-    return failed(`the world root could not be resolved (${codeOf(err)})`);
-  }
-  let current = root;
-  for (const segment of segments) {
-    const next = join(current, segment);
-    let entry;
-    try {
-      entry = await lstat(next);
-    } catch (err) {
-      if (!isErrno(err, 'ENOENT')) {
-        return failed(`a parent component could not be read (${codeOf(err)})`);
-      }
-      try {
-        await mkdir(next);
-      } catch (mkdirError) {
-        if (!isErrno(mkdirError, 'EEXIST')) {
-          return failed(`a parent component could not be created (${codeOf(mkdirError)})`);
-        }
-      }
-      try {
-        entry = await lstat(next);
-      } catch (again) {
-        return failed(`a parent component could not be read (${codeOf(again)})`);
-      }
-    }
-    if (!entry.isDirectory()) {
-      return failed(`a parent component is not a directory (${segment})`);
-    }
-    current = next;
-  }
-  let parent: FileHandle;
-  try {
-    parent = await open(current, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY
-      | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
-  } catch (err) {
-    return failed(`the parent directory could not be opened (${codeOf(err)})`);
+    return failed(`the world root could not be resolved (${worldFsLabel(err)})`);
   }
   try {
-    let pinned: string;
-    try {
-      pinned = await realpath(`/proc/self/fd/${parent.fd}`);
-    } catch {
-      return failed('the parent directory could not be pinned (/proc unavailable)');
+    if (seams.afterRootPin !== undefined) {
+      await seams.afterRootPin({ fd: root.fd, rootPath: io.path });
     }
-    if (pinned !== root && !pinned.startsWith(root + sep)) {
-      return failed('the parent directory resolves outside the world');
-    }
-    let info;
+    let parent: FileHandle;
     try {
-      info = await parent.stat();
+      parent = await openPinnedParent(root.fd, segments, { create: true, ...pinOptions });
     } catch (err) {
-      return failed(`the parent directory could not be inspected (${codeOf(err)})`);
+      return failed(`a parent component could not be pinned (${worldFsLabel(err)})`);
     }
-    if (!info.isDirectory()) return failed('the parent path is not a directory');
-    const existing = await readExisting(join(current, base), bytes, mode);
-    if (existing.state === 'equal') {
-      // The bytes match; git's exec bit must match too, or the next add --all
-      // stages a silent `mode change 100755 => 100644`.
-      if (existing.execMatches) return { ok: true, moved: false };
-      const fixed = await setExecutable(join(current, base), mode === '100755');
-      if (fixed !== null) return failed(fixed);
-      return { ok: true, moved: false };
-    }
-    if (existing.state === 'directory') return failed('the target path is a directory');
-    // The temp is 0600: an existing 100755 entry must be materialized
-    // executable, or the rename would flip the ratified mode (git tracks the
-    // exec bit; the next add --all would stage the change).
-    if (mode === '100755') {
+    try {
+      let rootReal: string;
+      let parentReal: string;
       try {
-        await chmod(temp, 0o755);
+        rootReal = await realpathFd(root, pinOptions);
+        parentReal = await realpathFd(parent, pinOptions);
       } catch (err) {
-        return failed(`the executable mode could not be set (${codeOf(err)})`);
+        return failed(`the parent directory could not be pinned (${worldFsLabel(err)})`);
       }
+      if (parentReal !== rootReal && !parentReal.startsWith(rootReal + sep)) {
+        return failed('the parent directory resolves outside the world');
+      }
+      let info;
+      try {
+        info = await parent.stat();
+      } catch (err) {
+        return failed(`the parent directory could not be inspected (${codeOf(err)})`);
+      }
+      if (!info.isDirectory()) return failed('the parent path is not a directory');
+      // The distinct later seam: after the FINAL parent pin, before the leaf
+      // lstat/read. Never fired after an intermediate directory pin.
+      if (seams.afterPinned !== undefined) {
+        await seams.afterPinned({ fd: parent.fd, root: io.path, rel: segments.join('/') });
+      }
+      const existing = await readExistingPinned(parent.fd, base, bytes, mode, pinOptions);
+      if (existing.state === 'equal') {
+        // The bytes match; git's exec bit must match too, or the next add --all
+        // stages a silent `mode change 100755 => 100644`.
+        if (existing.execMatches) return { ok: true, moved: false };
+        const fixed = await setExecutablePinned(
+          parent.fd, base, mode === '100755', pinOptions);
+        if (fixed !== null) return failed(fixed);
+        return { ok: true, moved: false };
+      }
+      if (existing.state === 'directory') return failed('the target path is a directory');
+      let es: FileHandle;
+      try {
+        es = await openPinnedRoot(esDir, pinOptions);
+      } catch (err) {
+        return failed(`the .es temp directory could not be pinned (${worldFsLabel(err)})`);
+      }
+      try {
+        // The temp is 0600: an existing 100755 entry must be materialized
+        // executable, or the rename would flip the ratified mode (git tracks
+        // the exec bit; the next add --all would stage the change).
+        if (mode === '100755') {
+          let tempHandle: FileHandle;
+          try {
+            tempHandle = await openLeafAt(
+              es.fd, tempName, fsConstants.O_RDONLY, pinOptions);
+          } catch (err) {
+            return failed(`the executable mode could not be set (${worldFsLabel(err)})`);
+          }
+          try {
+            await chmodFd(tempHandle, 0o755);
+          } catch (err) {
+            return failed(`the executable mode could not be set (${worldFsLabel(err)})`);
+          } finally {
+            await tempHandle.close().catch(() => {});
+          }
+        }
+        try {
+          await renameAt(es.fd, tempName, parent.fd, base, pinOptions);
+        } catch (err) {
+          return failed(`the rename failed (${worldFsLabel(err)})`);
+        }
+      } finally {
+        await es.close().catch(() => {});
+      }
+      return { ok: true, moved: true };
+    } finally {
+      await parent.close().catch(() => {});
     }
-    try {
-      // The pinned chain: the destination is the open parent fd's own entry.
-      await rename(temp, join('/proc/self/fd', String(parent.fd), base));
-    } catch (err) {
-      return failed(`the rename failed (${codeOf(err)})`);
-    }
-    return { ok: true, moved: true };
   } finally {
-    await parent.close().catch(() => {});
+    await root.close().catch(() => {});
   }
 }
 
@@ -632,17 +699,19 @@ function failed(reason: string): Materialized {
 }
 
 /**
- * Sets or clears the exec bit on an existing regular world file, through a
- * no-follow fd (the exec bit is the only mode git tracks). Returns a bounded
+ * Sets or clears the exec bit on an existing regular world file, through the
+ * pinned leaf fd (the exec bit is the only mode git tracks). Returns a bounded
  * reason on failure, `null` on success.
  */
-async function setExecutable(path: string, executable: boolean): Promise<string | null> {
+async function setExecutablePinned(
+  parentFd: number, base: string, executable: boolean,
+  options: { readonly procRoot?: string },
+): Promise<string | null> {
   let handle: FileHandle;
   try {
-    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW
-      | fsConstants.O_NONBLOCK);
+    handle = await openLeafAt(parentFd, base, fsConstants.O_RDONLY, options);
   } catch (err) {
-    return `the worktree copy could not be opened to set its mode (${codeOf(err)})`;
+    return `the worktree copy could not be opened to set its mode (${worldFsLabel(err)})`;
   }
   try {
     const info = await handle.stat();
@@ -650,10 +719,10 @@ async function setExecutable(path: string, executable: boolean): Promise<string 
     const current = info.mode & 0o777;
     const next = executable ? current | 0o111 : current & ~0o111;
     if (next === current) return null;
-    await handle.chmod(next);
+    await chmodFd(handle, next);
     return null;
   } catch (err) {
-    return `the worktree copy's mode could not be set (${codeOf(err)})`;
+    return `the worktree copy's mode could not be set (${worldFsLabel(err)})`;
   } finally {
     await handle.close().catch(() => {});
   }
@@ -666,17 +735,16 @@ type Existing = {
   readonly execMatches: boolean;
 };
 
-async function readExisting(
-  path: string, bytes: Uint8Array, mode: string,
+async function readExistingPinned(
+  parentFd: number, base: string, bytes: Uint8Array, mode: string,
+  options: { readonly procRoot?: string },
 ): Promise<Existing> {
   const wantExec = mode === '100755';
   let entry;
   try {
-    entry = await lstat(path);
+    entry = await lstatAt(parentFd, base, options);
   } catch (err) {
-    if (isErrno(err, 'ENOENT') || isErrno(err, 'ENOTDIR')) {
-      return { state: 'absent', execMatches: false };
-    }
+    if (err instanceof WorldFsMissingError) return { state: 'absent', execMatches: false };
     return { state: 'other', execMatches: false };
   }
   if (entry.isDirectory()) return { state: 'directory', execMatches: false };
@@ -686,8 +754,7 @@ async function readExisting(
   }
   let handle: FileHandle;
   try {
-    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW
-      | fsConstants.O_NONBLOCK);
+    handle = await openLeafAt(parentFd, base, fsConstants.O_RDONLY, options);
   } catch {
     return { state: 'other', execMatches: false };
   }
@@ -702,6 +769,27 @@ async function readExisting(
     return { state: 'other', execMatches: false };
   } finally {
     await handle.close().catch(() => {});
+  }
+}
+
+/** Best-effort pinned unlink of one `.es` artifact; a /proc failure leaves the bounded residue. */
+async function unlinkPinned(
+  dir: string, name: string, procRoot: string | undefined,
+): Promise<void> {
+  if (name === '' || name.includes('/')) return;
+  const pinOptions = procRoot !== undefined ? { procRoot } : {};
+  let root: FileHandle;
+  try {
+    root = await openPinnedRoot(dir, pinOptions);
+  } catch {
+    return;
+  }
+  try {
+    await unlinkAt(root.fd, name, pinOptions);
+  } catch {
+    // The uniquely named residue in `.es` is bounded; never a path fallback.
+  } finally {
+    await root.close().catch(() => {});
   }
 }
 
@@ -734,8 +822,17 @@ function boundWarning(text: string): string {
 /** The errno code of a failure, or a bounded label; never a message with a path. */
 function codeOf(err: unknown): string {
   if (err instanceof GitCommandError) return `git ${err.kind} failure`;
+  if (err instanceof WorldFsError) return err.errno ?? err.reason;
   const code = (err as NodeJS.ErrnoException | undefined)?.code;
   return typeof code === 'string' && code !== '' ? code : 'unknown failure';
+}
+
+/** The bounded label of one pinned-helper failure. */
+function worldFsLabel(err: unknown): string {
+  if (err instanceof WorldFsError) {
+    return err.reason === 'proc-unavailable' ? err.reason : (err.errno ?? err.reason);
+  }
+  return codeOf(err);
 }
 
 /** A fresh hex suffix for this process's temp names (one per call and attempt). */

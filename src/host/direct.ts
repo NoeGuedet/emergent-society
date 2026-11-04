@@ -14,7 +14,9 @@ import { singleLine } from '../text.js';
 import {
   CHAT_ABSENT_OVERLAY_NOTICE, ChatWriteError, ChatWriter,
 } from './chat.js';
-import { readOperatorFile } from './charter-file.js';
+import {
+  readPinnedOperatorFile, type PinnedOperatorPin,
+} from './charter-file.js';
 import { HostConfigError, UsageError } from './errors.js';
 import {
   assertCellLayout, assertHomePermissions, worldPairOf,
@@ -42,12 +44,13 @@ import {
  * authored `human`. The machinery is `node/world-ratify.ts` (the fresh private
  * index, the stdin hash, the mode rule, the unchanged question, the both-pairs
  * identity, the CAS, the re-seeding retry, materialize-first); this module owns
- * the operator surface: the `--file` read discipline (shared with the charter
- * file: regular, UTF-8, bounded, `providers.json` refused by path AND inode),
- * the tree-path form (the same discipline as the overlay's `read_world`), the
- * world's gates (`WorldRepo.open`: cell layout, home permissions, the legacy
- * world's migration refusal, the trust scan), the audit line, and the exit
- * codes.
+ * the operator surface: the `--file` read discipline (the shared pinned
+ * `charter-file.ts` core: the configured legacy world-root alias is the only
+ * trusted symlink prefix, every ancestor and the leaf are no-follow, regular,
+ * UTF-8, bounded, `providers.json` refused by path AND inode), the tree-path
+ * form (the same discipline as the overlay's `read_world`), the world's gates
+ * (`WorldRepo.open`: cell layout, home permissions, the legacy world's
+ * migration refusal, the trust scan), the audit line, and the exit codes.
  *
  * THE FLAG COMBINATIONS are strict (A6): `--text` XOR `--file`, exactly one;
  * `--path` requires `--file` and refuses `--text`; the bare default (with
@@ -114,6 +117,14 @@ export type DirectOptions = {
   readonly beforePublish?: (parent: string | null) => Promise<void>;
   /** The ratification's scar seam (after a successful CAS, before the rename). */
   readonly afterPublish?: (commit: string) => Promise<void>;
+  /**
+   * Test-only: fires once after the source read's final parent pin and before
+   * the leaf lstat/open (the reply's source read, and the ratification's source
+   * read; never the materialization).
+   */
+  readonly afterPinned?: (pin: PinnedOperatorPin) => Promise<void>;
+  /** Test-only: the source read's proc-filesystem root; also passed to `ratify`. */
+  readonly procRoot?: string;
 };
 
 /**
@@ -164,9 +175,11 @@ async function replyText(options: DirectOptions): Promise<string> {
   if (options.file === undefined) {
     throw new UsageError('direct requires --text "<msg>" or --file <abs-path>');
   }
-  const file = await readOperatorFile(options.home, options.file, 'the message file', {
-    refuseSymlinks: true,
+  const file = await readPinnedOperatorFile(options.home, options.file, 'the message file', {
+    worldRoot: worldPairOf(options.home).world,
     allowEmpty: true,
+    ...(options.afterPinned !== undefined ? { afterPinned: options.afterPinned } : {}),
+    ...(options.procRoot !== undefined ? { procRoot: options.procRoot } : {}),
   });
   // A message FILE conventionally ends in a newline; the record is the line the
   // session's own typing would have produced, so one trailing line terminator is
@@ -194,17 +207,23 @@ async function runRatify(
   } catch (error) {
     throw new HostConfigError(error instanceof Error ? error.message : 'the --path is invalid');
   }
-  const file = await readOperatorFile(options.home, options.file, 'the ratification file', {
-    refuseSymlinks: true,
-    allowEmpty: true,
-  });
   const pair = worldPairOf(options.home);
+  // The source read stays before any world open and any CAS. `procRoot` is
+  // forwarded to the source read only on the reply act: the ratification gives
+  // it to `ratify`'s post-CAS materialization instead, so an absent `/proc`
+  // cannot mask the existing post-CAS warning behind a pre-CAS refusal.
+  const file = await readPinnedOperatorFile(options.home, options.file, 'the ratification file', {
+    worldRoot: pair.world,
+    allowEmpty: true,
+    ...(options.afterPinned !== undefined ? { afterPinned: options.afterPinned } : {}),
+  });
   const repo = await WorldRepo.open(pair.world, { gitDir: pair.gitDir });
   const outcome: RatifyOutcome = await ratify(worldIoOf(repo), {
     path: treePath,
     bytes: file.bytes,
     ...(options.beforePublish !== undefined ? { beforePublish: options.beforePublish } : {}),
     ...(options.afterPublish !== undefined ? { afterPublish: options.afterPublish } : {}),
+    ...(options.procRoot !== undefined ? { procRoot: options.procRoot } : {}),
   });
   for (const warning of outcome.warnings) err(`warning: ${warning}\n`);
   out(outcome.kind === 'committed'

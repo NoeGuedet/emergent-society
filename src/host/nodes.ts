@@ -1,7 +1,8 @@
-import { lstat, readFile } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import { assertNodeUid } from '../journal/index.js';
 import { HostConfigError } from './errors.js';
+import { readPinnedOperatorFile } from './charter-file.js';
+import { worldPairOf } from './layout.js';
 
 /**
  * `--nodes-file`: the operator's declaration of a multi-node boot.
@@ -19,13 +20,23 @@ import { HostConfigError } from './errors.js';
  * Unknown keys are refused rather than ignored, so a typo cannot silently boot
  * a node with the wrong model; duplicate uids would give one home two nodes
  * fighting for the same local log, so they are refused too.
+ *
+ * THE DECLARATION IS EXTERNAL HOST CONFIGURATION. It is read through the pinned
+ * operator chain (`readPinnedOperatorFile`) with `requireExternal: true`: a
+ * world-addressed declaration — inside the configured `home/world` pair or its
+ * canonical root, including the legacy symlinked pair's target — is a typed
+ * refusal BEFORE the JSON parse. A guest-writable file must not select the
+ * host's charter/model inputs; the declaration's entry charters may still be
+ * world-addressed because the operator explicitly named them. The pinned read
+ * also preserves the file's existing 64 KiB byte bound (the shared over-cap
+ * sentence, with the `; the limit is N` suffix).
  */
 
 /** The cap on one nodes file: a society, not a fork bomb. */
 export const MAX_NODES = 16;
 
 /** The file's own byte ceiling: a declaration, not a payload. */
-const MAX_NODES_FILE_BYTES = 64 * 1024;
+export const MAX_NODES_FILE_BYTES = 64 * 1024;
 
 /** One node's boot input, already validated as JSON. */
 export type NodeSpec = {
@@ -41,24 +52,17 @@ const ENTRY_KEYS = new Set(['uid', 'model', 'heading', 'charterFile', 'spawn']);
 
 /** Reads and validates one nodes file for `start` or `resume`. */
 export async function readNodesFile(
-  path: string, command: 'start' | 'resume',
+  home: string, path: string, command: 'start' | 'resume',
 ): Promise<readonly NodeSpec[]> {
-  const entry = await lstat(path).catch((err: unknown) => {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new HostConfigError(`nodes file does not exist: ${path}`);
-    }
-    throw err;
+  const { text } = await readPinnedOperatorFile(home, path, 'the nodes file', {
+    worldRoot: worldPairOf(home).world,
+    requireExternal: true,
+    allowEmpty: false,
+    maxBytes: MAX_NODES_FILE_BYTES,
   });
-  if (!entry.isFile()) {
-    throw new HostConfigError(`nodes file must be a regular file: ${path}`);
-  }
-  if (entry.size > MAX_NODES_FILE_BYTES) {
-    throw new HostConfigError(`nodes file is larger than ${MAX_NODES_FILE_BYTES} bytes`);
-  }
-  const raw = await readFile(path, 'utf8');
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(text);
   } catch (err) {
     throw new HostConfigError(`nodes file is not JSON: ${path}`, { cause: err });
   }

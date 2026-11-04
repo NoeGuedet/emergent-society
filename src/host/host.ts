@@ -1635,7 +1635,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       // exit-2 refusal that never writes one) and validated entry by entry.
       const specs: readonly NodeSpec[] = options.nodesFile === undefined
         ? [singleNodeSpec(options)]
-        : await readNodesFile(options.nodesFile, command);
+        : await readNodesFile(home, options.nodesFile, command);
       const primaryUid = specs[0]!.uid;
       // The owner record comes BEFORE the long config fold: a `pause` issued
       // while the boot is still reading the journal then targets a live host
