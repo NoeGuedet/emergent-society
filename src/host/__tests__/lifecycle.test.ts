@@ -41,6 +41,8 @@ import {
   type HostHandle, type HostOptions, type ProcessHandlersTarget,
 } from '../host.js';
 import { createHostLog, type HostLog } from '../observe.js';
+import { ChatWriter, readChat } from '../chat.js';
+import { NodeTokenCounter, readNodeTokenSnapshot } from '../token-counter.js';
 import { readOwner, requestPause } from '../owner.js';
 import { formatStatus, readStatus } from '../status.js';
 
@@ -527,6 +529,8 @@ type HostOnceSetup = {
   readonly memoryRemember?: boolean;
   /** The start-only wake cadence (wake v1): `--heartbeat-seconds`. */
   readonly heartbeatSeconds?: number;
+  /** The start-only aggregate node token limit. */
+  readonly tokenLimit?: number;
 };
 
 /**
@@ -548,6 +552,7 @@ async function runHostOnce(command: 'start' | 'resume', setup: HostOnceSetup = {
         ...(setup.memoryRemember === true ? { memoryRemember: true } : {}),
         ...(setup.heartbeatSeconds !== undefined
           ? { heartbeatSeconds: setup.heartbeatSeconds } : {}),
+        ...(setup.tokenLimit !== undefined ? { tokenLimit: setup.tokenLimit } : {}),
       }
     : (() => {
         const { model, heading, ...resumeOpts } = opts;
@@ -1874,5 +1879,135 @@ describe('the wake policy at host activation (wake v1)', () => {
         message: { content: string };
       }).message.content);
     expect(results).toEqual(['Waiting until a foreign world commit']);
+  }, 30_000);
+});
+
+describe('the node token limit at host start', () => {
+  const usageIdle: ReplyBody = {
+    body: JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: 'idle' } }],
+      usage: { prompt_tokens: 0, completion_tokens: 0 },
+    }),
+  };
+
+  it('creates on a fresh start and preserves partial spend across resume', async () => {
+    await serve(() => usageIdle);
+    expect(await runHostOnce('start', { tokenLimit: 10 })).toBe(0);
+    expect(await readNodeTokenSnapshot(home)).toEqual({
+      v: 0, limitTokens: 10, usedTokens: 0, state: 'active',
+    });
+    const counter = await NodeTokenCounter.open(home);
+    await counter!.record(2, 3);
+    expect(await runHostOnce('resume', {})).toBe(0);
+    expect((await readNodeTokenSnapshot(home))!.usedTokens).toBe(5);
+  }, 30_000);
+
+  it('refuses a different limit and an exhausted stored state before node effects', async () => {
+    await mkdir(join(home, '.es'), { recursive: true, mode: 0o700 });
+    const counter = await NodeTokenCounter.open(home, { createLimit: 5 });
+    await counter!.record(5, 0);
+    expect(await runHostOnce('resume', { expectRefusal: true })).toBe(2);
+    expect(await readNodeTokenSnapshot(home)).toMatchObject({
+      limitTokens: 5, usedTokens: 5, state: 'exhausted',
+    });
+    expect((await readC13(home, 'node-0')).some((event) => event.type === 'turn/start'))
+      .toBe(false);
+    expect(await runHostOnce('start', { tokenLimit: 6, expectRefusal: true })).toBe(2);
+    expect((await readNodeTokenSnapshot(home))!.limitTokens).toBe(5);
+  }, 40_000);
+
+  it('never retrofits a token counter onto a configured or live unlimited home', async () => {
+    await serve();
+    expect(await runHostOnce('start', {})).toBe(0);
+    expect(await readNodeTokenSnapshot(home)).toBeNull();
+    expect(await runHostOnce('start', { tokenLimit: 5, expectRefusal: true })).toBe(2);
+    expect(await readNodeTokenSnapshot(home)).toBeNull();
+
+    await resetHome();
+    const first = track(startHost({ ...opts }, hostDeps));
+    await vi.waitFor(async () => {
+      expect((await readOwner(home)).kind).toBe('live');
+    }, { timeout: 10_000 });
+    const second = track(startHost({ ...opts, tokenLimit: 5 }, hostDeps));
+    expect(await second.done).toBe(2);
+    expect(await readNodeTokenSnapshot(home)).toBeNull();
+    first.stop();
+    expect(await first.done).toBe(0);
+  }, 40_000);
+
+  it('halts and exits normally on cap with no gateway configured', async () => {
+    await serve(() => ({
+      body: JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: 'idle' } }],
+        usage: { prompt_tokens: 5, completion_tokens: 5 },
+      }),
+    }));
+    const handle = track(startHost({ ...opts, tokenLimit: 5 }, hostDeps));
+    expect(await handle.done).toBe(0);
+    expect((await readNodeTokenSnapshot(home))!.state).toBe('exhausted');
+  }, 30_000);
+
+  it('retains a configured gateway on cap and answers chat with its own model', async () => {
+    const unique = 'unique-chat-after-node-exhaustion';
+    const server = await serve((request) => {
+      const body = JSON.parse(request.body.toString('utf8')) as { model?: string };
+      const gateway = body.model === 'gateway-model';
+      return {
+        body: JSON.stringify({
+          choices: [{ message: {
+            role: 'assistant', content: gateway ? `gateway reply: ${unique}` : 'idle',
+          } }],
+          usage: gateway
+            ? { prompt_tokens: 1, completion_tokens: 1 }
+            : { prompt_tokens: 5, completion_tokens: 5 },
+        }),
+      };
+    }, windowed('first-light-test', 'gateway-model'));
+    const charter = join(home, 'gateway.charter.md');
+    await writeFile(charter, 'You are the gateway overlay.\n', { mode: 0o600 });
+    const handle = track(startHost({
+      ...opts, pollMs: 25, tokenLimit: 5, gatewayCharter: charter, gatewayModel: 'gateway-model',
+    }, hostDeps));
+    try {
+      await vi.waitFor(async () => {
+        expect((await readNodeTokenSnapshot(home))?.state).toBe('exhausted');
+      });
+      const exhausted = await readNodeTokenSnapshot(home);
+      expect(exhausted?.usedTokens).toBe(10);
+      const nodeRequestsBefore = server.requests.filter((request) => {
+        const body = JSON.parse(request.body.toString('utf8')) as { model?: string };
+        return body.model === 'first-light-test';
+      }).length;
+      await ChatWriter.for(home).append(unique, Date.now());
+      await vi.waitFor(() => {
+        expect(server.requests.some(
+          (request) => request.body.toString('utf8').includes(unique),
+        )).toBe(true);
+      }, { timeout: 10_000 });
+      await vi.waitFor(async () => {
+        expect((await readChat(home)).some(
+          (record) => record.uid === 'gateway' && record.text.includes(unique),
+        )).toBe(true);
+      }, { timeout: 10_000 });
+      const gatewayRequest = server.requests.find(
+        (request) => request.body.toString('utf8').includes(unique),
+      );
+      expect(gatewayRequest).toBeDefined();
+      const gatewayBody = JSON.parse(gatewayRequest!.body.toString('utf8')) as { model?: string };
+      expect(gatewayBody.model).toBe('gateway-model');
+      expect(server.requests.filter((request) => {
+        const body = JSON.parse(request.body.toString('utf8')) as { model?: string };
+        return body.model === 'first-light-test';
+      }).length).toBe(nodeRequestsBefore);
+      expect((await readNodeTokenSnapshot(home))?.usedTokens).toBe(10);
+      const settled = await Promise.race([
+        handle.done.then(() => 'settled'),
+        new Promise<string>((resolve) => { setTimeout(() => resolve('pending'), 100); }),
+      ]);
+      expect(settled).toBe('pending');
+    } finally {
+      handle.stop();
+      expect(await handle.done).toBe(0);
+    }
   }, 30_000);
 });

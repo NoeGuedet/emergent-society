@@ -136,6 +136,7 @@ async function runHost(command: HostRun, deps: CliDeps, err: Sink): Promise<numb
           ...(command.gatewayModel !== undefined ? { gatewayModel: command.gatewayModel } : {}),
           ...(command.heartbeatSeconds !== undefined
             ? { heartbeatSeconds: command.heartbeatSeconds } : {}),
+          ...(command.tokenLimit !== undefined ? { tokenLimit: command.tokenLimit } : {}),
           ...(command.memoryRemember === true ? { memoryRemember: true } : {}),
         }
       : {}),

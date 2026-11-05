@@ -94,6 +94,14 @@ export type SendResult =
  */
 export type SendOptions = { readonly window?: number };
 
+/** The optional node-only token counter port; the gateway never receives one. */
+export type NodeTokenAdmission = 'admit' | 'exhausted' | 'unknown';
+export interface NodeTokenBudgetPort {
+  admit(): NodeTokenAdmission;
+  record(inputTokens: number, outputTokens: number): Promise<void>;
+  markUnknown(): Promise<void>;
+}
+
 /** The structured OpenAI error code that names a context-window refusal. */
 const CONTEXT_EXCEEDED_CODE = 'context_length_exceeded';
 
@@ -290,6 +298,7 @@ export class ProviderAdapter {
     private readonly transport: SerializedTransport,
     private readonly policy: ProviderPolicy,
     private readonly frontier: Frontier,
+    private readonly budget?: NodeTokenBudgetPort,
   ) {}
 
   async send(
@@ -311,6 +320,9 @@ export class ProviderAdapter {
     /** The first begin mints the group; every retry reuses it. */
     let group: string | undefined;
     for (;;) {
+      if (this.budget !== undefined && this.budget.admit() !== 'admit') {
+        return { kind: 'failure', failure: { code: 'request-limit', status: null } };
+      }
       // An already-aborted signal prevents any send (a stop/park never sends).
       if (gate.signal.aborted) {
         return { kind: 'failure', failure: { code: 'cancelled', status: null } };
@@ -380,6 +392,25 @@ export class ProviderAdapter {
           encoding: 'binary',
           complete: true,
         });
+        // The counter reads the raw provider usage before assistant projection
+        // and before the context-window filter. A valid usage counts even when
+        // projection itself then fails; a malformed 200 is unknown.
+        if (this.budget !== undefined) {
+          let rawUsage: MeterUsage | null = null;
+          let malformed = false;
+          try {
+            const raw = JSON.parse(Buffer.from(result.body).toString('utf8')) as unknown;
+            const usage = isRecord(raw) ? raw['usage'] : undefined;
+            rawUsage = parseUsage(usage);
+            malformed = rawUsage === null;
+          } catch {
+            malformed = true;
+          }
+          if (malformed) await this.budget.markUnknown();
+          else if (rawUsage !== null) {
+            await this.budget.record(rawUsage.promptTokens, rawUsage.completionTokens);
+          }
+        }
         let projected: Projected;
         try {
           projected = project(result.body, plan);

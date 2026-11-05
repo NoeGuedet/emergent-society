@@ -66,6 +66,8 @@ export type HostCliCommand =
        * wins — so the parser refuses it there.
        */
       readonly heartbeatSeconds?: number;
+      /** The optional start-only aggregate node token stop. */
+      readonly tokenLimit?: number;
     }
   | {
       readonly command: 'resume'; readonly home: string; readonly uid: string;
@@ -93,8 +95,8 @@ export type HostCliCommand =
  */
 export const USAGE = `Usage:
   node dist/host/main.js init   --home <abs-dir>
-  node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--heartbeat-seconds N] [--memory-remember] [--no-sandbox]
-  node dist/host/main.js start  --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--heartbeat-seconds N] [--memory-remember] [--no-sandbox]
+  node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--heartbeat-seconds N] [--token-limit N] [--memory-remember] [--no-sandbox]
+  node dist/host/main.js start  --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--heartbeat-seconds N] [--token-limit N] [--memory-remember] [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> [--uid node-0] [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]
   node dist/host/main.js pause  --home <abs-dir>
@@ -139,6 +141,12 @@ the legacy sliding-hour wakeBudgetPerHour forever, with no migration. A cell jou
 without policy.wake keeps its legacy wait form ({until} only, after_seconds refused) and its
 exact budget behavior; the old key remains accepted for those cells and is never re-emitted
 by a fresh composition.
+--token-limit is the optional start-only aggregate NODE response-token stop (input+output),
+stored in <home>/.es/node-token-limit.json. A stored limit is authoritative: a later start with a
+different value is a configuration refusal, the same value preserves used/state, and a resume
+never takes the flag. Gateway calls are uncapped and use the separate gateway model. This is a
+response-accounted stop, not a money or exact provider-bill ceiling; in-flight responses can
+overshoot.
 --memory-remember is the memory gate, start-only and home-level: it journals
 policy.memory {remember: true, messages: false} into every node this start composes and the
 composed extend offering advertises the remember verb (the node authors what replaces the fixed
@@ -246,6 +254,7 @@ function parseStart(args: readonly string[]): HostCliCommand {
     'gateway-charter': { type: 'string' },
     'gateway-model': { type: 'string' },
     'heartbeat-seconds': { type: 'string' },
+    'token-limit': { type: 'string' },
     'memory-remember': { type: 'boolean' },
     uid: { type: 'string' },
     'no-sandbox': { type: 'boolean' },
@@ -286,6 +295,7 @@ function parseStart(args: readonly string[]): HostCliCommand {
   }
   const home = homeOf(values, 'start');
   const heartbeatSeconds = heartbeatSecondsOf(values);
+  const tokenLimit = tokenLimitOf(values);
   const nodesFile = nodesFileOf(values);
   if (nodesFile !== undefined) {
     // The file carries every node's config: a solo flag beside it would be
@@ -302,6 +312,7 @@ function parseStart(args: readonly string[]): HostCliCommand {
       ...(gatewayModel !== undefined ? { gatewayModel } : {}),
       // Home-level: both gates apply to every node the file declares.
       ...(heartbeatSeconds !== undefined ? { heartbeatSeconds } : {}),
+      ...(tokenLimit !== undefined ? { tokenLimit } : {}),
       ...(values['memory-remember'] === true ? { memoryRemember: true } : {}),
     };
   }
@@ -316,6 +327,7 @@ function parseStart(args: readonly string[]): HostCliCommand {
     ...(gatewayCharter !== undefined ? { gatewayCharter } : {}),
     ...(gatewayModel !== undefined ? { gatewayModel } : {}),
     ...(heartbeatSeconds !== undefined ? { heartbeatSeconds } : {}),
+    ...(tokenLimit !== undefined ? { tokenLimit } : {}),
     ...(values['memory-remember'] === true ? { memoryRemember: true } : {}),
   };
 }
@@ -337,6 +349,23 @@ function heartbeatSecondsOf(values: OptionValues): number | undefined {
     throw new UsageError('--heartbeat-seconds takes a decimal integer from 0 to 604800');
   }
   return seconds;
+}
+
+/**
+ * `--token-limit`: one positive safe integer, start-only. The stored sidecar is
+ * authoritative on every later start/resume, so this flag never resets it.
+ */
+function tokenLimitOf(values: OptionValues): number | undefined {
+  const raw = values['token-limit'];
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || !/^[0-9]+$/.test(raw)) {
+    throw new UsageError('--token-limit takes a positive integer');
+  }
+  const limit = Number(raw);
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new UsageError('--token-limit takes a positive integer');
+  }
+  return limit;
 }
 
 /** `--nodes-file`, optional and absolute like the other operator paths. */

@@ -16,7 +16,9 @@ import { failFrontierFlushes, openTestFrontier, readFrontier } from '../../front
 import type { Frontier, FrontierJournal } from '../../frontier/index.js';
 import { serializeWire } from '../wire.js';
 import { headerDigest, priceMessage, priceWire } from '../../context/meter.js';
-import { ProviderAdapter, type ProviderPolicy } from '../adapter.js';
+import {
+  ProviderAdapter, type NodeTokenBudgetPort, type ProviderPolicy,
+} from '../adapter.js';
 import { OpenAITransport } from '../transport.js';
 import type { SerializedTransport, TransportFacts, TransportResult } from '../transport.js';
 import type {
@@ -59,8 +61,9 @@ async function openFrontier(): Promise<FrontierJournal> {
 /** An adapter bound to this test's frontier journal. */
 async function adapterWith(
   transport: SerializedTransport, policy: ProviderPolicy = policies(),
+  budget?: NodeTokenBudgetPort,
 ): Promise<ProviderAdapter> {
-  return new ProviderAdapter(transport, policy, (await openFrontier()).gate);
+  return new ProviderAdapter(transport, policy, (await openFrontier()).gate, budget);
 }
 
 /** The facts a test transport declares (the fixture endpoint and credential id). */
@@ -458,6 +461,69 @@ describe('ProviderAdapter: the usage dialect and the anchor sample (A2iii/A7)', 
       // reads as absent on every replay (the fold's own re-derivation row lives
       // beside the loop harness, where a turn is open).
       expect('accounting' in record).toBe(false);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('does not issue an HTTP attempt when the node token admission is closed', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult(validBody({
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    }))]);
+    const adapter = await adapterWith(transport, policies(), {
+      admit: () => 'exhausted',
+      record: async () => {},
+      markUnknown: async () => {},
+    });
+    try {
+      const result = await adapter.send(plan(), session.gate('turn', 0));
+      expect(result.kind).toBe('failure');
+      expect(result.kind === 'failure' ? result.failure.code : null).toBe('request-limit');
+      expect(transport.sends).toBe(0);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('counts raw valid usage before projection; a failed projection does not erase it', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult(JSON.stringify({
+      choices: [],
+      usage: { prompt_tokens: 7, completion_tokens: 3 },
+    }))]);
+    const recorded: Array<readonly [number, number]> = [];
+    let unknowns = 0;
+    const adapter = await adapterWith(transport, policies(), {
+      admit: () => 'admit',
+      record: async (input, output) => { recorded.push([input, output]); },
+      markUnknown: async () => { unknowns += 1; },
+    });
+    try {
+      const result = await adapter.send(plan(), session.gate('turn', 0));
+      expect(result.kind).toBe('failure');
+      expect(recorded).toEqual([[7, 3]]);
+      expect(unknowns).toBe(0);
+    } finally {
+      await session.shutdown();
+    }
+  });
+
+  it('marks a malformed 200 as accounting-unknown and never invents zero', async () => {
+    const session = await openSession();
+    const transport = new ScriptedTransport([transportResult('not json at all')]);
+    let recorded = 0;
+    let unknowns = 0;
+    const adapter = await adapterWith(transport, policies(), {
+      admit: () => 'admit',
+      record: async () => { recorded += 1; },
+      markUnknown: async () => { unknowns += 1; },
+    });
+    try {
+      const result = await adapter.send(plan(), session.gate('turn', 0));
+      expect(result.kind).toBe('failure');
+      expect(recorded).toBe(0);
+      expect(unknowns).toBe(1);
     } finally {
       await session.shutdown();
     }

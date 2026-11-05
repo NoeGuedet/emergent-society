@@ -45,7 +45,7 @@ import { llmCredentialFrom, loadProviderStore } from './credentials.js';
 import {
   assertCellLayout, assertHomeOutsideCheckout, assertHomePermissions, cellPaths,
 } from './layout.js';
-import { assertExecutionStartable } from './execution.js';
+import { assertExecutionStartable, ensureExecutionDirectory } from './execution.js';
 import { readCharterFile } from './charter-file.js';
 import type { HostLog } from './observe.js';
 import {
@@ -70,6 +70,8 @@ import {
 import { acquireOwner, type HostCommand, type OwnerHandle } from './owner.js';
 import { MAX_NODES, readNodesFile, type NodeSpec } from './nodes.js';
 import { HostAlreadyRunningError, HostConfigError } from './errors.js';
+import { NodeTokenCounter } from './token-counter.js';
+import type { NodeTokenBudgetPort } from '../provider/adapter.js';
 import { UnsafeWorldPathError, WorldNotARepoError } from '../node/errors.js';
 
 /**
@@ -161,6 +163,8 @@ export type CellOptions = {
    * over the pool, whose check-and-mark refuses the last live node.
    */
   readonly depart?: DepartPort;
+  /** The host's one aggregate node-token counter; never passed to the gateway. */
+  readonly nodeBudget?: NodeTokenBudgetPort;
   readonly pollMs?: number; readonly log: HostLog;
 };
 
@@ -224,6 +228,7 @@ export type CellSetOptions = {
   readonly fence?: FencePort;
   readonly storage?: StorageConfig;
   readonly doctorRunner?: CellOptions['doctorRunner'];
+  readonly nodeBudget?: NodeTokenBudgetPort;
   readonly pollMs?: number; readonly log: HostLog;
 };
 
@@ -316,7 +321,9 @@ async function composeNode(options: CellOptions, shared: SharedCell): Promise<No
     key: credential.key,
     credentialId: credential.credentialId,
   });
-  const adapter = new ProviderAdapter(transport, systemProviderPolicy, nodeFrontier);
+  const adapter = new ProviderAdapter(
+    transport, systemProviderPolicy, nodeFrontier, options.nodeBudget,
+  );
   // The extend port (C1.5): the host composes the store and the supervisor
   // once per runtime over the cell's own roots. The supervisor is built
   // INSIDE the factory: its event port is the loop's router and its service
@@ -592,6 +599,7 @@ function nodeOptionsOf(
     sandbox: options.sandbox, log: options.log,
     ...(spawn !== undefined ? { spawn } : {}),
     ...(spec.depart !== undefined ? { depart: spec.depart } : {}),
+    ...(options.nodeBudget !== undefined ? { nodeBudget: options.nodeBudget } : {}),
     ...(options.fence !== undefined ? { fence: options.fence } : {}),
     ...(options.storage !== undefined ? { storage: options.storage } : {}),
     ...(options.doctorRunner !== undefined ? { doctorRunner: options.doctorRunner } : {}),
@@ -712,6 +720,11 @@ export type HostOptions = {
    * (or an out-of-domain programmatic value) is a `HostConfigError` (exit 2).
    */
   readonly heartbeatSeconds?: number;
+  /**
+   * The start-only node token limit. A present sidecar is authoritative on
+   * resume/start; this only creates a fresh counter or validates an equal one.
+   */
+  readonly tokenLimit?: number;
   /**
    * A JSON nodes file declaring the whole boot: its uids (and, on a start, each
    * model, heading and optional absolute charter file) replace the solo flags.
@@ -1089,6 +1102,7 @@ class NodePool {
     readonly storage: StorageConfig;
     readonly log: HostLog;
     readonly maxNodes: number;
+    readonly nodeBudget?: NodeTokenBudgetPort;
     readonly composeChild?: ChildComposeSeam;
   }) {}
 
@@ -1260,6 +1274,7 @@ class NodePool {
         credential: this.deps.credential, providers: this.deps.providers,
         sandbox: this.deps.sandbox, log: this.deps.log,
         storage: this.deps.storage,
+        ...(this.deps.nodeBudget !== undefined ? { nodeBudget: this.deps.nodeBudget } : {}),
         ...(canSpawn ? { spawn: this.portFor(uid) } : {}),
         // Every node holds its own clean end — the grant is the pool's rule,
         // not a declared capability, so a composed child mirrors a booted one.
@@ -1572,8 +1587,21 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
   let owner: OwnerHandle | null = null;
   let clearKeepAlive: (() => void) | null = null;
   let detach: (() => void) | null = null;
+  let holdArmed = false;
+  let releaseHold: () => void = () => {};
+  const held = new Promise<void>((resolve) => { releaseHold = resolve; });
+
+  const onBudgetTerminal = (): void => {
+    if (stopRequested) return;
+    if (overlay !== null) holdArmed = true;
+    void pool?.stopAll();
+  };
 
   const stop = (): void => {
+    // Resolve the retained-overlay wait BEFORE the idempotent early return:
+    // a stop that landed before the budget halt armed the wait must still
+    // release it.
+    releaseHold();
     if (stopRequested) return;
     stopRequested = true;
     for (const node of composed?.nodes ?? []) node.driver.stop('stop-requested');
@@ -1619,6 +1647,29 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       // markerless home and a landlock marker keep the existing path.
       await assertExecutionStartable(home, { noSandbox: sandbox === false });
       await assertCellLayout(home);
+      // The counter is a host policy file: backend/home gates precede every
+      // budget read. This early peek is READ-ONLY; it must not install a policy
+      // on a start that later fails before the owner/config/provider gates.
+      let tokenCounter: NodeTokenCounter | null = null;
+      let storedCounterSeen = false;
+      const storedCounter = await NodeTokenCounter.open(home, {
+        onTerminal: onBudgetTerminal,
+      });
+      if (storedCounter !== null) {
+        storedCounterSeen = true;
+        if (options.tokenLimit !== undefined
+          && options.tokenLimit !== storedCounter.snapshot().limitTokens) {
+          throw new HostConfigError(
+            `the stored node token limit is ${storedCounter.snapshot().limitTokens};`
+            + ` refusing ${options.tokenLimit}`,
+          );
+        }
+        const state = storedCounter.snapshot();
+        if (state.state !== 'active' || state.usedTokens >= state.limitTokens) {
+          throw new HostConfigError('the node token budget is exhausted or accounting-unknown');
+        }
+        tokenCounter = storedCounter;
+      }
       // The human channel's delivery surface, opened once per host: outside the
       // world, kernel-owned, and independent of composition. A failed open is a
       // refused boot (a kernel-owned record that cannot be read is not reset).
@@ -1751,6 +1802,36 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       const overlayConfig = await resolveGatewayOverlay(
         home, command, options, credential.models,
       );
+      // Re-read the canonical counter under the acquired owner, after the
+      // fresh-start config/provider gates. Only here may a fresh start create
+      // the policy; a configured/live home cannot be retrofitted by a failed
+      // start. The file remains authoritative.
+      const canonicalCounter = await NodeTokenCounter.open(home, {
+        onTerminal: onBudgetTerminal,
+      });
+      if (storedCounterSeen && canonicalCounter === null) {
+        throw new HostConfigError('the node token limit file disappeared during start');
+      }
+      if (canonicalCounter !== null) {
+        if (options.tokenLimit !== undefined
+          && options.tokenLimit !== canonicalCounter.snapshot().limitTokens) {
+          throw new HostConfigError(
+            `the stored node token limit is ${canonicalCounter.snapshot().limitTokens};`
+            + ` refusing ${options.tokenLimit}`,
+          );
+        }
+        const state = canonicalCounter.snapshot();
+        if (state.state !== 'active' || state.usedTokens >= state.limitTokens) {
+          throw new HostConfigError('the node token budget is exhausted or accounting-unknown');
+        }
+        tokenCounter = canonicalCounter;
+      } else if (command === 'start' && options.tokenLimit !== undefined) {
+        await ensureExecutionDirectory(home);
+        tokenCounter = await NodeTokenCounter.open(home, {
+          createLimit: options.tokenLimit,
+          onTerminal: onBudgetTerminal,
+        });
+      }
       // The declared spawn grant: one port per node whose nodes-file entry
       // says `spawn: true` (a solo flag boot grants nobody). The port closes
       // over the pool, which exists only after the shared parts are composed;
@@ -1777,6 +1858,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       // the same validated providers/credential and the one attached sandbox.
       const sharedOptions = {
         home, credential, providers, sandbox: cellSandbox, log, storage,
+        ...(tokenCounter !== null ? { nodeBudget: tokenCounter } : {}),
         ...(deps.fence !== undefined ? { fence: deps.fence } : {}),
         ...(deps.doctorRunner !== undefined ? { doctorRunner: deps.doctorRunner } : {}),
         ...(pollMs !== undefined ? { pollMs } : {}),
@@ -1813,6 +1895,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
           conversation: ConversationLog.for(home),
         },
         providers, credential, sandbox: cellSandbox, storage, log, maxNodes: MAX_NODES,
+        ...(tokenCounter !== null ? { nodeBudget: tokenCounter } : {}),
         ...(deps.composeChild !== undefined ? { composeChild: deps.composeChild } : {}),
       });
       // The conversation's live recipients: a record addressed to a uid no live
@@ -1883,6 +1966,10 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
         for (const node of composed.nodes) node.driver.stop('stop-requested');
       }
       await pool.drain();
+      // A budget halt retains the already-started gateway/watchers/owner/chat;
+      // a nodes-only host keeps the ordinary drain/finally exit. A full stop
+      // has already released this wait in `stop()`.
+      if (holdArmed && !stopRequested) await held;
     } catch (err) {
       // A usage/config refusal is exit 2, matching AGENTS: the host's own
       // configuration classes plus the world open/trust family (a legacy or

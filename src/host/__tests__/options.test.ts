@@ -280,3 +280,29 @@ it('parses the start-only --heartbeat-seconds domain, solo and nodes-file', () =
   expect(USAGE).toContain('--heartbeat-seconds N');
   expect(USAGE).toContain('start-only');
 });
+
+it('parses the start-only positive --token-limit and refuses it elsewhere', () => {
+  expect(parseHostCommand([
+    'start', '--home', '/x', '--model', 'm', '--heading', 'h', '--token-limit', '100',
+  ])).toMatchObject({ command: 'start', tokenLimit: 100 });
+  expect(parseHostCommand([
+    'start', '--home', '/x', '--nodes-file', '/tmp/nodes.json', '--token-limit', '250',
+  ])).toEqual({
+    command: 'start', home: '/x', uid: 'node-0', noSandbox: false,
+    nodesFile: '/tmp/nodes.json', tokenLimit: 250,
+  });
+  expect('tokenLimit' in parseHostCommand([
+    'start', '--home', '/x', '--model', 'm', '--heading', 'h',
+  ])).toBe(false);
+  for (const argv of [
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--token-limit'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--token-limit='],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--token-limit', '0'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--token-limit', '-1'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--token-limit', '1.5'],
+    ['start', '--home', '/x', '--model', 'm', '--heading', 'h', '--token-limit', 'abc'],
+    ['resume', '--home', '/x', '--token-limit', '10'],
+  ]) {
+    expect(() => parseHostCommand(argv)).toThrow(UsageError);
+  }
+});

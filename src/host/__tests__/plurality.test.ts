@@ -22,6 +22,7 @@ import {
 } from '../host.js';
 import { initHome } from '../layout.js';
 import { createHostLog } from '../observe.js';
+import { readNodeTokenSnapshot } from '../token-counter.js';
 
 /**
  * A1/A3: several nodes on one home, and the flat pool they live in.
@@ -138,6 +139,7 @@ function boot(home: string, opts: {
   readonly nodesFile?: string;
   readonly charterFile?: string;
   readonly heartbeatSeconds?: number;
+  readonly tokenLimit?: number;
   readonly deps?: HostDeps;
 }): HostHandle {
   const options: HostOptions = {
@@ -148,6 +150,7 @@ function boot(home: string, opts: {
     ...(opts.charterFile !== undefined ? { charterFile: opts.charterFile } : {}),
     ...(opts.heartbeatSeconds !== undefined
       ? { heartbeatSeconds: opts.heartbeatSeconds } : {}),
+    ...(opts.tokenLimit !== undefined ? { tokenLimit: opts.tokenLimit } : {}),
     log: createHostLog((line) => opts.lines.push(line)),
   };
   return startHost(options, {
@@ -309,6 +312,56 @@ it('spawns through a declared grant, names the requester, and denies the ungrant
     (event) => event.event === 'host/ended' && event.uid === 'node-1')).toBe(true);
   const attribution = await readAttribution(home);
   expect(attribution.some((record) => record.uid === 'node-1')).toBe(true);
+}, 60_000);
+
+it('counts a spawned child in the one shared node token counter', async () => {
+  const { home } = await initFixture();
+  const counts = new Map<string, number>();
+  const usageReply = (content: string, tool?: unknown) => ({
+    body: JSON.stringify({
+      choices: [{ message: tool !== undefined
+        ? { role: 'assistant', content: null, tool_calls: [tool] }
+        : { role: 'assistant', content } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    }),
+  });
+  const server = await serveJson((request) => {
+    const body = request.body.toString('utf8');
+    const uid = body.includes('You are node-1, composed by node-0.') ? 'node-1' : 'node-0';
+    const count = counts.get(uid) ?? 0;
+    counts.set(uid, count + 1);
+    if (uid === 'node-0' && count === 0) {
+      return usageReply('', {
+        id: 's0', type: 'function',
+        function: { name: 'extend', arguments: JSON.stringify({ verb: 'spawn', heading: 'Worker.' }) },
+      });
+    }
+    return usageReply('idle');
+  });
+  servers.push(server);
+  await providers(home, server.url);
+  const nodesFile = await writeNodes(home, [
+    { uid: 'node-0', model: 'first-light-test', heading: 'Lead.', spawn: true },
+  ]);
+  const lines: string[] = [];
+  const handle = boot(home, { nodesFile, tokenLimit: 3, lines });
+  try {
+    await vi.waitFor(() => {
+      expect(hostEvents(lines).filter((event) => event.event === 'host/spawned'))
+        .toHaveLength(1);
+    }, { timeout: 30_000 });
+    await vi.waitFor(async () => {
+      expect(await readNodeTokenSnapshot(home)).toMatchObject({
+        limitTokens: 3, usedTokens: 4, state: 'exhausted',
+      });
+    }, { timeout: 20_000 });
+  } finally {
+    handle.stop();
+    await handle.done;
+  }
+  expect(await readNodeTokenSnapshot(home)).toMatchObject({
+    limitTokens: 3, usedTokens: 4, state: 'exhausted',
+  });
 }, 60_000);
 
 it('refuses an out-of-catalog spawned model with the whole clamp-budgeted enumeration', async () => {

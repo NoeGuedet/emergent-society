@@ -10,6 +10,7 @@ import { readWorldState } from '../node/world-state.js';
 import { readOwner, type OwnerStorage } from './owner.js';
 import { readOverlaySidecars } from '../overlay/charter.js';
 import { HostConfigError } from './errors.js';
+import { readNodeTokenSnapshot, type NodeTokenSnapshot } from './token-counter.js';
 
 /**
  * The read-only `status` report: one cell home, observed, never perturbed.
@@ -93,6 +94,8 @@ export type StatusReport = {
     readonly state: 'healthy' | 'degraded';
     readonly reason?: string;
   };
+  /** The optional node token counter, read directly from the host sidecar. */
+  readonly budget?: NodeTokenSnapshot;
 };
 
 /** The delay before the world read's single retry. */
@@ -348,13 +351,23 @@ export async function readStatus(home: string): Promise<StatusReport> {
   // projection can never turn the report itself into a failure. It is read
   // after the world probes, so the fields describe one point in time.
   const worldState = await readWorldState(home);
+  let budget: NodeTokenSnapshot | null = null;
+  try {
+    budget = await readNodeTokenSnapshot(home);
+  } catch {
+    // A damaging counter is a start refusal, not a report failure.
+    budget = null;
+  }
   const world: StatusReport['world'] = worldState.degraded
     ? {
       ...observedWorld, state: 'degraded',
       ...(worldState.reason !== undefined ? { reason: worldState.reason } : {}),
     }
     : { ...observedWorld, state: 'healthy' };
-  return { home, host, overlay, frontier, world };
+  return {
+    home, host, overlay, frontier, world,
+    ...(budget !== null ? { budget } : {}),
+  };
 }
 
 /**
@@ -388,6 +401,11 @@ async function overlayOf(home: string): Promise<StatusReport['overlay']> {
 export function formatStatus(report: StatusReport): string {
   const lines = [`home: ${report.home}`];
   lines.push(hostLine(report.host));
+  if (report.budget !== undefined) {
+    lines.push(
+      `tokens: ${report.budget.usedTokens}/${report.budget.limitTokens} ${report.budget.state}`,
+    );
+  }
   lines.push(overlayLine(report.overlay));
   lines.push(
     `frontier: ${report.frontier.count} events last=${report.frontier.lastHash} `

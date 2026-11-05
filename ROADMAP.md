@@ -7,7 +7,8 @@ References: [Vision](docs/vision.md) — what the project is; [Architecture](doc
 **Position.** The engine exists and runs: kernel, node driver, host, seven-command CLI,
 gateway overlay and Package layer. The last pushed wave is the quota-free modern wake policy
 on `main` at `99fe917` (preceding `d6e5ac7`, `63b68bb`). The system is operated through the
-CLI; there is no cockpit frontend.
+CLI; an optional start-only operator node response-token stop is available, and there is no
+cockpit frontend.
 
 **Gaps.** No generic credential broker (the loader supports only `llm` and `tavily`), no
 research observation/analysis pipeline and no cockpit frontier viewer, no full escalating kill
@@ -104,8 +105,9 @@ before code. The order is a proposal.
 5. **Real model and the first controlled experiment with restart.** *Acceptance:* a real
    endpoint (local RTX3090 and/or sponsored credits) runs a controlled restart; both raw
    truths record the session; the report states what was observed, with provenance and limits.
-   No cost, token or count admission quota is reintroduced, and legacy cells keep their old
-   policy with no migration. C1/C3 are claimed only if their criteria are demonstrated.
+   No price/cost admission quota is reintroduced; the optional operator node response-token stop
+   is operational, gateway-uncapped and not a money ceiling. Legacy cells keep their old policy
+   with no migration. C1/C3 are claimed only if their criteria are demonstrated.
 
 ## Checkpoints
 
@@ -144,5 +146,5 @@ broker design remains a proposal, not the active wave.
 - No code before the design is validated.
 - No organizational structure is coded; no metric is GIVEN to the agents (the node's own derivations from its records are its behavior, measured like any other); fidelity is measured on acts, never self-reports.
 - The frontier journal is the only truth; replay is not re-execution.
-- Hard physics: the kill switch, the frontier journal and its gate, the mutation gate, the confinement boundary, the storage circuit breaker and the per-child deadlines. Spending is deployment policy (an optional upstream key limit), not a kernel-installed quota or a prerequisite: a local GPU or sponsored credits is a supported deployment.
+- Hard physics: the kill switch, the frontier journal and its gate, the mutation gate, the confinement boundary, the storage circuit breaker and the per-child deadlines. Spending is deployment policy (an optional upstream key limit), not a kernel-installed quota or a prerequisite: a local GPU or sponsored credits is a supported deployment. The optional start-only operator node response-token stop is an operational node cap, not a price or spending ceiling; the gateway is uncapped.
 - Git history is the project's chronicle.

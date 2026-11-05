@@ -28,7 +28,7 @@ run. Status lives in ROADMAP only; never infer it from this file or from a doc d
   both-valid home is left unchanged (the exclusive `.es/init.lock` metadata is the only
   effect), and a valid marker with a missing/one-sided world pair is refused without adopting
   a history.
-- `start --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--heartbeat-seconds N] [--memory-remember] [--no-sandbox]` —
+- `start --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--heartbeat-seconds N] [--token-limit N] [--memory-remember] [--no-sandbox]` —
   boot and run a node; Landlock confinement is the default, `--no-sandbox` is the explicit
   opt-out; `--charter-file` is the base of the composed charter on a start into a cell with no
   journaled configuration (its content is journaled as configuration; the kernel appends the
@@ -62,7 +62,7 @@ run. Status lives in ROADMAP only; never infer it from this file or from a doc d
   without `policy.wake` remain legacy forever: their `{until}`-only wait form, optional
   `wakeBudgetPerHour` (absent reads `12`) and fire-time refusal are retained, with no
   migration. Fresh compositions never emit the old cost key.
-- `start --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--heartbeat-seconds N] [--memory-remember] [--no-sandbox]` — boot a declared
+- `start --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--heartbeat-seconds N] [--token-limit N] [--memory-remember] [--no-sandbox]` — boot a declared
   node set on one home: a strict JSON array of at most 16 `{uid, model, heading,
   charterFile?, spawn?}` entries with unique uids, read at the config gate (exit 2
   on a malformed file). The declaration itself must be an EXTERNAL host file: one inside the

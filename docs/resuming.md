@@ -127,8 +127,10 @@ Wake notes:
 - A positive cadence, for example `--heartbeat-seconds 3600` on a fresh home, creates hourly
   wake opportunities. It does not guarantee progress, work or a turn with output.
 - Legacy cells keep their journaled old policy with no migration.
-- No spending ceiling, token tank or admission quota exists in the kernel. Cost is deployment
-  policy; a local GPU or sponsored credits is a supported deployment.
+- No price, spending ceiling or monetary economy exists in the kernel. The optional start-only
+  `--token-limit N` is an operational node response-token stop: it aggregates provider-reported
+  node usage, leaves the gateway uncapped, and is not an exact provider bill. Without it, cost is
+  deployment policy; a local GPU or sponsored credits is a supported deployment.
 
 Never launch an experiment or make a paid model call as part of orientation. The live wrapper
 is gated by `ES_LIVE_LLM=1`, but that variable gates only

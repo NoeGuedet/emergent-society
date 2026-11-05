@@ -17,6 +17,7 @@ import { TEST_STORAGE } from '../../frontier/__tests__/helpers.js';
 import { WorldRepo } from '../../node/world.js';
 import { clearWorldState, markWorldDegraded } from '../../node/world-state.js';
 import { commitAs } from '../../node/__tests__/helpers.js';
+import { NodeTokenCounter } from '../token-counter.js';
 
 /**
  * The read-only `status` report, observed over a real cell home.
@@ -358,4 +359,16 @@ it('surfaces the storage fact in JSON, and in the human line only when unquoted'
   });
   expect(formatStatus(await readStatus(home))).not.toContain('storage=');
   await legacy.release();
+});
+
+it('reports the node token counter directly, body-free', async () => {
+  await mkdir(join(home, '.es'), { recursive: true, mode: 0o700 });
+  const counter = await NodeTokenCounter.open(home, { createLimit: 10 });
+  await counter!.record(2, 3);
+  const report = await readStatus(home);
+  expect(report.budget).toEqual({
+    v: 0, limitTokens: 10, usedTokens: 5, state: 'active',
+  });
+  expect(formatStatus(report)).toContain('tokens: 5/10 active');
+  expect(JSON.stringify(report)).not.toContain('prompt_tokens');
 });
