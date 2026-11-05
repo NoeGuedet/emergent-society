@@ -306,3 +306,13 @@ it('parses the start-only positive --token-limit and refuses it elsewhere', () =
     expect(() => parseHostCommand(argv)).toThrow(UsageError);
   }
 });
+
+it('parses resume --observer and refuses it with a nodes file', () => {
+  expect(parseHostCommand([
+    'resume', '--home', '/x', '--observer',
+  ])).toMatchObject({ command: 'resume', uid: 'node-0', observer: true });
+  expect('observer' in parseHostCommand(['resume', '--home', '/x'])).toBe(false);
+  expect(() => parseHostCommand([
+    'resume', '--home', '/x', '--nodes-file', '/tmp/nodes.json', '--observer',
+  ])).toThrow(UsageError);
+});

@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Emergent Society cockpit</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>Emergent Society</h1>
+    <span class="muted">local cockpit</span>
+  </header>
+  <main>
+    <section id="login" class="panel">
+      <h2>Operator token</h2>
+      <p class="muted">Paste the bearer token. It stays in this tab's session storage and is never placed in a URL or page markup.</p>
+      <form id="login-form">
+        <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="bearer token">
+        <button type="submit">Open</button>
+      </form>
+      <div id="login-error" class="error" role="alert"></div>
+    </section>
+
+    <section id="app" hidden>
+      <div class="columns">
+        <aside class="panel runs">
+          <div class="row between">
+            <h2>Runs</h2>
+            <button id="refresh" type="button">Refresh</button>
+          </div>
+          <ul id="run-list"></ul>
+        </aside>
+
+        <section class="panel">
+          <h2>New run</h2>
+          <form id="create-form">
+            <label>Label <input id="label" required maxlength="200"></label>
+            <label>Heading <textarea id="heading" required rows="3" maxlength="4096"></textarea></label>
+            <div class="row">
+              <label>Node model <input id="node-model" required list="models"></label>
+              <label>Gateway model <input id="gateway-model" required list="models"></label>
+            </div>
+            <div class="row">
+              <label>Nodes <input id="node-count" type="number" min="1" max="16" value="1" required></label>
+              <label>Node token limit <input id="node-limit" type="number" min="1" required></label>
+              <label class="check"><input id="spawn" type="checkbox"> Allow spawn</label>
+            </div>
+            <button type="submit">Create and launch</button>
+            <div id="create-error" class="error" role="alert"></div>
+          </form>
+
+          <div id="selected" hidden>
+            <hr>
+            <div class="row between">
+              <h2 id="selected-label"></h2>
+              <div class="row">
+                <button id="observe" type="button">Observe gateway</button>
+                <button id="pause" type="button">Pause</button>
+              </div>
+            </div>
+            <p id="run-meta" class="muted"></p>
+            <div class="row">
+              <button id="tab-activity" type="button">Activity</button>
+              <button id="tab-chat" type="button">Chat</button>
+              <button id="tab-mailbox" type="button">Mailbox</button>
+              <button id="tab-tree" type="button">World tree</button>
+            </div>
+            <div id="pane-activity" class="pane"></div>
+            <div id="pane-chat" class="pane" hidden>
+              <div id="chat"></div>
+              <form id="chat-form">
+                <input id="chat-text" maxlength="8192" placeholder="message to agent zero">
+                <button type="submit">Send</button>
+              </form>
+            </div>
+            <div id="pane-mailbox" class="pane" hidden></div>
+            <div id="pane-tree" class="pane" hidden></div>
+            <div id="run-error" class="error" role="alert"></div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+  <datalist id="models"></datalist>
+  <script src="/app.js"></script>
+</body>
+</html>

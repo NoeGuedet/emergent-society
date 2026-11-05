@@ -230,6 +230,31 @@ async function kernelSources(): Promise<{ readonly rel: string; readonly text: s
   return out;
 }
 
+/**
+ * Non-TypeScript executable sources. Only the browser frontend JavaScript is
+ * excluded (its fetch is legitimate); a backend `.mjs`/`.js` helper must not
+ * hide process primitives from the guard.
+ */
+async function executableSources(): Promise<{ readonly rel: string; readonly text: string }[]> {
+  const out: { rel: string; text: string }[] = [];
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === '__tests__') continue;
+        await walk(path);
+        continue;
+      }
+      if (!entry.isFile() || !/\.(?:mjs|js|cjs)$/.test(entry.name)) continue;
+      const rel = relative(SRC_ROOT, path).split(sep).join('/');
+      if (rel.startsWith('host/cockpit/frontend/')) continue;
+      out.push({ rel, text: await readFile(path, 'utf8') });
+    }
+  };
+  await walk(SRC_ROOT);
+  return out;
+}
+
 function containing(
   sources: readonly { readonly rel: string; readonly text: string }[], needle: string,
 ): string[] {
@@ -423,8 +448,26 @@ describe('proof 1: one mediated path (a regression guard on kernel sources)', ()
       'node/tools/web.ts', 'provider/transport.ts',
     ]);
 
+    // ONE exact inbound exception: the operator cockpit's local HTTP server.
+    // It may only import createServer and the HTTP request/response types; it
+    // must not gain an outbound request/get path, a namespace import, or a
+    // dynamic entry. Every other network module remains banned below.
+    const HTTP_MODULE = 'node:' + 'http';
+    expect(containing(sources, HTTP_MODULE)).toEqual(['host/cockpit/server.ts']);
+    const inbound = sources.find((source) => source.rel === 'host/cockpit/server.ts');
+    expect(inbound?.text).toContain(
+      "import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';",
+    );
+    expect(inbound?.text).toContain('createServer(');
+    expect(inbound?.text.match(/node:http/g)).toHaveLength(1);
+    expect(inbound?.text).not.toMatch(/\bhttp\.(request|get)\s*\(/);
+    expect(inbound?.text).not.toContain('http.createServer');
+    expect(inbound?.text).not.toContain('import * as');
+    expect(inbound?.text).not.toMatch(/\bimport\s*\(\s*['"]node:http['"]\s*\)/);
+    expect(inbound?.text).not.toContain("from 'http'");
+
     for (const banned of [
-      'node:' + 'http', 'node:' + 'https', 'node:' + 'net', 'node:' + 'tls',
+      'node:' + 'https', 'node:' + 'net', 'node:' + 'tls',
       'node:' + 'http2', 'node:' + 'dgram', 'undici', 'WebSocket',
     ]) {
       expect({ needle: banned, files: containing(sources, banned) })
@@ -445,14 +488,58 @@ describe('proof 1: one mediated path (a regression guard on kernel sources)', ()
       }
     }
 
-    // Exactly five legitimate kernel sites (the supervisor's plain spawn is
-    // the fourth, C1.5 design §5.2; the shared locked-append primitive is the
-    // fifth — Node has no flock binding, so the conversation and chat appends
-    // run a short-lived child under `flock -F`); a sixth fails the proof.
+    // The one cockpit operator adapter is explicitly typed and fixed: it may
+    // launch only process.execPath + the existing start-service script, and it
+    // may run only exact `systemctl --user show/stop` operations.
+    const operatorRuntime = sources.find(
+      (source) => source.rel === 'host/cockpit/runtime.ts',
+    );
+    expect(operatorRuntime?.text).toContain(
+      "import { spawn, execFile, type ChildProcess } from 'node:child_process';",
+    );
+    expect(operatorRuntime?.text.match(/node:child_process/g)).toHaveLength(1);
+    expect(operatorRuntime?.text).toContain('spawn(process.execPath, [START_SERVICE, ...args]');
+    expect(operatorRuntime?.text).toContain("execFileAsync('systemctl', [");
+    expect(operatorRuntime?.text).toContain("'--user', 'show', unit");
+    expect(operatorRuntime?.text).toContain("'--user', 'stop', unit");
+    expect(operatorRuntime?.text).not.toMatch(/\b(spawnSync|execSync|fork|exec)\s*\(/);
+    expect(operatorRuntime?.text).not.toContain('shell: true');
+    expect(operatorRuntime?.text).not.toContain('import * as');
+    expect(operatorRuntime?.text).not.toContain('export *');
+    expect(operatorRuntime?.text).not.toMatch(/\bimport\s*\(/);
+    expect(operatorRuntime?.text.match(/export (?:async )?function/g)).toHaveLength(3);
+
+    // Exactly six legitimate TS process sites: the existing five plus the
+    // cockpit's fixed operator adapter above.
     expect(containing(sources, 'child' + '_process')).toEqual([
-      'journal/lock.ts', 'locked-append.ts', 'node/packages/supervisor.ts',
-      'node/tools/sandbox.ts', 'node/world-git.ts',
+      'host/cockpit/runtime.ts', 'journal/lock.ts', 'locked-append.ts',
+      'node/packages/supervisor.ts', 'node/tools/sandbox.ts', 'node/world-git.ts',
     ]);
+
+    // No backend non-TS executable may hide a process or network primitive;
+    // only the exact browser frontend JavaScript is exempt (its fetch is
+    // legitimate). This keeps future .mjs/.js backend helpers in scope.
+    const executable = await executableSources();
+    expect(containing(executable, 'child' + '_process')).toEqual([]);
+    expect(executable.filter((source) => FETCH_RE.test(source.text))
+      .map((source) => source.rel).sort()).toEqual([]);
+    for (const banned of [
+      'node:' + 'http', 'node:' + 'https', 'node:' + 'net', 'node:' + 'tls',
+      'node:' + 'http2', 'node:' + 'dgram', 'undici', 'WebSocket',
+    ]) {
+      expect({ needle: banned, files: containing(executable, banned) })
+        .toEqual({ needle: banned, files: [] });
+    }
+    for (const bare of ['http', 'https', 'net', 'tls', 'http2', 'dgram']) {
+      for (const needle of [
+        `from '${bare}'`, `from "${bare}"`,
+        `require('${bare}')`, `require("${bare}")`,
+        `import('${bare}')`, `import("${bare}")`,
+      ]) {
+        expect({ needle, files: containing(executable, needle) })
+          .toEqual({ needle, files: [] });
+      }
+    }
   });
 
   it('sees each frontier consumer only at its definition and documented home', async () => {

@@ -114,6 +114,20 @@ is persisted; a later `resume` takes the persisted pair, while a start without t
 stays nodes-only even when a pair exists ([AGENTS.md](../AGENTS.md)). Do not launch it
 automatically. `--no-sandbox` is the explicit confinement opt-out; the default is Landlock.
 
+The local cockpit is a loopback-only operator surface, not a remote service:
+
+```sh
+npm run build
+npm run cockpit -- --runs-root <abs-private-dir> --provider-home <abs-dir> \
+  --gateway-charter <abs-adapted-charter> [--port <port>]
+```
+
+It prints the URL and the host-private bearer **path**; paste the bearer into the page. The
+token is never accepted on argv, echoed, or placed in HTML/static assets. `resume --observer`
+is the gateway-only host behind an observer action: it shares the persisted gateway pair,
+world, frontier, owner and chat without composing a node, reading the node counter or making a
+node model call. A local cockpit run remains local; it is not a hosted or multi-user service.
+
 The executable references for a no-key boot are
 [scripts/first-light-smoke.mjs](../scripts/first-light-smoke.mjs) (scenarios A–E against a
 loopback provider) and [scripts/wake-policy-smoke.mjs](../scripts/wake-policy-smoke.mjs) (the

@@ -15,7 +15,8 @@
     "test:first-light": "npm run build && node scripts/first-light-smoke.mjs",
     "test:first-light-packages": "npm run build && node scripts/first-light-packages-smoke.mjs",
     "live:first-light": "node scripts/first-light-live.mjs",
-    "start": "node dist/host/main.js"
+    "start": "node dist/host/main.js",
+    "cockpit": "node dist/host/cockpit/main.js"
   },
   "dependencies": {
     "@lydell/node-pty": "1.2.0-beta.15",

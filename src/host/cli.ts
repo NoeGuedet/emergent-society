@@ -140,6 +140,7 @@ async function runHost(command: HostRun, deps: CliDeps, err: Sink): Promise<numb
           ...(command.memoryRemember === true ? { memoryRemember: true } : {}),
         }
       : {}),
+    ...(command.command === 'resume' && command.observer === true ? { observer: true } : {}),
     ...(command.nodesFile !== undefined ? { nodesFile: command.nodesFile } : {}),
   });
   return await handle.done;

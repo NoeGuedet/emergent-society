@@ -7,8 +7,13 @@ References: [Vision](docs/vision.md) — what the project is; [Architecture](doc
 **Position.** The engine exists and runs: kernel, node driver, host, seven-command CLI,
 gateway overlay and Package layer. The last pushed wave is the quota-free modern wake policy
 on `main` at `99fe917` (preceding `d6e5ac7`, `63b68bb`). The system is operated through the
-CLI; an optional start-only operator node response-token stop is available, and there is no
-cockpit frontend.
+CLI; an optional start-only operator node response-token stop is available. A local loopback
+cockpit (gateway-only observer and vanilla page) is implemented and independently validated:
+148 test files / 2,508 tests, no skips, the nine Node 24 gates, and a real compiled
+fake-provider HTTP lifecycle acceptance. Browser rendering was not validated (the installed
+Firefox is snap single-instance); there is no remote cockpit or cockpit frontier viewer.
+Next is the cross-brick check of the committed token-limit and cockpit wave before delivery
+and demo setup.
 
 **Gaps.** No generic credential broker (the loader supports only `llm` and `tavily`), no
 research observation/analysis pipeline and no cockpit frontier viewer, no full escalating kill
@@ -128,8 +133,9 @@ A checkpoint is reached when its criterion is demonstrated on a running system, 
   own initiative", but the implemented gateway overlay is not a node and holds no `extend`; the
   demonstrated evidence is the node-side Package layer. Treat the wording/actor as design debt,
   not a current capability.
-- **Cockpit form and authority.** The cockpit's surface, export format and write authority are
-  unresolved; it is proposed, not implemented, and must not become a new authority.
+- **Cockpit form and authority.** The local V0 cockpit exists and must not become a new
+  authority; remote/multi-user access, export format and additional write authority remain
+  unresolved and proposed.
 
 ## Next safe action
 

@@ -74,10 +74,12 @@ run. Status lives in ROADMAP only; never infer it from this file or from a doc d
   grant by booting a one-entry nodes file with `spawn: true`. Each node gets its own
   local log, scratch leaf and cgroup leaf; all share the home's world and frontier
   journal. `--nodes-file` replaces `--uid`/`--model`/`--heading`/`--charter-file`.
-- `resume --home <abs-dir> [--uid node-0] [--no-sandbox]` — resume a parked node;
-  `--model`/`--heading`/`--charter-file` are refused as unknown flags, and so are
-  `--gateway-charter`/`--gateway-model`, `--heartbeat-seconds` and `--memory-remember` — the
-  persisted configuration wins.
+- `resume --home <abs-dir> [--uid node-0] [--observer] [--no-sandbox]` — resume a parked node;
+  `--observer` is gateway-only: it shares the persisted gateway pair, world, frontier, owner
+  and chat without composing a node, booting a node journal, reading the node counter or making
+  a node model call; it rejects `--nodes-file`. `--model`/`--heading`/`--charter-file` are
+  refused as unknown flags, and so are `--gateway-charter`/`--gateway-model`,
+  `--heartbeat-seconds` and `--memory-remember` — the persisted configuration wins.
 - `resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]` — resume a
   declared node set; entries declare only `uid` and `spawn` (the journaled config
   wins for everything else).
@@ -154,6 +156,7 @@ stopping.
   the bridged turn).
 - `live:first-light` — live-model wrapper; refuses and exits `2` unless `ES_LIVE_LLM=1`.
 - `start` — `node dist/host/main.js`.
+- `cockpit` — `npm run build && npm run cockpit -- --runs-root <abs-dir> --provider-home <abs-dir> --gateway-charter <abs-path> [--port <port>]`; binds `127.0.0.1` only, prints the URL and the host-private bearer **path** (never the token), and serves the local vanilla page. It is a local operator surface, not a remote or multi-user service; the CLI remains the primary surface.
 
 ## Conventions
 
@@ -265,9 +268,10 @@ a kernel failure.
 - No lint/format tooling, no coverage tooling.
 - No `src/skills/`, no `src/cli/` — the skills system is target design only, specified in
   `docs/kernel.md`.
-- No cockpit frontend or dedicated cockpit server. The operator surface is the CLI (`status`,
-  `chat`, `direct`, `pause`), the kernel-owned logs and the world's git; the cockpit is
-  proposed in [ROADMAP.md](ROADMAP.md), not implemented.
+- The local cockpit exists as a loopback-only Node HTTP process and vanilla page; it is not a
+  remote or multi-user service, and it has no frontier viewer, scheduler, analytics pipeline,
+  file preview/editor or ratification UI. The CLI (`status`, `chat`, `direct`, `pause`) remains
+  the primary operator surface.
 - No generic credential broker and no endpoint-bound placeholders. The `providers.json`
   loader supports exactly `llm` and `tavily`; the agent environment must not carry real
   secrets. Broker-side injection, per-node capability attenuation and mediated exchanges

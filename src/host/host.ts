@@ -261,7 +261,11 @@ type SharedCell = {
  * home: under a multi-node host the single writer lock is the host's, not a
  * node's.
  */
-async function openCellShared(options: CellOptions): Promise<SharedCell> {
+type SharedCellOptions = Pick<
+  CellOptions, 'home' | 'uid' | 'log' | 'storage' | 'doctorRunner'
+>;
+
+async function openCellShared(options: SharedCellOptions): Promise<SharedCell> {
   const { home, uid, log } = options;
   // The one storage seam for this cell: the production default (no quota) when
   // the host injected nothing. The frontier writer + gate and the driver + its
@@ -725,6 +729,8 @@ export type HostOptions = {
    * resume/start; this only creates a fresh counter or validates an equal one.
    */
   readonly tokenLimit?: number;
+  /** `resume --observer`: gateway-only shared run, never a node or counter user. */
+  readonly observer?: boolean;
   /**
    * A JSON nodes file declaring the whole boot: its uids (and, on a start, each
    * model, heading and optional absolute charter file) replace the solo flags.
@@ -1582,6 +1588,7 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
     close(): Promise<void>;
   } | null = null;
   let pool: NodePool | null = null;
+  let observerShared: SharedCell | null = null;
   let chat: ChatLog | null = null;
   let overlay: OverlayService | null = null;
   let owner: OwnerHandle | null = null;
@@ -1647,6 +1654,58 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       // markerless home and a landlock marker keep the existing path.
       await assertExecutionStartable(home, { noSandbox: sandbox === false });
       await assertCellLayout(home);
+      if (options.observer === true) {
+        if (command !== 'resume') {
+          throw new HostConfigError('observer is resume-only');
+        }
+        // Gateway-only observer: no node counter admission, node spec, config
+        // fold, pool, node journal or node model call. It shares the world,
+        // frontier, owner, chat and the persisted gateway overlay.
+        const openedObserverChat = await ChatLog.open(home);
+        chat = openedObserverChat;
+        await openConversationLog(home);
+        const observerProviders = await loadProviderStore(home);
+        const observerCredential = llmCredentialFrom(observerProviders);
+        const observerOverlay = await resolveGatewayOverlay(
+          home, 'resume', options, observerCredential.models,
+        );
+        if (observerOverlay === null) {
+          throw new HostConfigError('observer requires a persisted gateway configuration');
+        }
+        owner = await acquireOwner(home, {
+          uid: options.uid,
+          command: 'resume',
+          ...(deps.now !== undefined ? { now: deps.now } : {}),
+          sandbox: sandbox === false ? 'off' : 'landlock',
+        });
+        const shared = await openCellShared({
+          home, uid: options.uid, log, storage: resolveStorage(deps),
+        });
+        observerShared = shared;
+        const gatewayFrontier = shared.frontier.attribute(GATEWAY_ADDRESSEE);
+        const gatewayAdapter = new ProviderAdapter(
+          new OpenAITransport({
+            endpoint: observerCredential.endpoint,
+            key: observerCredential.key,
+            credentialId: observerCredential.credentialId,
+          }),
+          systemProviderPolicy,
+          gatewayFrontier,
+        );
+        overlay = new OverlayService({
+          home,
+          config: observerOverlay,
+          chat: openedObserverChat,
+          conversation: ConversationLog.for(home),
+          world: shared.world,
+          send: (plan, gate) => gatewayAdapter.send(plan, gate),
+          log,
+          ...(pollMs !== undefined ? { pollMs } : {}),
+        });
+        if (!stopRequested) overlay.start();
+        await held;
+        return 0;
+      }
       // The counter is a host policy file: backend/home gates precede every
       // budget read. This early peek is READ-ONLY; it must not install a policy
       // on a start that later fails before the owner/config/provider gates.
@@ -2011,6 +2070,13 @@ export function startHost(options: HostOptions, deps: HostDeps = {}): HostHandle
       if (composed !== null) {
         try {
           await composed.close();
+        } catch {
+          code = 1;
+        }
+      }
+      if (observerShared !== null) {
+        try {
+          await observerShared.frontier.close();
         } catch {
           code = 1;
         }

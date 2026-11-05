@@ -16,6 +16,7 @@ const launcherRel = join('native', 'es-landlock', 'es-landlock');
 const required = [
   'journal/lock.js', 'journal/lock-guard.mjs', 'node/conversation.js',
   'node/conversation-append.mjs', 'node/tools/sandbox.js', 'host/main.js',
+  'host/cockpit/main.js',
 ];
 
 const toPosix = (path) => path.split(sep).join('/');
@@ -56,6 +57,15 @@ export async function copyRuntimeAssets(root, out = join(root, 'dist')) {
     await mkdir(dirname(destination), { recursive: true });
     await copyFile(join(root, 'src', rel[0], rel[1]), destination);
   }
+  // The cockpit page is plain assets; runtime.ts compiles to runtime.js.
+  const cockpitOut = join(out, 'host', 'cockpit');
+  await mkdir(cockpitOut, { recursive: true });
+  const frontend = join(root, 'src', 'host', 'cockpit', 'frontend');
+  const frontendOut = join(cockpitOut, 'frontend');
+  await mkdir(frontendOut, { recursive: true });
+  for (const name of ['index.html', 'app.js', 'style.css']) {
+    await copyFile(join(frontend, name), join(frontendOut, name));
+  }
 }
 
 export async function ensureNative(root) {
@@ -75,6 +85,15 @@ export async function verifyDist(out = dist) {
   const label = (rel) => `${basename(out)}/${toPosix(rel)}`;
 
   for (const rel of required) {
+    if ((await statFile(join(out, ...rel.split('/')))) === null) {
+      throw new Error(`missing ${label(rel)}`);
+    }
+  }
+  for (const rel of [
+    'host/cockpit/frontend/index.html',
+    'host/cockpit/frontend/app.js',
+    'host/cockpit/frontend/style.css',
+  ]) {
     if ((await statFile(join(out, ...rel.split('/')))) === null) {
       throw new Error(`missing ${label(rel)}`);
     }

@@ -1,7 +1,7 @@
 import { constants as fsConstants } from 'node:fs';
-import type { Stats } from 'node:fs';
+import type { Dirent, Stats } from 'node:fs';
 import {
-  lstat, mkdir, open, realpath, rename, unlink,
+  lstat, mkdir, open, readdir, realpath, rename, unlink,
 } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
@@ -256,6 +256,33 @@ export async function lstatAt(
     return await lstat(procEntry(procRoot, parentFd, name));
   } catch (err) {
     mapEntryError(err, 'the pinned entry');
+  }
+}
+
+/** Lists one directory relative to a pinned parent fd; entries are not followed. */
+export async function readdirAt(
+  parentFd: number, name: string, options: PinnedOptions = {},
+): Promise<Dirent[]> {
+  assertName(name);
+  const procRoot = procRootOf(options);
+  await probeProc(procRoot);
+  try {
+    return await readdir(procEntry(procRoot, parentFd, name), { withFileTypes: true });
+  } catch (err) {
+    mapEntryError(err, 'the pinned directory');
+  }
+}
+
+/** Lists an already-pinned directory handle without resolving its path again. */
+export async function readdirFd(
+  handle: FileHandle, options: PinnedOptions = {},
+): Promise<Dirent[]> {
+  const procRoot = procRootOf(options);
+  await probeProc(procRoot);
+  try {
+    return await readdir(`${procRoot}/self/fd/${handle.fd}`, { withFileTypes: true });
+  } catch (err) {
+    mapEntryError(err, 'the pinned directory');
   }
 }
 

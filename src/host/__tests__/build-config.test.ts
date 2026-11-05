@@ -13,8 +13,12 @@ it('copies the runtime assets and verifies the dist invariants behaviorally', as
   try {
     await mkdir(join(fixture, 'src', 'journal'), { recursive: true });
     await mkdir(join(fixture, 'src', 'node'), { recursive: true });
+    await mkdir(join(fixture, 'src', 'host', 'cockpit', 'frontend'), { recursive: true });
     await writeFile(join(fixture, 'src', 'journal', 'lock-guard.mjs'), '// guard\n');
     await writeFile(join(fixture, 'src', 'node', 'conversation-append.mjs'), '// writer\n');
+    for (const name of ['index.html', 'app.js', 'style.css']) {
+      await writeFile(join(fixture, 'src', 'host', 'cockpit', 'frontend', name), `// ${name}\n`);
+    }
     await copyRuntimeAssets(fixture, out);
     expect(await readFile(join(out, 'journal', 'lock-guard.mjs'), 'utf8')).toBe('// guard\n');
     expect(await readFile(join(out, 'node', 'conversation-append.mjs'), 'utf8'))
@@ -22,11 +26,15 @@ it('copies the runtime assets and verifies the dist invariants behaviorally', as
 
     await mkdir(join(out, 'journal'), { recursive: true });
     await mkdir(join(out, 'node', 'tools'), { recursive: true });
-    await mkdir(join(out, 'host'), { recursive: true });
+    await mkdir(join(out, 'host', 'cockpit'), { recursive: true });
     await writeFile(join(out, 'journal', 'lock.js'), '// lock\n');
     await writeFile(join(out, 'node', 'conversation.js'), '// conversation\n');
     await writeFile(join(out, 'node', 'tools', 'sandbox.js'), '// sandbox\n');
     await writeFile(join(out, 'host', 'main.js'), '// main\n');
+    await writeFile(join(out, 'host', 'cockpit', 'main.js'), '// cockpit\n');
+    for (const name of ['index.html', 'app.js', 'style.css']) {
+      await writeFile(join(out, 'host', 'cockpit', 'frontend', name), `// ${name}\n`);
+    }
     const launcher = join(fixture, 'native', 'es-landlock', 'es-landlock');
     await mkdir(dirname(launcher), { recursive: true });
     await writeFile(launcher, '#!/bin/sh\n');
@@ -42,6 +50,10 @@ it('copies the runtime assets and verifies the dist invariants behaviorally', as
     await rm(join(out, 'host', 'main.js'));
     await expect(verifyDist(out)).rejects.toThrow(/missing dist\/host\/main\.js/);
     await writeFile(join(out, 'host', 'main.js'), '// main\n');
+    await writeFile(join(out, 'host', 'cockpit', 'main.js'), '// cockpit\n');
+    for (const name of ['index.html', 'app.js', 'style.css']) {
+      await writeFile(join(out, 'host', 'cockpit', 'frontend', name), `// ${name}\n`);
+    }
     await mkdir(join(out, 'native'), { recursive: true });
     await expect(verifyDist(out)).rejects.toThrow(/dist\/native/);
   } finally {
@@ -56,5 +68,6 @@ it('pins the build config, package scripts and ignore entry', async () => {
   expect(build.exclude).toContain('src/**/__tests__/**');
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   expect(pkg.scripts.build).toBe('node scripts/build.mjs');
+  expect(pkg.scripts.cockpit).toBe('node dist/host/cockpit/main.js');
   expect(await readFile(join(root, '.gitignore'), 'utf8')).toContain('/dist/');
 });

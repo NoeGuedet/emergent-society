@@ -72,6 +72,8 @@ export type HostCliCommand =
   | {
       readonly command: 'resume'; readonly home: string; readonly uid: string;
       readonly noSandbox: boolean; readonly nodesFile?: string;
+      /** Gateway-only observer: no node specs/composition/counter admission. */
+      readonly observer?: boolean;
     }
   | { readonly command: 'pause'; readonly home: string }
   | { readonly command: 'status'; readonly home: string; readonly json: boolean }
@@ -97,7 +99,7 @@ export const USAGE = `Usage:
   node dist/host/main.js init   --home <abs-dir>
   node dist/host/main.js start  --home <abs-dir> --model <id> --heading <text> [--charter-file <abs-path>] [--gateway-charter <abs-path> [--gateway-model <id>]] [--uid node-0] [--heartbeat-seconds N] [--token-limit N] [--memory-remember] [--no-sandbox]
   node dist/host/main.js start  --home <abs-dir> --nodes-file <abs-path> [--gateway-charter <abs-path> [--gateway-model <id>]] [--heartbeat-seconds N] [--token-limit N] [--memory-remember] [--no-sandbox]
-  node dist/host/main.js resume --home <abs-dir> [--uid node-0] [--no-sandbox]
+  node dist/host/main.js resume --home <abs-dir> [--uid node-0] [--observer] [--no-sandbox]
   node dist/host/main.js resume --home <abs-dir> --nodes-file <abs-path> [--no-sandbox]
   node dist/host/main.js pause  --home <abs-dir>
   node dist/host/main.js status --home <abs-dir> [--json]
@@ -147,6 +149,9 @@ different value is a configuration refusal, the same value preserves used/state,
 never takes the flag. Gateway calls are uncapped and use the separate gateway model. This is a
 response-accounted stop, not a money or exact provider-bill ceiling; in-flight responses can
 overshoot.
+--observer is resume-only and gateway-only: it shares the persisted gateway pair, world and
+frontier without composing a node, reading the node counter or making a node model call; it
+cannot be combined with --nodes-file.
 --memory-remember is the memory gate, start-only and home-level: it journals
 policy.memory {remember: true, messages: false} into every node this start composes and the
 composed extend offering advertises the remember verb (the node authors what replaces the fixed
@@ -388,10 +393,14 @@ function parseResume(args: readonly string[]): HostCliCommand {
     'nodes-file': { type: 'string' },
     uid: { type: 'string' },
     'no-sandbox': { type: 'boolean' },
+    observer: { type: 'boolean' },
   });
   const nodesFile = nodesFileOf(values);
   if (nodesFile !== undefined && values['uid'] !== undefined) {
     throw new UsageError('--nodes-file replaces --uid; pass the uids in the nodes file');
+  }
+  if (nodesFile !== undefined && values['observer'] === true) {
+    throw new UsageError('--observer cannot be combined with --nodes-file');
   }
   return {
     command: 'resume',
@@ -399,6 +408,7 @@ function parseResume(args: readonly string[]): HostCliCommand {
     uid: uidOf(values),
     noSandbox: values['no-sandbox'] === true,
     ...(nodesFile !== undefined ? { nodesFile } : {}),
+    ...(values['observer'] === true ? { observer: true } : {}),
   };
 }
 

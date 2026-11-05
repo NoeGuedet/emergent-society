@@ -1,0 +1,59 @@
+:root {
+  color-scheme: dark;
+  --bg: #101316;
+  --panel: #171b20;
+  --line: #2a3138;
+  --text: #e6e9ec;
+  --muted: #8b969f;
+  --accent: #77b7ff;
+  --error: #ff8b8b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+header {
+  display: flex; align-items: baseline; gap: 12px;
+  padding: 16px 22px; border-bottom: 1px solid var(--line);
+}
+h1 { font-size: 18px; margin: 0; font-weight: 600; }
+h2 { font-size: 14px; margin: 0 0 10px; font-weight: 600; }
+main { padding: 18px; max-width: 1300px; margin: 0 auto; }
+.panel {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 14px; margin-bottom: 14px;
+}
+.columns { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 14px; }
+.runs ul { list-style: none; margin: 0; padding: 0; }
+.runs li { margin: 4px 0; }
+button, input, textarea {
+  font: inherit; color: var(--text); background: #0d1013;
+  border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px;
+}
+button { cursor: pointer; }
+button:hover, button.selected { border-color: var(--accent); }
+button.selected { color: var(--accent); }
+.runs button { width: 100%; text-align: left; }
+label { display: block; margin: 7px 0; color: var(--muted); }
+label input, label textarea { display: block; width: 100%; margin-top: 3px; }
+.check { display: flex; align-items: center; gap: 6px; }
+.check input { width: auto; }
+.row { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
+.row > label { flex: 1 1 180px; }
+.between { justify-content: space-between; align-items: center; }
+.muted { color: var(--muted); }
+.error { color: var(--error); min-height: 1.2em; }
+hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
+.pane { max-height: 52vh; overflow: auto; margin-top: 10px; }
+.entry { border-bottom: 1px solid var(--line); padding: 7px 0; }
+.entry p { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tree { padding: 2px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tree.directory { color: var(--accent); }
+.tree.symlink { color: #ffd27d; }
+.tree.special { color: var(--error); }
+#chat-form { display: flex; gap: 8px; margin-top: 8px; }
+#chat-form input { flex: 1; }
+@media (max-width: 800px) { .columns { grid-template-columns: 1fr; } }
