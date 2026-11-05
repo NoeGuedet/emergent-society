@@ -507,6 +507,26 @@ describe('the interactive session', () => {
     }
   });
 
+  it('an already-aborted wait signal interrupts before the first poll', async () => {
+    const dir = await home();
+    await configured(dir);
+    const controller = new AbortController();
+    controller.abort();
+    const stdin = scriptedStdin(['hello', '']);
+    const out = sink();
+    const result = await runChatSession({
+      home: dir, stdin, stdout: out.write, stderr: sink().write,
+      waitTimeoutMs: 250, waitPollMs: 20, waitNoteMs: 1_000,
+      waitSignal: controller.signal,
+    });
+    expect(result.code).toBe(0);
+    expect(out.text()).toContain(CHAT_INTERRUPTED_NOTICE);
+    expect(out.text()).not.toContain(CHAT_TIMEOUT_NOTICE);
+    expect((await readChat(dir)).map((record) => [record.uid, record.text]))
+      .toEqual([[HUMAN_AUTHOR, 'hello']]);
+    expect(stdin.reads()).toBe(3);
+  });
+
   it('detects the absent overlay up front and saves the message anyway', async () => {
     const dir = await home();
     const out = sink();

@@ -765,6 +765,10 @@ async function waitForResponse(
   process.on('SIGINT', onAbort);
   options.signal?.addEventListener('abort', onAbort, { once: true });
   try {
+    if (options.signal?.aborted === true) {
+      onAbort();
+      return { kind: 'interrupted' };
+    }
     const deadline = options.now() + Math.max(0, options.timeoutMs);
     let nextNote = options.now() + Math.max(1, options.noteMs);
     for (;;) {
