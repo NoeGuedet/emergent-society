@@ -50,6 +50,29 @@ file first and do not infer status from this checklist.
   ([docs/kernel.md](kernel.md) §Credential store and broker).
 - **Confinement scope** — the `execute` shell and package Runs are Landlock-confined on
   filesystem content. Egress is currently open by decision; this is not network mediation.
+- **Shell facts** — `HOME` is the world root; `TMPDIR` is the designated per-node scratch leaf
+  and the writable scratch (use `$TMPDIR`, not `/tmp`). Writes are limited to the world, that
+  scratch, and the granted device files. Reads cover the runtime paths granted by confinement
+  (for example merged-usr runtime paths and selected `/proc`); host and cell-private files
+  remain off-limits. The shell's working directory, exports and background jobs persist across
+  `execute` calls; start command blocks with `cd "$HOME"` or verified absolute `$HOME` paths and
+  never assume the cwd is `project/` or `tests/`. The kernel owns turn-end commits; do not run
+  shell git.
+- **Journal reading** — read node journals with `JournalReader` and `resolveBlobs: true` over
+  the full source-known event-type union, importing the proper module exports from source
+  (`C13_EVENT_TYPES`, the context + node-lifecycle union; `FRONTIER_EVENT_TYPES` for the
+  frontier; plus any source-known union the reader requires). Verify the exports against source;
+  never use a data-derived/observed-type whitelist or a raw line scan. A missing blob or read
+  failure is incomplete, not inferred; a raw scan can miss blob-backed accounting.
+- **Tool errors** — a `tool/result` may have `isError:true` with `failure:null`; the diagnostic
+  is in `message.content` (for example `extend`/Package errors). A null failure is not "no
+  error" and not a structured code; there is no guarantee every extend/Package error has one.
+  Preserve raw counts and do not infer an engine bug from actor/tool errors.
+- **Non-guarantees** — a world-side PASS is not self-certifying; external canonical checks are
+  authoritative. Gateway numeric usage is not guaranteed and is separate from the node budget;
+  unknown is not zero. A bounded campaign does not establish universal task quality, security,
+  or production readiness. No universal network isolation is claimed: shell/Run egress is open
+  by decision, and Landlock confines filesystem content, not network.
 - **Observation boundary** — the frontier records only kernel-mediated HTTP exchanges; it
   does not record shell syscalls, direct shell/Run egress or individual intra-turn filesystem
   effects. The world's git observes committed changes at commit granularity: the author is the
@@ -136,6 +159,11 @@ The overlay's request timeout is a host-side constant, not journaled: newly star
 code (including `resume --observer`) uses 120 s, while an already-running old overlay keeps
 30 s until restarted. A fresh node start uses 120 s; an old cell's journaled 30 s policy is
 preserved on resume.
+
+The factory/runtime code is unchanged by documentation; there is no new API, schema, flag or
+migration. Journaled node policies win. The cockpit's 300 s launch heartbeat is source-compiled;
+an existing cockpit process must be restarted, and the operator must confirm that restart, before
+any live-deployment claim. Source presence alone is not a deployment claim.
 
 The executable references for a no-key boot are
 [scripts/first-light-smoke.mjs](../scripts/first-light-smoke.mjs) (scenarios A–E against a

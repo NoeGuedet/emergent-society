@@ -173,9 +173,12 @@ stopping.
 ## Durable execution protocol
 
 - The orchestrating session plans, reviews and owns the required gates. Repo source
-  implementation is delegated to a DeepSeek Account `deepseek-flash` sub-agent at high
-  reasoning effort; verify the available routes each session and never silently change
-  provider. `opencode-go` is not an established route.
+  implementation is delegated to a repository executor on the Lead-verified route
+  `opencode-go` / model `deepseek-v4.1-flash` at high reasoning effort; this is distinct from
+  provider-specific runtime node/gateway model IDs (for example, the campaign's
+  `deepseek-flash`), and it does not fix the engine's global model choice. Verify that route is
+  available each session and never fall back silently to another provider or model; if it is
+  unavailable, stop and report instead of switching.
 - Before coding: produce the plan, then run four independent audits — doctrine, feasibility,
   invariants and minimalism — until all four return READY (4/4).
 - Then implement sequential atomic bricks. Each brick gets an independent counter-audit,

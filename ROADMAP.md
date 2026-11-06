@@ -5,16 +5,21 @@ References: [Vision](docs/vision.md) — what the project is; [Architecture](doc
 ## Resume here
 
 **Position.** The engine exists and runs: kernel, node driver, host, seven-command CLI,
-gateway overlay and Package layer. The last pushed wave is the token-limit and cockpit wave
-on `main` at `f1d0f52` (preceding `a7831a6`, `8a10b2e`). The system is operated through the
-CLI; an optional start-only operator node response-token stop (input+output) is available.
-A local loopback cockpit (gateway-only observer and vanilla page) is implemented and
-independently validated:
-148 test files / 2,508 tests, no skips, the nine Node 24 gates, and a real compiled
-fake-provider HTTP lifecycle acceptance. Browser rendering was not validated (the installed
-Firefox is snap single-instance); there is no remote cockpit or cockpit frontier viewer.
-Next is the cross-brick check of the committed token-limit and cockpit wave before delivery
-and demo setup.
+gateway overlay and Package layer. The validated runtime code is `50290c5`: it carries the
+bounded 120 s fresh-node/gateway request defaults ([config.ts](src/context/config.ts),
+[policy.ts](src/overlay/policy.ts)) and the cockpit's fixed 300 s launch heartbeat
+([manager.ts](src/host/cockpit/manager.ts)); the nine Node 24 gates are green at that code
+(148 files / 2,510 tests, 0 skips; 4 mutants killed; counter audit accepted). The system is
+operated through the CLI; an optional start-only operator node response-token stop
+(input+output) is available. A local loopback cockpit (gateway-only observer and vanilla page)
+is implemented; browser rendering was not validated (the installed Firefox is snap
+single-instance), and there is no remote cockpit or cockpit frontier viewer. The
+engine/provider-only three-world acceptance and its caveats are recorded once in the Validation
+checkpoint below.
+
+The cockpit's 300 s heartbeat is source-compiled; an existing cockpit process must be restarted,
+and the operator must confirm that restart, before any live-deployment claim. Source presence
+alone is not a deployment claim.
 
 **Gaps.** No generic credential broker (the loader supports only `llm` and `tavily`), no
 research observation/analysis pipeline and no cockpit frontier viewer, no full escalating kill
@@ -64,18 +69,36 @@ fence, reap and wake-policy smokes). That is development evidence for B2a, not a
 
 ## Validation checkpoint
 
-The wake-policy wave's closure record, at `99fe917` (preceding `d6e5ac7`, `63b68bb`), was
-135 test files / 2,404 tests (33.43 s), `typecheck` and `build` green, first-light scenarios
-A–E and packages F green, and the refusal, fence, reap and wake-policy smokes green without
-skips under Node 24. This is PRIOR evidence recorded when the wave closed; it is NOT a current
-rerun and NOT a live-inference result. The closure logs live outside the repository and are
-optional, nonportable evidence — never a prerequisite to resume.
+The current validation record is the validated runtime code `50290c5` with the nine Node 24
+gates green (148 files / 2,510 tests, 0 skips; 4 mutants killed; counter audit accepted). This
+is the validation record for that code, not a new gate run by a later session.
 
-Limits: no local RTX3090 inference was validated; the live path has run against a hosted
-model ([first-light.md](docs/first-light.md)); a green framework check does not prove C1's
-readable projection or C3's coherence criterion. The exact gate order and the four compiled
-smokes are in [AGENTS.md](AGENTS.md); a new session must run them itself before any push and
-must not present these numbers as a current pass.
+**Engine/provider-only campaign acceptance.** Three sequential worlds (w01–w03) each exhausted a
+fresh shared 5,000,000 provider-reported node input+output budget with exact accounting. The
+three worlds used 15,144,540 provider-reported node tokens (144,540 over the three shared caps).
+Gateway usage is 497,160 / 510,719 / 229,486, total 1,237,365, known separately and not a money
+ceiling. All three had zero frontier-recorded provider HTTP/network/timeout errors, zero
+retries, and zero engine faults. Across the worlds: 5/3/3 nodes, 3/2/2 spawns, 17/14/14 commits;
+all spawned models were `deepseek-flash`. Post-cap gateway work created no new node calls; world
+services stopped and owners released; four historical empty transient slices remain active with
+0 tasks and 0 active child units; the runs slot is empty. Teardown used 0 backstop stops. The
+literal actor-command-clean streak is 0/3: 17/5/3 unintended non-cap actor/tool errors are
+retained, and the old actor-strict result is preserved as false. Under the Lead's clarified
+criterion, the acceptance is met; this is not a claim of universal task quality, security, or
+production readiness. Paid worlds stopped at 3/10; no w04.
+
+**Remaining risks.** All three missions are partial. w01's mission was partial at cap (12 valid
+digests; MANIFEST/CONFLICTS/STRESS/INJECT missing) and its external verifier failed on those
+missing artifacts. w02's operator-executed confined independent canonical check was 15/15 PASS;
+much hardening is not fully proven. w03's mission was partial (EVIDENCE/HARDENING missing; no
+live external probe; only post-stop PID/port-gone). The earlier usage gap was a reader artifact,
+not engine drift: exact reconciliation uses `JournalReader` with `resolveBlobs` and the full
+source-known event union. The 120 s source default is intentional headroom; the largest observed
+response was 36.075 s (operator measurement), one bounded sample, not a provider SLA. The initial
+Bug Bounty stop was two 30 s provider timeouts, not a Run leak. No engine source fix is
+demonstrated by the actor/tool errors. The cockpit 300 s heartbeat is compiled in source; an
+existing cockpit process must be restarted and the operator must confirm that restart before any
+live-deployment claim. Source presence alone is not a deployment claim.
 
 ## Proposed next lots (proposal only)
 
@@ -140,13 +163,11 @@ A checkpoint is reached when its criterion is demonstrated on a running system, 
 
 ## Next safe action
 
-A new session starts at [docs/resuming.md](docs/resuming.md), confirms the checkout and HEAD,
-and does not start source work from a status document. The active shared-VM wave has B1
-implemented and B2 split into B2a (the host path pin: operator reads, ratification
-materialization, doctor IO) and B2b (one commit lease). B2a is implemented, audited (four fresh
-READY) and gate-validated. B2b is next and follows only after its own frozen plan and four READY
-audits; it stays design-not-ready until then. B3+ stay hard-gated on a real B0c KVM proof. The
-broker design remains a proposal, not the active wave.
+A new session starts at [docs/resuming.md](docs/resuming.md), confirms the current HEAD and the
+required gates, and does not start source work from a status document. Await the Lead-defined
+next scope; run the cross-brick nine sequential gates before any next push. VM/B2b work remains
+paused. The existing GUI/cockpit restart remains an operator step before any live-deployment
+claim; no live-fixed claim is made.
 
 ## Framing rules
 
