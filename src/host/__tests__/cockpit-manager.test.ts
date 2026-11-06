@@ -52,6 +52,7 @@ it('reserves one active slot, launches the fixed wrapper args, and pauses it', a
   expect(active.id).toBe(manifest.id);
   expect(calls[0]).toEqual(expect.arrayContaining([
     'start', '--token-limit', '5', '--gateway-model', 'g', '--nodes-file',
+    '--heartbeat-seconds', '300',
   ]));
   expect(calls[0]).not.toContain('--no-sandbox');
 
@@ -61,6 +62,8 @@ it('reserves one active slot, launches the fixed wrapper args, and pauses it', a
 
   await manager.observe(manifest);
   expect(calls[1]).toEqual(expect.arrayContaining(['resume', '--observer']));
+  expect(calls[1]).not.toContain('--heartbeat-seconds');
+  expect(calls[1]).not.toContain('--token-limit');
   expect(manager.active()?.id).toBe(manifest.id);
   await manager.pause(manifest.id);
   expect(manager.active()).toBeNull();

@@ -237,4 +237,7 @@ it('reads leave the world untouched and an unknown tool is a teaching refusal', 
 it('declares the overlay policy the tools bound under', () => {
   expect(OVERLAY_POLICY.maxToolResultBytes).toBe(OVERLAY_TOOL_RESULT_BYTES);
   expect(OVERLAY_POLICY.maxToolArgumentBytes).toBeGreaterThan(0);
+  expect(OVERLAY_POLICY.requestTimeoutMs).toBe(120_000);
+  expect(OVERLAY_POLICY.maxAttempts).toBe(2);
+  expect(OVERLAY_POLICY.retryDelayMs).toBe(250);
 });

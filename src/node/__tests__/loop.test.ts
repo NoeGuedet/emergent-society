@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Buffer } from 'node:buffer';
 import { access, chmod, copyFile, mkdir, writeFile } from 'node:fs/promises';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { NodeDriver, type NodeDriverOptions, type TurnHandler } from '../driver.js';
@@ -14,6 +16,7 @@ import { ContextFold } from '../../context/fold.js';
 import { verifyPerceptions } from '../../context/__tests__/verify-perceptions.js';
 import { readFrontier } from '../../frontier/__tests__/helpers.js';
 import { openTestDriver } from './helpers.js';
+import { cadencePhaseMs } from '../cadence.js';
 import { C13_EVENT_TYPES, createBoundaryRegistry } from '../../context/events.js';
 import { loadVerifiedEvents } from '../../context/loader.js';
 import type { BoundaryGate, DriverHooks } from '../gate.js';
@@ -109,6 +112,97 @@ class ScriptedTransport implements SerializedTransport {
     if (next === undefined) throw new Error('scripted transport exhausted');
     return next;
   }
+}
+
+/**
+ * A loopback 200 response that stalls after the headers. The server writes the
+ * headers and a partial body; the transport signals `onHeaders` only after the
+ * fetch resolved, so the test can fire the adapter's captured deadline at a
+ * known post-header point. No wall-clock timeout races the handshake.
+ */
+class PostHeaderStallTransport implements SerializedTransport {
+  readonly facts: TransportFacts = TEST_FACTS;
+  readonly sends: Uint8Array[] = [];
+  private readonly endpoint: string;
+  private readonly onHeaders: () => void;
+
+  constructor(endpoint: string, onHeaders: () => void) {
+    this.endpoint = endpoint;
+    this.onHeaders = onHeaders;
+  }
+
+  async post(body: Uint8Array, signal: AbortSignal, _maxBytes: number): Promise<TransportResult> {
+    this.sends.push(body);
+    const response = await fetch(this.endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+      signal,
+    });
+    this.onHeaders();
+    if (this.sends.length > 2) {
+      const text = await response.text();
+      return {
+        status: response.status, headers: {}, body: Buffer.from(text),
+        complete: true, failure: null,
+      };
+    }
+    await new Promise<void>((resolve) => {
+      if (signal.aborted) { resolve(); return; }
+      signal.addEventListener('abort', () => resolve(), { once: true });
+    });
+    if (response.body !== null) await response.body.cancel().catch(() => {});
+    return {
+      status: response.status, headers: {}, body: Buffer.from('{"choices":'),
+      complete: false, failure: { code: 'cancelled', status: response.status },
+    };
+  }
+}
+
+/** Captures the adapter's timeout callbacks; the test fires them explicitly. */
+function manualProviderPolicy(): {
+  readonly deadlines: { readonly ms: number; readonly fire: () => void }[];
+  readonly policy: ProviderPolicy;
+} {
+  const deadlines: { ms: number; fire: () => void }[] = [];
+  return {
+    deadlines,
+    policy: {
+      delay: async () => {},
+      schedule: (ms, callback) => {
+        deadlines.push({ ms, fire: callback });
+        return () => {};
+      },
+    },
+  };
+}
+
+/** Captures the driver's park timers; the test fires the cadence explicitly. */
+function manualDriverSchedule(): {
+  readonly timers: { readonly ms: number; readonly fire: () => void }[];
+  readonly schedule: (ms: number, callback: () => void) => () => void;
+} {
+  const timers: { ms: number; fire: () => void }[] = [];
+  return {
+    timers,
+    schedule: (ms, callback) => {
+      timers.push({ ms, fire: callback });
+      return () => {};
+    },
+  };
+}
+
+async function listen(server: Server): Promise<string> {
+  await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve); });
+  const address = server.address() as AddressInfo;
+  return `http://127.0.0.1:${address.port}/v1/chat/completions`;
+}
+
+async function closeServer(server: Server): Promise<void> {
+  server.closeAllConnections();
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => { if (error) reject(error); else resolve(); });
+  });
 }
 
 function noCalls(content: string): TransportResult {
@@ -450,6 +544,92 @@ describe('recoverable provider failure', () => {
       .map((event) => (event.data as { outcome: string }).outcome);
     expect(outcomes).toEqual(['error', 'waiting']);
   });
+
+  it('parks a post-header 200 stall as timeout and recovers on cadence', async () => {
+    const fx = fixture();
+    const NOW = cadencePhaseMs('n1', 5_000);
+    const provider = manualProviderPolicy();
+    const cadence = manualDriverSchedule();
+    let serverRequests = 0;
+    let headers = 0;
+    const server = createServer((req, res) => {
+      req.on('error', () => {});
+      res.on('error', () => {});
+      req.on('data', () => {});
+      req.on('end', () => {
+        serverRequests += 1;
+        if (serverRequests <= 2) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.write('{"choices":');
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: 'recovered' } }],
+        }));
+      });
+    });
+    const endpoint = await listen(server);
+    let driver: NodeDriver | null = null;
+    let running: Promise<void> | null = null;
+    try {
+      const transport = new PostHeaderStallTransport(endpoint, () => { headers += 1; });
+      const adapter = await adapterFor(fx, transport, provider.policy);
+      const runtime = await createAgentRuntime({
+        home: fx.home, uid: 'n1', world: fx.world,
+        initialConfig: configWith({
+          policy: { requestTimeoutMs: 60_000, maxAttempts: 2, retryDelayMs: 1 },
+        }),
+        terminal: { env: DEFAULT_TERMINAL_ENV },
+        adapter,
+      });
+      driver = await openRuntime(fx, runtime, {
+        wakePolicy: () => ({ heartbeatSeconds: 5 }),
+        schedule: cadence.schedule,
+        now: () => NOW,
+      });
+      running = driver.run();
+
+      await vi.waitFor(() => expect(headers).toBe(1));
+      await vi.waitFor(() => expect(provider.deadlines).toHaveLength(1));
+      provider.deadlines[0]!.fire();
+      await vi.waitFor(() => expect(headers).toBe(2));
+      await vi.waitFor(() => expect(provider.deadlines).toHaveLength(2));
+      provider.deadlines[1]!.fire();
+
+      await vi.waitFor(() => expect(driver!.state).toBe('waiting'));
+      const events = await eventsOf(fx);
+      const failed = events.filter((event) => event.type === 'turn/end').at(-1);
+      expect(failed?.data).toMatchObject({ outcome: 'error', error: 'timeout 200' });
+
+      const frontier = await readFrontier(fx.home);
+      const requestEvents = frontier.filter((event) => event.type === 'http/request')
+        .map((event) => event.data as unknown as { attempt: number });
+      const responses = frontier.filter((event) => event.type === 'http/response')
+        .map((event) => event.data as unknown as {
+          status: number; error: { code: string } | null; body: { complete: boolean };
+        });
+      expect(requestEvents.map((request) => request.attempt)).toEqual([0, 1]);
+      expect(responses.map((response) => response.status)).toEqual([200, 200]);
+      expect(responses.map((response) => response.error?.code)).toEqual(['timeout', 'timeout']);
+      expect(responses.map((response) => response.body.complete)).toEqual([false, false]);
+      expect(provider.deadlines.map((deadline) => deadline.ms)).toEqual([60_000, 60_000]);
+
+      await vi.waitFor(() => expect(cadence.timers).toHaveLength(1));
+      expect(cadence.timers[0]!.ms).toBe(5_000);
+      cadence.timers[0]!.fire();
+      await vi.waitFor(() => expect(serverRequests).toBe(3));
+      await vi.waitFor(() => expect(driver!.state).toBe('waiting'));
+      const triggers = (await eventsOf(fx))
+        .filter((event) => event.type === 'turn/start')
+        .map((event) => (event.data as { trigger: string }).trigger);
+      expect(triggers).toContain('cadence');
+    } finally {
+      driver?.stop();
+      await running?.catch(() => {});
+      await closeServer(server);
+    }
+  }, 30_000);
 });
 
 describe('stop', () => {

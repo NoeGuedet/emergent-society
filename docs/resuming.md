@@ -128,6 +128,15 @@ is the gateway-only host behind an observer action: it shares the persisted gate
 world, frontier, owner and chat without composing a node, reading the node counter or making a
 node model call. A local cockpit run remains local; it is not a hosted or multi-user service.
 
+A cockpit build containing the fixed 300 s launch heartbeat applies it only to new launches;
+an already-running cockpit process keeps its loaded code until restarted. The CLI default
+remains 0; a CLI campaign start passes `--heartbeat-seconds 300` explicitly.
+
+The overlay's request timeout is a host-side constant, not journaled: newly started overlay
+code (including `resume --observer`) uses 120 s, while an already-running old overlay keeps
+30 s until restarted. A fresh node start uses 120 s; an old cell's journaled 30 s policy is
+preserved on resume.
+
 The executable references for a no-key boot are
 [scripts/first-light-smoke.mjs](../scripts/first-light-smoke.mjs) (scenarios A–E against a
 loopback provider) and [scripts/wake-policy-smoke.mjs](../scripts/wake-policy-smoke.mjs) (the
@@ -143,8 +152,9 @@ Wake notes:
 - Legacy cells keep their journaled old policy with no migration.
 - No price, spending ceiling or monetary economy exists in the kernel. The optional start-only
   `--token-limit N` is an operational node response-token stop: it aggregates provider-reported
-  node usage, leaves the gateway uncapped, and is not an exact provider bill. Without it, cost is
-  deployment policy; a local GPU or sponsored credits is a supported deployment.
+  node input+output token usage, leaves the gateway uncapped, and is not an exact provider
+  bill. Without it, cost is deployment policy; a local GPU or sponsored credits is a supported
+  deployment.
 
 Never launch an experiment or make a paid model call as part of orientation. The live wrapper
 is gated by `ES_LIVE_LLM=1`, but that variable gates only

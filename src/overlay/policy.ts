@@ -52,7 +52,7 @@ export const OVERLAY_POLICY: SeedPolicy = {
   keepRecentGroups: 0,
   maxAttempts: 2,
   retryDelayMs: 250,
-  requestTimeoutMs: 30_000,
+  requestTimeoutMs: 120_000,
   // Inert: no shell, no kill, no capture in the overlay.
   shellTimeoutMs: 30_000,
   killGraceMs: 200,

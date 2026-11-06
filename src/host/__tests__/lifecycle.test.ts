@@ -630,6 +630,32 @@ describe('the declared context window: the boot rule and the migration (A3)', ()
     expect(server!.requests.length).toBeGreaterThan(0);
   }, 30_000);
 
+  it('resumes an old journaled 30 s request policy unchanged', async () => {
+    const factory = defaultAgentConfig();
+    const old = validateAgentConfig({
+      ...factory, model: 'first-light-test', heading: 'First light.',
+      policy: {
+        ...factory.policy,
+        requestTimeoutMs: 30_000,
+        maxAttempts: 2,
+        retryDelayMs: 250,
+      },
+    });
+    await serve(undefined, windowed('first-light-test'));
+    await seedConfig(old);
+    const { model: _model, heading: _heading, ...resumeOpts } = opts;
+    const resumed = track(startHost({ ...resumeOpts, command: 'resume' }, hostDeps));
+    await waitForLog(log, 'host/parked');
+    resumed.stop();
+    expect(await resumed.done).toBe(0);
+    const events = await readC13(home, 'node-0');
+    expect(events.filter((event) => event.type === 'system/message')).toHaveLength(1);
+    const policy = firstConfig(events).policy;
+    expect(policy.requestTimeoutMs).toBe(30_000);
+    expect(policy.maxAttempts).toBe(2);
+    expect(policy.retryDelayMs).toBe(250);
+  }, 30_000);
+
   it('plumbs a two-model store (1M/200k) to each fresh cell', async () => {
     await serve(undefined, [
       { id: 'model-1m', contextTokens: 1_000_000, maxOutputTokens: 256_000 },

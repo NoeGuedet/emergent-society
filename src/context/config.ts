@@ -128,7 +128,7 @@ export function defaultAgentConfig(): AgentConfig {
     ],
     policy: {
       stepsPerTurn: 8, compactAfterBytes: 262144, keepRecentGroups: 8,
-      maxAttempts: 2, retryDelayMs: 250, requestTimeoutMs: 30000,
+      maxAttempts: 2, retryDelayMs: 250, requestTimeoutMs: 120000,
       shellTimeoutMs: 300000, killGraceMs: 200,
       maxCaptureBytes: 33554432, maxRequestBytes: 33554432,
       maxShellCaptureBytes: 16777216,

@@ -5,10 +5,11 @@ References: [Vision](docs/vision.md) — what the project is; [Architecture](doc
 ## Resume here
 
 **Position.** The engine exists and runs: kernel, node driver, host, seven-command CLI,
-gateway overlay and Package layer. The last pushed wave is the quota-free modern wake policy
-on `main` at `99fe917` (preceding `d6e5ac7`, `63b68bb`). The system is operated through the
-CLI; an optional start-only operator node response-token stop is available. A local loopback
-cockpit (gateway-only observer and vanilla page) is implemented and independently validated:
+gateway overlay and Package layer. The last pushed wave is the token-limit and cockpit wave
+on `main` at `f1d0f52` (preceding `a7831a6`, `8a10b2e`). The system is operated through the
+CLI; an optional start-only operator node response-token stop (input+output) is available.
+A local loopback cockpit (gateway-only observer and vanilla page) is implemented and
+independently validated:
 148 test files / 2,508 tests, no skips, the nine Node 24 gates, and a real compiled
 fake-provider HTTP lifecycle acceptance. Browser rendering was not validated (the installed
 Firefox is snap single-instance); there is no remote cockpit or cockpit frontier viewer.

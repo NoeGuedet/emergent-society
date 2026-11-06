@@ -87,6 +87,7 @@ export class CockpitManager {
       '--gateway-charter', await this.runs.charterFile(manifest.id),
       '--gateway-model', manifest.gatewayModel,
       '--token-limit', String(limit),
+      '--heartbeat-seconds', '300',
     ];
     return await this.spawnSlot(slot, args);
   }
